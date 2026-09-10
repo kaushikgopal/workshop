@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "workflows": [
+    {
+      "id": "<workflow-id>",
+      "definitionHash": "<sha256>",
+      "activation": {
+        "state": "active",
+        "startedAt": "<iso>",
+        "startedRuns": 1,
+        "maxRuns": 6,
+        "nextRunAt": "<iso>"
+      },
+      "currentRun": {
+        "id": "<run-id>",
+        "status": "blocked",
+        "desiredState": "running",
+        "orchestratorPhase": "idle",
+        "startedAt": "<iso>",
+        "blocker": "agent_requested",
+        "nodes": [
+          {
+            "id": "<node-id>",
+            "status": "completed",
+            "attempts": [
+              {
+                "number": 1,
+                "status": "completed",
+                "progress": null,
+                "validator": "passed",
+                "failure": null,
+                "blocker": null
+              }
+            ]
+          },
+          {
+            "id": "<node-id>",
+            "status": "blocked",
+            "attempts": [
+              {
+                "number": 1,
+                "status": "blocked",
+                "progress": "<progress-or-null>",
+                "validator": null,
+                "failure": null,
+                "blocker": "agent_requested"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

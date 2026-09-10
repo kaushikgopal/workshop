@@ -248,6 +248,7 @@ async function applyDecision(input: {
               packetPath: packetPath(run.run_dir, latest.node_id, latest.attempt + 1),
               resolvedMaxAttempts: latest.resolved_max_attempts,
               resolvedTimeoutMs: latest.resolved_timeout_ms,
+              chainPosition: chain.order.indexOf(latest.node_id),
               now: clock.now(),
             })
           : null;

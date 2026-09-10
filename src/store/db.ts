@@ -74,6 +74,7 @@ CREATE TABLE IF NOT EXISTS node_attempts (
   started_at TEXT,
   updated_at TEXT NOT NULL,
   finished_at TEXT,
+  chain_position INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (run_id, node_id, attempt)
 );
 

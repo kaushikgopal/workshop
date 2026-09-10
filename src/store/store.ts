@@ -83,6 +83,7 @@ export interface AttemptRow {
   current_progress: string | null;
   validator_status: "passed" | "failed" | null;
   validator_reason: string | null;
+  chain_position: number;
   started_at: string | null;
   updated_at: string;
   finished_at: string | null;
@@ -376,6 +377,7 @@ export class Store {
     packetPath: string;
     resolvedMaxAttempts: number;
     resolvedTimeoutMs: number | null;
+    chainPosition: number;
     now: Date;
   }): AttemptRow {
     return this.tx(() => {
@@ -386,10 +388,10 @@ export class Store {
       this.db
         .query(
           `INSERT INTO node_attempts (run_id, node_id, attempt, status, resolved_max_attempts, resolved_timeout_ms,
-             packet_path, updated_at)
-           VALUES (?, ?, 1, 'pending', ?, ?, ?, ?)`,
+             chain_position, packet_path, updated_at)
+           VALUES (?, ?, 1, 'pending', ?, ?, ?, ?, ?)`,
         )
-        .run(input.runId, input.nodeId, input.resolvedMaxAttempts, input.resolvedTimeoutMs, input.packetPath, nowIso);
+        .run(input.runId, input.nodeId, input.resolvedMaxAttempts, input.resolvedTimeoutMs, input.chainPosition, input.packetPath, nowIso);
       const row = this.getAttempt(input.runId, input.nodeId, 1);
       if (!row) throw new Error("attempt insert vanished");
       return row;
@@ -407,6 +409,7 @@ export class Store {
     packetPath: string;
     resolvedMaxAttempts: number;
     resolvedTimeoutMs: number | null;
+    chainPosition: number;
     now: Date;
   }): AttemptRow | null {
     return this.tx(() => {
@@ -417,10 +420,10 @@ export class Store {
       this.db
         .query(
           `INSERT INTO node_attempts (run_id, node_id, attempt, status, resolved_max_attempts, resolved_timeout_ms,
-             packet_path, updated_at)
-           VALUES (?, ?, ?, 'pending', ?, ?, ?, ?)`,
+             chain_position, packet_path, updated_at)
+           VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?)`,
         )
-        .run(input.runId, input.nodeId, next, input.resolvedMaxAttempts, input.resolvedTimeoutMs, input.packetPath, nowIso);
+        .run(input.runId, input.nodeId, next, input.resolvedMaxAttempts, input.resolvedTimeoutMs, input.chainPosition, input.packetPath, nowIso);
       const row = this.getAttempt(input.runId, input.nodeId, next);
       if (!row) throw new Error("attempt insert vanished");
       return row;
@@ -568,7 +571,7 @@ export class Store {
     validatorStatus: "passed" | "failed" | null;
     validatorReason: string | null;
     now: Date;
-    successor: { nodeId: string; packetPath: string; resolvedMaxAttempts: number; resolvedTimeoutMs: number | null } | null;
+    successor: { nodeId: string; packetPath: string; resolvedMaxAttempts: number; resolvedTimeoutMs: number | null; chainPosition?: number } | null;
   }): { completed: boolean; successorCreated: boolean } {
     return this.tx(() => {
       // Durable stop wins even over late completion evidence.
@@ -605,6 +608,7 @@ export class Store {
             packetPath: input.successor.packetPath,
             resolvedMaxAttempts: input.successor.resolvedMaxAttempts,
             resolvedTimeoutMs: input.successor.resolvedTimeoutMs,
+            chainPosition: input.successor.chainPosition ?? 0,
             now: input.now,
           });
           successorCreated = true;

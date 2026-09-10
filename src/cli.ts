@@ -1,13 +1,17 @@
 #!/usr/bin/env bun
+import { readFileSync } from "node:fs";
 import { findInstallation, ensureDirs, workflowPath } from "./config.js";
 import { join } from "node:path";
 import { loadAndValidateDefinition, startWorkflow, runChain, preflightIfNeeded, scaffoldFirstAttempt } from "./execute.js";
 import { openDb } from "./store/db.js";
 import { Store, GuardRejected } from "./store/store.js";
 import { buildStatusDto, renderStatusText, STATUS_DTO_VERSION } from "./status/dto.js";
+import { resolveNode } from "./runner/attempt.js";
+import { isTerminal } from "./store/store.js";
 import { blockKindFor } from "./runner/attempt.js";
 import { SystemClock } from "./util/clock.js";
 import { runtimeCliInvocation } from "./util/cli-path.js";
+import { DaemonLockHeld } from "./daemon.js";
 
 /**
  * Workshop CLI. Public surface:
@@ -109,12 +113,23 @@ async function main(): Promise<void> {
       await cmdStop(args);
       process.exit(0);
     case "logs":
+      return cmdLogs(args);
     case "diagram":
-    case "orchestrate":
-      die(`"${command}" is not implemented yet — it lands in a later work package`);
-    default:
-      process.stdout.write(HELP);
-      die(`unknown command "${command}"`);
+      return cmdDiagram(args);
+    case "node":
+      return cmdNode(args);
+    case "orchestrate": {
+      const inst = findInstallation();
+      ensureDirs(inst);
+      const { runDaemon } = await import("./daemon.js");
+      try {
+        await runDaemon(inst);
+      } catch (e) {
+        if (e instanceof DaemonLockHeld) die(e.message);
+        throw e;
+      }
+      return;
+    }
   }
 }
 
@@ -167,7 +182,7 @@ async function cmdStart(args: string[]): Promise<void> {
 
   // Package 1: execute the chain inline. The daemon (package 4) takes over
   // claiming and recurrence; the same guarded path is reused.
-  const final = await runChain({ store, inst, loaded, runId: started.runId, cliPath: cliPathOf() });
+  const final = await runChain({ store, inst, loaded, runId: started.runId, cliPath: runtimeCliInvocation() });
   process.stdout.write(`run ${final.run_id} → ${final.status}\n`);
   // The runner holds live handles (spawned-process listeners) by design;
   // CLI commands terminate their own process when the work is done.
@@ -281,6 +296,7 @@ async function cmdResume(args: string[]): Promise<void> {
         packetPath: join("packets", `${blocked.node_id}-attempt-${blocked.attempt + 1}.md`),
         resolvedMaxAttempts: blocked.resolved_max_attempts + 1, // one manual extension
         resolvedTimeoutMs: blocked.resolved_timeout_ms,
+        chainPosition: loaded.chain.order.indexOf(blocked.node_id),
         now,
       });
       if (fresh) {
@@ -333,6 +349,7 @@ async function recreateMissingSuccessor(
     packetPath: packetPath(run.run_dir, nextId, 1),
     resolvedMaxAttempts: resolved.maxAttempts,
     resolvedTimeoutMs: resolved.timeoutMs,
+    chainPosition: loaded.chain.order.indexOf(nextId),
     now,
   });
 }
@@ -397,9 +414,120 @@ function flagValue(args: string[], flag: string): string | null {
   return args[idx + 1] ?? null;
 }
 
-function cliPathOf(): string {
-  return runtimeCliInvocation();
+/** Most recent run by seq; prints its worklog, optionally tailing to completion. */
+async function cmdLogs(args: string[]): Promise<void> {
+  const follow = args.includes("--follow");
+  const workflowId = requireArg(args.filter((a) => !a.startsWith("--")), "workflow-id");
+  const inst = findInstallation();
+  const store = new Store(openDb(inst.dbPath));
+  const run = store.getMostRecentRun(workflowId);
+  if (!run) die(`no runs for workflow "${workflowId}"`);
+
+  process.stdout.write(readFileSync(run.worklog_path, "utf8"));
+  if (!follow) return;
+
+  // Tail: print appended worklog lines until the run reaches a terminal state.
+  let offset = (readFileSync(run.worklog_path, "utf8")).length;
+  for (;;) {
+    const fresh = store.getRun(run.run_id)!;
+    const content = readFileSync(fresh.worklog_path, "utf8");
+    if (content.length > offset) {
+      process.stdout.write(content.slice(offset));
+      offset = content.length;
+    }
+    if (isTerminal(fresh.status)) return;
+    await new Promise((r) => setTimeout(r, 500));
+  }
 }
+
+/** Chain rendering with runtime status; --mermaid emits a flowchart. */
+function cmdDiagram(args: string[]): void {
+  const mermaid = args.includes("--mermaid");
+  const workflowId = requireArg(args.filter((a) => !a.startsWith("--")), "workflow-id");
+  const inst = findInstallation();
+  const store = new Store(openDb(inst.dbPath));
+  const wf = store.getWorkflow(workflowId);
+  if (!wf) die(`no workflow "${workflowId}"`);
+  const run = store.getMostRecentRun(workflowId);
+  const loaded = loadAndValidateDefinition(wf.canonical_definition_hash === "" ? workflowPath(inst, workflowId) : join(run?.run_dir ?? "", "definition.yaml"));
+  const nodeStatus = new Map<string, string>();
+  if (run) {
+    for (const attempt of store.listAttempts(run.run_id)) {
+      const existing = nodeStatus.get(attempt.node_id);
+      const rank = (s: string) => (s === "completed" ? 0 : s === "failed" || s === "blocked" || s === "cancelled" ? 1 : 2);
+      if (!existing || rank(attempt.status) < rank(existing)) nodeStatus.set(attempt.node_id, attempt.status);
+    }
+  }
+
+  if (mermaid) {
+    const lines = ["flowchart LR"];
+    for (const id of loaded.chain.order) {
+      const status = nodeStatus.get(id);
+      const label = status ? `${id} [${status}]` : id;
+      lines.push(`  ${id.replaceAll("-", "_")}["${label}"]`);
+      const next = loaded.chain.next.get(id);
+      if (next) lines.push(`  ${id.replaceAll("-", "_")} --> ${next.replaceAll("-", "_")}`);
+    }
+    process.stdout.write(lines.join("\n") + "\n");
+  } else {
+    const parts = loaded.chain.order.map((id) => {
+      const status = nodeStatus.get(id);
+      const glyph = status === "completed" ? "◉" : status === "failed" ? "✗" : status === "blocked" ? "⊘" : status ? "◎" : "○";
+      return `${glyph} ${id}${status ? ` (${status})` : ""}`;
+    });
+    process.stdout.write(parts.join(" → ") + "\n");
+  }
+}
+
+/** Snapshot properties + resolved settings + runtime status for one node. */
+function cmdNode(args: string[]): void {
+  const [sub, workflowId, nodeId] = args;
+  if (sub !== "describe" || !workflowId || !nodeId) die("usage: workshop node describe <workflow-id> <node-id> [--json]");
+  const json = args.includes("--json");
+  const inst = findInstallation();
+  const store = new Store(openDb(inst.dbPath));
+  const run = store.getMostRecentRun(workflowId);
+  const snapshotPath = run ? join(run.run_dir, "definition.yaml") : workflowPath(inst, workflowId);
+  const loaded = loadAndValidateDefinition(snapshotPath);
+  const node = loaded.def.nodes[nodeId];
+  if (!node) die(`no node "${nodeId}" in ${workflowId}`);
+  const resolved = resolveNode(loaded.def, nodeId, inst);
+  const attempts = run ? store.listAttempts(run.run_id).filter((a) => a.node_id === nodeId) : [];
+
+  if (json) {
+    process.stdout.write(
+      `${JSON.stringify(
+        {
+          id: nodeId,
+          run: resolved.run.kind === "command" ? { command: resolved.run.command } : { agent: { model: resolved.run.resolution.model?.full, instructions: resolved.run.agent.instructions } },
+          validator: resolved.validator
+            ? resolved.validator.kind === "command"
+              ? { command: resolved.validator.command, timeoutMs: resolved.validator.timeoutMs }
+              : { agent: { model: resolved.validator.resolution.model?.full } }
+            : null,
+          successor: loaded.chain.next.get(nodeId) ?? null,
+          resolvedMaxAttempts: resolved.maxAttempts,
+          resolvedTimeoutMs: resolved.timeoutMs,
+          attempts: attempts.map((a) => ({ number: a.attempt, status: a.status, failure: a.failure_kind, progress: a.current_progress, validator: a.validator_status })),
+        },
+        null,
+        2,
+      )}\n`,
+    );
+    return;
+  }
+  const lines = [
+    `Node      ${nodeId}`,
+    `Run       ${resolved.run.kind === "command" ? "command" : "agent"}${resolved.run.kind === "command" ? ": " + resolved.run.command : ""}`,
+    `Successor ${loaded.chain.next.get(nodeId) ?? "(end)"}`,
+    `Attempts  ≤ ${resolved.maxAttempts} · timeout ${resolved.timeoutMs ?? "unlimited"}ms`,
+  ];
+  for (const a of attempts) {
+    lines.push(`  #${a.attempt} ${a.status}${a.failure_kind ? ` (${a.failure_kind})` : ""}${a.current_progress ? ` — ${a.current_progress}` : ""}`);
+  }
+  process.stdout.write(lines.join("\n") + "\n");
+}
+
 process.on("unhandledRejection", (e) => {
   die(errorText(e));
 });

@@ -149,6 +149,7 @@ async function recoverRunningAttempt(input: {
     packetPath: packetPath(run.run_dir, attempt.node_id, attempt.attempt + 1),
     resolvedMaxAttempts: attempt.resolved_max_attempts,
     resolvedTimeoutMs: attempt.resolved_timeout_ms,
+    chainPosition: bundle.chain.order.indexOf(attempt.node_id),
     now: clock.now(),
   });
   if (retried) {
@@ -246,6 +247,7 @@ async function recoverFinishingAttempt(input: {
           packetPath: packetPath(run.run_dir, successorId, 1),
           resolvedMaxAttempts: resolved.maxAttempts,
           resolvedTimeoutMs: resolved.timeoutMs,
+          chainPosition: bundle.chain.order.indexOf(successorId),
         };
       })()
     : null;

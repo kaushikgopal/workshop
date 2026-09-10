@@ -454,6 +454,7 @@ export async function executeAttempt(input: {
       packetPath: string;
       resolvedMaxAttempts: number;
       resolvedTimeoutMs: number | null;
+      chainPosition: number;
     } | null = null;
     if (successorId) {
       const succResolved = resolveNode(def, successorId, inst);
@@ -463,6 +464,7 @@ export async function executeAttempt(input: {
         packetPath: packetPath(run.run_dir, successorId, 1),
         resolvedMaxAttempts: succResolved.maxAttempts,
         resolvedTimeoutMs: succResolved.timeoutMs,
+        chainPosition: chain.order.indexOf(successorId),
       };
     }
     try {

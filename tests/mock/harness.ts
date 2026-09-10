@@ -41,13 +41,14 @@ for (const key of required) {
 const prompt = readFileSync(env.WORKSHOP_PROMPT_FILE!, "utf8");
 const sentinels = new Set<string>();
 // Sentinels ride in the prompt (node/validator instructions) or in argv
-// (sites without YAML instructions, like the orchestrator).
+// (sites without YAML instructions, like the orchestrator). Progress
+// registers before block so a reporting-then-blocking agent keeps its
+// last progress visible on the attempt row.
+for (const m of prompt.matchAll(/MOCK:progress=(.+)/g)) sentinels.add(`MOCK:progress=${m[1]!.trim()}`);
 for (const arg of process.argv.slice(2)) {
   if (/^MOCK:[a-z0-9=-]+/.test(arg) || /^MOCK:progress=/.test(arg)) sentinels.add(arg.trim());
 }
 for (const m of prompt.matchAll(/MOCK:(?!progress)[a-z0-9=-]+/g)) sentinels.add(m[0]);
-// progress values may contain spaces: capture to end of line
-for (const m of prompt.matchAll(/MOCK:progress=(.+)/g)) sentinels.add(`MOCK:progress=${m[1]!.trim()}`);
 
 function report(mode: "log" | "error", message: string): void {
   if (mode === "log") console.log(message);

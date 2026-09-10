@@ -79,8 +79,11 @@ export function buildWorkflowDto(store: Store, wf: WorkflowRow, _now: Date): Wor
 
 export function buildRunDto(store: Store, run: RunRow): RunStatusDto {
   const attempts = store.listAttempts(run.run_id);
+  // Arrays are ordered by chain position, then attempt number.
   const nodeIds: string[] = [];
-  for (const a of attempts) if (!nodeIds.includes(a.node_id)) nodeIds.push(a.node_id);
+  for (const a of attempts.slice().sort((x, y) => x.chain_position - y.chain_position || x.attempt - y.attempt)) {
+    if (!nodeIds.includes(a.node_id)) nodeIds.push(a.node_id);
+  }
   return {
     id: run.run_id,
     status: run.status,

@@ -239,6 +239,7 @@ export function scaffoldFirstAttempt(input: {
     packetPath: packetPath(runDirOf(inst, runId), startNode, 1),
     resolvedMaxAttempts: startResolved.maxAttempts,
     resolvedTimeoutMs: startResolved.timeoutMs,
+    chainPosition: loaded.chain.order.indexOf(startNode),
     now,
   });
 }
