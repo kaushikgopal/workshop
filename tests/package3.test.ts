@@ -345,3 +345,46 @@ describe("gate 24 — orchestrator phase recovery", () => {
 
 // Used by the crash test to load the snapshot bundle for the chain.
 void loadSnapshot;
+
+describe("gate 22 — unknown external effects", () => {
+  test("an owner-authenticated unknown_external report blocks, cannot auto-retry, and refuses resume", async () => {
+    const inst = makeInstallation({
+      "unknown": `version: 1
+id: unknown
+description: Agent reports an uncertain external effect.
+defaults:
+  max_attempts: 2
+  timeout: 1m
+  agent:
+    harness:
+      command: '${MOCK}'
+    model: "mock/mock-model:low"
+nodes:
+  node-uncertain:
+    run:
+      agent:
+        instructions: |
+          MOCK:block-unknown
+    max_attempts: 1
+    next: null
+`,
+    });
+    const r = runCli(inst, "start unknown");
+    expect(r.stdout).toContain("blocked");
+
+    const runs = dbRuns(inst);
+    expect(runs[0]!.block_kind).toBe("unknown_external");
+
+    const attempt = dbAttempts(inst, String(runs[0]!.run_id))[0]!;
+    expect(attempt.block_kind).toBe("unknown_external");
+    expect(attempt.status).toBe("blocked");
+
+    // Resume refuses.
+    const resumed = runCli(inst, "resume unknown");
+    expect(resumed.code).toBe(1);
+    expect(resumed.stderr).toContain("not resumable");
+
+    // The block persists — no retry appeared.
+    expect(dbAttempts(inst, String(runs[0]!.run_id)).length).toBe(1);
+  }, 60_000);
+});
