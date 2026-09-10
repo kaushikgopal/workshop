@@ -11,8 +11,10 @@ import { isProcessAlive, processStartId, terminateProcessGroup } from "./util/pr
 import type { Clock } from "./util/clock.js";
 import {
   WorklogIntegrityError,
+  attemptDir,
   extractMarker,
   mergePacket,
+  orchestratorDir,
   packetPath,
   scaffoldPacket,
   validatePacket,
@@ -98,7 +100,7 @@ async function recoverRunPhases(input: {
     if (orchestratorOwnerDead(fresh)) {
       await killRecordedGroup(fresh.orchestrator_worker_pid);
       const token = fresh.orchestrator_owner_token!;
-      const receipt = join(fresh.run_dir, "receipts", `orchestrator-${token}.json`);
+      const receipt = join(orchestratorDir(fresh.run_dir, token), "merge-receipt.json");
       if (fresh.orchestrator_phase === "applying" && existsSync(receipt)) {
         // The decision was applied; only the phase close is missing.
         store.finishOrchestrator(fresh.run_id, clock.now());
@@ -146,14 +148,13 @@ async function recoverRunningAttempt(input: {
     runId: run.run_id,
     nodeId: attempt.node_id,
     previousAttempt: attempt.attempt,
-    packetPath: packetPath(run.run_dir, attempt.node_id, attempt.attempt + 1),
     resolvedMaxAttempts: attempt.resolved_max_attempts,
     resolvedTimeoutMs: attempt.resolved_timeout_ms,
     chainPosition: bundle.chain.order.indexOf(attempt.node_id),
     now: clock.now(),
   });
   if (retried) {
-    scaffoldPacket(run.run_dir, attempt.node_id, retried.attempt, bundle.chain.next.get(attempt.node_id) ?? null);
+    scaffoldPacket(attemptDir(run.run_dir, retried.execution_seq, retried.node_id), retried.attempt, bundle.chain.next.get(attempt.node_id) ?? null);
     report.interruptedRetried.push(`${run.run_id}/${attempt.node_id} #${retried.attempt}`);
   } else {
     // Bound exhausted: protect for orchestration.
@@ -195,9 +196,10 @@ async function recoverFinishingAttempt(input: {
 
   // Verify the receipt — or idempotently perform the missing merge — then
   // finalize from durable evidence without rerunning the node.
-  let receipt = verifyMergeReceipt({ runDir: run.run_dir, nodeId: attempt.node_id, attempt: attempt.attempt });
+  const attemptFolder = attemptDir(run.run_dir, attempt.execution_seq, attempt.node_id);
+  let receipt = verifyMergeReceipt(attemptFolder);
   if (!receipt) {
-    const packetFile = packetPath(run.run_dir, attempt.node_id, attempt.attempt);
+    const packetFile = packetPath(attemptFolder);
     try {
       validatePacket(packetFile, attempt.node_id, attempt.attempt, bundle.chain.next.get(attempt.node_id) ?? null);
     } catch (e) {
@@ -219,6 +221,7 @@ async function recoverFinishingAttempt(input: {
       runId: run.run_id,
       nodeId: attempt.node_id,
       attempt: attempt.attempt,
+      attemptFolder,
       successorId: bundle.chain.next.get(attempt.node_id) ?? null,
       ownerToken: newToken,
       now: clock.now(),
@@ -226,16 +229,15 @@ async function recoverFinishingAttempt(input: {
   }
 
   // Node output from the packet — durable evidence, never a rerun.
-  const packetFile = packetPath(run.run_dir, attempt.node_id, attempt.attempt);
+  const packetFile = packetPath(attemptFolder);
   const packet = readFileSync(packetFile, "utf8");
   const usesWorkflowOutput = packet.includes("<workflow-output>");
   const opening = usesWorkflowOutput ? "<workflow-output>" : /<next-node-output id="[^"]*">/.exec(packet)?.[0] ?? "";
   const closing = usesWorkflowOutput ? "</workflow-output>" : "</next-node-output>";
   let output = extractMarker(packet, opening, closing);
   if (output.trim() === "") output = packet;
-  const logsDir = join(run.run_dir, "logs");
-  mkdirSync(logsDir, { recursive: true });
-  const outputFile = join(logsDir, `${attempt.node_id}-attempt-${attempt.attempt}.output`);
+  mkdirSync(attemptFolder, { recursive: true });
+  const outputFile = join(attemptFolder, "output");
   writeFileSync(outputFile, output, "utf8");
 
   const successorId = bundle.chain.next.get(attempt.node_id) ?? null;
@@ -244,7 +246,6 @@ async function recoverFinishingAttempt(input: {
         const resolved = resolveNode(bundle.def, successorId, inst);
         return {
           nodeId: successorId,
-          packetPath: packetPath(run.run_dir, successorId, 1),
           resolvedMaxAttempts: resolved.maxAttempts,
           resolvedTimeoutMs: resolved.timeoutMs,
           chainPosition: bundle.chain.order.indexOf(successorId),

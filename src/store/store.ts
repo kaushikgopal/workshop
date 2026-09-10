@@ -2,6 +2,8 @@ import type { Database } from "bun:sqlite";
 import { toIso } from "../util/clock.js";
 import { formatRunId, newOwnerToken } from "../util/ids.js";
 import { processStartId } from "../util/process.js";
+import { attemptDir } from "../worklog/worklog.js";
+import { join } from "node:path";
 
 /**
  * Store operations. Every transition that could race uses a guarded
@@ -79,6 +81,7 @@ export interface AttemptRow {
   worker_pid: number | null;
   worker_process_start_id: string | null;
   worker_process_group: number | null;
+  execution_seq: number;
   last_heartbeat_at: string | null;
   current_progress: string | null;
   validator_status: "passed" | "failed" | null;
@@ -375,7 +378,6 @@ export class Store {
   createSuccessorAttempt(input: {
     runId: string;
     nodeId: string;
-    packetPath: string;
     resolvedMaxAttempts: number;
     resolvedTimeoutMs: number | null;
     chainPosition: number;
@@ -386,17 +388,32 @@ export class Store {
       const live = this.getLiveAttempt(input.runId);
       if (live) throw new GuardRejected(`run ${input.runId} already has a live attempt (${live.node_id} #${live.attempt})`);
       const nowIso = toIso(input.now);
+      const seq = this.nextExecutionSeq(input.runId);
+      const packetPath = this.packetPathFor(input.runId, seq, input.nodeId);
       this.db
         .query(
           `INSERT INTO node_attempts (run_id, node_id, attempt, status, resolved_max_attempts, resolved_timeout_ms,
-             chain_position, packet_path, updated_at)
-           VALUES (?, ?, 1, 'pending', ?, ?, ?, ?, ?)`,
+             chain_position, execution_seq, packet_path, updated_at)
+           VALUES (?, ?, 1, 'pending', ?, ?, ?, ?, ?, ?)`,
         )
-        .run(input.runId, input.nodeId, input.resolvedMaxAttempts, input.resolvedTimeoutMs, input.chainPosition, input.packetPath, nowIso);
+        .run(input.runId, input.nodeId, input.resolvedMaxAttempts, input.resolvedTimeoutMs, input.chainPosition, seq, packetPath, nowIso);
       const row = this.getAttempt(input.runId, input.nodeId, 1);
       if (!row) throw new Error("attempt insert vanished");
       return row;
     });
+  }
+
+  /** The next chronological execution number for a run. */
+  private nextExecutionSeq(runId: string): number {
+    const row = this.db.query<{ m: number | null }, [string]>("SELECT MAX(execution_seq) AS m FROM node_attempts WHERE run_id = ?").get(runId);
+    return (row?.m ?? 0) + 1;
+  }
+
+  /** The attempt folder derives from the run row's directory + execution number. */
+  private packetPathFor(runId: string, executionSeq: number, nodeId: string): string {
+    const run = this.getRun(runId);
+    if (!run) throw new GuardRejected(`no run "${runId}"`);
+    return join(attemptDir(run.run_dir, executionSeq, nodeId), "packet.md");
   }
 
   /**
@@ -407,7 +424,6 @@ export class Store {
     runId: string;
     nodeId: string;
     previousAttempt: number;
-    packetPath: string;
     resolvedMaxAttempts: number;
     resolvedTimeoutMs: number | null;
     chainPosition: number;
@@ -418,13 +434,15 @@ export class Store {
       if (input.previousAttempt >= input.resolvedMaxAttempts) return null;
       const next = input.previousAttempt + 1;
       const nowIso = toIso(input.now);
+      const seq = this.nextExecutionSeq(input.runId);
+      const packetPath = this.packetPathFor(input.runId, seq, input.nodeId);
       this.db
         .query(
           `INSERT INTO node_attempts (run_id, node_id, attempt, status, resolved_max_attempts, resolved_timeout_ms,
-             chain_position, packet_path, updated_at)
-           VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?)`,
+             chain_position, execution_seq, packet_path, updated_at)
+           VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)`,
         )
-        .run(input.runId, input.nodeId, next, input.resolvedMaxAttempts, input.resolvedTimeoutMs, input.chainPosition, input.packetPath, nowIso);
+        .run(input.runId, input.nodeId, next, input.resolvedMaxAttempts, input.resolvedTimeoutMs, input.chainPosition, seq, packetPath, nowIso);
       const row = this.getAttempt(input.runId, input.nodeId, next);
       if (!row) throw new Error("attempt insert vanished");
       return row;
@@ -572,7 +590,7 @@ export class Store {
     validatorStatus: "passed" | "failed" | null;
     validatorReason: string | null;
     now: Date;
-    successor: { nodeId: string; packetPath: string; resolvedMaxAttempts: number; resolvedTimeoutMs: number | null; chainPosition?: number } | null;
+    successor: { nodeId: string; resolvedMaxAttempts: number; resolvedTimeoutMs: number | null; chainPosition: number } | null;
   }): { completed: boolean; successorCreated: boolean } {
     return this.tx(() => {
       // Durable stop wins even over late completion evidence.
@@ -606,7 +624,6 @@ export class Store {
           this.createSuccessorAttempt({
             runId: input.runId,
             nodeId: input.successor.nodeId,
-            packetPath: input.successor.packetPath,
             resolvedMaxAttempts: input.successor.resolvedMaxAttempts,
             resolvedTimeoutMs: input.successor.resolvedTimeoutMs,
             chainPosition: input.successor.chainPosition ?? 0,

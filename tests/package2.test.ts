@@ -187,5 +187,5 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 
 function validateDir(inst: ReturnType<typeof makeInstallation>, runId: string, nodeId: string, attempt: number): string {
-  return join(inst.root, ".workshop/state/runs", runId, "validation", `${nodeId}-attempt-${attempt}`);
+  return join(inst.root, ".workshop/state/runs", runId, "attempts", `${String(attempt).padStart(3, "0")}-${nodeId}`, "validation");
 }

@@ -234,7 +234,7 @@ describe("gate 15 — stop fencing", () => {
         validatorStatus: null,
         validatorReason: null,
         now: new Date(),
-        successor: { nodeId: "node-slow", packetPath: "p", resolvedMaxAttempts: 2, resolvedTimeoutMs: 1 },
+        successor: { nodeId: "node-slow", resolvedMaxAttempts: 2, resolvedTimeoutMs: 1, chainPosition: 1 },
       }),
     ).toThrow(GuardRejected);
 
@@ -322,12 +322,12 @@ describe("gate 24 — orchestrator phase recovery", () => {
     const store = new Store(openDb(real.dbPath));
 
     const token = "tok1234567890";
-    const { atomicWriteFileSync } = await import("../src/worklog/worklog.js");
+    const { atomicWriteFileSync, orchestratorDir } = await import("../src/worklog/worklog.js");
     const { mkdirSync } = await import("node:fs");
     const run = store.getRun(started.runId)!;
-    mkdirSync(join(run.run_dir, "receipts"), { recursive: true });
+    mkdirSync(orchestratorDir(run.run_dir, token), { recursive: true });
     atomicWriteFileSync(
-      join(run.run_dir, "receipts", `orchestrator-${token}.json`),
+      join(orchestratorDir(run.run_dir, token), "merge-receipt.json"),
       JSON.stringify({ ownerToken: token, resultSha256: "sha256:x", appliedAt: new Date().toISOString() }),
     );
     store.tx(() => {

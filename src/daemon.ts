@@ -14,7 +14,7 @@ import { parseDuration } from "./util/duration.js";
 import { atomicWriteFileSync, scaffoldWorklog } from "./worklog/worklog.js";
 import { terminateProcessGroup } from "./util/process.js";
 import { runtimeCliInvocation } from "./util/cli-path.js";
-import { openSync, closeSync, renameSync, writeFileSync } from "node:fs";
+import { openSync, closeSync, rmSync, writeFileSync } from "node:fs";
 
 /**
  * One deterministic guardian process per installation: polls SQLite, admits
@@ -44,7 +44,7 @@ function acquireSingletonLock(stateDir: string): SingletonLock {
       const fd = openSync(path, "wx");
       writeFileSync(fd, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
       closeSync(fd);
-      return { release: () => releaseLock(path) };
+      return { release: () => unlinkLock(path) };
     } catch (e) {
       if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
       let holderPid: number | null = null;
@@ -55,15 +55,23 @@ function acquireSingletonLock(stateDir: string): SingletonLock {
         throw new DaemonLockHeld(holderPid); // holder alive
       } catch (err) {
         if (err instanceof DaemonLockHeld) throw err;
-        renameSync(path, `${path}.stale-${Date.now()}`); // holder dead or unreadable
+        rmLock(path); // holder dead or unreadable
       }
     }
   }
 }
 
-function releaseLock(path: string): void {
+function unlinkLock(path: string): void {
   try {
-    renameSync(path, `${path}.released`);
+    rmSync(path);
+  } catch {
+    /* already gone */
+  }
+}
+
+function rmLock(path: string): void {
+  try {
+    rmSync(path);
   } catch {
     /* already gone */
   }

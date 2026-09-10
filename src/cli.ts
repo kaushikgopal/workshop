@@ -294,15 +294,14 @@ async function cmdResume(args: string[]): Promise<void> {
         runId: run.run_id,
         nodeId: blocked.node_id,
         previousAttempt: blocked.attempt,
-        packetPath: join("packets", `${blocked.node_id}-attempt-${blocked.attempt + 1}.md`),
         resolvedMaxAttempts: blocked.resolved_max_attempts + 1, // one manual extension
         resolvedTimeoutMs: blocked.resolved_timeout_ms,
         chainPosition: loaded.chain.order.indexOf(blocked.node_id),
         now,
       });
       if (fresh) {
-        const { scaffoldPacket } = await import("./worklog/worklog.js");
-        scaffoldPacket(run.run_dir, blocked.node_id, fresh.attempt, chain.next.get(blocked.node_id) ?? null);
+        const { scaffoldPacket, attemptDir } = await import("./worklog/worklog.js");
+        scaffoldPacket(attemptDir(run.run_dir, fresh.execution_seq, fresh.node_id), fresh.attempt, chain.next.get(blocked.node_id) ?? null);
       }
       store.setRunStatus(run.run_id, "running", now, null);
       break;
@@ -341,18 +340,17 @@ async function recreateMissingSuccessor(
   const nextId = loaded.chain.next.get(lastNodeId) ?? null;
   if (!nextId) return;
   const resolved = (await import("./runner/attempt.js")).resolveNode(loaded.def, nextId, inst);
-  const { scaffoldPacket, packetPath } = await import("./worklog/worklog.js");
   const run = store.getRun(runId)!;
-  scaffoldPacket(run.run_dir, nextId, 1, loaded.chain.next.get(nextId) ?? null);
-  store.createSuccessorAttempt({
+  const fresh = store.createSuccessorAttempt({
     runId,
     nodeId: nextId,
-    packetPath: packetPath(run.run_dir, nextId, 1),
     resolvedMaxAttempts: resolved.maxAttempts,
     resolvedTimeoutMs: resolved.timeoutMs,
     chainPosition: loaded.chain.order.indexOf(nextId),
     now,
   });
+  const { scaffoldPacket, attemptDir } = await import("./worklog/worklog.js");
+  scaffoldPacket(attemptDir(run.run_dir, fresh.execution_seq, fresh.node_id), fresh.attempt, loaded.chain.next.get(nextId) ?? null);
 }
 
 function cmdStatus(args: string[]): void {

@@ -7,7 +7,7 @@ import { canonicalHash } from "./definition/hash.js";
 import { validateChain, unresolvedAgentSites, type ChainInfo } from "./definition/validate.js";
 import { openDb } from "./store/db.js";
 import { Store, isTerminal, type RunRow } from "./store/store.js";
-import { atomicWriteFileSync, packetPath, scaffoldPacket, scaffoldWorklog, worklogPath } from "./worklog/worklog.js";
+import { attemptDir, atomicWriteFileSync, scaffoldPacket, scaffoldWorklog, worklogPath } from "./worklog/worklog.js";
 import { executeAttempt, resolveNode } from "./runner/attempt.js";
 import { parseDuration, parseTimeout } from "./util/duration.js";
 import { SystemClock, type Clock } from "./util/clock.js";
@@ -232,16 +232,15 @@ export function scaffoldFirstAttempt(input: {
   const { store, inst, loaded, runId, now } = input;
   const startNode = loaded.chain.order[0]!;
   const startResolved = resolveNode(loaded.def, startNode, inst);
-  scaffoldPacket(runDirOf(inst, runId), startNode, 1, loaded.chain.next.get(startNode) ?? null);
-  store.createSuccessorAttempt({
+  const fresh = store.createSuccessorAttempt({
     runId,
     nodeId: startNode,
-    packetPath: packetPath(runDirOf(inst, runId), startNode, 1),
     resolvedMaxAttempts: startResolved.maxAttempts,
     resolvedTimeoutMs: startResolved.timeoutMs,
     chainPosition: loaded.chain.order.indexOf(startNode),
     now,
   });
+  scaffoldPacket(attemptDir(runDirOf(inst, runId), fresh.execution_seq, fresh.node_id), fresh.attempt, loaded.chain.next.get(startNode) ?? null);
 }
 
 export function runDirOf(inst: Installation, runId: string): string {

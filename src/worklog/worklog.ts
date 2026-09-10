@@ -6,6 +6,7 @@ import {
   openSync,
   readFileSync,
   renameSync,
+  rmSync,
   statSync,
   writeFileSync,
   fsyncSync,
@@ -30,16 +31,36 @@ export function worklogPath(runDir: string): string {
   return join(runDir, "WORKSHOP_LOG.md");
 }
 
-export function packetPath(runDir: string, nodeId: string, attempt: number): string {
-  return join(runDir, "packets", `${nodeId}-attempt-${attempt}.md`);
+/**
+ * Attempt-scoped layout: chronological per-run execution folders under
+ * attempts/ — attempts/001-node-timestamp/, attempts/002-node-generate-line/.
+ * Everything about one execution lives there: packet, streams, output,
+ * prompt, validation/, and its merge receipt. The sequence is per run, not
+ * per node; a node's own attempt number stays in the DB and packet content.
+ */
+export function attemptFolderName(executionSeq: number, nodeId: string): string {
+  return `${String(executionSeq).padStart(3, "0")}-${nodeId}`;
 }
 
-export function receiptPath(runDir: string, nodeId: string, attempt: number): string {
-  return join(runDir, "receipts", `${nodeId}-attempt-${attempt}.json`);
+export function attemptDir(runDir: string, executionSeq: number, nodeId: string): string {
+  return join(runDir, "attempts", attemptFolderName(executionSeq, nodeId));
+}
+
+export function packetPath(attemptFolder: string): string {
+  return join(attemptFolder, "packet.md");
+}
+
+export function receiptPath(attemptFolder: string): string {
+  return join(attemptFolder, "merge-receipt.json");
+}
+
+/** Run-scoped orchestrator invocation artifacts, bound to the owner token. */
+export function orchestratorDir(runDir: string, ownerToken: string): string {
+  return join(runDir, "orchestrator", ownerToken);
 }
 
 /** The marker a node's attempt is authorized to carry. */
-export function authorizedMarker(nodeId: string, successorId: string | null): { opening: string; closing: string } {
+export function authorizedMarker(successorId: string | null): { opening: string; closing: string } {
   if (successorId === null) {
     return { opening: "<workflow-output>", closing: "</workflow-output>" };
   }
@@ -48,6 +69,7 @@ export function authorizedMarker(nodeId: string, successorId: string | null): { 
     closing: "</next-node-output>",
   };
 }
+
 
 export function scaffoldWorklog(
   runDir: string,
@@ -93,13 +115,12 @@ ${marker.closing}
 
 /** Scaffold one attempt's packet file: attempt headings + one authorized marker. */
 export function scaffoldPacket(
-  runDir: string,
-  nodeId: string,
+  attemptFolder: string,
   attempt: number,
   successorId: string | null,
 ): string {
-  const marker = authorizedMarker(nodeId, successorId);
-  const path = packetPath(runDir, nodeId, attempt);
+  const marker = authorizedMarker(successorId);
+  const path = packetPath(attemptFolder);
   mkdirSync(dirname(path), { recursive: true });
   return atomicWriteFileSync(path, packetTemplate(attempt, marker));
 }
@@ -117,7 +138,7 @@ export interface PacketCheck {
  */
 export function validatePacket(packetFile: string, nodeId: string, attempt: number, successorId: string | null): void {
   const content = readFileSync(packetFile, "utf8");
-  const marker = authorizedMarker(nodeId, successorId);
+  const marker = authorizedMarker(successorId);
 
   for (const line of content.split("\n")) {
     if (/^#{1,3} /.test(line.trim())) {
@@ -187,13 +208,14 @@ export function mergePacket(input: {
   runId: string;
   nodeId: string;
   attempt: number;
+  attemptFolder: string;
   successorId: string | null;
   ownerToken: string;
   now: Date;
 }): MergeReceipt {
   const logPath = worklogPath(input.runDir);
-  const packetFile = packetPath(input.runDir, input.nodeId, input.attempt);
-  const receiptFile = receiptPath(input.runDir, input.nodeId, input.attempt);
+  const packetFile = packetPath(input.attemptFolder);
+  const receiptFile = receiptPath(input.attemptFolder);
 
   const packetSha = sha256File(packetFile);
   const existingReceipt = readReceipt(receiptFile);
@@ -215,7 +237,7 @@ export function mergePacket(input: {
   const normalized = packet.trimStart().startsWith(attemptHeading)
     ? packet
     : `${attemptHeading}\n\n${packet.trimStart()}`;
-  const escaped = escapeReservedMarkers(normalized, authorizedMarker(input.nodeId, input.successorId));
+  const escaped = escapeReservedMarkers(normalized, authorizedMarker(input.successorId));
 
   const log = readFileSync(logPath, "utf8");
   const nodeHeading = `### Node: ${input.nodeId}`;
@@ -238,12 +260,8 @@ export function mergePacket(input: {
 }
 
 /** Verify (or idempotently create) the receipt during recovery. */
-export function verifyMergeReceipt(input: {
-  runDir: string;
-  nodeId: string;
-  attempt: number;
-}): MergeReceipt | null {
-  return readReceipt(receiptPath(input.runDir, input.nodeId, input.attempt));
+export function verifyMergeReceipt(attemptFolder: string): MergeReceipt | null {
+  return readReceipt(receiptPath(attemptFolder));
 }
 
 function readReceipt(path: string): MergeReceipt | null {
@@ -357,7 +375,7 @@ export class RunLock {
       // Only remove if we still own it.
       const content = readFileSync(this.path, "utf8");
       const holder = JSON.parse(content) as { pid: number };
-      if (holder.pid === process.pid) renameSync(this.path, `${this.path}.released`);
+      if (holder.pid === process.pid) rmSync(this.path);
     } catch {
       /* already gone */
     }
@@ -372,7 +390,7 @@ export class RunLock {
         return; // alive
       } catch {
         // Dead holder: take over.
-        renameSync(this.path, `${this.path}.stale-${Date.now()}`);
+        rmSync(this.path);
       }
     } catch {
       /* lock vanished */

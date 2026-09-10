@@ -6,7 +6,7 @@ import { resolveAgent, type ChainInfo, type ParsedModel } from "./definition/val
 import type { RunRow, Store } from "./store/store.js";
 import { attemptEnv, renderAgentPrompt } from "./runner/env.js";
 import { spawnTracked } from "./runner/spawn.js";
-import { atomicWriteFileSync, packetPath, RunLock, scaffoldPacket, sha256File } from "./worklog/worklog.js";
+import { attemptDir, atomicWriteFileSync, orchestratorDir, RunLock, scaffoldPacket, sha256File } from "./worklog/worklog.js";
 import type { Clock } from "./util/clock.js";
 import { parseTimeout } from "./util/duration.js";
 
@@ -43,11 +43,15 @@ export function orchestratorTimeoutMs(def: WorkflowDefinition, inst: Installatio
 }
 
 function resultFile(runDir: string, ownerToken: string): string {
-  return join(runDir, "results", `orchestrator-${ownerToken}.json`);
+  return join(orchestratorDir(runDir, ownerToken), "result.json");
 }
 
 function receiptFile(runDir: string, ownerToken: string): string {
-  return join(runDir, "receipts", `orchestrator-${ownerToken}.json`);
+  return join(orchestratorDir(runDir, ownerToken), "merge-receipt.json");
+}
+
+function orchestratorArtifact(runDir: string, ownerToken: string, name: string): string {
+  return join(orchestratorDir(runDir, ownerToken), name);
 }
 
 interface DecisionReceipt {
@@ -85,7 +89,7 @@ export async function invokeOrchestrator(input: {
   const { ownerToken } = claimed;
 
   const rFile = resultFile(run.run_dir, ownerToken);
-  const promptFile = join(run.run_dir, "results", `orchestrator-${ownerToken}.prompt.md`);
+  const promptFile = orchestratorArtifact(run.run_dir, ownerToken, "prompt.md");
   atomicWriteFileSync(
     promptFile,
     renderOrchestratorPrompt({ def, run: store.getRun(run.run_id)!, resultFile: rFile }),
@@ -100,8 +104,8 @@ export async function invokeOrchestrator(input: {
     nodeOutputFile: rFile,
     previousOutputFile: null,
     packetFile: promptFile,
-    stdoutFile: join(run.run_dir, "results", `orchestrator-${ownerToken}.stdout`),
-    stderrFile: join(run.run_dir, "results", `orchestrator-${ownerToken}.stderr`),
+    stdoutFile: orchestratorArtifact(run.run_dir, ownerToken, "stdout"),
+    stderrFile: orchestratorArtifact(run.run_dir, ownerToken, "stderr"),
     ownerToken,
     validationFile: null,
     model: resolution.model,
@@ -114,8 +118,8 @@ export async function invokeOrchestrator(input: {
     command: resolution.harnessCommand,
     cwd: inst.projectDir,
     env,
-    stdoutFile: join(run.run_dir, "results", `orchestrator-${ownerToken}.stdout`),
-    stderrFile: join(run.run_dir, "results", `orchestrator-${ownerToken}.stderr`),
+    stdoutFile: orchestratorArtifact(run.run_dir, ownerToken, "stdout"),
+    stderrFile: orchestratorArtifact(run.run_dir, ownerToken, "stderr"),
   });
 
   const heartbeat = setInterval(() => {
@@ -245,7 +249,6 @@ async function applyDecision(input: {
               runId: run.run_id,
               nodeId: latest.node_id,
               previousAttempt: latest.attempt,
-              packetPath: packetPath(run.run_dir, latest.node_id, latest.attempt + 1),
               resolvedMaxAttempts: latest.resolved_max_attempts,
               resolvedTimeoutMs: latest.resolved_timeout_ms,
               chainPosition: chain.order.indexOf(latest.node_id),
@@ -256,7 +259,7 @@ async function applyDecision(input: {
           // The orchestrator cannot exceed the resolved bound; the retry is
           // in-bounds here. Scaffold the packet with the same authorized marker.
           const successorId = chain.next.get(latest!.node_id) ?? null;
-          scaffoldPacket(run.run_dir, latest!.node_id, latest!.attempt + 1, successorId);
+          scaffoldPacket(attemptDir(run.run_dir, created.execution_seq, created.node_id), created.attempt, successorId);
         } else {
           store.setRunStatus(run.run_id, "failed", clock.now(), null);
         }

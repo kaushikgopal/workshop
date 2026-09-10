@@ -7,7 +7,7 @@ import { dirname } from "node:path";
  * only; there is no event stream. WAL mode and foreign keys are required.
  */
 
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -75,6 +75,7 @@ CREATE TABLE IF NOT EXISTS node_attempts (
   updated_at TEXT NOT NULL,
   finished_at TEXT,
   chain_position INTEGER NOT NULL DEFAULT 0,
+  execution_seq INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (run_id, node_id, attempt)
 );
 
@@ -110,6 +111,21 @@ function migrate(db: Database): void {
     })();
     return;
   }
-  // Future migrations: step from `current` to SCHEMA_VERSION here.
-  throw new Error(`unsupported schema version ${current}`);
+  // v1 → v2: execution_seq — the chronological per-run counter that names
+  // attempt folders (attempts/001-node-timestamp/).
+  if (current < 2) {
+    db.transaction(() => {
+      db.exec("ALTER TABLE node_attempts ADD COLUMN execution_seq INTEGER NOT NULL DEFAULT 0");
+      db.exec(
+        `UPDATE node_attempts SET execution_seq = (
+           SELECT COUNT(*) FROM node_attempts AS earlier
+           WHERE earlier.run_id = node_attempts.run_id
+             AND (earlier.started_at < node_attempts.started_at
+                  OR (earlier.started_at = node_attempts.started_at AND earlier.ROWID <= node_attempts.ROWID))
+         )`,
+      );
+      db.exec(`UPDATE meta SET value = '2' WHERE key = 'schema_version'`);
+    })();
+  }
+  // Future migrations step from `current` to SCHEMA_VERSION here.
 }

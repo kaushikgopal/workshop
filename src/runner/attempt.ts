@@ -10,6 +10,7 @@ import type { AttemptRow, BlockKind, FailureKind, RunRow, Store } from "../store
 import { GuardRejected } from "../store/store.js";
 import {
   WorklogIntegrityError,
+  attemptDir,
   authorizedMarker,
   extractMarker as extractMarkerText,
   mergePacket,
@@ -118,14 +119,13 @@ export interface AttemptPaths {
   promptFile: string;
 }
 
-export function attemptPaths(runDir: string, nodeId: string, attempt: number): AttemptPaths {
-  const logsDir = join(runDir, "logs");
-  mkdirSync(logsDir, { recursive: true });
+export function attemptPaths(attemptFolder: string): AttemptPaths {
+  mkdirSync(attemptFolder, { recursive: true });
   return {
-    stdoutFile: join(logsDir, `${nodeId}-attempt-${attempt}.stdout`),
-    stderrFile: join(logsDir, `${nodeId}-attempt-${attempt}.stderr`),
-    outputFile: join(logsDir, `${nodeId}-attempt-${attempt}.output`),
-    promptFile: join(logsDir, `${nodeId}-attempt-${attempt}.prompt`),
+    stdoutFile: join(attemptFolder, "stdout"),
+    stderrFile: join(attemptFolder, "stderr"),
+    outputFile: join(attemptFolder, "output"),
+    promptFile: join(attemptFolder, "prompt"),
   };
 }
 
@@ -149,8 +149,9 @@ export async function executeAttempt(input: {
 
   const successorId = chain.next.get(nodeId) ?? null;
   const now = () => clock.now();
-  const paths = attemptPaths(run.run_dir, nodeId, attemptNo);
-  const packetFile = packetPath(run.run_dir, nodeId, attemptNo);
+  const folder = attemptDir(run.run_dir, attempt.execution_seq, nodeId);
+  const paths = attemptPaths(folder);
+  const packetFile = packetPath(folder);
 
   // Claim: CAS pending → running with our identity. Losers never spawn.
   let ownerToken: string;
@@ -221,7 +222,7 @@ export async function executeAttempt(input: {
    * (timeouts, dead processes) leave no empty sections behind.
    */
   const mergeFailureEvidence = async (failureKind: FailureKind): Promise<void> => {
-    const marker = authorizedMarker(nodeId, successorId);
+    const marker = authorizedMarker(successorId);
     let packet: string;
     try {
       packet = readFileSync(packetFile, "utf8");
@@ -253,6 +254,7 @@ export async function executeAttempt(input: {
         runId: run.run_id,
         nodeId,
         attempt: attemptNo,
+        attemptFolder: folder,
         successorId,
         ownerToken,
         now: now(),
@@ -382,7 +384,7 @@ export async function executeAttempt(input: {
         exitCode: code,
         stdoutFile: paths.stdoutFile,
         validatorLine: "pending",
-        marker: authorizedMarker(nodeId, successorId),
+        marker: authorizedMarker(successorId),
       });
     }
     const output = extractNodeOutput(resolved.run.kind, packetFile, paths.stdoutFile);
@@ -398,7 +400,7 @@ export async function executeAttempt(input: {
         inst,
         run,
         validator: resolved.validator,
-        nodeId,
+        attemptFolder: folder,
         attemptNo,
         packetFile,
         outputFile: paths.outputFile,
@@ -417,7 +419,7 @@ export async function executeAttempt(input: {
           exitCode: code,
           stdoutFile: paths.stdoutFile,
           validatorLine: `Validator passed: ${validatorOutcome.reason}`,
-          marker: authorizedMarker(nodeId, successorId),
+          marker: authorizedMarker(successorId),
         });
       }
     }
@@ -438,6 +440,7 @@ export async function executeAttempt(input: {
         runId: run.run_id,
         nodeId,
         attempt: attemptNo,
+        attemptFolder: folder,
         successorId,
         ownerToken,
         now: now(),
@@ -452,17 +455,14 @@ export async function executeAttempt(input: {
     // Guarded completion + persisted successor (one transaction).
     let successor: {
       nodeId: string;
-      packetPath: string;
       resolvedMaxAttempts: number;
       resolvedTimeoutMs: number | null;
       chainPosition: number;
     } | null = null;
     if (successorId) {
       const succResolved = resolveNode(def, successorId, inst);
-      scaffoldPacket(run.run_dir, successorId, 1, chain.next.get(successorId) ?? null);
       successor = {
         nodeId: successorId,
-        packetPath: packetPath(run.run_dir, successorId, 1),
         resolvedMaxAttempts: succResolved.maxAttempts,
         resolvedTimeoutMs: succResolved.timeoutMs,
         chainPosition: chain.order.indexOf(successorId),
@@ -483,6 +483,12 @@ export async function executeAttempt(input: {
     } catch (e) {
       if (e instanceof GuardRejected) return { status: "cancelled", detail: e.message };
       throw e;
+    }
+
+    // Scaffold the persisted successor's packet from its own row.
+    if (successorId) {
+      const row = store.getAttempt(run.run_id, successorId, 1)!;
+      scaffoldPacket(attemptDir(run.run_dir, row.execution_seq, row.node_id), row.attempt, chain.next.get(successorId) ?? null);
     }
 
     return { status: "completed" };
@@ -576,7 +582,7 @@ async function runValidator(input: {
   inst: Installation;
   run: RunRow;
   validator: NodeValidator;
-  nodeId: string;
+  attemptFolder: string;
   attemptNo: number;
   packetFile: string;
   outputFile: string;
@@ -584,7 +590,7 @@ async function runValidator(input: {
   stderrFile: string;
   cliPath: string;
 }): Promise<ValidatorOutcome> {
-  const validationDir = join(input.run.run_dir, "validation", `${input.nodeId}-attempt-${input.attemptNo}`);
+  const validationDir = join(input.attemptFolder, "validation");
   mkdirSync(validationDir, { recursive: true });
   const validationFile = join(validationDir, "validation.json");
 
@@ -599,7 +605,7 @@ async function runValidator(input: {
   const env = attemptEnv({
     logPath: input.run.worklog_path,
     runId: input.run.run_id,
-    nodeId: input.nodeId,
+    nodeId: nodeFromFolder(input.attemptFolder),
     attempt: input.attemptNo,
     promptFile: null,
     nodeOutputFile: input.outputFile,
@@ -620,7 +626,7 @@ async function runValidator(input: {
     const promptFile = join(validationDir, "prompt.md");
     writeFileSync(
       promptFile,
-      renderValidatorPrompt(input.nodeId, input.validator.agent.instructions, {
+      renderValidatorPrompt(nodeFromFolder(input.attemptFolder), input.validator.agent.instructions, {
         packetFile: input.packetFile,
         outputFile: input.outputFile,
         logPath: input.run.worklog_path,
@@ -673,6 +679,13 @@ async function runValidator(input: {
     passed: result.passed,
     reason: reason || (result.passed ? "validator passed" : "validator failed without a reason"),
   };
+}
+
+/** "attempts/007-node-x" → "node-x" and the per-node attempt ordinal. */
+export function nodeFromFolder(attemptFolder: string): string {
+  const base = attemptFolder.split("/").pop() ?? "";
+  const noSeq = base.replace(/^\d+-/, "");
+  return noSeq;
 }
 
 function renderValidatorPrompt(

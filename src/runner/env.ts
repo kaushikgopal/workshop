@@ -87,7 +87,7 @@ export function renderAgentPrompt(input: {
 
   // The packet exists on disk by claim time (scaffolded at attempt creation).
   // Show it verbatim so the model treats the marker pair as load-bearing.
-  const marker = authorizedMarker(input.nodeId, input.successorId);
+  const marker = authorizedMarker(input.successorId);
   let scaffold: string;
   try {
     scaffold = readFileSync(input.packetFile, "utf8");
