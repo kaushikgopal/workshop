@@ -1,7 +1,7 @@
 import type { Store, WorkflowRow, RunRow, AttemptRow } from "../store/store.js";
 import { isTerminal } from "../store/store.js";
 import { loadSnapshot } from "../recovery.js";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 
 /**
@@ -9,6 +9,7 @@ import { join } from "node:path";
  * Nodes render in chain order (from the run's definition snapshot), with
  * glyph status, attempt history, and progress. Older terminal runs collapse
  * into a count; unresolved runs and the most recent run always render.
+ * Long lines word-wrap with aligned continuation indents — never column 0.
  */
 
 const GLYPH: Record<string, string> = {
@@ -31,10 +32,38 @@ function clock(iso: string | null): string {
   return iso.slice(11, 19); // HH:MM:SS UTC
 }
 
+/**
+ * Word-wrap one rendered line to the terminal width. `contIndent` is added to
+ * every continuation line so wrapped text stays inside the tree.
+ */
+function wrap(text: string, contIndent: string): string[] {
+  const width = Math.max(60, (process.stdout.columns ?? 100) - 1);
+  const usable = Math.max(20, width - contIndent.length);
+  const leadMatch = /^(\s*)(.*)$/.exec(text);
+  const lead = leadMatch?.[1] ?? "";
+  const words = (leadMatch?.[2] ?? "").split(/\s+/).filter(Boolean);
+
+  const out: string[] = [];
+  let line = "";
+  for (const word of words) {
+    const candidate = line ? `${line} ${word}` : word;
+    if (candidate.length <= usable) {
+      line = candidate;
+    } else {
+      if (line) out.push(line);
+      line = word;
+    }
+  }
+  if (line || out.length === 0) out.push(line);
+  return out.map((l, i) => (i === 0 ? lead + l : contIndent + l));
+}
+
 export function renderTreeStatus(store: Store): string {
   const lines: string[] = [];
   const workflows = store.listWorkflows();
-  if (workflows.length === 0) return "no workflows — start one with: workshop start <workflow-id>\n";
+  if (workflows.length === 0) {
+    return "no workflows — start one with: workshop start <workflow-id>\n";
+  }
 
   for (const wf of workflows) {
     lines.push(...renderWorkflow(store, wf));
@@ -68,17 +97,16 @@ function renderWorkflow(store: Store, wf: WorkflowRow): string[] {
 
   for (const run of runs) {
     if (!shown.has(run.run_id)) continue;
-    lines.push(...renderRun(store, run, run.run_id === unresolved[unresolved.length - 1]?.run_id));
+    lines.push(...renderRun(store, run, unresolved[unresolved.length - 1]?.run_id === run.run_id));
   }
   return lines;
 }
 
 function renderRun(store: Store, run: RunRow, isCurrent: boolean): string[] {
-  const lines: string[] = [];
   const statusBits: string[] = [run.status];
   if (run.block_kind) statusBits.push(run.block_kind);
   const marker = isCurrent ? "└─" : "·";
-  lines.push(`${marker} run ${run.run_id}  ${glyph(run.status)} ${statusBits.join(" · ")}  ${clock(run.started_at)}`);
+  const lines = wrap(`${marker} run ${run.run_id}  ${glyph(run.status)} ${statusBits.join(" · ")}  ${clock(run.started_at)}`, "  ");
 
   // Chain order from the run's own snapshot; fall back to row order.
   let order: string[] | null = null;
@@ -106,23 +134,24 @@ function renderRun(store: Store, run: RunRow, isCurrent: boolean): string[] {
     const nodeAttempts = attempts.filter((a) => a.node_id === id).sort((a, b) => a.attempt - b.attempt);
     const nodeStatus = nodeStatusOf(nodeAttempts);
     const connector = isLastNode ? "└─" : "├─";
-    lines.push(`   ${connector} ${glyph(nodeStatus)} ${id}  ${nodeStatus}`);
+    lines.push(...wrap(`   ${connector} ${glyph(nodeStatus)} ${id}  ${nodeStatus}`, "     "));
     for (const a of nodeAttempts) {
-      lines.push(...renderAttempt(a, isLastNode));
+      lines.push(...renderAttempt(a));
     }
   });
   return lines;
 }
 
-function renderAttempt(attempt: AttemptRow, isLastNode: boolean): string[] {
-  const indent = isLastNode ? "        " : "        ";
+const ATTEMPT_INDENT = "        ";
+
+function renderAttempt(attempt: AttemptRow): string[] {
   const bits: string[] = [`#${attempt.attempt} ${attempt.status}`];
   if (attempt.validator_status) bits.push(`validator ${attempt.validator_status}`);
   if (attempt.failure_kind) bits.push(attempt.failure_kind);
   if (attempt.block_kind) bits.push(attempt.block_kind);
-  const lines = [`${indent}· ${bits.join(" · ")}`];
+  const lines = wrap(`${ATTEMPT_INDENT}· ${bits.join(" · ")}`, `${ATTEMPT_INDENT}  `);
   if (attempt.current_progress) {
-    lines.push(`${indent}  progress: ${attempt.current_progress}`);
+    lines.push(...wrap(`${ATTEMPT_INDENT}  progress: ${attempt.current_progress}`, `${ATTEMPT_INDENT}    `));
   }
   return lines;
 }
@@ -134,10 +163,4 @@ function nodeStatusOf(attempts: AttemptRow[]): string {
     if (attempts.some((a) => a.status === status)) return status;
   }
   return "pending";
-}
-
-/** Read-only helper for callers that want the raw worklog of the newest run. */
-export function newestWorklogPath(run: RunRow): string {
-  void readFileSync;
-  return run.worklog_path;
 }
