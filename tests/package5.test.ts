@@ -9,7 +9,7 @@ const MOCK = mockAgentHarness();
 /** Replace volatile values so the live DTO compares equal to the golden shape. */
 function normalize(value: unknown): unknown {
   if (typeof value === "string") {
-    if (/^run-\d{8}-\d{3}$/.test(value)) return "<run-id>";
+    if (/^[a-z0-9-]+-\d{8}-\d{3}$/.test(value)) return "<run-id>";
     if (/^sha256:[0-9a-f]{64}$/.test(value)) return "<sha256>";
     if (/^\d{4}-\d{2}-\d{2}T[\d:.]+Z$/.test(value)) return "<iso>";
     if (/^node-[a-z0-9-]+$/.test(value)) return "<node-id>";

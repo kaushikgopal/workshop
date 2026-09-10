@@ -281,12 +281,13 @@ export class Store {
         }
       }
 
-      const dayPrefix = toIso(input.now).slice(0, 10).replace(/-/g, "");
+      // The sequence is per-workflow: each run folder is identifiable to the
+      // workflow that spawned it (hemingway-clock-20260910-001).
       const seqRow = this.db
-        .query<{ m: number | null }, [string]>("SELECT MAX(seq) AS m FROM runs WHERE run_id LIKE ?")
-        .get(`run-${dayPrefix}-%`);
+        .query<{ m: number | null }, [string]>("SELECT MAX(seq) AS m FROM runs WHERE workflow_id = ?")
+        .get(input.workflowId);
       const seq = (seqRow?.m ?? 0) + 1;
-      const runId = formatRunId(input.now, seq);
+      const runId = formatRunId(input.workflowId, input.now, seq);
       const nowIso = toIso(input.now);
 
       this.db

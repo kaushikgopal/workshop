@@ -214,9 +214,9 @@ describe("gates 2+3 — manual run, execution, idempotent start", () => {
     const r = runCli(inst, "start mock-chain");
     if (r.code !== 0) console.error(r.stderr);
     expect(r.code).toBe(0);
-    expect(r.stdout).toMatch(/run-\S+ → completed/);
+    expect(r.stdout).toMatch(/\S+-\d{8}-\d{3} → completed/);
 
-    const runId = r.stdout.match(/run-\S+/)![0];
+    const runId = r.stdout.match(/\S+-\d{8}-\d{3}/)![0];
     const log = readWorklog(inst, runId);
     expect(log).toContain("hello from node-cmd"); // gate 6: command stdout in first packet
     expect(log).toContain("### Node: node-agent");
@@ -285,7 +285,7 @@ nodes:
     expect(Date.now() - began).toBeLessThan(20_000); // killed well before the 30s sleep ends
     expect(r.stdout).toContain("failed");
 
-    const runId = r.stdout.match(/run-\S+/)![0];
+    const runId = r.stdout.match(/\S+-\d{8}-\d{3}/)![0];
     const attempt = dbAttempts(inst, runId)[0]!;
     expect(attempt.failure_kind).toBe("timeout");
     expect(attempt.status).toBe("failed");
@@ -319,7 +319,7 @@ nodes:
     const r = runCli(inst, "start tamper");
     expect(r.stdout).toContain("failed");
 
-    const runId = r.stdout.match(/run-\S+/)![0];
+    const runId = r.stdout.match(/\S+-\d{8}-\d{3}/)![0];
     const attempt = dbAttempts(inst, runId)[0]!;
     expect(attempt.failure_kind).toBe("worklog_integrity");
   }, 60_000);
@@ -347,7 +347,7 @@ nodes:
     });
     const r = runCli(inst, "start progress");
     expect(r.code).toBe(0);
-    const runId = r.stdout.match(/run-\S+/)![0];
+    const runId = r.stdout.match(/\S+-\d{8}-\d{3}/)![0];
     const attempt = dbAttempts(inst, runId)[0]!;
     expect(attempt.current_progress).toBe("halfway done");
   }, 60_000);

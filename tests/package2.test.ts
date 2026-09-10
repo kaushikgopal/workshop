@@ -32,7 +32,7 @@ nodes:
     expect(r.code).toBe(0);
     expect(r.stdout).toContain("completed");
 
-    const runId = r.stdout.match(/run-\S+/)![0];
+    const runId = r.stdout.match(/\S+-\d{8}-\d{3}/)![0];
     const attempt = dbAttempts(inst, runId)[0]!;
     expect(attempt.validator_status).toBe("passed");
     expect(existsSync(validateDir(inst, runId, "node-out", 1))).toBe(true);
@@ -68,7 +68,7 @@ nodes:
     const r = runCli(inst, "start agent-validator");
     expect(r.stdout).toContain("failed");
 
-    const runId = r.stdout.match(/run-\S+/)![0];
+    const runId = r.stdout.match(/\S+-\d{8}-\d{3}/)![0];
     const attempt = dbAttempts(inst, runId)[0]!;
     expect(attempt.failure_kind).toBe("validator_rejection");
     expect(String(attempt.validator_reason)).toContain("mock validator rejected");
@@ -107,7 +107,7 @@ nodes:
     if (r.code !== 0) console.error(r.stderr);
     expect(r.stdout).toContain("completed");
 
-    const runId = r.stdout.match(/run-\S+/)![0];
+    const runId = r.stdout.match(/\S+-\d{8}-\d{3}/)![0];
     const attempts = dbAttempts(inst, runId);
     expect(attempts.length).toBe(2);
     expect(attempts[0]!.status).toBe("failed");
@@ -150,7 +150,7 @@ nodes:
     const r = runCli(inst, "start retry-bound");
     expect(r.stdout).toContain("failed");
 
-    const runId = r.stdout.match(/run-\S+/)![0];
+    const runId = r.stdout.match(/\S+-\d{8}-\d{3}/)![0];
     expect(dbAttempts(inst, runId).length).toBe(1);
   }, 60_000);
 
