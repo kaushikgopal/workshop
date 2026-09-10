@@ -1,11 +1,13 @@
 #!/usr/bin/env bun
 import { findInstallation, ensureDirs, workflowPath } from "./config.js";
-import { loadAndValidateDefinition, startWorkflow, runChain } from "./execute.js";
+import { join } from "node:path";
+import { loadAndValidateDefinition, startWorkflow, runChain, preflightIfNeeded, scaffoldFirstAttempt } from "./execute.js";
 import { openDb } from "./store/db.js";
 import { Store, GuardRejected } from "./store/store.js";
 import { buildStatusDto, renderStatusText, STATUS_DTO_VERSION } from "./status/dto.js";
 import { blockKindFor } from "./runner/attempt.js";
 import { SystemClock } from "./util/clock.js";
+import { runtimeCliInvocation } from "./util/cli-path.js";
 
 /**
  * Workshop CLI. Public surface:
@@ -99,11 +101,13 @@ async function main(): Promise<void> {
     case "runtime":
       return cmdRuntime(args);
     case "pause":
-      die("pause is not implemented yet — it lands with the daemon work package");
+      return cmdPause(args);
     case "resume":
-      die("resume is not implemented yet — it lands with the daemon work package");
+      await cmdResume(args);
+      process.exit(0);
     case "stop":
-      return cmdStop(args);
+      await cmdStop(args);
+      process.exit(0);
     case "logs":
     case "diagram":
     case "orchestrate":
@@ -212,6 +216,127 @@ async function cmdStop(args: string[]): Promise<void> {
   store.setActivationState(workflowId, "stopped");
 }
 
+/** Pause: suppress future occurrences; the current node finishes, then no successor. */
+function cmdPause(args: string[]): void {
+  const workflowId = requireArg(args, "workflow-id");
+  const inst = findInstallation();
+  const store = new Store(openDb(inst.dbPath));
+  const run = store.getUnresolvedRun(workflowId);
+  if (run) store.setDesiredState(run.run_id, "paused", new Date());
+  store.setActivationState(workflowId, "paused");
+  process.stdout.write(run ? `paused ${workflowId}: run ${run.run_id} pauses before its successor\n` : `paused ${workflowId}\n`);
+}
+
+/**
+ * Resume run-level blockers per kind, re-enable the schedule, and recreate
+ * any missing successor attempt.
+ */
+async function cmdResume(args: string[]): Promise<void> {
+  const workflowId = requireArg(args, "workflow-id");
+  const inst = findInstallation();
+  const store = new Store(openDb(inst.dbPath));
+  const now = new Date();
+  const wf = store.getWorkflow(workflowId);
+  if (!wf) die(`no workflow "${workflowId}"`);
+
+  const run = store.getUnresolvedRun(workflowId);
+  if (!run) {
+    store.setActivationState(workflowId, "active");
+    process.stdout.write(`resumed ${workflowId}: schedule re-enabled (no unresolved run)\n`);
+    return;
+  }
+
+  switch (run.block_kind) {
+    case "preflight": {
+      const loaded = loadAndValidateDefinition(join(run.run_dir, "definition.yaml"));
+      await preflightIfNeeded({ store, inst, loaded, runId: run.run_id, clock: new SystemClock() });
+      const after = store.getRun(run.run_id)!;
+      if (after.status === "blocked" && after.block_kind === "preflight") {
+        die("preflight still blocked — fix the environment first");
+      }
+      store.setRunStatus(run.run_id, "running", now, null); // clears the blocker
+      scaffoldFirstAttempt({ store, inst, loaded, runId: run.run_id, now });
+      break;
+    }
+    case "orchestrator_unresolved": {
+      // Re-resolve happens at next orchestrator claim; move the protected
+      // phase back to pending so judgment can proceed.
+      store.releaseOrchestratorToPending(run.run_id, null, now);
+      store.setRunStatus(run.run_id, "running", now, null);
+      break;
+    }
+    case "agent_requested":
+    case "orchestrator":
+    case "operator": {
+      // A fresh attempt when the node is repeat-safe; one manual bound extension.
+      const loaded = loadAndValidateDefinition(join(run.run_dir, "definition.yaml"));
+      const chain = loaded.chain;
+      const attempts = store.listAttempts(run.run_id).filter((a) => a.status === "blocked");
+      const blocked = attempts[attempts.length - 1];
+      if (!blocked) die("blocked run has no blocked attempt");
+      const fresh = store.createRetryAttempt({
+        runId: run.run_id,
+        nodeId: blocked.node_id,
+        previousAttempt: blocked.attempt,
+        packetPath: join("packets", `${blocked.node_id}-attempt-${blocked.attempt + 1}.md`),
+        resolvedMaxAttempts: blocked.resolved_max_attempts + 1, // one manual extension
+        resolvedTimeoutMs: blocked.resolved_timeout_ms,
+        now,
+      });
+      if (fresh) {
+        const { scaffoldPacket } = await import("./worklog/worklog.js");
+        scaffoldPacket(run.run_dir, blocked.node_id, fresh.attempt, chain.next.get(blocked.node_id) ?? null);
+      }
+      store.setRunStatus(run.run_id, "running", now, null);
+      break;
+    }
+    case "unknown_external":
+      die("unknown_external is not resumable — stop the run and explicitly change workflow policy");
+    default:
+      // Plain paused run: just continue; missing successors are recreated.
+      store.setRunStatus(run.run_id, "running", now, null);
+  }
+
+  // Recreate the missing successor attempt for a paused-before-successor run.
+  const freshRun = store.getRun(run.run_id)!;
+  if (freshRun.status === "running" && !store.getLiveAttempt(run.run_id)) {
+    const loaded = loadAndValidateDefinition(join(run.run_dir, "definition.yaml"));
+    await recreateMissingSuccessor(store, inst, loaded, run.run_id, now);
+  }
+
+  store.setActivationState(workflowId, "active");
+  process.stdout.write(`resumed ${workflowId}: run ${run.run_id} → ${store.getRun(run.run_id)!.status}\n`);
+}
+
+/** Create the pending successor attempt when a completed node has none. */
+async function recreateMissingSuccessor(
+  store: Store,
+  inst: ReturnType<typeof findInstallation>,
+  loaded: ReturnType<typeof loadAndValidateDefinition>,
+  runId: string,
+  now: Date,
+): Promise<void> {
+  const completed = store
+    .listAttempts(runId)
+    .filter((a) => a.status === "completed")
+    .sort((a, b) => (a.updated_at < b.updated_at ? 1 : -1))[0];
+  const lastNodeId = completed?.node_id ?? loaded.chain.order[loaded.chain.order.length - 1]!;
+  const nextId = loaded.chain.next.get(lastNodeId) ?? null;
+  if (!nextId) return;
+  const resolved = (await import("./runner/attempt.js")).resolveNode(loaded.def, nextId, inst);
+  const { scaffoldPacket, packetPath } = await import("./worklog/worklog.js");
+  const run = store.getRun(runId)!;
+  scaffoldPacket(run.run_dir, nextId, 1, loaded.chain.next.get(nextId) ?? null);
+  store.createSuccessorAttempt({
+    runId,
+    nodeId: nextId,
+    packetPath: packetPath(run.run_dir, nextId, 1),
+    resolvedMaxAttempts: resolved.maxAttempts,
+    resolvedTimeoutMs: resolved.timeoutMs,
+    now,
+  });
+}
+
 function cmdStatus(args: string[]): void {
   const json = args.includes("--json");
   const positional = args.filter((a) => !a.startsWith("--"));
@@ -273,9 +398,7 @@ function flagValue(args: string[], flag: string): string | null {
 }
 
 function cliPathOf(): string {
-  // Unquoted-expansion friendly: "bun /abs/path/cli.ts".
-  const script = process.argv[1];
-  return script ? `bun ${new URL(`file://${script}`).pathname}` : "workshop";
+  return runtimeCliInvocation();
 }
 process.on("unhandledRejection", (e) => {
   die(errorText(e));

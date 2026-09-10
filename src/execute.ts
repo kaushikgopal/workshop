@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Installation } from "./config.js";
 import { parseStrictYaml } from "./definition/parse.js";
@@ -150,31 +150,88 @@ export async function startWorkflow(input: {
   const runId = admitRun({ store, inst, loaded, clock });
 
   // Preflight runs after scaffolding; a failure blocks before any attempt.
-  if (def.environment?.preflight) {
-    const pf = def.environment.preflight;
-    let timeoutMs: number | null = inst.defaultTimeoutMs;
-    if (pf.timeout) {
-      const t = parseTimeout(pf.timeout);
-      timeoutMs = t.kind === "unlimited" ? null : t.ms;
-    }
-    try {
-      await runPreflight(inst, pf.command, timeoutMs);
-      appendEnvironmentObservation(inst, runId, `preflight passed (${pf.command})`);
-    } catch (e) {
-      if (e instanceof PreflightBlocked) {
-        appendEnvironmentObservation(inst, runId, `preflight blocked: ${e.message}\n\n\`\`\`\n${e.stderrTail}\n\`\`\``);
-        store.setRunStatus(runId, "blocked", clock.now(), "preflight");
-        return { runId, created: true, warnings };
-      }
-      throw e;
-    }
-  } else {
-    appendEnvironmentObservation(inst, runId, "no preflight configured");
+  // A first success is cached against the canonical workflow hash.
+  await preflightIfNeeded({ store, inst, loaded, runId, clock });
+
+  // A blocked preflight leaves no initial attempt behind.
+  if (store.getRun(runId)!.status !== "blocked") {
+    scaffoldFirstAttempt({ store, inst, loaded, runId, now: clock.now() });
   }
 
-  // The initial pending attempt for the start node.
+  void activation;
+
+  void activation;
+  return { runId, created: true, warnings };
+}
+
+export const preflightCacheDir = (inst: Installation): string => join(inst.stateDir, "preflight-cache");
+
+/**
+ * Run the optional command preflight unless already cached for this
+ * canonical hash; a blocked preflight marks the run blocked.
+ */
+export async function preflightIfNeeded(input: {
+  store: Store;
+  inst: Installation;
+  loaded: LoadedDefinition;
+  runId: string;
+  clock: Clock;
+}): Promise<void> {
+  const { store, inst, loaded, runId, clock } = input;
+  const pf = loaded.def.environment?.preflight;
+  if (!pf) {
+    appendEnvironmentObservation(inst, runId, "no preflight configured");
+    return;
+  }
+  const cacheFile = join(preflightCacheDir(inst), loaded.canonicalHash.replaceAll(":", "-"));
+  if (existsSync(cacheFile)) {
+    appendEnvironmentObservation(inst, runId, `preflight cached for ${loaded.canonicalHash}`);
+    clearPreflightBlocker(store, runId, clock);
+    return;
+  }
+  let timeoutMs: number | null = inst.defaultTimeoutMs;
+  if (pf.timeout) {
+    const t = parseTimeout(pf.timeout);
+    timeoutMs = t.kind === "unlimited" ? null : t.ms;
+  }
+  try {
+    await runPreflight(inst, pf.command, timeoutMs);
+    mkdirSync(preflightCacheDir(inst), { recursive: true });
+    atomicWriteFileSync(cacheFile, `${new Date().toISOString()} ${pf.command}\n`);
+    appendEnvironmentObservation(inst, runId, `preflight passed (${pf.command})`);
+    clearPreflightBlocker(store, runId, clock);
+  } catch (e) {
+    if (e instanceof PreflightBlocked) {
+      appendEnvironmentObservation(inst, runId, `preflight blocked: ${e.message}\n\n\`\`\`\n${e.stderrTail}\n\`\`\``);
+      store.setRunStatus(runId, "blocked", clock.now(), "preflight");
+      return;
+    }
+    throw e;
+  }
+}
+
+/** Successful initial or resumed preflight unblocks the run in one transaction. */
+function clearPreflightBlocker(store: Store, runId: string, clock: Clock): void {
+  store.tx(() => {
+    store.db
+      .query(
+        "UPDATE runs SET status = 'running', block_kind = NULL, desired_state = 'running', updated_at = ? WHERE run_id = ? AND status = 'blocked' AND block_kind = 'preflight'",
+      )
+      .run(clock.now().toISOString(), runId);
+  });
+}
+
+/** The initial pending attempt for the run's start node. */
+export function scaffoldFirstAttempt(input: {
+  store: Store;
+  inst: Installation;
+  loaded: LoadedDefinition;
+  runId: string;
+  now: Date;
+}): void {
+  const { store, inst, loaded, runId, now } = input;
   const startNode = loaded.chain.order[0]!;
-  const startResolved = resolveNode(def, startNode, inst);
+  const startResolved = resolveNode(loaded.def, startNode, inst);
   scaffoldPacket(runDirOf(inst, runId), startNode, 1, loaded.chain.next.get(startNode) ?? null);
   store.createSuccessorAttempt({
     runId,
@@ -182,11 +239,8 @@ export async function startWorkflow(input: {
     packetPath: packetPath(runDirOf(inst, runId), startNode, 1),
     resolvedMaxAttempts: startResolved.maxAttempts,
     resolvedTimeoutMs: startResolved.timeoutMs,
-    now: clock.now(),
+    now,
   });
-
-  void activation;
-  return { runId, created: true, warnings };
 }
 
 export function runDirOf(inst: Installation, runId: string): string {
