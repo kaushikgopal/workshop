@@ -99,8 +99,11 @@ async function main(): Promise<void> {
     case "runtime":
       return cmdRuntime(args);
     case "pause":
+      die("pause is not implemented yet — it lands with the daemon work package");
     case "resume":
+      die("resume is not implemented yet — it lands with the daemon work package");
     case "stop":
+      return cmdStop(args);
     case "logs":
     case "diagram":
     case "orchestrate":
@@ -165,6 +168,48 @@ async function cmdStart(args: string[]): Promise<void> {
   // The runner holds live handles (spawned-process listeners) by design;
   // CLI commands terminate their own process when the work is done.
   process.exit(0);
+}
+
+/**
+ * Durable stop: the intent (desired_state + activation) is written before the
+ * runner is signalled, so a restart cannot reinterpret it as a retry. The
+ * recorded process group is terminated and confirmed afterwards.
+ */
+async function cmdStop(args: string[]): Promise<void> {
+  const workflowId = requireArg(args, "workflow-id");
+  const inst = findInstallation();
+  const store = new Store(openDb(inst.dbPath));
+  const now = new Date();
+
+  const wf = store.getWorkflow(workflowId);
+  if (!wf) die(`no workflow "${workflowId}"`);
+
+  const run = store.getUnresolvedRun(workflowId);
+  if (run) {
+    // 1. Durable intent first.
+    store.stopRun({ runId: run.run_id, now });
+
+    // 2. Terminate and confirm the recorded process groups.
+    const live = store.getLiveAttempt(run.run_id);
+    if (live?.worker_process_group != null) {
+      const { terminateProcessGroup } = await import("./util/process.js");
+      await terminateProcessGroup(live.worker_process_group);
+    }
+    const fresh = store.getRun(run.run_id)!;
+    if (fresh.orchestrator_worker_pid != null && (fresh.orchestrator_phase === "owned" || fresh.orchestrator_phase === "applying")) {
+      const { terminateProcessGroup } = await import("./util/process.js");
+      await terminateProcessGroup(fresh.orchestrator_worker_pid);
+      store.finishOrchestrator(run.run_id, now);
+    }
+
+    // 3. Cancel any live attempt rows left after the signal.
+    const after = store.getLiveAttempt(run.run_id);
+    if (after) store.cancelAttempt({ runId: run.run_id, nodeId: after.node_id, attempt: after.attempt, now });
+    process.stdout.write(`stopped ${workflowId}: run ${run.run_id} cancelled\n`);
+  } else {
+    process.stdout.write(`stopped ${workflowId}: no unresolved run\n`);
+  }
+  store.setActivationState(workflowId, "stopped");
 }
 
 function cmdStatus(args: string[]): void {

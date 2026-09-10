@@ -62,6 +62,8 @@ CREATE TABLE IF NOT EXISTS node_attempts (
   node_output_path TEXT,
   packet_path TEXT NOT NULL,
   owner_token TEXT,
+  wrapper_pid INTEGER,
+  wrapper_process_start_id TEXT,
   worker_pid INTEGER,
   worker_process_start_id TEXT,
   worker_process_group INTEGER,

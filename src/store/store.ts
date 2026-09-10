@@ -74,6 +74,8 @@ export interface AttemptRow {
   node_output_path: string | null;
   packet_path: string;
   owner_token: string | null;
+  wrapper_pid: number | null;
+  wrapper_process_start_id: string | null;
   worker_pid: number | null;
   worker_process_start_id: string | null;
   worker_process_group: number | null;
@@ -189,16 +191,14 @@ export class Store {
     });
   }
 
-  setActivationState(workflowId: string, state: ActivationState, now: Date): void {
+  setActivationState(workflowId: string, state: ActivationState): void {
     this.tx(() => {
       const changes = this.db
         .query("UPDATE workflows SET activation_state = ? WHERE workflow_id = ?")
         .run(state, workflowId);
       if (Number(changes.changes) === 0) throw new GuardRejected(`no workflow "${workflowId}"`);
-      void now;
     });
   }
-
   resetActivationCounter(workflowId: string, now: Date): void {
     this.tx(() => {
       this.db
@@ -444,13 +444,16 @@ export class Store {
       const startId = processStartIdOrThrow(process.pid);
       const changes = this.db
         .query(
-          `UPDATE node_attempts SET status = 'running', owner_token = ?, worker_pid = ?,
+          `UPDATE node_attempts SET status = 'running', owner_token = ?, wrapper_pid = ?,
+             wrapper_process_start_id = ?, worker_pid = ?,
              worker_process_start_id = ?, worker_process_group = ?, last_heartbeat_at = ?, started_at = ?, updated_at = ?
            WHERE run_id = ? AND node_id = ? AND attempt = ? AND status = 'pending'`,
         )
         .run(
           ownerToken,
-          process.pid,
+          process.pid, // wrapper identity — the claimer that collects evidence
+          startId,
+          process.pid, // worker identity — replaced by the child after spawn
           startId,
           pgid,
           toIso(input.now),
@@ -568,6 +571,11 @@ export class Store {
     successor: { nodeId: string; packetPath: string; resolvedMaxAttempts: number; resolvedTimeoutMs: number | null } | null;
   }): { completed: boolean; successorCreated: boolean } {
     return this.tx(() => {
+      // Durable stop wins even over late completion evidence.
+      const runBefore = this.getRun(input.runId)!;
+      if (runBefore.desired_state === "stopped") {
+        throw new GuardRejected("run is stopped — late completion is fenced");
+      }
       const changes = this.db
         .query(
           `UPDATE node_attempts SET status = 'completed', node_output_path = ?, validator_status = ?,
@@ -650,7 +658,7 @@ export class Store {
     });
   }
 
-  /** Fail an attempt (running|finishing → failed) and protect for orchestration. */
+  /** Fail an attempt (running|finishing → failed) and optionally protect for orchestration. */
   failAttempt(input: {
     runId: string;
     nodeId: string;
@@ -658,6 +666,7 @@ export class Store {
     ownerToken: string | null;
     failureKind: FailureKind;
     validatorReason?: string | null;
+    protectForOrchestration?: boolean;
     now: Date;
   }): { failed: boolean; orchestratorPending: boolean } {
     return this.tx(() => {
@@ -676,7 +685,12 @@ export class Store {
       if (Number(changes.changes) !== 1) return { failed: false, orchestratorPending: false };
 
       // The same transaction moves the run into the protected phase, which
-      // blocks every new node claim until the orchestrator decides.
+      // blocks every new node claim until the orchestrator decides. A dead
+      // worker auto-retries instead — the only technical interruption that
+      // never needs judgment.
+      if (input.protectForOrchestration === false) {
+        return { failed: true, orchestratorPending: false };
+      }
       const phaseChanges = this.db
         .query("UPDATE runs SET orchestrator_phase = 'pending', orchestrator_owner_token = NULL, updated_at = ? WHERE run_id = ? AND orchestrator_phase = 'idle'")
         .run(toIso(input.now), input.runId);
@@ -695,6 +709,67 @@ export class Store {
         .run(toIso(input.now), toIso(input.now), input.runId, input.nodeId, input.attempt);
     });
   }
+
+  /**
+   * Durable stop: desired_state is written first (a daemon restart cannot
+   * reinterpret cancellation as a retry); the run row cancels only when
+   * still unresolved. Returns the run row after the transition.
+   */
+  stopRun(input: { runId: string; now: Date }): void {
+    this.tx(() => {
+      // Durable intent and attempt cancellation land in one transaction:
+      // a late completion's owner CAS then fails on status.
+      this.db
+        .query("UPDATE runs SET desired_state = 'stopped', updated_at = ? WHERE run_id = ?")
+        .run(toIso(input.now), input.runId);
+      this.db
+        .query(
+          `UPDATE node_attempts SET status = 'cancelled', finished_at = ?, updated_at = ?
+           WHERE run_id = ? AND status IN ('pending','running','finishing')`,
+        )
+        .run(toIso(input.now), toIso(input.now), input.runId);
+      this.db
+        .query(
+          "UPDATE runs SET status = 'cancelled', block_kind = NULL, finished_at = ?, updated_at = ? WHERE run_id = ? AND status IN ('queued','running','paused','blocked')",
+        )
+        .run(toIso(input.now), toIso(input.now), input.runId);
+    });
+  }
+
+  /**
+   * Recovery transfer of a finishing attempt to a recovery owner by
+   * compare-and-set; the old owner's death is a precondition of the caller.
+   */
+  transferFinishingOwner(input: {
+    runId: string;
+    nodeId: string;
+    attempt: number;
+    priorOwnerToken: string;
+    now: Date;
+  }): string | null {
+    return this.tx(() => {
+      const newToken = newOwnerToken();
+      const changes = this.db
+        .query(
+          `UPDATE node_attempts SET owner_token = ?, worker_pid = ?, worker_process_start_id = ?,
+             worker_process_group = NULL, updated_at = ?
+           WHERE run_id = ? AND node_id = ? AND attempt = ? AND owner_token = ? AND status = 'finishing'`,
+        )
+        .run(
+          newToken,
+          process.pid,
+          processStartIdOrThrow(process.pid),
+          toIso(input.now),
+          input.runId,
+          input.nodeId,
+          input.attempt,
+          input.priorOwnerToken,
+        );
+      return Number(changes.changes) === 1 ? newToken : null;
+    });
+  }
+
+  // ---------- orchestrator phase machine ----------
 
   // ---------- orchestrator phase machine ----------
 
