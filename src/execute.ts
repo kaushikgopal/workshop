@@ -1,0 +1,286 @@
+import { readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import type { Installation } from "./config.js";
+import { parseStrictYaml } from "./definition/parse.js";
+import { workflowSchema, type WorkflowDefinition } from "./definition/schema.js";
+import { canonicalHash } from "./definition/hash.js";
+import { validateChain, unresolvedAgentSites, type ChainInfo } from "./definition/validate.js";
+import { openDb } from "./store/db.js";
+import { Store, isTerminal, type RunRow } from "./store/store.js";
+import { atomicWriteFileSync, packetPath, scaffoldPacket, scaffoldWorklog, worklogPath } from "./worklog/worklog.js";
+import { executeAttempt, resolveNode } from "./runner/attempt.js";
+import { parseDuration, parseTimeout } from "./util/duration.js";
+import { SystemClock, type Clock } from "./util/clock.js";
+import { spawnTracked } from "./runner/spawn.js";
+
+/**
+ * Loading, validation, and the chain executor. The executor claims pending
+ * attempts and runs them to completion; the daemon reuses the same functions.
+ */
+
+export interface LoadedDefinition {
+  def: WorkflowDefinition;
+  chain: ChainInfo;
+  canonicalHash: string;
+  sourcePath: string;
+}
+
+export function loadAndValidateDefinition(sourcePath: string): LoadedDefinition {
+  let src: string;
+  try {
+    src = readFileSync(sourcePath, "utf8");
+  } catch (e) {
+    throw new Error(`cannot read workflow definition at ${sourcePath}: ${(e as Error).message}`);
+  }
+  const raw = parseStrictYaml(src, sourcePath);
+  const def = workflowSchema.parse(raw);
+  const chain = validateChain(def);
+  return { def, chain, canonicalHash: canonicalHash(def), sourcePath };
+}
+
+/** All start validation that must fail before any state exists. */
+export function preflightValidation(def: WorkflowDefinition, inst: Installation): string[] {
+  const warnings: string[] = [];
+  const unresolved = unresolvedAgentSites(def, inst.machineAgent);
+  if (unresolved.length > 0) {
+    throw new Error(
+      `cannot start: agent sites cannot resolve a harness command and model:\n  - ${unresolved.join("\n  - ")}`,
+    );
+  }
+  if (def.schedule && def.schedule.max_runs <= 0) {
+    warnings.push(`max_runs is ${def.schedule.max_runs} — this workflow runs until stopped (indefinite)`);
+  }
+  return warnings;
+}
+
+export class PreflightBlocked extends Error {
+  constructor(
+    public exitCode: number | null,
+    public stderrTail: string,
+  ) {
+    super(`environment preflight failed with exit code ${exitCode ?? "null"}`);
+    this.name = "PreflightBlocked";
+  }
+}
+
+/** Run the optional command preflight. Exit 0 = ready. */
+export async function runPreflight(inst: Installation, command: string, timeoutMs: number | null): Promise<void> {
+  const out = join(inst.stateDir, "preflight-last.stdout");
+  const err = join(inst.stateDir, "preflight-last.stderr");
+  const proc = spawnTracked({
+    shell: inst.shell,
+    command,
+    cwd: inst.projectDir,
+    env: {},
+    stdoutFile: out,
+    stderrFile: err,
+  });
+  const result =
+    timeoutMs === null
+      ? { kind: "exit" as const, exit: await proc.exit }
+      : await Promise.race([
+          proc.exit.then((exit) => ({ kind: "exit" as const, exit })),
+          new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), timeoutMs)),
+        ]);
+  if (result === "timeout") {
+    await proc.kill();
+    throw new PreflightBlocked(null, `preflight timed out after ${timeoutMs}ms`);
+  }
+  if (result.exit.code !== 0) {
+    throw new PreflightBlocked(result.exit.code, tailOf(err, 2000));
+  }
+}
+
+function tailOf(path: string, max: number): string {
+  try {
+    const content = readFileSync(path, "utf8");
+    return content.length > max ? content.slice(-max) : content;
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Start a run: create or refresh the activation, admit the run (idempotent
+ * while unresolved), scaffold worklog + first packet, snapshot the
+ * definition, run preflight, and create the initial pending attempt.
+ */
+export async function startWorkflow(input: {
+  inst: Installation;
+  loaded: LoadedDefinition;
+  clock?: Clock;
+}): Promise<{ runId: string; created: boolean; warnings: string[] }> {
+  const clock = input.clock ?? new SystemClock();
+  const { inst, loaded } = input;
+  const store = new Store(openDb(inst.dbPath));
+  const now = clock.now();
+  const def = loaded.def;
+
+  const warnings = preflightValidation(def, inst);
+
+  const activation = store.upsertWorkflowActivation({
+    workflowId: def.id,
+    definitionPath: loaded.sourcePath,
+    definitionHash: loaded.canonicalHash,
+    every: def.schedule?.every ?? null,
+    maxRuns: def.schedule?.max_runs ?? 1,
+    now,
+  });
+
+  const unresolved = store.getUnresolvedRun(def.id);
+  if (unresolved) return { runId: unresolved.run_id, created: false, warnings };
+
+  const runId = admitRun({ store, inst, loaded, clock });
+
+  // Preflight runs after scaffolding; a failure blocks before any attempt.
+  if (def.environment?.preflight) {
+    const pf = def.environment.preflight;
+    let timeoutMs: number | null = inst.defaultTimeoutMs;
+    if (pf.timeout) {
+      const t = parseTimeout(pf.timeout);
+      timeoutMs = t.kind === "unlimited" ? null : t.ms;
+    }
+    try {
+      await runPreflight(inst, pf.command, timeoutMs);
+      appendEnvironmentObservation(inst, runId, `preflight passed (${pf.command})`);
+    } catch (e) {
+      if (e instanceof PreflightBlocked) {
+        appendEnvironmentObservation(inst, runId, `preflight blocked: ${e.message}\n\n\`\`\`\n${e.stderrTail}\n\`\`\``);
+        store.setRunStatus(runId, "blocked", clock.now(), "preflight");
+        return { runId, created: true, warnings };
+      }
+      throw e;
+    }
+  } else {
+    appendEnvironmentObservation(inst, runId, "no preflight configured");
+  }
+
+  // The initial pending attempt for the start node.
+  const startNode = loaded.chain.order[0]!;
+  const startResolved = resolveNode(def, startNode, inst);
+  scaffoldPacket(runDirOf(inst, runId), startNode, 1, loaded.chain.next.get(startNode) ?? null);
+  store.createSuccessorAttempt({
+    runId,
+    nodeId: startNode,
+    packetPath: packetPath(runDirOf(inst, runId), startNode, 1),
+    resolvedMaxAttempts: startResolved.maxAttempts,
+    resolvedTimeoutMs: startResolved.timeoutMs,
+    now: clock.now(),
+  });
+
+  void activation;
+  return { runId, created: true, warnings };
+}
+
+export function runDirOf(inst: Installation, runId: string): string {
+  return join(inst.runsDir, runId);
+}
+
+/** Admit the run row with snapshot + scaffolding in place. */
+function admitRun(input: {
+  store: Store;
+  inst: Installation;
+  loaded: LoadedDefinition;
+  clock: Clock;
+}): string {
+  const { store, inst, loaded, clock } = input;
+  const now = clock.now();
+  const everyMs = loaded.def.schedule ? parseDuration(loaded.def.schedule.every) : null;
+
+  const admitted = store.createRun({
+    workflowId: loaded.def.id,
+    definitionHash: loaded.canonicalHash,
+    definitionSnapshotPath: "",
+    runDir: "",
+    worklogPath: "",
+    now,
+    isRecurring: Boolean(loaded.def.schedule),
+    everyMs,
+  });
+
+  const run = store.getRun(admitted.runId)!;
+  const runDir = runDirOf(inst, run.run_id);
+  atomicWriteFileSync(join(runDir, "definition.yaml"), readFileSync(loaded.sourcePath, "utf8"));
+  scaffoldWorklog(runDir, loaded.def.id, loaded.def.description, loaded.chain.order);
+  store.tx(() => {
+    store.db
+      .query("UPDATE runs SET definition_snapshot_path = ?, run_dir = ?, worklog_path = ? WHERE run_id = ?")
+      .run(join(runDir, "definition.yaml"), runDir, worklogPath(runDir), run.run_id);
+  });
+  return run.run_id;
+}
+
+function appendEnvironmentObservation(inst: Installation, runId: string, observation: string): void {
+  const logPath = join(runDirOf(inst, runId), "WORKSHOP_LOG.md");
+  try {
+    const content = readFileSync(logPath, "utf8");
+    const marker = "## Environment\n";
+    const idx = content.indexOf(marker);
+    if (idx === -1) return;
+    const at = idx + marker.length;
+    const updated = `${content.slice(0, at)}\n- ${new Date().toISOString()} — ${observation}\n${content.slice(at)}`;
+    writeFileSync(logPath, updated, "utf8");
+  } catch {
+    /* observation is best-effort; SQLite remains authoritative */
+  }
+}
+
+/**
+ * Execute all pending attempts of one run until the chain ends, fails, or
+ * pauses. Uses the same guarded claims the daemon uses.
+ */
+export async function runChain(input: {
+  store: Store;
+  inst: Installation;
+  loaded: LoadedDefinition;
+  runId: string;
+  clock?: Clock;
+  cliPath: string;
+}): Promise<RunRow> {
+  const clock = input.clock ?? new SystemClock();
+  const { store, inst, loaded, runId } = input;
+
+  for (;;) {
+    const run = store.getRun(runId);
+    if (!run) throw new Error(`run ${runId} vanished`);
+    if (isTerminal(run.status) || run.status === "paused" || run.status === "blocked") return run;
+
+    const live = store.getLiveAttempt(runId);
+    if (!live || live.status !== "pending") return store.getRun(runId)!;
+
+    const prevNode = loaded.chain.prev.get(live.node_id) ?? null;
+    const prevOutput = prevNode ? latestSuccessfulOutput(store, runId, prevNode) : null;
+
+    const outcome = await executeAttempt({
+      store,
+      inst,
+      def: loaded.def,
+      chain: loaded.chain,
+      run,
+      nodeId: live.node_id,
+      attemptNo: live.attempt,
+      previousOutputFile: prevOutput,
+      clock,
+      cliPath: input.cliPath,
+    });
+
+    if (outcome.status === "failed") {
+      // Package 1 behavior: the run fails terminally. Package 2 replaces this
+      // with orchestrator judgment.
+      store.setRunStatus(runId, "failed", clock.now(), null);
+      return store.getRun(runId)!;
+    }
+    if (outcome.status !== "completed") {
+      return store.getRun(runId)!;
+    }
+    // Loop: the completed attempt persisted its successor.
+  }
+}
+
+function latestSuccessfulOutput(store: Store, runId: string, nodeId: string): string | null {
+  const attempts = store
+    .listAttempts(runId)
+    .filter((a) => a.node_id === nodeId && a.status === "completed" && a.node_output_path)
+    .sort((a, b) => b.attempt - a.attempt);
+  return attempts[0]?.node_output_path ?? null;
+}

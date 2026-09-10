@@ -1,0 +1,57 @@
+version: 1
+id: hemingway-clock
+description: Generate an original Hemingway-inspired line on a schedule.
+
+schedule:
+  every: 10m
+  max_runs: 6
+
+defaults:
+  max_attempts: 2
+  timeout: 10m
+  agent:
+    harness:
+      # Pi 0.85
+      command: 'pi --print --mode json --approve --no-session --model "$WORKSHOP_MODEL_WITH_THINKING" -- "$(cat "$WORKSHOP_PROMPT_FILE")"'
+
+      # OpenCode 1.18
+      # command: 'opencode run --format json --auto --model "$WORKSHOP_MODEL" --variant "$WORKSHOP_THINKING" -- "$(cat "$WORKSHOP_PROMPT_FILE")"'
+
+      # Claude Code 2.1
+      # command: 'claude --print --output-format text --permission-mode auto --no-session-persistence --model "$WORKSHOP_MODEL_ID" --effort "$WORKSHOP_THINKING" -- "$(cat "$WORKSHOP_PROMPT_FILE")"'
+
+    model: "openai-codex/gpt-5.3-codex:medium"
+
+environment:
+  preflight:
+    command: 'command -v pi >/dev/null'
+
+nodes:
+  node-timestamp:
+    run:
+      command: "date -u +%FT%TZ"
+
+    validator:
+      command: 'test -n "$(cat "$WORKSHOP_NODE_OUTPUT_FILE")"'
+
+    next: node-generate-line
+
+  node-generate-line:
+    run:
+      agent:
+        instructions: |
+          Read your assigned work packet and the previous node handoff.
+          Generate one original Hemingway-inspired sentence.
+          Do not claim that it is a real Hemingway quotation.
+          Record progress only in your assigned packet file.
+          Put the final sentence inside the <workflow-output> block.
+
+    validator:
+      agent:
+        model: "openai-codex/gpt-5.3-codex:high"
+        instructions: |
+          Pass only if the workflow output contains one original sentence,
+          does not attribute it to Hemingway, and is valid Markdown.
+
+    max_attempts: 2
+    next: null
