@@ -1,6 +1,6 @@
 version: 1
 id: hemingway-clock
-description: Generate an original Hemingway-inspired line on a schedule.
+description: Generate an original Hemingway-inspired line on a schedule and append it to hemingway.quotes.md.
 
 schedule:
   every: 10m
@@ -56,4 +56,16 @@ nodes:
           does not attribute it to Hemingway, and is valid Markdown.
 
     max_attempts: 2
+    next: node-append-quote
+
+  node-append-quote:
+    run:
+      command: |
+        file=".workshop/config/workflows/hemingway.quotes.md"
+        [ -f "$file" ] || printf '# Hemingway clock quotes\n\n' > "$file"
+        printf '<quote run-id="%s">\n%s\n</quote>\n\n' \
+          "$WORKSHOP_RUN_ID" "$(cat "$WORKSHOP_PREVIOUS_OUTPUT_FILE")" >> "$file"
+    # Appending to a shared file is not repeat-safe: a retry would
+    # duplicate the quote, so this node gets exactly one attempt.
+    max_attempts: 1
     next: null
