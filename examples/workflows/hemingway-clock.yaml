@@ -44,6 +44,8 @@ nodes:
           Generate one original Hemingway-inspired sentence.
           Do not claim that it is a real Hemingway quotation.
           Record progress only in your assigned packet file.
+          Keep the packet's scaffolded headings (#### Attempt, ##### Progress,
+          ##### Decisions, ##### Validation, ##### Blockers) intact.
           Put the final sentence inside the <workflow-output> block.
 
     validator:

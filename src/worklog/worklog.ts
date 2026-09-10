@@ -104,41 +104,25 @@ export function scaffoldPacket(
   return atomicWriteFileSync(path, packetTemplate(attempt, marker));
 }
 
-const ALLOWED_PACKET_HEADINGS = [
-  /^#### Attempt \d+$/,
-  /^##### Progress$/,
-  /^##### Decisions$/,
-  /^##### Validation$/,
-  /^##### Blockers$/,
-];
-
 export interface PacketCheck {
   ok: true;
 }
 
 /**
- * Validate a finished packet before merge:
- * - exactly its scaffolded headings, no unowned headings;
- * - exactly one authorized marker, with its closing tag.
- * Extra reserved marker openings are tolerated but escaped.
+ * Validate a finished packet before merge. Ownership is the gate:
+ * - exactly one authorized marker with its closing tag (spec §8);
+ * - no headings that own runtime sections (#, ##, ###).
+ * Formatting drift inside the attempt block — dropped or extra ####/#####
+ * headings — is tolerated; the merge normalizes the attempt heading.
  */
 export function validatePacket(packetFile: string, nodeId: string, attempt: number, successorId: string | null): void {
   const content = readFileSync(packetFile, "utf8");
   const marker = authorizedMarker(nodeId, successorId);
 
-  const headings = content
-    .split("\n")
-    .filter((line) => /^#{1,6} /.test(line))
-    .map((line) => line.trim());
-  if (headings[0] !== `#### Attempt ${attempt}`) {
-    throw new WorklogIntegrityError(
-      `packet for ${nodeId} #${attempt} must start with "#### Attempt ${attempt}"`,
-    );
-  }
-  for (const heading of headings) {
-    if (!ALLOWED_PACKET_HEADINGS.some((re) => re.test(heading))) {
+  for (const line of content.split("\n")) {
+    if (/^#{1,3} /.test(line.trim())) {
       throw new WorklogIntegrityError(
-        `packet for ${nodeId} #${attempt} contains a heading it does not own: "${heading}"`,
+        `packet for ${nodeId} #${attempt} contains a heading it does not own: "${line.trim()}" — "#", "##", and "###" sections belong to the runtime`,
       );
     }
   }
@@ -225,7 +209,13 @@ export function mergePacket(input: {
 
   validatePacket(packetFile, input.nodeId, input.attempt, input.successorId);
   const packet = readFileSync(packetFile, "utf8");
-  const escaped = escapeReservedMarkers(packet, authorizedMarker(input.nodeId, input.successorId));
+  // Formatting drift tolerance: the merged attempt block always begins with
+  // its attempt heading, even when the agent dropped it.
+  const attemptHeading = `#### Attempt ${input.attempt}`;
+  const normalized = packet.trimStart().startsWith(attemptHeading)
+    ? packet
+    : `${attemptHeading}\n\n${packet.trimStart()}`;
+  const escaped = escapeReservedMarkers(normalized, authorizedMarker(input.nodeId, input.successorId));
 
   const log = readFileSync(logPath, "utf8");
   const nodeHeading = `### Node: ${input.nodeId}`;

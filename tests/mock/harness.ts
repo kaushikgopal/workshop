@@ -139,6 +139,13 @@ function fillPacket(opts: {
   if (sentinels.has("MOCK:bad-heading")) {
     out += `\n## Run outcome\n\nagents must not own this\n`;
   }
+  if (sentinels.has("MOCK:drop-headings")) {
+    // Real-model drift: rewrite without the scaffold headings, keep the marker.
+    out = out
+      .replace(/^#### Attempt \d+\n\n/, "")
+      .replaceAll(/^##### .*$/gm, "")
+      .replace(/\n{3,}/g, "\n\n");
+  }
   if (sentinels.has("MOCK:drop-marker")) {
     out = out.replace(markerRe, "\n");
   }

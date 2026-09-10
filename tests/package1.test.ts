@@ -352,3 +352,66 @@ nodes:
     expect(attempt.current_progress).toBe("halfway done");
   }, 60_000);
 });
+
+describe("gate 5 — packet validation against real-model drift", () => {
+  test("an agent that drops the scaffolded headings still merges (drift tolerated)", () => {
+    const inst = makeInstallation({
+      "drift": `version: 1
+id: drift
+description: Agent rewrites the packet without scaffold headings.
+defaults:
+  max_attempts: 2
+  timeout: 1m
+  agent:
+    harness:
+      command: '${MOCK}'
+    model: "mock/mock-model:low"
+nodes:
+  node-drift:
+    run:
+      agent:
+        instructions: |
+          MOCK:drop-headings
+    next: null
+`,
+    });
+    const r = runCli(inst, "start drift");
+    expect(r.code).toBe(0);
+    expect(r.stdout).toContain("completed");
+
+    const runId = r.stdout.match(/\S+-\d{8}-\d{3}/)![0];
+    const log = readWorklog(inst, runId);
+    expect(log).toContain("#### Attempt 1"); // normalized at merge
+    expect(log).toContain("Mock deterministic output from node-drift attempt 1.");
+  }, 60_000);
+
+  test("an agent that injects a runtime-owned heading fails the attempt", () => {
+    const inst = makeInstallation({
+      "hostile": `version: 1
+id: hostile
+description: Agent writes a runtime-owned heading.
+defaults:
+  max_attempts: 2
+  timeout: 1m
+  agent:
+    harness:
+      command: '${MOCK}'
+    model: "mock/mock-model:low"
+nodes:
+  node-hostile:
+    run:
+      agent:
+        instructions: |
+          MOCK:bad-heading
+    max_attempts: 1
+    next: null
+`,
+    });
+    const r = runCli(inst, "start hostile");
+    // No orchestrator configured: the run blocks for the operator instead of failing.
+    expect(r.stdout).toContain("blocked");
+    const runId = r.stdout.match(/\S+-\d{8}-\d{3}/)![0];
+    const attempt = dbAttempts(inst, runId)[0]!;
+    expect(attempt.failure_kind).toBe("worklog_integrity");
+  }, 60_000);
+});
