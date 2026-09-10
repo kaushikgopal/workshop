@@ -124,37 +124,3 @@ function nodeStatusFromAttempts(attempts: AttemptRow[]): string {
   if (attempts.some((a) => a.status === "cancelled")) return "cancelled";
   return "pending";
 }
-
-/** Human text rendering of the same DTO data. */
-export function renderStatusText(dto: StatusDto): string {
-  const lines: string[] = [];
-  for (const wf of dto.workflows) {
-    lines.push(`Workflow  ${wf.id}`);
-    if (wf.activation) {
-      lines.push(
-        `Activation ${wf.activation.state} (runs ${wf.activation.startedRuns}${wf.activation.maxRuns != null ? `/${wf.activation.maxRuns}` : ""})` +
-          (wf.activation.nextRunAt ? ` next ${wf.activation.nextRunAt}` : ""),
-      );
-    }
-    const run = wf.currentRun;
-    if (!run) {
-      lines.push("Run      (none unresolved)");
-      lines.push("");
-      continue;
-    }
-    lines.push(`Run       ${run.id} — ${run.status}${run.blocker ? ` (blocked: ${run.blocker})` : ""}`);
-    for (const node of run.nodes) {
-      lines.push(`  Node    ${node.id} — ${node.status}`);
-      for (const attempt of node.attempts) {
-        const bits: string[] = [`${attempt.number}`, attempt.status];
-        if (attempt.progress) bits.push(`progress: ${attempt.progress}`);
-        if (attempt.validator) bits.push(`validator: ${attempt.validator}`);
-        if (attempt.failure) bits.push(`failure: ${attempt.failure}`);
-        if (attempt.blocker) bits.push(`blocker: ${attempt.blocker}`);
-        lines.push(`    Attempt ${bits.join(" · ")}`);
-      }
-    }
-    lines.push("");
-  }
-  return lines.join("\n").trimEnd() + "\n";
-}

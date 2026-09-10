@@ -5,7 +5,8 @@ import { join } from "node:path";
 import { loadAndValidateDefinition, startWorkflow, runChain, preflightIfNeeded, scaffoldFirstAttempt } from "./execute.js";
 import { openDb } from "./store/db.js";
 import { Store, GuardRejected } from "./store/store.js";
-import { buildStatusDto, renderStatusText, STATUS_DTO_VERSION } from "./status/dto.js";
+import { buildStatusDto, STATUS_DTO_VERSION } from "./status/dto.js";
+import { renderTreeStatus } from "./status/tree.js";
 import { resolveNode } from "./runner/attempt.js";
 import { isTerminal } from "./store/store.js";
 import { blockKindFor } from "./runner/attempt.js";
@@ -363,7 +364,7 @@ function cmdStatus(args: string[]): void {
   if (json) {
     process.stdout.write(`${JSON.stringify(dto, null, 2)}\n`);
   } else {
-    process.stdout.write(renderStatusText(dto));
+    process.stdout.write(renderTreeStatus(store));
   }
   void positional;
 }
