@@ -16,6 +16,16 @@ import { packetPath } from "../src/worklog/worklog.js";
 
 const MOCK = mockAgentHarness();
 
+/** A mock orchestrator that applies the given decision (sentinel rides argv). */
+function mockOrchestrator(decision: "retry" | "block" | "fail"): string {
+  return `orchestrator:
+  agent:
+    harness:
+      command: '${MOCK} MOCK:orchestrator=${decision}'
+    model: "mock/mock-model:low"
+`;
+}
+
 function chainWorkflow(extra = ""): string {
   return `version: 1
 id: mock-chain
@@ -258,6 +268,7 @@ defaults:
     harness:
       command: '${MOCK}'
     model: "mock/mock-model:low"
+${mockOrchestrator("fail")}
 nodes:
   node-slow:
     run:
@@ -294,6 +305,7 @@ defaults:
     harness:
       command: '${MOCK}'
     model: "mock/mock-model:low"
+${mockOrchestrator("fail")}
 nodes:
   node-tamper:
     run:

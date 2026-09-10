@@ -14,6 +14,7 @@ import {
   extractMarker as extractMarkerText,
   mergePacket,
   packetPath,
+  packetTemplate,
   scaffoldPacket,
   validatePacket,
   worklogFingerprint,
@@ -183,6 +184,7 @@ export async function executeAttempt(input: {
   const fingerprintBefore = resolved.run.kind === "agent" ? worklogFingerprint(run.run_dir) : null;
 
   let proc: TrackedProcess | null = null;
+  let lastExitCode: number | null = null;
   let heartbeat: ReturnType<typeof setInterval> | null = null;
   const stopHeartbeat = (): void => {
     if (heartbeat) clearInterval(heartbeat);
@@ -205,6 +207,7 @@ export async function executeAttempt(input: {
       // The CAS loses when a block or stop already ended the attempt; that
       // outcome wins and the run keeps its blocked/cancelled status.
       if (!result.failed) return { status: "cancelled", detail: "attempt already left running state" };
+      await mergeFailureEvidence(failureKind);
       return { status: "failed", failureKind, detail };
     } catch (e) {
       if (e instanceof GuardRejected) return { status: "cancelled", detail: `lost ownership: ${e.message}` };
@@ -212,6 +215,54 @@ export async function executeAttempt(input: {
     }
   };
 
+  /**
+   * Failed attempts are immutable evidence too: their packets merge into the
+   * worklog when the agent actually wrote something. Untouched scaffolds
+   * (timeouts, dead processes) leave no empty sections behind.
+   */
+  const mergeFailureEvidence = async (failureKind: FailureKind): Promise<void> => {
+    const marker = authorizedMarker(nodeId, successorId);
+    let packet: string;
+    try {
+      packet = readFileSync(packetFile, "utf8");
+    } catch {
+      return; // no packet evidence to merge
+    }
+    if (packet === packetTemplate(attemptNo, marker)) return;
+    if (resolved.run.kind === "command") {
+      fillCommandPacket({
+        packetFile,
+        attempt: attemptNo,
+        exitCode: lastExitCode,
+        stdoutFile: paths.stdoutFile,
+        validatorLine: `Attempt failed (${failureKind}) before validation.`,
+        marker,
+      });
+    }
+    try {
+      validatePacket(packetFile, nodeId, attemptNo, successorId);
+    } catch (e) {
+      if (e instanceof WorklogIntegrityError) return; // tampered packet stays unmerged
+      throw e;
+    }
+    const lock = new RunLock(run.run_dir);
+    await lock.acquire();
+    try {
+      mergePacket({
+        runDir: run.run_dir,
+        runId: run.run_id,
+        nodeId,
+        attempt: attemptNo,
+        successorId,
+        ownerToken,
+        now: now(),
+      });
+    } catch (e) {
+      if (!(e instanceof WorklogIntegrityError)) throw e;
+    } finally {
+      lock.release();
+    }
+  };
   try {
     writeFileSync(paths.promptFile, resolved.run.kind === "command" ? "(command node — no prompt)\n" : "", "utf8");
     let command: string;
@@ -292,6 +343,7 @@ export async function executeAttempt(input: {
     }
     stopHeartbeat();
     const { code, signal } = exitOrTimeout.exit;
+    lastExitCode = code;
 
     // Durable stop: desired_state stopped cancels the attempt and the run.
     const runAfter = store.getRun(run.run_id)!;
@@ -318,6 +370,26 @@ export async function executeAttempt(input: {
       }
     }
 
+
+    // Durable evidence first: command packets are filled by the runtime; agent
+    // packets were written by the agent. The extracted output lands in the
+    // output file before validation — validators judge durable evidence.
+    if (resolved.run.kind === "command") {
+      fillCommandPacket({
+        packetFile,
+        attempt: attemptNo,
+        exitCode: code,
+        stdoutFile: paths.stdoutFile,
+        validatorLine: "pending",
+        marker: authorizedMarker(nodeId, successorId),
+      });
+    }
+    const output = extractNodeOutput(resolved.run.kind, packetFile, paths.stdoutFile);
+    if (output === null) {
+      return await fail("worklog_integrity", `authorized marker missing from packet for ${nodeId} #${attemptNo}`);
+    }
+    writeFileSync(paths.outputFile, output, "utf8");
+
     // Validator: optional internal completion gate.
     let validatorOutcome: { passed: boolean; reason: string } | null = null;
     if (resolved.validator) {
@@ -336,26 +408,18 @@ export async function executeAttempt(input: {
       if (!validatorOutcome.passed) {
         return await fail("validator_rejection", validatorOutcome.reason, validatorOutcome.reason);
       }
+      // Record the passing evidence in the packet before the merge.
+      if (resolved.run.kind === "command") {
+        fillCommandPacket({
+          packetFile,
+          attempt: attemptNo,
+          exitCode: code,
+          stdoutFile: paths.stdoutFile,
+          validatorLine: `Validator passed: ${validatorOutcome.reason}`,
+          marker: authorizedMarker(nodeId, successorId),
+        });
+      }
     }
-
-    // Durable evidence: command packets are filled by the runtime; agent
-    // packets were written by the agent. Output extracted to the output file.
-    if (resolved.run.kind === "command") {
-      fillCommandPacket({
-        packetFile,
-        attempt: attemptNo,
-        exitCode: code,
-        stdoutFile: paths.stdoutFile,
-        validatorLine: validatorOutcome ? `Validator passed: ${validatorOutcome.reason}` : "No validator configured.",
-        marker: authorizedMarker(nodeId, successorId),
-      });
-    }
-    const output = extractNodeOutput(resolved.run.kind, packetFile, paths.stdoutFile);
-    if (output === null) {
-      return await fail("worklog_integrity", `authorized marker missing from packet for ${nodeId} #${attemptNo}`);
-    }
-    writeFileSync(paths.outputFile, output, "utf8");
-
     // Owner-fenced finishing: evidence is durable; the merge is fenced next.
     try {
       store.claimFinishing({ runId: run.run_id, nodeId, attempt: attemptNo, ownerToken, now: now() });

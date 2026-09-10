@@ -12,11 +12,28 @@ import { executeAttempt, resolveNode } from "./runner/attempt.js";
 import { parseDuration, parseTimeout } from "./util/duration.js";
 import { SystemClock, type Clock } from "./util/clock.js";
 import { spawnTracked } from "./runner/spawn.js";
+import { invokeOrchestrator } from "./orchestrator.js";
+
+/** Deterministic Run outcome prose; the runtime owns this section. */
+function appendRunOutcome(run: RunRow, text: string): void {
+  try {
+    const content = readFileSync(run.worklog_path, "utf8");
+    const heading = "## Run outcome\n";
+    const idx = content.indexOf(heading);
+    if (idx === -1) return;
+    const at = idx + heading.length;
+    const updated = `${content.slice(0, at)}\n- ${new Date().toISOString()} — ${text}\n${content.slice(at)}`;
+    atomicWriteFileSync(run.worklog_path, updated);
+  } catch {
+    /* outcome prose is best-effort; SQLite stays authoritative */
+  }
+}
 
 /**
  * Loading, validation, and the chain executor. The executor claims pending
  * attempts and runs them to completion; the daemon reuses the same functions.
  */
+
 
 export interface LoadedDefinition {
   def: WorkflowDefinition;
@@ -265,10 +282,18 @@ export async function runChain(input: {
     });
 
     if (outcome.status === "failed") {
-      // Package 1 behavior: the run fails terminally. Package 2 replaces this
-      // with orchestrator judgment.
-      store.setRunStatus(runId, "failed", clock.now(), null);
-      return store.getRun(runId)!;
+      // Exception judgment: the same transaction that failed the attempt
+      // moved the run into the protected phase; a fresh orchestrator decides.
+      await invokeOrchestrator({ store, inst, def: loaded.def, chain: loaded.chain, run: store.getRun(runId)!, clock, cliPath: input.cliPath });
+      const judged = store.getRun(runId)!;
+      if (judged.status === "failed") appendRunOutcome(judged, "run failed (orchestrator decision)");
+      // A retry decision leaves the run running with a pending attempt —
+      // keep looping; blocked/failed terminal states return via the head.
+      if (judged.status !== "running") return judged;
+      continue;
+    }
+    if (outcome.status === "completed" && !loaded.chain.next.get(live.node_id)) {
+      appendRunOutcome(store.getRun(runId)!, "run completed: chain finished");
     }
     if (outcome.status !== "completed") {
       return store.getRun(runId)!;
@@ -276,6 +301,7 @@ export async function runChain(input: {
     // Loop: the completed attempt persisted its successor.
   }
 }
+
 
 function latestSuccessfulOutput(store: Store, runId: string, nodeId: string): string | null {
   const attempts = store

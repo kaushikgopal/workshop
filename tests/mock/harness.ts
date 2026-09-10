@@ -40,6 +40,11 @@ for (const key of required) {
 
 const prompt = readFileSync(env.WORKSHOP_PROMPT_FILE!, "utf8");
 const sentinels = new Set<string>();
+// Sentinels ride in the prompt (node/validator instructions) or in argv
+// (sites without YAML instructions, like the orchestrator).
+for (const arg of process.argv.slice(2)) {
+  if (/^MOCK:[a-z0-9=-]+/.test(arg) || /^MOCK:progress=/.test(arg)) sentinels.add(arg.trim());
+}
 for (const m of prompt.matchAll(/MOCK:(?!progress)[a-z0-9=-]+/g)) sentinels.add(m[0]);
 // progress values may contain spaces: capture to end of line
 for (const m of prompt.matchAll(/MOCK:progress=(.+)/g)) sentinels.add(`MOCK:progress=${m[1]!.trim()}`);
@@ -76,10 +81,33 @@ function fillPacket(opts: {
   const packetFile = env.WORKSHOP_NODE_PACKET_FILE!;
   const original = readFileSync(packetFile, "utf8");
 
-  const isValidatorSite = sentinels.has("MOCK:validator=pass") || sentinels.has("MOCK:validator=fail");
+  // Orchestrator contract: write the owner-bound result file, exit 0.
+  for (const decision of ["retry", "block", "fail"] as const) {
+    if (sentinels.has(`MOCK:orchestrator=${decision}`)) {
+      const resultFile = env.WORKSHOP_ORCHESTRATOR_RESULT_FILE!;
+      writeFileSync(
+        resultFile,
+        JSON.stringify({
+          decision,
+          reason: `mock orchestrator chose ${decision}`,
+          notes: `Mock orchestrator notes: ${decision} recorded by the runtime.`,
+        }) + "\n",
+        "utf8",
+      );
+      process.exit(0);
+    }
+  }
+
+  const isValidatorSite = sentinels.has("MOCK:validator=pass") || sentinels.has("MOCK:validator=fail") ||
+    [...sentinels].some((s) => s.startsWith("MOCK:validator-until-attempt="));
   if (isValidatorSite) {
     // Validator contract: write validation.json, not packet prose.
-    const passed = sentinels.has("MOCK:validator=pass");
+    let passed = sentinels.has("MOCK:validator=pass");
+    const until = [...sentinels].find((s) => s.startsWith("MOCK:validator-until-attempt="));
+    if (until) {
+      const nth = Number(until.split("=")[1]);
+      passed = Number(env.WORKSHOP_ATTEMPT) >= nth;
+    }
     writeFileSync(
       env.WORKSHOP_VALIDATION_FILE ?? "validation.json",
       JSON.stringify({ passed, reason: passed ? "mock validator passed" : "mock validator rejected the output" }) + "\n",

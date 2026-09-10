@@ -74,15 +74,9 @@ ${nodeSections}
   return atomicWriteFileSync(worklogPath(runDir), content);
 }
 
-/** Scaffold one attempt's packet file: attempt headings + one authorized marker. */
-export function scaffoldPacket(
-  runDir: string,
-  nodeId: string,
-  attempt: number,
-  successorId: string | null,
-): string {
-  const marker = authorizedMarker(nodeId, successorId);
-  const content = `#### Attempt ${attempt}
+/** The scaffold content for one attempt's packet file. */
+export function packetTemplate(attempt: number, marker: { opening: string; closing: string }): string {
+  return `#### Attempt ${attempt}
 
 ##### Progress
 
@@ -95,9 +89,19 @@ export function scaffoldPacket(
 ${marker.opening}
 ${marker.closing}
 `;
+}
+
+/** Scaffold one attempt's packet file: attempt headings + one authorized marker. */
+export function scaffoldPacket(
+  runDir: string,
+  nodeId: string,
+  attempt: number,
+  successorId: string | null,
+): string {
+  const marker = authorizedMarker(nodeId, successorId);
   const path = packetPath(runDir, nodeId, attempt);
   mkdirSync(dirname(path), { recursive: true });
-  return atomicWriteFileSync(path, content);
+  return atomicWriteFileSync(path, packetTemplate(attempt, marker));
 }
 
 const ALLOWED_PACKET_HEADINGS = [

@@ -162,6 +162,9 @@ async function cmdStart(args: string[]): Promise<void> {
   // claiming and recurrence; the same guarded path is reused.
   const final = await runChain({ store, inst, loaded, runId: started.runId, cliPath: cliPathOf() });
   process.stdout.write(`run ${final.run_id} → ${final.status}\n`);
+  // The runner holds live handles (spawned-process listeners) by design;
+  // CLI commands terminate their own process when the work is done.
+  process.exit(0);
 }
 
 function cmdStatus(args: string[]): void {
