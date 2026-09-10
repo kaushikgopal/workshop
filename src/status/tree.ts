@@ -149,9 +149,13 @@ function renderAttempt(attempt: AttemptRow): string[] {
   if (attempt.validator_status) bits.push(`validator ${attempt.validator_status}`);
   if (attempt.failure_kind) bits.push(attempt.failure_kind);
   if (attempt.block_kind) bits.push(attempt.block_kind);
-  const lines = wrap(`${ATTEMPT_INDENT}· ${bits.join(" · ")}`, `${ATTEMPT_INDENT}  `);
+  // Hanging indents: continuations align under the text after the label, so
+  // a wrapped line reads as a continuation, not a new bullet.
+  const bulletIndent = `${ATTEMPT_INDENT}· `;
+  const lines = wrap(`${bulletIndent}${bits.join(" · ")}`, bulletIndent);
   if (attempt.current_progress) {
-    lines.push(...wrap(`${ATTEMPT_INDENT}  progress: ${attempt.current_progress}`, `${ATTEMPT_INDENT}    `));
+    const progressIndent = `${ATTEMPT_INDENT}  progress: `;
+    lines.push(...wrap(`${progressIndent}${attempt.current_progress}`, " ".repeat(progressIndent.length)));
   }
   return lines;
 }
