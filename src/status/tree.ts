@@ -9,7 +9,7 @@ import { join } from "node:path";
  * Nodes render in chain order (from the run's definition snapshot), with
  * glyph status, attempt history, and progress. Older terminal runs collapse
  * into a count; unresolved runs and the most recent run always render.
- * Long lines word-wrap with aligned continuation indents — never column 0.
+ * Long lines word-wrap with hanging indents and a continuous spine.
  */
 
 const GLYPH: Record<string, string> = {
@@ -134,28 +134,27 @@ function renderRun(store: Store, run: RunRow, isCurrent: boolean): string[] {
     const nodeAttempts = attempts.filter((a) => a.node_id === id).sort((a, b) => a.attempt - b.attempt);
     const nodeStatus = nodeStatusOf(nodeAttempts);
     const connector = isLastNode ? "└─" : "├─";
-    lines.push(...wrap(`   ${connector} ${glyph(nodeStatus)} ${id}  ${nodeStatus}`, "     "));
+    // Children of a non-final node keep the spine (│); a final node's
+    // children are plain-indented.
+    const childPrefix = isLastNode ? "      " : "   │  ";
+    lines.push(...wrap(`   ${connector} ${glyph(nodeStatus)} ${id}  ${nodeStatus}`, childPrefix));
     for (const a of nodeAttempts) {
-      lines.push(...renderAttempt(a));
+      lines.push(...renderAttempt(a, childPrefix));
     }
   });
   return lines;
 }
 
-const ATTEMPT_INDENT = "        ";
-
-function renderAttempt(attempt: AttemptRow): string[] {
+function renderAttempt(attempt: AttemptRow, childPrefix: string): string[] {
+  const bullet = `${childPrefix}· `;
   const bits: string[] = [`#${attempt.attempt} ${attempt.status}`];
   if (attempt.validator_status) bits.push(`validator ${attempt.validator_status}`);
   if (attempt.failure_kind) bits.push(attempt.failure_kind);
   if (attempt.block_kind) bits.push(attempt.block_kind);
-  // Hanging indents: continuations align under the text after the label, so
-  // a wrapped line reads as a continuation, not a new bullet.
-  const bulletIndent = `${ATTEMPT_INDENT}· `;
-  const lines = wrap(`${bulletIndent}${bits.join(" · ")}`, bulletIndent);
+  const lines = wrap(`${bullet}${bits.join(" · ")}`, bullet);
   if (attempt.current_progress) {
-    const progressIndent = `${ATTEMPT_INDENT}  progress: `;
-    lines.push(...wrap(`${progressIndent}${attempt.current_progress}`, " ".repeat(progressIndent.length)));
+    const label = `${childPrefix}  progress: `;
+    lines.push(...wrap(`${label}${attempt.current_progress}`, " ".repeat(label.length)));
   }
   return lines;
 }
