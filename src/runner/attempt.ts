@@ -284,6 +284,7 @@ export async function executeAttempt(input: {
           logPath: run.worklog_path,
           packetFile,
           previousOutputFile: input.previousOutputFile,
+          successorId,
         }),
         "utf8",
       );

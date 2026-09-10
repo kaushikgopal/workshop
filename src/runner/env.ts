@@ -1,4 +1,6 @@
 import type { ParsedModel } from "../definition/validate.js";
+import { readFileSync } from "node:fs";
+import { authorizedMarker, packetTemplate } from "../worklog/worklog.js";
 
 /**
  * The runtime context every attempt process receives. The prompt is never
@@ -77,10 +79,22 @@ export function renderAgentPrompt(input: {
   logPath: string;
   packetFile: string;
   previousOutputFile: string | null;
+  successorId: string | null;
 }): string {
   const previous = input.previousOutputFile
     ? `Previous node output file: ${input.previousOutputFile}`
     : `Previous node output file: (none — this is the first node)`;
+
+  // The packet exists on disk by claim time (scaffolded at attempt creation).
+  // Show it verbatim so the model treats the marker pair as load-bearing.
+  const marker = authorizedMarker(input.nodeId, input.successorId);
+  let scaffold: string;
+  try {
+    scaffold = readFileSync(input.packetFile, "utf8");
+  } catch {
+    scaffold = packetTemplate(input.attempt, marker);
+  }
+
   return `# Workshop attempt
 
 Workflow: ${input.workflowId}
@@ -101,5 +115,20 @@ ${previous}
 ## Contract
 
 ${AGENT_CONTRACT}
+
+## Your packet, as it exists right now
+
+Edit this file in place. Two lines in it are load-bearing and MUST survive
+everything you do — never delete, rename, or move them:
+
+    ${marker.opening}
+    ${marker.closing}
+
+Write the text your successor (or the final result) consumes between those two
+lines. The other headings structure the runtime's record — keep them if you
+can, but the marker pair is the one hard rule: without it your work is
+rejected as invalid and the whole run blocks.
+
+    ${scaffold.split("\n").join("\n    ")}
 `;
 }

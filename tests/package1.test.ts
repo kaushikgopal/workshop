@@ -415,3 +415,20 @@ nodes:
     expect(attempt.failure_kind).toBe("worklog_integrity");
   }, 60_000);
 });
+
+describe("prompt hardening — marker preservation", () => {
+  test("the injected prompt shows the verbatim packet scaffold and the never-delete rule", () => {
+    const inst = makeInstallation({ "mock-chain": chainWorkflow() });
+    const r = runCli(inst, "start mock-chain");
+    expect(r.code).toBe(0);
+    const runId = r.stdout.match(/\S+-\d{8}-\d{3}/)![0];
+
+    const prompt = readFileSync(
+      join(inst.root, ".workshop/state/runs", runId, "logs", "node-agent-attempt-1.prompt"),
+      "utf8",
+    );
+    expect(prompt).toContain("never delete, rename, or move");
+    expect(prompt).toContain("<workflow-output>"); // terminal node marker
+    expect(prompt).toContain("#### Attempt 1"); // verbatim scaffold embedded
+  }, 90_000);
+});
