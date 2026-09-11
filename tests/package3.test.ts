@@ -1,7 +1,8 @@
 import { describe, test, expect } from "bun:test";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
-import { makeInstallation, runCli, mockAgentHarness, dbAttempts, dbRuns } from "./helpers.js";
+import { makeInstallation, runCli, mockAgentHarness, dbAttempts, dbRuns, readWorklog } from "./helpers.js";
 import { openDb } from "../src/store/db.js";
 import { Store, GuardRejected } from "../src/store/store.js";
 import { loadAndValidateDefinition, startWorkflow, runChain } from "../src/execute.js";
@@ -54,12 +55,12 @@ describe("gate 11 — claims", () => {
     const store = new Store(openDb(real.dbPath));
 
     // Winner.
-    const winner = store.claimAttempt({ runId: started.runId, nodeId: "node-fast", attempt: 1, now: new Date() });
+    const winner = store.claimAttempt({ runId: started.runId, nodeId: "node-fast", attempt: 1, now: new Date(), maxConcurrentRuns: 99 });
     expect(winner.ownerToken).toBeTruthy();
 
     // Loser: the attempt is no longer pending.
     expect(() =>
-      store.claimAttempt({ runId: started.runId, nodeId: "node-fast", attempt: 1, now: new Date() }),
+      store.claimAttempt({ runId: started.runId, nodeId: "node-fast", attempt: 1, now: new Date(), maxConcurrentRuns: 99 }),
     ).toThrow(GuardRejected);
 
     // The row records exactly one owner.
@@ -77,7 +78,7 @@ describe("gate 12 — stale results", () => {
     const loaded = loadAndValidateDefinition(join(inst.workflowsDir, "crash-chain.yaml"));
     const started = await startWorkflow({ inst: real, loaded });
     const store = new Store(openDb(real.dbPath));
-    const claim = store.claimAttempt({ runId: started.runId, nodeId: "node-fast", attempt: 1, now: new Date() });
+    const claim = store.claimAttempt({ runId: started.runId, nodeId: "node-fast", attempt: 1, now: new Date(), maxConcurrentRuns: 99 });
 
     // Simulate supersession: recovery reassigned ownership.
     const superseding = "deadbeef".repeat(4);
@@ -89,7 +90,7 @@ describe("gate 12 — stale results", () => {
 
     // The stale owner cannot finish, complete, progress, or heartbeat.
     expect(() =>
-      store.claimFinishing({ runId: started.runId, nodeId: "node-fast", attempt: 1, ownerToken: claim.ownerToken, now: new Date() }),
+      store.claimFinishing({ runId: started.runId, nodeId: "node-fast", attempt: 1, ownerToken: claim.ownerToken, nodeOutputPath: "out", validatorStatus: null, validatorReason: null, now: new Date() }),
     ).toThrow(GuardRejected);
     expect(store.setProgress({ runId: started.runId, nodeId: "node-fast", attempt: 1, ownerToken: claim.ownerToken, progress: "stale", now: new Date() })).toBe(false);
     expect(store.heartbeat({ runId: started.runId, nodeId: "node-fast", attempt: 1, ownerToken: claim.ownerToken, now: new Date() })).toBe(false);
@@ -216,10 +217,10 @@ describe("gate 15 — stop fencing", () => {
     const loaded = loadAndValidateDefinition(join(inst.workflowsDir, "crash-chain.yaml"));
     const started = await startWorkflow({ inst: real, loaded });
     const store = new Store(openDb(real.dbPath));
-    const claim = store.claimAttempt({ runId: started.runId, nodeId: "node-fast", attempt: 1, now: new Date() });
+    const claim = store.claimAttempt({ runId: started.runId, nodeId: "node-fast", attempt: 1, now: new Date(), maxConcurrentRuns: 99 });
 
     // Late completion: owner-fenced finishing, then a durable stop arrives.
-    store.claimFinishing({ runId: started.runId, nodeId: "node-fast", attempt: 1, ownerToken: claim.ownerToken, now: new Date() });
+    store.claimFinishing({ runId: started.runId, nodeId: "node-fast", attempt: 1, ownerToken: claim.ownerToken, nodeOutputPath: "out", validatorStatus: null, validatorReason: null, now: new Date() });
     const { stopRun } = { stopRun: store.stopRun.bind(store) };
     stopRun({ runId: started.runId, now: new Date() });
 
@@ -230,16 +231,12 @@ describe("gate 15 — stop fencing", () => {
         nodeId: "node-fast",
         attempt: 1,
         ownerToken: claim.ownerToken,
-        nodeOutputPath: "x",
-        validatorStatus: null,
-        validatorReason: null,
         now: new Date(),
         successor: { nodeId: "node-slow", resolvedMaxAttempts: 2, resolvedTimeoutMs: 1, chainPosition: 1 },
       }),
     ).toThrow(GuardRejected);
 
-    // The wrapper-side cancel marks the attempt cancelled.
-    store.cancelAttempt({ runId: started.runId, nodeId: "node-fast", attempt: 1, now: new Date() });
+    // Stop's finalize path cancelled the attempt and the run in place.
     const attempt = store.getAttempt(started.runId, "node-fast", 1)!;
     expect(attempt.status).toBe("cancelled");
     const runs = dbRuns(inst);
@@ -313,7 +310,7 @@ describe("gate 24 — orchestrator phase recovery", () => {
     expect(store.getRun(started.runId)!.orchestrator_owner_token).toBeNull();
   }, 30_000);
 
-  test("an applying phase with a decision receipt finishes the same decision idempotently", async () => {
+  test("an applying phase with a normalized result reapplies the same decision idempotently", async () => {
     const inst = makeInstallation({ "crash-chain": twoNodeWorkflow() });
     const real = findInstallation(inst.root);
     ensureDirs(real);
@@ -322,24 +319,47 @@ describe("gate 24 — orchestrator phase recovery", () => {
     const store = new Store(openDb(real.dbPath));
 
     const token = "tok1234567890";
-    const { atomicWriteFileSync, orchestratorDir } = await import("../src/worklog/worklog.js");
-    const { mkdirSync } = await import("node:fs");
+    const { atomicWriteFileSync } = await import("../src/worklog/worklog.js");
+    const { orchestratorResultFile } = await import("../src/orchestrator.js");
     const run = store.getRun(started.runId)!;
-    mkdirSync(orchestratorDir(run.run_dir, token), { recursive: true });
+    const resultPath = orchestratorResultFile(run.run_dir, token);
     atomicWriteFileSync(
-      join(orchestratorDir(run.run_dir, token), "merge-receipt.json"),
-      JSON.stringify({ ownerToken: token, resultSha256: "sha256:x", appliedAt: new Date().toISOString() }),
+      resultPath,
+      JSON.stringify({ decision: "block", reason: "durable choice", notes: null }, null, 2) + "\n",
     );
     store.tx(() => {
       store.db
-        .query("UPDATE runs SET orchestrator_phase = 'applying', orchestrator_owner_token = ?, orchestrator_worker_pid = 999999 WHERE run_id = ?")
-        .run(token, started.runId);
+        .query(
+          `UPDATE runs SET orchestrator_phase = 'applying', orchestrator_owner_token = ?,
+             orchestrator_wrapper_pid = 999999, orchestrator_wrapper_process_start_id = 'gone',
+             orchestrator_worker_pid = NULL, orchestrator_worker_process_start_id = NULL,
+             orchestrator_process_group = NULL, orchestrator_result_path = ?
+           WHERE run_id = ?`,
+        )
+        .run(token, resultPath, started.runId);
     });
 
     const { recoverInstallation: recover } = await import("../src/recovery.js");
+    await recover({ store, inst: real, clock: new SystemClock() });
+    // The decision applied from the normalized result file: prose merged, run blocked.
+    expect(readWorklog(inst, started.runId)).toContain("orchestrator block: durable choice");
+    expect(store.getRun(started.runId)!.status).toBe("blocked");
+    expect(store.getRun(started.runId)!.orchestrator_phase).toBe("idle");
+
+    // Recreate the crash window after the prose merge but before the DB effect:
+    // recovery reapplies the same decision without repeating the prose.
+    const worklogBefore = readWorklog(inst, started.runId);
+    store.db
+      .query(
+        `UPDATE runs SET orchestrator_phase = 'applying', orchestrator_owner_token = ?,
+           orchestrator_wrapper_pid = 999999, orchestrator_wrapper_process_start_id = 'gone',
+           orchestrator_result_path = ? WHERE run_id = ?`,
+      )
+      .run(token, resultPath, started.runId);
     const report = await recover({ store, inst: real, clock: new SystemClock() });
     expect(report.orchestratorFinished).toContain(started.runId);
     expect(store.getRun(started.runId)!.orchestrator_phase).toBe("idle");
+    expect(readWorklog(inst, started.runId)).toBe(worklogBefore);
   }, 30_000);
 });
 

@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 import {
   closeSync,
   existsSync,
+  fsyncSync,
+  linkSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -9,7 +11,6 @@ import {
   rmSync,
   statSync,
   writeFileSync,
-  fsyncSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
 
@@ -17,7 +18,10 @@ import { dirname, join } from "node:path";
  * The worklog is runtime-owned. The runtime scaffolds every heading before
  * work starts (no model call creates structure), agents write packet files
  * only, and the runtime validates and merges packets under the run lock.
- * Receipts make each merge idempotent and key it by (run_id, node_id, attempt).
+ * Each merge publishes the packet inside deterministic begin/end markers
+ * keyed by (run_id, node_id, attempt, packet digest) and records a receipt
+ * that hashes the exact marked block — together they make every merge
+ * idempotent and every crash window reconcilable.
  */
 
 export class WorklogIntegrityError extends Error {
@@ -38,7 +42,7 @@ export function worklogPath(runDir: string): string {
  * prompt, validation/, and its merge receipt. The sequence is per run, not
  * per node; a node's own attempt number stays in the DB and packet content.
  */
-export function attemptFolderName(executionSeq: number, nodeId: string): string {
+function attemptFolderName(executionSeq: number, nodeId: string): string {
   return `${String(executionSeq).padStart(3, "0")}-${nodeId}`;
 }
 
@@ -71,14 +75,13 @@ export function authorizedMarker(successorId: string | null): { opening: string;
 }
 
 
-export function scaffoldWorklog(
-  runDir: string,
+export function worklogTemplate(
   workflowId: string,
   description: string,
   nodeIds: string[],
 ): string {
   const nodeSections = nodeIds.map((id) => `### Node: ${id}\n`).join("\n");
-  const content = `# Workflow run: ${workflowId}
+  return `# Workflow run: ${workflowId}
 
 ## Goal
 
@@ -90,9 +93,17 @@ ${description}
 
 ## Work packets
 
-${nodeSections}
-## Run outcome
+${nodeSections}## Run outcome
 `;
+}
+
+export function scaffoldWorklog(
+  runDir: string,
+  workflowId: string,
+  description: string,
+  nodeIds: string[],
+): string {
+  const content = worklogTemplate(workflowId, description, nodeIds);
   return atomicWriteFileSync(worklogPath(runDir), content);
 }
 
@@ -113,7 +124,7 @@ ${marker.closing}
 `;
 }
 
-/** Scaffold one attempt's packet file: attempt headings + one authorized marker. */
+/** Scaffold one attempt, creating missing pristine evidence without overwrite. */
 export function scaffoldPacket(
   attemptFolder: string,
   attempt: number,
@@ -121,8 +132,9 @@ export function scaffoldPacket(
 ): string {
   const marker = authorizedMarker(successorId);
   const path = packetPath(attemptFolder);
-  mkdirSync(dirname(path), { recursive: true });
-  return atomicWriteFileSync(path, packetTemplate(attempt, marker));
+  const content = packetTemplate(attempt, marker);
+  ensurePristineFile(path, content);
+  return content;
 }
 
 export interface PacketCheck {
@@ -169,7 +181,9 @@ export function escapeReservedMarkers(content: string, keep: { opening: string; 
     .replaceAll("<workflow-output>", "\\<workflow-output>")
     .replaceAll("</workflow-output>", "\\</workflow-output>")
     .replace(/<next-node-output id="[^"]*">/g, (m) => `\\${m}`)
-    .replaceAll("</next-node-output>", "\\</next-node-output>");
+    .replaceAll("</next-node-output>", "\\</next-node-output>")
+    // Runtime merge markers: packet prose must never mint a live one.
+    .replace(/<!-- workshop:merge (?:begin|end)/g, (m) => `\\${m}`);
   return out.replaceAll(OPEN, keep.opening).replaceAll(CLOSE, keep.closing);
 }
 
@@ -187,7 +201,19 @@ export function sha256File(path: string): string {
   return `sha256:${createHash("sha256").update(readFileSync(path)).digest("hex")}`;
 }
 
-export interface MergeReceipt {
+/** Content digest of an in-memory string, same format as sha256File. */
+export function sha256String(content: string): string {
+  return `sha256:${createHash("sha256").update(content, "utf8").digest("hex")}`;
+}
+
+/**
+ * Merge receipts are versioned. V1 carried the owning owner token and a
+ * whole-node section digest. V2 drops the token — ownership is SQLite's CAS
+ * concern, never filesystem evidence — and instead hashes the exact marked
+ * block the runtime published. V1 receipts still parse for compatibility,
+ * but only a v2 receipt is safe new finishing evidence.
+ */
+export interface MergeReceiptV1 {
   runId: string;
   nodeId: string;
   attempt: number;
@@ -197,11 +223,63 @@ export interface MergeReceipt {
   mergedAt: string;
 }
 
+export interface MergeReceiptV2 {
+  version: 2;
+  runId: string;
+  nodeId: string;
+  attempt: number;
+  packetSha256: string;
+  blockSha256: string;
+  /** Optional v1-era provenance; never used as a completion gate. */
+  sectionSha256?: string;
+  mergedAt: string;
+}
+
+export type MergeReceipt = MergeReceiptV1 | MergeReceiptV2;
+
+export function isV2MergeReceipt(receipt: MergeReceipt): receipt is MergeReceiptV2 {
+  return "version" in receipt && receipt.version === 2;
+}
+
+/** The merge key the runtime's begin/end markers are deterministic in. */
+export interface MergeMarkerKey {
+  runId: string;
+  nodeId: string;
+  attempt: number;
+  packetSha256: string;
+}
+
+/**
+ * The runtime's publication markers: HTML comments (invisible in rendered
+ * markdown) keyed by run/node/attempt and the exact packet digest at merge
+ * time. Identical inputs always produce identical marker text.
+ */
+export function mergeMarkers(key: MergeMarkerKey): { begin: string; end: string } {
+  const attrs = `run=${key.runId} node=${key.nodeId} attempt=${key.attempt} packet=${key.packetSha256}`;
+  return {
+    begin: `<!-- workshop:merge begin ${attrs} -->`,
+    end: `<!-- workshop:merge end ${attrs} -->`,
+  };
+}
+
 /**
  * Merge a validated packet into its worklog node section. Idempotent by
- * (run_id, node_id, attempt): an identical repeat is a no-op; the same key
- * with different digests is a worklog_integrity block. The caller must hold
- * the run lock and the finishing owner fence.
+ * (run_id, node_id, attempt). The runtime publishes the packet inside
+ * deterministic begin/end markers keyed by the merge key and the current
+ * packet digest, then records a v2 receipt that hashes the exact marked
+ * block. The caller must hold the run lock.
+ *
+ * Reconciliation treats crash windows as first-class:
+ * - marked block present, no receipt → verify the block, synthesize the receipt;
+ * - marked block + matching v2 receipt → strict shape/identity/digest
+ *   verification plus marked-block verification, then a no-op;
+ * - marked block + legacy v1 receipt → v1 is never safe new finishing
+ *   evidence; synthesize v2 from the verified block;
+ * - same merge key with a different packet digest, duplicate blocks,
+ *   malformed markers, or a receipt whose block is missing → worklog_integrity;
+ * - no marker and no receipt → insert once.
+ * An unmarked legacy attempt block (a pre-marker merge that never finalized)
+ * fails closed instead of being duplicated.
  */
 export function mergePacket(input: {
   runDir: string;
@@ -210,67 +288,306 @@ export function mergePacket(input: {
   attempt: number;
   attemptFolder: string;
   successorId: string | null;
-  ownerToken: string;
+  /** Legacy parameter: v2 receipts no longer record owner tokens. */
+  ownerToken?: string;
   now: Date;
 }): MergeReceipt {
   const logPath = worklogPath(input.runDir);
   const packetFile = packetPath(input.attemptFolder);
   const receiptFile = receiptPath(input.attemptFolder);
+  const identity = { runId: input.runId, nodeId: input.nodeId, attempt: input.attempt };
 
   const packetSha = sha256File(packetFile);
-  const existingReceipt = readReceipt(receiptFile);
-  if (existingReceipt) {
-    if (existingReceipt.packetSha256 === packetSha) {
-      return existingReceipt; // idempotent repeat
-    }
+  const log = readFileSync(logPath, "utf8");
+  const blocks = scanMarkedBlocks(log);
+  const mine = blocks.filter(
+    (b) => b.key.runId === identity.runId && b.key.nodeId === identity.nodeId && b.key.attempt === identity.attempt,
+  );
+  assertNoUnmarkedLegacyAttemptBlock(log, blocks, input.nodeId, input.attempt);
+
+  if (mine.length > 1) {
     throw new WorklogIntegrityError(
-      `merge receipt for ${input.nodeId} #${input.attempt} exists with a different packet digest — ` +
-        `earlier attempts are immutable evidence`,
+      `worklog holds ${mine.length} marked merge blocks for ${input.nodeId} #${input.attempt} — ` +
+        `duplicate merges are an integrity violation`,
     );
   }
 
+  if (mine.length === 1) {
+    return reconcileMarkedBlock(input, mine[0]!, packetSha);
+  }
+
+  const existingReceipt = verifyMergeReceipt(input.attemptFolder, identity);
+  if (existingReceipt) {
+    throw new WorklogIntegrityError(
+      `merge receipt for ${input.nodeId} #${input.attempt} exists but its marked block is missing from ` +
+        `the worklog — published evidence was lost`,
+    );
+  }
+  const blockSpan = renderMarkedPacketBlock(input, packetSha);
+  const merged = insertAttemptSection(log, `### Node: ${input.nodeId}`, `${blockSpan}\n`);
+
+  atomicWriteFileSync(logPath, merged);
+
+  const receipt: MergeReceiptV2 = {
+    version: 2,
+    ...identity,
+    packetSha256: packetSha,
+    blockSha256: sha256String(blockSpan),
+    mergedAt: input.now.toISOString(),
+  };
+  atomicWriteFileSync(receiptFile, JSON.stringify(receipt, null, 2) + "\n");
+  return receipt;
+}
+
+/** Render the exact immutable marker-to-marker attempt publication block. */
+function renderMarkedPacketBlock(input: {
+  runId: string; nodeId: string; attempt: number; attemptFolder: string; successorId: string | null;
+}, packetSha: string): string {
+  const packetFile = packetPath(input.attemptFolder);
   validatePacket(packetFile, input.nodeId, input.attempt, input.successorId);
   const packet = readFileSync(packetFile, "utf8");
-  // Formatting drift tolerance: the merged attempt block always begins with
-  // its attempt heading, even when the agent dropped it.
   const attemptHeading = `#### Attempt ${input.attempt}`;
   const normalized = packet.trimStart().startsWith(attemptHeading)
     ? packet
     : `${attemptHeading}\n\n${packet.trimStart()}`;
   const escaped = escapeReservedMarkers(normalized, authorizedMarker(input.successorId));
+  const marker = mergeMarkers({
+    runId: input.runId, nodeId: input.nodeId, attempt: input.attempt, packetSha256: packetSha,
+  });
+  const body = escaped.endsWith("\n") ? escaped : `${escaped}\n`;
+  return `${marker.begin}\n${body}${marker.end}`;
+}
 
-  const log = readFileSync(logPath, "utf8");
-  const nodeHeading = `### Node: ${input.nodeId}`;
-  const merged = insertAttemptSection(log, nodeHeading, escaped);
+/** One published marked block located in the worklog text. */
+interface MarkedBlock {
+  key: MergeMarkerKey;
+  beginIdx: number;
+  endIdx: number;
+  endLength: number;
+  block: string;
+}
 
-  atomicWriteFileSync(logPath, merged);
+/**
+ * Parse every runtime merge marker pair in the worklog. Any live marker
+ * occurrence that is not a well-formed pair is an integrity violation:
+ * packets cannot mint markers (they are escaped), so only the runtime or
+ * tampering can put them there.
+ */
+function scanMarkedBlocks(log: string): MarkedBlock[] {
+  const blocks: MarkedBlock[] = [];
+  const beginRe = /(?<!\\)<!-- workshop:merge begin run=(\S+) node=(\S+) attempt=(\d+) packet=(sha256:[0-9a-f]{64}) -->/g;
+  let match: RegExpExecArray | null;
+  while ((match = beginRe.exec(log)) !== null) {
+    const key: MergeMarkerKey = {
+      runId: match[1]!,
+      nodeId: match[2]!,
+      attempt: Number(match[3]!),
+      packetSha256: match[4]!,
+    };
+    const { end } = mergeMarkers(key);
+    const endIdx = indexOfUnescaped(log, end, match.index + match[0].length);
+    if (endIdx === -1) {
+      throw new WorklogIntegrityError(
+        `worklog has a runtime merge marker for ${key.runId}/${key.nodeId} #${key.attempt} without its closing marker`,
+      );
+    }
+    blocks.push({
+      key,
+      beginIdx: match.index,
+      endIdx,
+      endLength: end.length,
+      block: log.slice(match.index, endIdx + end.length),
+    });
+  }
+  const paired = new Set(blocks.flatMap((b) => [b.beginIdx, b.endIdx]));
+  let idx = log.indexOf("<!-- workshop:merge");
+  while (idx !== -1) {
+    if (!paired.has(idx) && log[idx - 1] !== "\\") {
+      throw new WorklogIntegrityError(`worklog contains a malformed runtime merge marker at offset ${idx}`);
+    }
+    idx = log.indexOf("<!-- workshop:merge", idx + 1);
+  }
+  return blocks;
+}
 
-  const receipt: MergeReceipt = {
-    runId: input.runId,
-    nodeId: input.nodeId,
-    attempt: input.attempt,
-    ownerToken: input.ownerToken,
-    packetSha256: packetSha,
-    sectionSha256: `sha256:${createHash("sha256").update(sectionFor(merged, nodeHeading)).digest("hex")}`,
-    mergedAt: input.now.toISOString(),
+function indexOfUnescaped(content: string, needle: string, from: number): number {
+  let at = content.indexOf(needle, from);
+  while (at !== -1 && content[at - 1] === "\\") at = content.indexOf(needle, at + 1);
+  return at;
+}
+
+/**
+ * A pre-marker merge (or its crash window) left an attempt block without
+ * runtime markers or a usable receipt. That evidence is unresolved: fail
+ * closed instead of publishing a duplicate.
+ */
+function assertNoUnmarkedLegacyAttemptBlock(
+  log: string,
+  blocks: MarkedBlock[],
+  nodeId: string,
+  attempt: number,
+): void {
+  const excised = exciseMarkedBlocks(log, blocks);
+  const section = sectionFor(excised, `### Node: ${nodeId}`);
+  if (section === "") return;
+  if (new RegExp(`^#### Attempt ${attempt}[ \t]*$`, "m").test(section)) {
+    throw new WorklogIntegrityError(
+      `worklog already holds an unmarked attempt block for ${nodeId} #${attempt} — a pre-marker merge never ` +
+        `finalized its receipt, so the evidence is unresolved and must not be duplicated`,
+    );
+  }
+}
+
+function exciseMarkedBlocks(log: string, blocks: MarkedBlock[]): string {
+  let out = log;
+  for (const b of [...blocks].sort((x, y) => y.beginIdx - x.beginIdx)) {
+    out = out.slice(0, b.beginIdx) + out.slice(b.endIdx + b.endLength);
+  }
+  return out;
+}
+
+/** Reconcile one existing marked block with its receipt, or lack thereof. */
+function reconcileMarkedBlock(
+  input: {
+    runId: string; nodeId: string; attempt: number; attemptFolder: string;
+    successorId: string | null; now: Date;
+  },
+  block: MarkedBlock,
+  packetSha: string,
+): MergeReceiptV2 {
+  if (block.key.packetSha256 !== packetSha) {
+    throw new WorklogIntegrityError(
+      `marked merge block for ${input.nodeId} #${input.attempt} records packet ${block.key.packetSha256}, ` +
+        `but the packet now hashes ${packetSha} — earlier attempts are immutable evidence`,
+    );
+  }
+  const expectedBlock = renderMarkedPacketBlock(input, packetSha);
+  if (block.block !== expectedBlock) {
+    throw new WorklogIntegrityError(
+      `marked merge block for ${input.nodeId} #${input.attempt} does not match the exact current packet publication`,
+    );
+  }
+  const blockSha = sha256String(block.block);
+  const existing = verifyMergeReceipt(input.attemptFolder, {
+    runId: input.runId, nodeId: input.nodeId, attempt: input.attempt,
+  });
+  if (existing && isV2MergeReceipt(existing)) {
+    if (existing.packetSha256 !== packetSha || existing.blockSha256 !== blockSha) {
+      throw new WorklogIntegrityError(
+        `merge receipt for ${input.nodeId} #${input.attempt} does not match the worklog's marked block — ` +
+          `recorded evidence is inconsistent`,
+      );
+    }
+    return existing;
+  }
+  const synthesized: MergeReceiptV2 = {
+    version: 2, runId: input.runId, nodeId: input.nodeId, attempt: input.attempt,
+    packetSha256: packetSha, blockSha256: blockSha, mergedAt: input.now.toISOString(),
   };
-  mkdirSync(dirname(receiptFile), { recursive: true });
-  atomicWriteFileSync(receiptFile, JSON.stringify(receipt, null, 2) + "\n");
-  return receipt;
+  atomicWriteFileSync(receiptPath(input.attemptFolder), JSON.stringify(synthesized, null, 2) + "\n");
+  return synthesized;
 }
 
-/** Verify (or idempotently create) the receipt during recovery. */
-export function verifyMergeReceipt(attemptFolder: string): MergeReceipt | null {
-  return readReceipt(receiptPath(attemptFolder));
+function isSha256(v: unknown): v is string {
+  return typeof v === "string" && /^sha256:[0-9a-f]{64}$/.test(v);
 }
 
-function readReceipt(path: string): MergeReceipt | null {
+function isIsoTimestamp(v: unknown): v is string {
+  return typeof v === "string" && !Number.isNaN(Date.parse(v));
+}
+
+/**
+ * Read one merge receipt, strictly validating its runtime shape and its
+ * identity against the (run, node, attempt) merge key. A malformed or
+ * foreign receipt is an integrity violation — never a trusted no-op.
+ * Returns null when no receipt exists.
+ *
+ * V1 receipts parse for compatibility with pre-marker runs; they carry
+ * owner tokens and a provenance-only whole-node digest, so callers must not
+ * treat them as safe new finishing evidence (see isV2MergeReceipt).
+ */
+export function verifyMergeReceipt(
+  attemptFolder: string,
+  identity: { runId: string; nodeId: string; attempt: number },
+): MergeReceipt | null {
+  const path = receiptPath(attemptFolder);
   if (!existsSync(path)) return null;
+  let parsed: unknown;
   try {
-    return JSON.parse(readFileSync(path, "utf8")) as MergeReceipt;
+    parsed = JSON.parse(readFileSync(path, "utf8"));
   } catch {
     throw new WorklogIntegrityError(`merge receipt at ${path} is not valid JSON`);
   }
+  if (typeof parsed !== "object" || parsed === null) {
+    throw new WorklogIntegrityError(`merge receipt at ${path} does not match the runtime receipt shape`);
+  }
+  const r = parsed as Record<string, unknown>;
+  const receipt = r.version === 2 ? parseV2Receipt(r, path) : parseV1Receipt(r, path);
+  if (receipt.runId !== identity.runId || receipt.nodeId !== identity.nodeId || receipt.attempt !== identity.attempt) {
+    throw new WorklogIntegrityError(
+      `merge receipt at ${path} identifies ${receipt.runId}/${receipt.nodeId} #${receipt.attempt}, ` +
+        `expected ${identity.runId}/${identity.nodeId} #${identity.attempt}`,
+    );
+  }
+  return receipt;
+}
+
+function parseV1Receipt(r: Record<string, unknown>, path: string): MergeReceiptV1 {
+  if (!hasExactKeys(r, ["attempt", "mergedAt", "nodeId", "ownerToken", "packetSha256", "runId", "sectionSha256"]) ||
+    typeof r.runId !== "string" ||
+    r.runId === "" ||
+    typeof r.nodeId !== "string" ||
+    r.nodeId === "" ||
+    typeof r.attempt !== "number" ||
+    !Number.isInteger(r.attempt) ||
+    typeof r.ownerToken !== "string" ||
+    r.ownerToken === "" ||
+    !isSha256(r.packetSha256) ||
+    !isSha256(r.sectionSha256) ||
+    !isIsoTimestamp(r.mergedAt)
+  ) {
+    throw new WorklogIntegrityError(`merge receipt at ${path} does not match the runtime receipt shape`);
+  }
+  return {
+    runId: r.runId,
+    nodeId: r.nodeId,
+    attempt: r.attempt,
+    ownerToken: r.ownerToken,
+    packetSha256: r.packetSha256,
+    sectionSha256: r.sectionSha256,
+    mergedAt: r.mergedAt,
+  };
+}
+
+function parseV2Receipt(r: Record<string, unknown>, path: string): MergeReceiptV2 {
+  const baseKeys = ["attempt", "blockSha256", "mergedAt", "nodeId", "packetSha256", "runId", "version"];
+  const knownShape = hasExactKeys(r, baseKeys) || hasExactKeys(r, [...baseKeys, "sectionSha256"]);
+  if (!knownShape ||
+    typeof r.runId !== "string" ||
+    r.runId === "" ||
+    typeof r.nodeId !== "string" ||
+    r.nodeId === "" ||
+    typeof r.attempt !== "number" ||
+    !Number.isInteger(r.attempt) ||
+    !isSha256(r.packetSha256) ||
+    !isSha256(r.blockSha256) ||
+    (r.sectionSha256 !== undefined && !isSha256(r.sectionSha256)) ||
+    !isIsoTimestamp(r.mergedAt)
+  ) {
+    throw new WorklogIntegrityError(`merge receipt at ${path} does not match the runtime receipt shape`);
+  }
+  return {
+    version: 2, runId: r.runId, nodeId: r.nodeId, attempt: r.attempt,
+    packetSha256: r.packetSha256, blockSha256: r.blockSha256,
+    ...(r.sectionSha256 === undefined ? {} : { sectionSha256: r.sectionSha256 }),
+    mergedAt: r.mergedAt,
+  };
+}
+
+function hasExactKeys(value: Record<string, unknown>, expected: string[]): boolean {
+  const actual = Object.keys(value).sort();
+  const keys = [...expected].sort();
+  return actual.length === keys.length && actual.every((key, i) => key === keys[i]);
 }
 
 /**
@@ -301,7 +618,11 @@ function sectionFor(log: string, nodeHeading: string): string {
   if (nodeIdx === -1) return "";
   const rest = log.slice(nodeIdx);
   const nextHeading = /^#{2,3} /m.exec(rest.slice(nodeHeading.length + 1));
-  const end = nextHeading ? nodeHeading.length + 1 + (nextHeading.index ?? 0) : log.length;
+  // next.index is relative to the text after the heading line: make the
+  // section end absolute before slicing, or early headings yield "".
+  const end = nextHeading
+    ? nodeIdx + nodeHeading.length + 1 + (nextHeading.index ?? 0)
+    : log.length;
   return log.slice(nodeIdx, end);
 }
 
@@ -314,6 +635,31 @@ function countOccurrences(haystack: string, needle: string): number {
   }
   return count;
 }
+
+/** Create missing pristine evidence; refuse any existing byte mismatch. */
+export function ensurePristineFile(path: string, content: string): void {
+  mkdirSync(dirname(path), { recursive: true });
+  const tmp = `${path}.prepare-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+  const fd = openSync(tmp, "wx");
+  try {
+    writeFileSync(fd, content);
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+  try {
+    linkSync(tmp, path); // hard-link installation is atomic and never replaces
+    fsyncDirectory(dirname(path));
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+  } finally {
+    try { rmSync(tmp); } catch { /* crash debris is harmless */ }
+  }
+  if (readFileSync(path, "utf8") !== content) {
+    throw new WorklogIntegrityError(`existing evidence at ${path} does not match its pristine scaffold`);
+  }
+}
+
 
 /** Write + fsync + rename, so readers never see a partial file. */
 export function atomicWriteFileSync(path: string, content: string): string {
@@ -329,6 +675,17 @@ export function atomicWriteFileSync(path: string, content: string): string {
   renameSync(tmp, path);
   fsyncDirectory(dirname(path));
   return content;
+}
+
+/** Flush an externally written file without changing its bytes or inode. */
+export function fsyncFileSync(path: string): void {
+  const fd = openSync(path, "r");
+  try {
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+  fsyncDirectory(dirname(path));
 }
 
 function fsyncDirectory(dir: string): void {
@@ -351,13 +708,42 @@ export class RunLock {
     this.path = join(runDir, "lock");
   }
 
+  acquireSync(timeoutMs = 5000): void {
+    const deadline = Date.now() + timeoutMs;
+    const wait = new Int32Array(new SharedArrayBuffer(4));
+    for (;;) {
+      try {
+        const fd = openSync(this.path, "wx");
+        try {
+          writeFileSync(fd, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
+          fsyncSync(fd);
+        } finally {
+          closeSync(fd);
+        }
+        return;
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+        this.takeoverIfStale();
+        if (Date.now() > deadline) {
+          throw new WorklogIntegrityError(`run lock at ${this.path} is held by another process`);
+        }
+        Atomics.wait(wait, 0, 0, 10);
+      }
+    }
+  }
+
+
   async acquire(timeoutMs = 5000): Promise<void> {
     const deadline = Date.now() + timeoutMs;
     for (;;) {
       try {
         const fd = openSync(this.path, "wx");
-        writeFileSync(fd, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
-        closeSync(fd);
+        try {
+          writeFileSync(fd, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
+          fsyncSync(fd);
+        } finally {
+          closeSync(fd);
+        }
         return;
       } catch (e) {
         if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;

@@ -4,12 +4,13 @@ import type { Installation } from "../config.js";
 import type { NodeDefinition, WorkflowDefinition } from "../definition/schema.js";
 import { resolveAgent, type AgentResolution, type ChainInfo, type ParsedModel } from "../definition/validate.js";
 import { parseTimeout } from "../util/duration.js";
-import { toIso, type Clock } from "../util/clock.js";
-import { isProcessAlive, terminateProcessGroup } from "../util/process.js";
-import type { AttemptRow, BlockKind, FailureKind, RunRow, Store } from "../store/store.js";
-import { GuardRejected } from "../store/store.js";
+import { type Clock } from "../util/clock.js";
+import type { BlockKind, FailureKind, RunRow, Store } from "../store/store.js";
+import { CapacityRejected, GuardRejected } from "../store/store.js";
 import {
   WorklogIntegrityError,
+  atomicWriteFileSync,
+  fsyncFileSync,
   attemptDir,
   authorizedMarker,
   extractMarker as extractMarkerText,
@@ -119,7 +120,7 @@ export interface AttemptPaths {
   promptFile: string;
 }
 
-export function attemptPaths(attemptFolder: string): AttemptPaths {
+function attemptPaths(attemptFolder: string): AttemptPaths {
   mkdirSync(attemptFolder, { recursive: true });
   return {
     stdoutFile: join(attemptFolder, "stdout"),
@@ -150,19 +151,51 @@ export async function executeAttempt(input: {
   const successorId = chain.next.get(nodeId) ?? null;
   const now = () => clock.now();
   const folder = attemptDir(run.run_dir, attempt.execution_seq, nodeId);
-  const paths = attemptPaths(folder);
   const packetFile = packetPath(folder);
 
-  // Claim: CAS pending → running with our identity. Losers never spawn.
+  // Serialize pristine packet verification with the claim. A losing launcher
+  // re-reads the row under this lock and never inspects a winner's live packet.
   let ownerToken: string;
+  const preparationLock = new RunLock(run.run_dir);
+  preparationLock.acquireSync();
   try {
-    const claim = store.claimAttempt({ runId: run.run_id, nodeId, attempt: attemptNo, now: now() });
-    ownerToken = claim.ownerToken;
-  } catch (e) {
-    if (e instanceof GuardRejected) return { status: "cancelled", detail: `claim lost: ${e.message}` };
-    throw e;
-  }
+    const fresh = store.getAttempt(run.run_id, nodeId, attemptNo);
+    if (!fresh || fresh.status !== "pending") {
+      return { status: "cancelled", detail: "attempt is no longer pending" };
+    }
+    if (fresh.packet_path !== packetFile) {
+      const detail = `pending attempt packet path ${fresh.packet_path} does not match ${packetFile}`;
+      store.failPendingPacketIntegrity({ runId: run.run_id, nodeId, attempt: attemptNo, error: detail, now: now() });
+      return { status: "cancelled", detail };
+    }
+    try {
+      // Repairs row→file crash gaps for first, successor, and retry attempts.
+      // Exact existing evidence is accepted; any mismatch is preserved.
+      scaffoldPacket(folder, fresh.attempt, successorId);
+    } catch (e) {
+      if (!(e instanceof WorklogIntegrityError)) throw e;
+      store.failPendingPacketIntegrity({ runId: run.run_id, nodeId, attempt: attemptNo, error: e.message, now: now() });
+      return { status: "cancelled", detail: e.message };
+    }
 
+    try {
+      const claim = store.claimAttempt({
+        runId: run.run_id,
+        nodeId,
+        attempt: attemptNo,
+        now: now(),
+        maxConcurrentRuns: inst.maxConcurrentRuns,
+      });
+      ownerToken = claim.ownerToken;
+    } catch (e) {
+      if (e instanceof CapacityRejected) return { status: "cancelled", detail: e.message };
+      if (e instanceof GuardRejected) return { status: "cancelled", detail: `claim lost: ${e.message}` };
+      throw e;
+    }
+  } finally {
+    preparationLock.release();
+  }
+  const paths = attemptPaths(folder);
   const model: ParsedModel | null = resolved.run.kind === "agent" ? resolved.run.resolution.model : null;
   const env = attemptEnv({
     logPath: run.worklog_path,
@@ -192,21 +225,37 @@ export async function executeAttempt(input: {
     heartbeat = null;
   };
 
+  const retireWorker = async (active: TrackedProcess): Promise<boolean> => {
+    const confirmed = await active.kill();
+    if (!confirmed) return false;
+    // Process-owned streams are evidence too. Flush them only after every
+    // group member is gone and no writer can mutate the files.
+    if (existsSync(paths.stdoutFile)) fsyncFileSync(paths.stdoutFile);
+    if (existsSync(paths.stderrFile)) fsyncFileSync(paths.stderrFile);
+    const cleared = store.clearAttemptProcessIdentity({
+      runId: run.run_id, nodeId, attempt: attemptNo, ownerToken, role: "worker",
+      pid: active.pid, startId: active.startId, pgid: active.pgid, now: now(),
+    });
+    if (cleared) return true;
+    // Stop/recovery may have cleared the exact identity after independently
+    // confirming death. That is safe; a replacement group is not.
+    return store.getAttempt(run.run_id, nodeId, attemptNo)?.worker_process_group === null;
+  };
+
   const fail = async (failureKind: FailureKind, detail: string, validatorReason?: string | null): Promise<AttemptOutcome> => {
     stopHeartbeat();
-    if (proc) await proc.kill();
+    if (proc) {
+      const active = proc;
+      if (!(await retireWorker(active))) {
+        return { status: "cancelled", detail: `${detail}; process-group death was not confirmed` };
+      }
+      proc = null;
+    }
     try {
       const result = store.failAttempt({
-        runId: run.run_id,
-        nodeId,
-        attempt: attemptNo,
-        ownerToken,
-        failureKind,
-        validatorReason: validatorReason ?? null,
-        now: now(),
+        runId: run.run_id, nodeId, attempt: attemptNo, ownerToken, failureKind,
+        validatorReason: validatorReason ?? null, now: now(),
       });
-      // The CAS loses when a block or stop already ended the attempt; that
-      // outcome wins and the run keeps its blocked/cancelled status.
       if (!result.failed) return { status: "cancelled", detail: "attempt already left running state" };
       await mergeFailureEvidence(failureKind);
       return { status: "failed", failureKind, detail };
@@ -293,7 +342,26 @@ export async function executeAttempt(input: {
       command = resolution.harnessCommand;
     }
 
-    // Spawn the harness in its own process group; record child identity.
+    // Provenance under owner fencing before execution (spec §5/§11): persist
+    // the unexpanded template, the exact command, and the resolved model.
+    if (
+      !store.recordResolvedExecution({
+        runId: run.run_id,
+        nodeId,
+        attempt: attemptNo,
+        ownerToken,
+        harnessTemplate:
+          resolved.run.kind === "command" ? resolved.run.command : (resolved.run.resolution.harnessTemplate ?? command),
+        harnessCommand: command,
+        model: resolved.run.kind === "agent" ? (resolved.run.resolution.model?.full ?? null) : null,
+        now: now(),
+      })
+    ) {
+      return { status: "cancelled", detail: "lost ownership before execution" };
+    }
+
+    // Spawn directly, detached; record the child identity immediately after
+    // spawn (the accepted POC boundary — no pre-exec gate).
     proc = spawnTracked({
       shell: inst.shell,
       command,
@@ -303,14 +371,8 @@ export async function executeAttempt(input: {
       stderrFile: paths.stderrFile,
     });
     store.recordChildIdentity({
-      runId: run.run_id,
-      nodeId,
-      attempt: attemptNo,
-      ownerToken,
-      childPid: proc.pid,
-      childStartId: proc.startId,
-      childPgid: proc.pgid,
-      now: now(),
+      runId: run.run_id, nodeId, attempt: attemptNo, ownerToken,
+      childPid: proc.pid, childStartId: proc.startId, childPgid: proc.pgid, now: now(),
     });
 
     heartbeat = setInterval(() => {
@@ -334,25 +396,24 @@ export async function executeAttempt(input: {
 
     const exitOrTimeout = await raceDeadline(proc, resolved.timeoutMs);
     if (exitOrTimeout.kind === "timeout") {
-      const confirmed = await proc.kill();
-      if (!confirmed) {
-        return {
-          status: "failed",
-          failureKind: "timeout",
-          detail: "deadline exceeded and the process group could not be confirmed dead",
-        };
-      }
       return await fail("timeout", `deadline exceeded (${resolved.timeoutMs}ms)`);
     }
     stopHeartbeat();
     const { code, signal } = exitOrTimeout.exit;
     lastExitCode = code;
+    const exited = proc;
+    if (!(await retireWorker(exited))) {
+      return {
+        status: "cancelled",
+        detail: "harness leader exited but surviving process-group members could not be confirmed dead",
+      };
+    }
+    proc = null;
 
-    // Durable stop: desired_state stopped cancels the attempt and the run.
+    // Stop intent remains protected until all recorded groups are dead.
     const runAfter = store.getRun(run.run_id)!;
     if (runAfter.desired_state === "stopped") {
-      store.cancelAttempt({ runId: run.run_id, nodeId, attempt: attemptNo, now: now() });
-      store.setRunStatus(run.run_id, "cancelled", now(), null);
+      store.finalizeStoppedRun({ runId: run.run_id, now: now() });
       return { status: "cancelled" };
     }
 
@@ -373,77 +434,79 @@ export async function executeAttempt(input: {
       }
     }
 
-
-    // Durable evidence first: command packets are filled by the runtime; agent
-    // packets were written by the agent. The extracted output lands in the
-    // output file before validation — validators judge durable evidence.
+    // Durable evidence first. Externally written packet bytes are fsynced;
+    // runtime-owned packet/output records use atomic write+fsync+rename.
     if (resolved.run.kind === "command") {
       fillCommandPacket({
-        packetFile,
-        attempt: attemptNo,
-        exitCode: code,
-        stdoutFile: paths.stdoutFile,
-        validatorLine: "pending",
-        marker: authorizedMarker(successorId),
+        packetFile, attempt: attemptNo, exitCode: code, stdoutFile: paths.stdoutFile,
+        validatorLine: "pending", marker: authorizedMarker(successorId),
       });
+    } else {
+      fsyncFileSync(packetFile); // the agent wrote the packet externally
     }
     const output = extractNodeOutput(resolved.run.kind, packetFile, paths.stdoutFile);
     if (output === null) {
       return await fail("worklog_integrity", `authorized marker missing from packet for ${nodeId} #${attemptNo}`);
     }
-    writeFileSync(paths.outputFile, output, "utf8");
+    atomicWriteFileSync(paths.outputFile, output);
 
-    // Validator: optional internal completion gate.
-    let validatorOutcome: { passed: boolean; reason: string } | null = null;
+    let validatorOutcome: ValidatorOutcome | null = null;
     if (resolved.validator) {
       validatorOutcome = await runValidator({
-        inst,
-        run,
-        validator: resolved.validator,
-        attemptFolder: folder,
-        attemptNo,
-        packetFile,
-        outputFile: paths.outputFile,
-        stdoutFile: paths.stdoutFile,
-        stderrFile: paths.stderrFile,
-        cliPath: input.cliPath,
+        store, ownerToken, clock, inst, run, nodeId, validator: resolved.validator,
+        attemptFolder: folder, attemptNo, packetFile, outputFile: paths.outputFile,
+        stdoutFile: paths.stdoutFile, stderrFile: paths.stderrFile, cliPath: input.cliPath,
       });
-      if (!validatorOutcome.passed) {
+      if (validatorOutcome.outcome === "unconfirmed") {
+        return { status: "cancelled", detail: validatorOutcome.reason };
+      }
+      if (validatorOutcome.outcome === "timeout") {
+        return await fail("timeout", validatorOutcome.reason, validatorOutcome.reason);
+      }
+      if (validatorOutcome.outcome === "rejected") {
         return await fail("validator_rejection", validatorOutcome.reason, validatorOutcome.reason);
       }
-      // Record the passing evidence in the packet before the merge.
       if (resolved.run.kind === "command") {
         fillCommandPacket({
-          packetFile,
-          attempt: attemptNo,
-          exitCode: code,
-          stdoutFile: paths.stdoutFile,
-          validatorLine: `Validator passed: ${validatorOutcome.reason}`,
-          marker: authorizedMarker(successorId),
+          packetFile, attempt: attemptNo, exitCode: code, stdoutFile: paths.stdoutFile,
+          validatorLine: `Validator passed: ${validatorOutcome.reason}`, marker: authorizedMarker(successorId),
         });
       }
     }
-    // Owner-fenced finishing: evidence is durable; the merge is fenced next.
+
+    // Owner-fenced finishing: evidence is durable and flushed; the merge is
+    // fenced next.
     try {
-      store.claimFinishing({ runId: run.run_id, nodeId, attempt: attemptNo, ownerToken, now: now() });
+      store.claimFinishing({
+        runId: run.run_id, nodeId, attempt: attemptNo, ownerToken,
+        nodeOutputPath: paths.outputFile,
+        validatorStatus: resolved.validator ? "passed" : null,
+        validatorReason: resolved.validator ? (validatorOutcome?.reason ?? "validator passed") : null,
+        now: now(),
+      });
     } catch (e) {
       if (e instanceof GuardRejected) return { status: "cancelled", detail: e.message };
       throw e;
     }
 
-    // Merge under the run lock; the receipt makes it idempotent.
+    let successor: {
+      nodeId: string; resolvedMaxAttempts: number; resolvedTimeoutMs: number | null; chainPosition: number;
+    } | null = null;
+    if (successorId) {
+      const succResolved = resolveNode(def, successorId, inst);
+      successor = {
+        nodeId: successorId, resolvedMaxAttempts: succResolved.maxAttempts,
+        resolvedTimeoutMs: succResolved.timeoutMs, chainPosition: chain.order.indexOf(successorId),
+      };
+    }
+
+    // Merge under the run lock; the marked-block receipt makes it idempotent.
     const lock = new RunLock(run.run_dir);
     try {
       await lock.acquire();
       mergePacket({
-        runDir: run.run_dir,
-        runId: run.run_id,
-        nodeId,
-        attempt: attemptNo,
-        attemptFolder: folder,
-        successorId,
-        ownerToken,
-        now: now(),
+        runDir: run.run_dir, runId: run.run_id, nodeId, attempt: attemptNo,
+        attemptFolder: folder, successorId, ownerToken, now: now(),
       });
     } catch (e) {
       if (e instanceof WorklogIntegrityError) return await fail("worklog_integrity", e.message);
@@ -453,38 +516,12 @@ export async function executeAttempt(input: {
     }
 
     // Guarded completion + persisted successor (one transaction).
-    let successor: {
-      nodeId: string;
-      resolvedMaxAttempts: number;
-      resolvedTimeoutMs: number | null;
-      chainPosition: number;
-    } | null = null;
-    if (successorId) {
-      const succResolved = resolveNode(def, successorId, inst);
-      successor = {
-        nodeId: successorId,
-        resolvedMaxAttempts: succResolved.maxAttempts,
-        resolvedTimeoutMs: succResolved.timeoutMs,
-        chainPosition: chain.order.indexOf(successorId),
-      };
-    }
     try {
-      store.completeAttempt({
-        runId: run.run_id,
-        nodeId,
-        attempt: attemptNo,
-        ownerToken,
-        nodeOutputPath: paths.outputFile,
-        validatorStatus: resolved.validator ? "passed" : null,
-        validatorReason: resolved.validator ? (validatorOutcome?.reason ?? "validator passed") : null,
-        now: now(),
-        successor,
-      });
+      store.completeAttempt({ runId: run.run_id, nodeId, attempt: attemptNo, ownerToken, now: now(), successor });
     } catch (e) {
       if (e instanceof GuardRejected) return { status: "cancelled", detail: e.message };
       throw e;
     }
-
     // Scaffold the persisted successor's packet from its own row.
     if (successorId) {
       const row = store.getAttempt(run.run_id, successorId, 1)!;
@@ -570,17 +607,38 @@ ${input.marker.opening}
 ${stdout.trimEnd()}
 ${input.marker.closing}
 `;
-  writeFileSync(input.packetFile, content, "utf8");
+  atomicWriteFileSync(input.packetFile, content);
 }
 
-interface ValidatorOutcome {
-  passed: boolean;
-  reason: string;
+/**
+ * The normalized validator record both validator kinds converge on: command
+ * validators record their exit-code verdict, agent validators the verdict
+ * parsed from their validation.json. Atomic and durable (S9).
+ */
+function writeValidatorRecord(
+  validationDir: string,
+  record: { kind: "command" | "agent"; status: "passed" | "failed"; reason: string },
+): void {
+  atomicWriteFileSync(join(validationDir, "validator-record.json"), JSON.stringify({ version: 1, ...record }, null, 2) + "\n");
 }
+
+/**
+ * Discriminated validator result. A timeout is machinery, not judgment: it is
+ * typed `timeout` (spec §10), never a `validator_rejection`.
+ */
+type ValidatorOutcome =
+  | { outcome: "passed"; reason: string }
+  | { outcome: "rejected"; reason: string }
+  | { outcome: "timeout"; reason: string }
+  | { outcome: "unconfirmed"; reason: string };
 
 async function runValidator(input: {
+  store: Store;
+  ownerToken: string;
+  clock: Clock;
   inst: Installation;
   run: RunRow;
+  nodeId: string;
   validator: NodeValidator;
   attemptFolder: string;
   attemptNo: number;
@@ -593,19 +651,31 @@ async function runValidator(input: {
   const validationDir = join(input.attemptFolder, "validation");
   mkdirSync(validationDir, { recursive: true });
   const validationFile = join(validationDir, "validation.json");
+  const validationStdout = join(validationDir, "stdout");
+  const validationStderr = join(validationDir, "stderr");
+  const normalized = (outcome: "passed" | "rejected", reason: string): ValidatorOutcome => {
+    // The runtime-owned normalized verdict: durable evidence both validator
+    // kinds converge on (command exit code, or the parsed validation.json).
+    writeValidatorRecord(validationDir, {
+      kind: input.validator.kind,
+      status: outcome === "passed" ? "passed" : "failed",
+      reason,
+    });
+    return { outcome, reason };
+  };
 
   const model = input.validator.kind === "agent" ? input.validator.resolution.model : null;
   if (
     input.validator.kind === "agent" &&
     (!input.validator.resolution.harnessCommand || !input.validator.resolution.model)
   ) {
-    return { passed: false, reason: "validator agent harness/model unresolved" };
+    return normalized("rejected", "validator agent harness/model unresolved");
   }
 
   const env = attemptEnv({
     logPath: input.run.worklog_path,
     runId: input.run.run_id,
-    nodeId: nodeFromFolder(input.attemptFolder),
+    nodeId: input.nodeId,
     attempt: input.attemptNo,
     promptFile: null,
     nodeOutputFile: input.outputFile,
@@ -613,7 +683,7 @@ async function runValidator(input: {
     packetFile: input.packetFile,
     stdoutFile: input.stdoutFile,
     stderrFile: input.stderrFile,
-    ownerToken: "validator-not-an-owner", // validators never own the attempt
+    ownerToken: "validator-not-an-owner",
     validationFile,
     model,
     cliPath: input.cliPath,
@@ -624,15 +694,12 @@ async function runValidator(input: {
     command = input.validator.command;
   } else {
     const promptFile = join(validationDir, "prompt.md");
-    writeFileSync(
+    atomicWriteFileSync(
       promptFile,
-      renderValidatorPrompt(nodeFromFolder(input.attemptFolder), input.validator.agent.instructions, {
-        packetFile: input.packetFile,
-        outputFile: input.outputFile,
-        logPath: input.run.worklog_path,
-        validationFile,
+      renderValidatorPrompt(input.nodeId, input.validator.agent.instructions, {
+        packetFile: input.packetFile, outputFile: input.outputFile,
+        logPath: input.run.worklog_path, validationFile,
       }),
-      "utf8",
     );
     env.WORKSHOP_PROMPT_FILE = promptFile;
     command = input.validator.resolution.harnessCommand!;
@@ -643,49 +710,65 @@ async function runValidator(input: {
     command,
     cwd: input.inst.projectDir,
     env,
-    stdoutFile: join(validationDir, "stdout"),
-    stderrFile: join(validationDir, "stderr"),
+    stdoutFile: validationStdout,
+    stderrFile: validationStderr,
   });
+  input.store.recordValidatorIdentity({
+    runId: input.run.run_id, nodeId: input.nodeId, attempt: input.attemptNo, ownerToken: input.ownerToken,
+    childPid: proc.pid, childStartId: proc.startId, childPgid: proc.pgid, now: input.clock.now(),
+  });
+
+
+  const retire = async (): Promise<boolean> => {
+    const confirmed = await proc.kill();
+    if (!confirmed) return false;
+    if (existsSync(validationStdout)) fsyncFileSync(validationStdout);
+    if (existsSync(validationStderr)) fsyncFileSync(validationStderr);
+    const cleared = input.store.clearAttemptProcessIdentity({
+      runId: input.run.run_id, nodeId: input.nodeId, attempt: input.attemptNo, ownerToken: input.ownerToken,
+      role: "validator", pid: proc.pid, startId: proc.startId, pgid: proc.pgid, now: input.clock.now(),
+    });
+    return cleared || input.store.getAttempt(input.run.run_id, input.nodeId, input.attemptNo)?.validator_process_group === null;
+  };
 
   const exitOrTimeout = await raceDeadline(proc, input.validator.timeoutMs);
   if (exitOrTimeout.kind === "timeout") {
-    await proc.kill();
-    return { passed: false, reason: `validator timed out after ${input.validator.timeoutMs}ms` };
+    if (!(await retire())) {
+      return { outcome: "unconfirmed", reason: "validator timed out and group death could not be confirmed" };
+    }
+    return { outcome: "timeout", reason: `validator timed out after ${input.validator.timeoutMs}ms` };
   }
   const { code } = exitOrTimeout.exit;
+  if (!(await retire())) {
+    return { outcome: "unconfirmed", reason: "validator leader exited but surviving group members remain" };
+  }
 
   if (input.validator.kind === "command") {
     return code === 0
-      ? { passed: true, reason: "command validator exited 0" }
-      : { passed: false, reason: `command validator exited ${code ?? "null"}` };
+      ? normalized("passed", "command validator exited 0")
+      : normalized("rejected", `command validator exited ${code ?? "null"}`);
   }
 
-  // Agent validator: parse validation.json; missing or invalid output fails.
+  // The agent wrote this file externally. Flush it before parsing or deriving
+  // the runtime-owned normalized validator record.
   if (!existsSync(validationFile)) {
-    return { passed: false, reason: `validator wrote no validation.json (exit ${code ?? "null"})` };
+    return normalized("rejected", `validator wrote no validation.json (exit ${code ?? "null"})`);
   }
+  fsyncFileSync(validationFile);
   let parsed: unknown;
   try {
     parsed = JSON.parse(readFileSync(validationFile, "utf8"));
   } catch (e) {
-    return { passed: false, reason: `validation.json is not valid JSON: ${(e as Error).message}` };
+    return normalized("rejected", `validation.json is not valid JSON: ${(e as Error).message}`);
   }
   const result = parsed as { passed?: unknown; reason?: unknown };
   if (typeof result.passed !== "boolean") {
-    return { passed: false, reason: "validation.json has no boolean 'passed'" };
+    return normalized("rejected", "validation.json has no boolean 'passed'");
   }
   const reason = typeof result.reason === "string" ? result.reason : "";
-  return {
-    passed: result.passed,
-    reason: reason || (result.passed ? "validator passed" : "validator failed without a reason"),
-  };
-}
-
-/** "attempts/007-node-x" → "node-x" and the per-node attempt ordinal. */
-export function nodeFromFolder(attemptFolder: string): string {
-  const base = attemptFolder.split("/").pop() ?? "";
-  const noSeq = base.replace(/^\d+-/, "");
-  return noSeq;
+  return result.passed
+    ? normalized("passed", reason || "validator passed")
+    : normalized("rejected", reason || "validator failed without a reason");
 }
 
 function renderValidatorPrompt(
@@ -717,18 +800,6 @@ Missing or invalid validation output counts as failure.
 `;
 }
 
-/** Recovery helpers (used by daemon reconciliation). */
-
-export async function terminateAttemptProcessGroup(attempt: AttemptRow): Promise<boolean> {
-  if (attempt.worker_process_group === null) return false;
-  return terminateProcessGroup(attempt.worker_process_group);
-}
-
-export function workerAlive(attempt: AttemptRow): boolean {
-  if (attempt.worker_pid === null) return false;
-  return isProcessAlive(attempt.worker_pid);
-}
-
 export function blockKindFor(kind: string): BlockKind | null {
   const valid: BlockKind[] = [
     "agent_requested",
@@ -739,8 +810,4 @@ export function blockKindFor(kind: string): BlockKind | null {
     "operator",
   ];
   return valid.includes(kind as BlockKind) ? (kind as BlockKind) : null;
-}
-
-export function attemptStartedIso(attempt: AttemptRow): string {
-  return attempt.started_at ?? toIso(new Date(0));
 }

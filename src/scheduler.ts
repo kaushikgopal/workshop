@@ -20,13 +20,13 @@ export function admitDueOccurrences(input: {
   store: Store;
   workflowIds: string[];
   clock: Clock;
-  createRun: (workflowId: string, now: Date) => { runId: string } | null;
+  createRun: (workflowId: string, now: Date) => { runId: string; created: boolean } | null;
 }): ScheduleAdmission[] {
   const { store, clock } = input;
   const out: ScheduleAdmission[] = [];
   for (const workflowId of input.workflowIds) {
     const wf = store.getWorkflow(workflowId);
-    if (!wf || !wf.schedule_every || !wf.schedule_max_runs) continue;
+    if (!wf || !wf.schedule_every || wf.schedule_max_runs == null) continue;
     const now = clock.now();
 
     if (wf.activation_state !== "active") {
@@ -43,15 +43,12 @@ export function admitDueOccurrences(input: {
       continue;
     }
 
-    // Overlap suppression: an unresolved run prevents another occurrence.
-    if (store.getUnresolvedRun(workflowId)) {
-      out.push({ admitted: null, skipped: `${workflowId}: unresolved run in flight` });
-      continue;
-    }
+    // The admission transaction owns overlap suppression. A suppressed due
+    // slot is still consumed there, atomically advancing the cursor.
 
     try {
       const created = input.createRun(workflowId, now);
-      out.push({ admitted: created?.runId ?? null, skipped: created ? null : `${workflowId}: overlap suppressed` });
+      out.push({ admitted: created?.created ? created.runId : null, skipped: created?.created ? null : `${workflowId}: overlap suppressed` });
     } catch (e) {
       if (e instanceof GuardRejected) {
         out.push({ admitted: null, skipped: `${workflowId}: ${e.message}` });

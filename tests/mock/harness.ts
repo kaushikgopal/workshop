@@ -58,8 +58,7 @@ function report(mode: "log" | "error", message: string): void {
 function runtime(args: string[]): number {
   const { execFileSync } = require("node:child_process") as typeof import("node:child_process");
   try {
-    // WORKSHOP_CLI is "bun /abs/path/cli.ts" — unquoted expansion splits it.
-    execFileSync("bash", ["-c", `${env.WORKSHOP_CLI} ${args.join(" ")}`], {
+    execFileSync(env.WORKSHOP_CLI!, args, {
       env: process.env,
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
@@ -179,7 +178,7 @@ function parseSleepMs(spec: string): number {
 for (const s of sentinels) {
   if (s.startsWith("MOCK:progress=")) {
     const text = s.slice("MOCK:progress=".length);
-    runtime(["runtime", "progress", "--text", `'${text}'`]);
+    runtime(["runtime", "progress", "--text", text]);
   }
   if (s.startsWith("MOCK:sleep=")) {
     sleepSync(parseSleepMs(s.slice("MOCK:sleep=".length)));
@@ -188,8 +187,8 @@ for (const s of sentinels) {
     appendFileSync(env.WORKSHOP_LOG!, "\nagent tampered with the worklog\n", "utf8");
   }
   if (s === "MOCK:block" || s === "MOCK:block-unknown") {
-    const kind = s === "MOCK:block-unknown" ? "--kind unknown_external" : "";
-    const code = runtime(["runtime", "block", kind, "--reason", "'mock requested block'"]).valueOf();
+    const kind = s === "MOCK:block-unknown" ? ["--kind", "unknown_external"] : [];
+    const code = runtime(["runtime", "block", ...kind, "--reason", "mock requested block"]).valueOf();
     // The wrapper terminates our process group once blocked; exit nonzero so
     // the harness does not report success after a block.
     process.exit(code === 0 ? 3 : 1);

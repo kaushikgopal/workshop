@@ -50,6 +50,11 @@ function signalGroup(pgid: number, signal: NodeJS.Signals): void {
   }
 }
 
+/**
+ * True while at least one live process remains in the group. EPERM means the
+ * group exists but holds a process we may not signal — treat it as alive so
+ * death is never confirmed optimistically.
+ */
 function groupAlive(pgid: number): boolean {
   try {
     process.kill(-pgid, 0);

@@ -1,12 +1,14 @@
+import { resolve } from "node:path";
+
 /**
- * The absolute invocation agents use for internal runtime commands
- * (progress/block). Unquoted-expansion friendly: "bun /abs/path/cli.ts".
- * Falls back to the installed bin when the script path is unknown.
+ * The single executable agents use for internal runtime commands.
+ * Source checkouts invoke the executable TypeScript entry point directly;
+ * installed packages fall back to the `workshop` binary.
  */
 export function runtimeCliInvocation(): string {
   const script = process.argv[1];
   if (script && script.endsWith(".ts")) {
-    return `bun ${new URL(`file://${script}`).pathname}`;
+    return resolve(script);
   }
   return "workshop";
 }

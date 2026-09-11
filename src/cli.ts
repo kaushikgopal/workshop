@@ -1,13 +1,15 @@
 #!/usr/bin/env bun
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { findInstallation, ensureDirs, workflowPath } from "./config.js";
 import { join } from "node:path";
 import { loadAndValidateDefinition, startWorkflow, runChain, preflightIfNeeded, scaffoldFirstAttempt } from "./execute.js";
 import { openDb } from "./store/db.js";
-import { Store, GuardRejected } from "./store/store.js";
+import { Store, GuardRejected, type AttemptRow } from "./store/store.js";
 import { buildStatusDto, STATUS_DTO_VERSION } from "./status/dto.js";
 import { renderTreeStatus } from "./status/tree.js";
 import { resolveNode } from "./runner/attempt.js";
+import { deriveNodeStatus } from "./status/node-status.js";
+import { attemptDir } from "./worklog/worklog.js";
 import { isTerminal } from "./store/store.js";
 import { blockKindFor } from "./runner/attempt.js";
 import { SystemClock } from "./util/clock.js";
@@ -205,31 +207,27 @@ async function cmdStop(args: string[]): Promise<void> {
   if (!wf) die(`no workflow "${workflowId}"`);
 
   const run = store.getUnresolvedRun(workflowId);
-  if (run) {
-    // 1. Durable intent first.
-    store.stopRun({ runId: run.run_id, now });
-
-    // 2. Terminate and confirm the recorded process groups.
-    const live = store.getLiveAttempt(run.run_id);
-    if (live?.worker_process_group != null) {
-      const { terminateProcessGroup } = await import("./util/process.js");
-      await terminateProcessGroup(live.worker_process_group);
-    }
-    const fresh = store.getRun(run.run_id)!;
-    if (fresh.orchestrator_worker_pid != null && (fresh.orchestrator_phase === "owned" || fresh.orchestrator_phase === "applying")) {
-      const { terminateProcessGroup } = await import("./util/process.js");
-      await terminateProcessGroup(fresh.orchestrator_worker_pid);
-      store.finishOrchestrator(run.run_id, now);
-    }
-
-    // 3. Cancel any live attempt rows left after the signal.
-    const after = store.getLiveAttempt(run.run_id);
-    if (after) store.cancelAttempt({ runId: run.run_id, nodeId: after.node_id, attempt: after.attempt, now });
-    process.stdout.write(`stopped ${workflowId}: run ${run.run_id} cancelled\n`);
-  } else {
+  if (!run) {
+    store.setActivationState(workflowId, "stopped");
     process.stdout.write(`stopped ${workflowId}: no unresolved run\n`);
+    return;
   }
-  store.setActivationState(workflowId, "stopped");
+
+  // Commit schedule suppression and run stop intent before signalling any
+  // group. Attempt/orchestrator ownership remains protected until confirmed
+  // death allows the separate final-cancellation transaction.
+  store.tx(() => {
+    store.stopRun({ runId: run.run_id, now });
+    store.setActivationState(workflowId, "stopped");
+  });
+  const { reconcileStoppedIntent } = await import("./recovery.js");
+  const cancelled = await reconcileStoppedIntent({
+    store, runId: run.run_id, clock: new SystemClock(),
+  });
+  if (!cancelled) {
+    die(`stop intent recorded for ${run.run_id}, but a process group could not be confirmed dead; recovery will continue cancellation`);
+  }
+  process.stdout.write(`stopped ${workflowId}: run ${run.run_id} cancelled\n`);
 }
 
 /** Pause: suppress future occurrences; the current node finishes, then no successor. */
@@ -277,33 +275,25 @@ async function cmdResume(args: string[]): Promise<void> {
     case "orchestrator_unresolved": {
       // Re-resolve happens at next orchestrator claim; move the protected
       // phase back to pending so judgment can proceed.
-      store.releaseOrchestratorToPending(run.run_id, null, now);
+      store.operatorResetOrchestrator(run.run_id, now);
       store.setRunStatus(run.run_id, "running", now, null);
       break;
     }
     case "agent_requested":
     case "orchestrator":
     case "operator": {
-      // A fresh attempt when the node is repeat-safe; one manual bound extension.
+      // One transaction: clear the blocker and create the fresh retry attempt
+      // for the latest blocked attempt (by execution sequence). The retry
+      // carries one manual bound extension.
       const loaded = loadAndValidateDefinition(join(run.run_dir, "definition.yaml"));
-      const chain = loaded.chain;
-      const attempts = store.listAttempts(run.run_id).filter((a) => a.status === "blocked");
-      const blocked = attempts[attempts.length - 1];
-      if (!blocked) die("blocked run has no blocked attempt");
-      const fresh = store.createRetryAttempt({
-        runId: run.run_id,
-        nodeId: blocked.node_id,
-        previousAttempt: blocked.attempt,
-        resolvedMaxAttempts: blocked.resolved_max_attempts + 1, // one manual extension
-        resolvedTimeoutMs: blocked.resolved_timeout_ms,
-        chainPosition: loaded.chain.order.indexOf(blocked.node_id),
-        now,
-      });
-      if (fresh) {
-        const { scaffoldPacket, attemptDir } = await import("./worklog/worklog.js");
-        scaffoldPacket(attemptDir(run.run_dir, fresh.execution_seq, fresh.node_id), fresh.attempt, chain.next.get(blocked.node_id) ?? null);
-      }
-      store.setRunStatus(run.run_id, "running", now, null);
+      const fresh = store.resumeBlockedRun({ runId: run.run_id, now });
+      if (!fresh) die("blocked run has no blocked attempt");
+      const { scaffoldPacket, attemptDir } = await import("./worklog/worklog.js");
+      scaffoldPacket(
+        attemptDir(run.run_dir, fresh.execution_seq, fresh.node_id),
+        fresh.attempt,
+        loaded.chain.next.get(fresh.node_id) ?? null,
+      );
       break;
     }
     case "unknown_external":
@@ -356,15 +346,17 @@ async function recreateMissingSuccessor(
 function cmdStatus(args: string[]): void {
   const json = args.includes("--json");
   const positional = args.filter((a) => !a.startsWith("--"));
+  if (positional.length > 1) die("usage: workshop status [<workflow-id>] [--json]");
   const inst = findInstallation();
   const store = new Store(openDb(inst.dbPath));
-  const dto = buildStatusDto(store, new SystemClock().now());
+  const workflowId = positional[0];
+  if (workflowId && !store.getWorkflow(workflowId)) die(`no workflow "${workflowId}"`);
+  const dto = buildStatusDto(store, new SystemClock().now(), workflowId);
   if (json) {
     process.stdout.write(`${JSON.stringify(dto, null, 2)}\n`);
   } else {
-    process.stdout.write(renderTreeStatus(store));
+    process.stdout.write(renderTreeStatus(store, workflowId));
   }
-  void positional;
 }
 
 /** Internal agent-facing commands. Owner-authenticated via environment. */
@@ -413,7 +405,19 @@ function flagValue(args: string[], flag: string): string | null {
   return args[idx + 1] ?? null;
 }
 
-/** Most recent run by seq; prints its worklog, optionally tailing to completion. */
+/** The attempt's process-log files that exist: streams and validator streams. */
+function attemptStreamFiles(attemptFolder: string): string[] {
+  const candidates = [
+    join(attemptFolder, "stdout"),
+    join(attemptFolder, "stderr"),
+    join(attemptFolder, "validation", "stdout"),
+    join(attemptFolder, "validation", "stderr"),
+  ];
+  return candidates.filter((p) => existsSync(p));
+}
+
+/** Most recent run by seq; prints its worklog plus its attempt process logs
+ *  in chronological execution order, optionally tailing to completion. */
 async function cmdLogs(args: string[]): Promise<void> {
   const follow = args.includes("--follow");
   const workflowId = requireArg(args.filter((a) => !a.startsWith("--")), "workflow-id");
@@ -423,6 +427,19 @@ async function cmdLogs(args: string[]): Promise<void> {
   if (!run) die(`no runs for workflow "${workflowId}"`);
 
   process.stdout.write(readFileSync(run.worklog_path, "utf8"));
+
+  // Process logs in execution order: the run's chronological spine, one
+  // labeled block per stream (agent/validator stdout + stderr).
+  const attempts = store.listAttempts(run.run_id).sort((a, b) => a.execution_seq - b.execution_seq);
+  for (const attempt of attempts) {
+    const folder = attemptDir(run.run_dir, attempt.execution_seq, attempt.node_id);
+    for (const stream of attemptStreamFiles(folder)) {
+      const relative = stream.slice(run.run_dir.length + 1);
+      process.stdout.write(`\n── ${relative} ──\n`);
+      process.stdout.write(readFileSync(stream, "utf8"));
+    }
+  }
+
   if (!follow) return;
 
   // Tail: print appended worklog lines until the run reaches a terminal state.
@@ -451,11 +468,13 @@ function cmdDiagram(args: string[]): void {
   const loaded = loadAndValidateDefinition(wf.canonical_definition_hash === "" ? workflowPath(inst, workflowId) : join(run?.run_dir ?? "", "definition.yaml"));
   const nodeStatus = new Map<string, string>();
   if (run) {
+    const byNode = new Map<string, AttemptRow[]>();
     for (const attempt of store.listAttempts(run.run_id)) {
-      const existing = nodeStatus.get(attempt.node_id);
-      const rank = (s: string) => (s === "completed" ? 0 : s === "failed" || s === "blocked" || s === "cancelled" ? 1 : 2);
-      if (!existing || rank(attempt.status) < rank(existing)) nodeStatus.set(attempt.node_id, attempt.status);
+      const list = byNode.get(attempt.node_id) ?? [];
+      list.push(attempt);
+      byNode.set(attempt.node_id, list);
     }
+    for (const [id, attempts] of byNode) nodeStatus.set(id, deriveNodeStatus(attempts));
   }
 
   if (mermaid) {

@@ -7,12 +7,13 @@ import { canonicalHash } from "./definition/hash.js";
 import { validateChain, unresolvedAgentSites, type ChainInfo } from "./definition/validate.js";
 import { openDb } from "./store/db.js";
 import { Store, isTerminal, type RunRow } from "./store/store.js";
-import { attemptDir, atomicWriteFileSync, scaffoldPacket, scaffoldWorklog, worklogPath } from "./worklog/worklog.js";
+import { attemptDir, atomicWriteFileSync, scaffoldPacket } from "./worklog/worklog.js";
 import { executeAttempt, resolveNode } from "./runner/attempt.js";
-import { parseDuration, parseTimeout } from "./util/duration.js";
+import { parseTimeout } from "./util/duration.js";
 import { SystemClock, type Clock } from "./util/clock.js";
 import { spawnTracked } from "./runner/spawn.js";
 import { invokeOrchestrator } from "./orchestrator.js";
+import { admitManualRun } from "./admission.js";
 
 /** Deterministic Run outcome prose; the runtime owns this section. */
 function appendRunOutcome(run: RunRow, text: string): void {
@@ -40,6 +41,7 @@ export interface LoadedDefinition {
   chain: ChainInfo;
   canonicalHash: string;
   sourcePath: string;
+  sourceText: string;
 }
 
 export function loadAndValidateDefinition(sourcePath: string): LoadedDefinition {
@@ -52,7 +54,7 @@ export function loadAndValidateDefinition(sourcePath: string): LoadedDefinition 
   const raw = parseStrictYaml(src, sourcePath);
   const def = workflowSchema.parse(raw);
   const chain = validateChain(def);
-  return { def, chain, canonicalHash: canonicalHash(def), sourcePath };
+  return { def, chain, canonicalHash: canonicalHash(def), sourcePath, sourceText: src };
 }
 
 /** All start validation that must fail before any state exists. */
@@ -135,33 +137,18 @@ export async function startWorkflow(input: {
 
   const warnings = preflightValidation(def, inst);
 
-  const activation = store.upsertWorkflowActivation({
-    workflowId: def.id,
-    definitionPath: loaded.sourcePath,
-    definitionHash: loaded.canonicalHash,
-    every: def.schedule?.every ?? null,
-    maxRuns: def.schedule?.max_runs ?? 1,
-    now,
-  });
+  const admitted = admitManualRun({ store, inst, loaded, now });
+  if (!admitted.created) return { runId: admitted.runId, created: false, warnings };
 
-  const unresolved = store.getUnresolvedRun(def.id);
-  if (unresolved) return { runId: unresolved.run_id, created: false, warnings };
+  // Preflight runs after replayable admission is fully prepared; a failure
+  // blocks before any attempt exists.
+  await preflightIfNeeded({ store, inst, loaded, runId: admitted.runId, clock });
 
-  const runId = admitRun({ store, inst, loaded, clock });
-
-  // Preflight runs after scaffolding; a failure blocks before any attempt.
-  // A first success is cached against the canonical workflow hash.
-  await preflightIfNeeded({ store, inst, loaded, runId, clock });
-
-  // A blocked preflight leaves no initial attempt behind.
-  if (store.getRun(runId)!.status !== "blocked") {
-    scaffoldFirstAttempt({ store, inst, loaded, runId, now: clock.now() });
+  if (store.getRun(admitted.runId)!.status !== "blocked") {
+    scaffoldFirstAttempt({ store, inst, loaded, runId: admitted.runId, now: clock.now() });
   }
 
-  void activation;
-
-  void activation;
-  return { runId, created: true, warnings };
+  return { runId: admitted.runId, created: true, warnings };
 }
 
 export const preflightCacheDir = (inst: Installation): string => join(inst.stateDir, "preflight-cache");
@@ -240,46 +227,14 @@ export function scaffoldFirstAttempt(input: {
     chainPosition: loaded.chain.order.indexOf(startNode),
     now,
   });
-  scaffoldPacket(attemptDir(runDirOf(inst, runId), fresh.execution_seq, fresh.node_id), fresh.attempt, loaded.chain.next.get(startNode) ?? null);
+  const run = store.getRun(runId)!;
+  scaffoldPacket(attemptDir(run.run_dir, fresh.execution_seq, fresh.node_id), fresh.attempt, loaded.chain.next.get(startNode) ?? null);
 }
 
 export function runDirOf(inst: Installation, runId: string): string {
   return join(inst.runsDir, runId);
 }
 
-/** Admit the run row with snapshot + scaffolding in place. */
-function admitRun(input: {
-  store: Store;
-  inst: Installation;
-  loaded: LoadedDefinition;
-  clock: Clock;
-}): string {
-  const { store, inst, loaded, clock } = input;
-  const now = clock.now();
-  const everyMs = loaded.def.schedule ? parseDuration(loaded.def.schedule.every) : null;
-
-  const admitted = store.createRun({
-    workflowId: loaded.def.id,
-    definitionHash: loaded.canonicalHash,
-    definitionSnapshotPath: "",
-    runDir: "",
-    worklogPath: "",
-    now,
-    isRecurring: Boolean(loaded.def.schedule),
-    everyMs,
-  });
-
-  const run = store.getRun(admitted.runId)!;
-  const runDir = runDirOf(inst, run.run_id);
-  atomicWriteFileSync(join(runDir, "definition.yaml"), readFileSync(loaded.sourcePath, "utf8"));
-  scaffoldWorklog(runDir, loaded.def.id, loaded.def.description, loaded.chain.order);
-  store.tx(() => {
-    store.db
-      .query("UPDATE runs SET definition_snapshot_path = ?, run_dir = ?, worklog_path = ? WHERE run_id = ?")
-      .run(join(runDir, "definition.yaml"), runDir, worklogPath(runDir), run.run_id);
-  });
-  return run.run_id;
-}
 
 function appendEnvironmentObservation(inst: Installation, runId: string, observation: string): void {
   const logPath = join(runDirOf(inst, runId), "WORKSHOP_LOG.md");

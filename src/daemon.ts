@@ -1,20 +1,17 @@
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Installation } from "./config.js";
 import { Store, type RunRow } from "./store/store.js";
 import { openDb } from "./store/db.js";
 import { admitDueOccurrences } from "./scheduler.js";
-import { loadAndValidateDefinition } from "./execute.js";
+import { loadAndValidateDefinition, runChain, scaffoldFirstAttempt, preflightIfNeeded } from "./execute.js";
 import { recoverInstallation, loadSnapshot } from "./recovery.js";
-import { runChain, scaffoldFirstAttempt, preflightIfNeeded } from "./execute.js";
 import { invokeOrchestrator } from "./orchestrator.js";
+import { admitScheduledRun } from "./admission.js";
 import type { Clock } from "./util/clock.js";
 import { SystemClock } from "./util/clock.js";
-import { parseDuration } from "./util/duration.js";
-import { atomicWriteFileSync, scaffoldWorklog } from "./worklog/worklog.js";
-import { terminateProcessGroup } from "./util/process.js";
-import { runtimeCliInvocation } from "./util/cli-path.js";
 import { openSync, closeSync, rmSync, writeFileSync } from "node:fs";
+import { runtimeCliInvocation } from "./util/cli-path.js";
 
 /**
  * One deterministic guardian process per installation: polls SQLite, admits
@@ -104,39 +101,45 @@ export async function tick(input: { inst: Installation; clock?: Clock }): Promis
     store,
     workflowIds,
     clock,
-    createRun: (workflowId, now) => {
-      const run = admitScheduledRun({ store, inst, workflowId, now });
-      return run ? { runId: run } : null;
-    },
+    createRun: (workflowId, now) => admitScheduledRun({ store, inst, workflowId, now }),
   });
   for (const a of admissions) if (a.admitted) result.admitted.push(a.admitted);
 
-  // 3. Execute pending attempts within the concurrency pool. A queued run
-  // is bootstrapped (first attempt) and launched in the same tick.
-  let slots = inst.maxConcurrentRuns;
+  // 3. Bootstrap all prepared queued runs. Capacity controls claims, not
+  // pending work creation, so rejected work remains available next tick.
   for (const run of store.listUnresolvedRuns()) {
-    if (slots <= 0) break;
-    if (run.desired_state !== "running" || run.orchestrator_phase !== "idle") continue;
-
-    let live = store.getLiveAttempt(run.run_id);
-    if (!live) {
-      if (run.status !== "queued") continue;
+    if (run.admission_state !== "ready" || run.desired_state !== "running") continue;
+    if (!store.getLiveAttempt(run.run_id) && run.status === "queued") {
       await bootstrapFirstAttempt({ store, inst, run, clock });
-      live = store.getLiveAttempt(run.run_id);
-      if (!live || live.status !== "pending") continue;
     }
-    if (live.status !== "pending") continue;
+  }
 
-    const bundle = loadSnapshot(join(run.run_dir, "definition.yaml"));
-    slots--;
+  // 4. Protected exception judgment takes the same global run slots.
+  for (const run of store.listUnresolvedRuns()) {
+    const fresh = store.getRun(run.run_id)!;
+    if (fresh.admission_state !== "ready" || fresh.orchestrator_phase !== "pending" || fresh.desired_state !== "running") continue;
+    if (!store.hasExecutionCapacity(inst.maxConcurrentRuns)) break;
+    const bundle = loadSnapshot(fresh.definition_snapshot_path);
+    await invokeOrchestrator({ store, inst, def: bundle.def, chain: bundle.chain, run: fresh, clock, cliPath: runtimeCliInvocation() });
+    result.orchestrated.push(fresh.run_id);
+  }
+
+  // 5. Claims re-check global capacity inside BEGIN IMMEDIATE. The advisory
+  // check only keeps reporting honest and avoids launching doomed promises.
+  for (const run of store.listUnresolvedRuns()) {
+    if (!store.hasExecutionCapacity(inst.maxConcurrentRuns)) break;
+    const fresh = store.getRun(run.run_id)!;
+    if (fresh.admission_state !== "ready" || fresh.desired_state !== "running" || fresh.orchestrator_phase !== "idle") continue;
+    const live = store.getLiveAttempt(run.run_id);
+    if (!live || live.status !== "pending") continue;
+
+    const bundle = loadSnapshot(fresh.definition_snapshot_path);
     result.launched.push(`${run.run_id}/${live.node_id}`);
-    // In-process execution through the same guarded path the CLI uses;
-    // the promise is surfaced so tests and the daemon can await it.
     result.pending.push(
       runChain({
         store,
         inst,
-        loaded: { def: bundle.def, chain: bundle.chain, canonicalHash: "", sourcePath: "" },
+        loaded: { def: bundle.def, chain: bundle.chain, canonicalHash: fresh.definition_hash, sourcePath: fresh.definition_snapshot_path, sourceText: "" },
         runId: run.run_id,
         clock,
         cliPath: runtimeCliInvocation(),
@@ -144,53 +147,9 @@ export async function tick(input: { inst: Installation; clock?: Clock }): Promis
     );
   }
 
-  // 4. Invoke the orchestrator for protected failures.
-  for (const run of store.listUnresolvedRuns()) {
-    const fresh = store.getRun(run.run_id)!;
-    if (fresh.orchestrator_phase !== "pending" || fresh.desired_state !== "running") continue;
-    const bundle = loadSnapshot(join(fresh.run_dir, "definition.yaml"));
-    await invokeOrchestrator({ store, inst, def: bundle.def, chain: bundle.chain, run: fresh, clock, cliPath: runtimeCliInvocation() });
-    result.orchestrated.push(fresh.run_id);
-  }
-
   return result;
 }
 
-/** Admit one scheduled occurrence: snapshot, scaffold, preflight, first attempt. */
-function admitScheduledRun(input: {
-  store: Store;
-  inst: Installation;
-  workflowId: string;
-  now: Date;
-}): string | null {
-  const { store, inst, workflowId, now } = input;
-  const wf = store.getWorkflow(workflowId)!;
-  const definitionPath = wf.definition_path;
-  if (!definitionPath || !existsSync(definitionPath)) return null;
-
-  const loaded = loadAndValidateDefinition(definitionPath);
-  const everyMs = wf.schedule_every ? parseDuration(wf.schedule_every) : null;
-  const admitted = store.createRun({
-    workflowId,
-    definitionHash: loaded.canonicalHash,
-    definitionSnapshotPath: "",
-    runDir: "",
-    worklogPath: "",
-    now,
-    isRecurring: Boolean(wf.schedule_every),
-    everyMs,
-  });
-  const run = store.getRun(admitted.runId)!;
-  const runDir = join(inst.runsDir, run.run_id);
-  atomicWriteFileSync(join(runDir, "definition.yaml"), readFileSync(definitionPath, "utf8"));
-  scaffoldWorklog(runDir, loaded.def.id, loaded.def.description, loaded.chain.order);
-  store.tx(() => {
-    store.db
-      .query("UPDATE runs SET definition_snapshot_path = ?, run_dir = ?, worklog_path = ? WHERE run_id = ?")
-      .run(join(runDir, "definition.yaml"), runDir, join(runDir, "WORKSHOP_LOG.md"), run.run_id);
-  });
-  return run.run_id;
-}
 
 async function bootstrapFirstAttempt(input: {
   store: Store;
@@ -200,10 +159,12 @@ async function bootstrapFirstAttempt(input: {
 }): Promise<void> {
   const { store, inst, run, clock } = input;
   const fresh = store.getRun(run.run_id)!;
-  if (!existsSync(fresh.definition_snapshot_path)) return;
+  if (fresh.admission_state !== "ready") return;
   const loaded = loadAndValidateDefinition(fresh.definition_snapshot_path);
   await preflightIfNeeded({ store, inst, loaded, runId: run.run_id, clock });
-  scaffoldFirstAttempt({ store, inst, loaded, runId: run.run_id, now: clock.now() });
+  if (store.getRun(run.run_id)!.status !== "blocked" && !store.getLiveAttempt(run.run_id)) {
+    scaffoldFirstAttempt({ store, inst, loaded, runId: run.run_id, now: clock.now() });
+  }
 }
 
 /** Foreground daemon. Ctrl-C stops it; the lock releases on exit. */

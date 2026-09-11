@@ -1,5 +1,6 @@
 import type { Store, WorkflowRow, RunRow, AttemptRow } from "../store/store.js";
 import { isTerminal } from "../store/store.js";
+import { deriveNodeStatus } from "./node-status.js";
 import { loadSnapshot } from "../recovery.js";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
@@ -32,6 +33,28 @@ function clock(iso: string | null): string {
   return iso.slice(11, 19); // HH:MM:SS UTC
 }
 
+/** `next <UTC clock> (in <relative>)` for the activation line. Shows the UTC
+ *  date when the due time falls on another day. Overlap suppression may skip
+ *  a due time while a run is unresolved, so this is the schedule's next
+ *  admission, not a guaranteed start. */
+function nextRunFragment(iso: string): string {
+  const now = new Date();
+  const sameDay = iso.slice(0, 10) === now.toISOString().slice(0, 10);
+  const when = sameDay ? iso.slice(11, 19) : `${iso.slice(0, 10)} ${iso.slice(11, 19)}`;
+  return `next ${when} (${untilDue(new Date(iso).getTime() - now.getTime())})`;
+}
+
+function untilDue(ms: number): string {
+  if (ms <= 0) return "now";
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `in ${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `in ${m}m`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `in ${h}h ${m % 60}m`;
+  return `in ${Math.floor(h / 24)}d ${h % 24}h`;
+}
+
 /**
  * Word-wrap one rendered line to the terminal width. `contIndent` is added to
  * every continuation line so wrapped text stays inside the tree.
@@ -58,11 +81,15 @@ function wrap(text: string, contIndent: string): string[] {
   return out.map((l, i) => (i === 0 ? lead + l : contIndent + l));
 }
 
-export function renderTreeStatus(store: Store): string {
+export function renderTreeStatus(store: Store, workflowId?: string): string {
   const lines: string[] = [];
-  const workflows = store.listWorkflows();
+  const workflows = store
+    .listWorkflows()
+    .filter((wf) => !workflowId || wf.workflow_id === workflowId);
   if (workflows.length === 0) {
-    return "no workflows — start one with: workshop start <workflow-id>\n";
+    return workflowId
+      ? `no workflow "${workflowId}" — list known ids with: workshop status\n`
+      : "no workflows — start one with: workshop start <workflow-id>\n";
   }
 
   for (const wf of workflows) {
@@ -78,7 +105,10 @@ function renderWorkflow(store: Store, wf: WorkflowRow): string[] {
 
   const scheduled = wf.schedule_every != null;
   const bound = wf.schedule_max_runs == null ? "" : ` ${wf.schedule_started_runs}/${wf.schedule_max_runs}`;
-  const activation = scheduled ? `${glyph(wf.activation_state)} ${wf.activation_state}${bound}` : "one-shot";
+  let activation = scheduled ? `${glyph(wf.activation_state)} ${wf.activation_state}${bound}` : "one-shot";
+  if (scheduled && wf.activation_state === "active" && wf.next_run_at) {
+    activation += ` · ${nextRunFragment(wf.next_run_at)}`;
+  }
   lines.push(`${wf.workflow_id}  ${activation}`);
 
   if (runs.length === 0) {
@@ -87,9 +117,12 @@ function renderWorkflow(store: Store, wf: WorkflowRow): string[] {
   }
 
   // Collapse older terminal runs; render unresolved runs + the most recent.
+  // The first/only run may still be unresolved — there is no terminal run to
+  // show, and the collapse line disappears with it.
   const unresolved = runs.filter((r) => !isTerminal(r.status));
   const terminal = runs.filter((r) => isTerminal(r.status));
-  const shown = new Set<string>([...unresolved.map((r) => r.run_id), terminal[terminal.length - 1]!.run_id]);
+  const shown = new Set<string>(unresolved.map((r) => r.run_id));
+  if (terminal.length > 0) shown.add(terminal[terminal.length - 1]!.run_id);
   const collapsed = runs.length - shown.size;
   if (collapsed > 0) {
     lines.push(`   · ${collapsed} earlier completed run${collapsed === 1 ? "" : "s"}`);
@@ -132,7 +165,7 @@ function renderRun(store: Store, run: RunRow, isCurrent: boolean): string[] {
   nodeIds.forEach((id, index) => {
     const isLastNode = index === nodeIds.length - 1;
     const nodeAttempts = attempts.filter((a) => a.node_id === id).sort((a, b) => a.attempt - b.attempt);
-    const nodeStatus = nodeStatusOf(nodeAttempts);
+    const nodeStatus = deriveNodeStatus(nodeAttempts);
     const connector = isLastNode ? "└─" : "├─";
     // Children of a non-final node keep the spine (│); a final node's
     // children are plain-indented.
@@ -157,13 +190,4 @@ function renderAttempt(attempt: AttemptRow, childPrefix: string): string[] {
     lines.push(...wrap(`${label}${attempt.current_progress}`, " ".repeat(label.length)));
   }
   return lines;
-}
-
-function nodeStatusOf(attempts: AttemptRow[]): string {
-  const live = attempts.find((a) => ["pending", "running", "finishing"].includes(a.status));
-  if (live) return live.status === "pending" ? "pending" : "running";
-  for (const status of ["blocked", "failed", "cancelled", "completed"]) {
-    if (attempts.some((a) => a.status === status)) return status;
-  }
-  return "pending";
 }

@@ -1,16 +1,25 @@
 import { closeSync, openSync } from "node:fs";
 import { spawn } from "node:child_process";
-import { isProcessAlive, processStartId, terminateProcessGroup } from "../util/process.js";
+import { processStartId, terminateProcessGroup } from "../util/process.js";
+
+type ExitInfo = { code: number | null; signal: NodeJS.Signals | null };
 
 /**
  * Spawn the harness command in its own process group so the runtime can
- * terminate the whole tree on timeout, stop, or cancel.
+ * terminate the whole tree on timeout, stop, or cancel. The returned identity
+ * is what callers must durably record immediately after spawn: the pid is the
+ * group leader, the pgid equals it, and the startId disambiguates PID reuse.
  */
 export interface TrackedProcess {
   pid: number;
   pgid: number;
   startId: string;
-  exit: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
+  exit: Promise<ExitInfo>;
+  /**
+   * Terminate the whole process group and confirm every member is gone.
+   * Returns true only when the whole group was observed dead — a dead leader
+   * alone never counts, because descendants can outlive it.
+   */
   kill: (graceMs?: number) => Promise<boolean>;
 }
 
@@ -32,27 +41,42 @@ export function spawnTracked(input: {
       detached: true, // child becomes its own process-group leader
     });
     const pid = child.pid!;
-    const pgid = pid; // detached group leader
-    const startId = processStartId(pid) ?? "";
+    let identity: { pid: number; pgid: number; startId: string };
+    try {
+      identity = captureIdentity(pid);
+    } catch (e) {
+      try { process.kill(-pid, "SIGKILL"); } catch { /* already gone */ }
+      throw e;
+    }
 
-    const exit = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+    const exit = new Promise<ExitInfo>((resolve) => {
       child.on("exit", (code, signal) => resolve({ code, signal }));
       child.on("error", () => resolve({ code: -1, signal: null }));
     });
 
     return {
-      pid,
-      pgid,
-      startId,
+      ...identity,
       exit,
-      kill: async (graceMs?: number) => {
-        const confirmed = await terminateProcessGroup(pgid, graceMs ?? 2000);
-        return confirmed || !isProcessAlive(pid);
-      },
+      kill: async (graceMs?: number) => terminateProcessGroup(identity.pgid, graceMs ?? 2000),
     };
   } finally {
     // The child holds its own dup of each fd; closing ours now is safe.
     closeSync(stdout);
     closeSync(stderr);
   }
+}
+
+/**
+ * Capture the process-start identity right after spawn. `ps` metadata can lag
+ * the fork by a few milliseconds; recording an empty identity would leave
+ * recovery unable to verify (and therefore terminate) the recorded group.
+ */
+function captureIdentity(pid: number): { pid: number; pgid: number; startId: string } {
+  const wait = new Int32Array(new SharedArrayBuffer(4));
+  for (let i = 0; i < 40; i++) {
+    const startId = processStartId(pid);
+    if (startId !== null) return { pid, pgid: pid, startId };
+    Atomics.wait(wait, 0, 0, 5);
+  }
+  throw new Error(`cannot capture process-start identity for pid ${pid}`);
 }

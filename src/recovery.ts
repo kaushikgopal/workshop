@@ -1,31 +1,28 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
 import type { Installation } from "./config.js";
+import { canonicalHash } from "./definition/hash.js";
 import { validateChain, type ChainInfo } from "./definition/validate.js";
 import { workflowSchema, type WorkflowDefinition } from "./definition/schema.js";
 import { parseStrictYaml } from "./definition/parse.js";
 import { resolveNode } from "./runner/attempt.js";
 import type { Store } from "./store/store.js";
-import { isTerminal, type AttemptRow, type RunRow } from "./store/store.js";
+import { GuardRejected, type AttemptRow, type RunRow } from "./store/store.js";
+import { recoverAdmissions } from "./admission.js";
 import { isProcessAlive, processStartId, terminateProcessGroup } from "./util/process.js";
 import type { Clock } from "./util/clock.js";
 import {
   WorklogIntegrityError,
   attemptDir,
-  extractMarker,
   mergePacket,
-  orchestratorDir,
-  packetPath,
   scaffoldPacket,
-  validatePacket,
-  verifyMergeReceipt,
+  RunLock,
 } from "./worklog/worklog.js";
+import { recoverOrchestratorDecision } from "./orchestrator.js";
 
 /**
- * Deterministic recovery. A stale lease never authorizes reclaim by itself;
- * it starts terminate-and-confirm. Recovery transfers ownership by
- * compare-and-set and finalizes from durable evidence — completed nodes
- * never rerun.
+ * Deterministic recovery. A stale wrapper starts terminate-and-confirm; it
+ * never grants reclaim by itself. False/unknown death confirmation preserves
+ * ownership and process identity, so a replacement cannot overlap old work.
  */
 
 export interface SnapshotBundle {
@@ -33,7 +30,6 @@ export interface SnapshotBundle {
   chain: ChainInfo;
 }
 
-/** Load the validated snapshot a run executes against. */
 export function loadSnapshot(snapshotPath: string): SnapshotBundle {
   const raw = parseStrictYaml(readFileSync(snapshotPath, "utf8"), snapshotPath);
   const def = workflowSchema.parse(raw);
@@ -49,7 +45,6 @@ export interface RecoveryReport {
   skipped: string[];
 }
 
-/** Recover all stale work in one installation pass. */
 export async function recoverInstallation(input: {
   store: Store;
   inst: Installation;
@@ -64,12 +59,39 @@ export async function recoverInstallation(input: {
     skipped: [],
   };
 
-  for (const run of input.store.listUnresolvedRuns()) {
-    if (run.desired_state === "stopped") {
-      report.skipped.push(`${run.run_id} (stopped)`);
+  recoverAdmissions({ store: input.store, inst: input.inst, now: input.clock.now() });
+
+  const candidates = input.store.listUnresolvedRuns();
+  for (const run of candidates) {
+    if (run.admission_state !== "ready") {
+      report.skipped.push(`${run.run_id} (admission ${run.admission_state})`);
       continue;
     }
-    const bundle = loadSnapshot(join(run.run_dir, "definition.yaml"));
+
+    // Stopped intent is a recovery phase, not a terminal status. Reconcile all
+    // durable groups before final cancellation; never skip it.
+    if (run.desired_state === "stopped") {
+      await reconcileStoppedRun(input.store, run, input.clock, report);
+      continue;
+    }
+
+    let bundle: SnapshotBundle;
+    try {
+      bundle = loadSnapshot(run.definition_snapshot_path);
+      if (canonicalHash(bundle.def) !== run.definition_hash) {
+        throw new WorklogIntegrityError(`definition snapshot for ${run.run_id} does not match its reserved hash`);
+      }
+    } catch (e) {
+      const dead = await terminateAllRunGroups(input.store, run, input.clock);
+      if (!dead) {
+        report.skipped.push(`${run.run_id} (snapshot integrity; process death unconfirmed)`);
+        continue;
+      }
+      const message = e instanceof Error ? e.message : String(e);
+      input.store.failRunIntegrity(run.run_id, message, input.clock.now());
+      report.skipped.push(`${run.run_id} (snapshot integrity)`);
+      continue;
+    }
     await recoverRunPhases({ ...input, run, bundle, report });
   }
   return report;
@@ -85,7 +107,6 @@ async function recoverRunPhases(input: {
 }): Promise<void> {
   const { store, inst, run, bundle, clock, report } = input;
 
-  // 1. Stale node attempts (interrupted or left finishing).
   for (const attempt of store.listAttempts(run.run_id)) {
     if (attempt.status === "running") {
       await recoverRunningAttempt({ store, inst, run, attempt, bundle, clock, report });
@@ -94,23 +115,20 @@ async function recoverRunPhases(input: {
     }
   }
 
-  // 2. Stale orchestrator phases.
-  const fresh = store.getRun(run.run_id)!;
-  if (fresh.orchestrator_phase === "owned" || fresh.orchestrator_phase === "applying") {
-    if (orchestratorOwnerDead(fresh)) {
-      await killRecordedGroup(fresh.orchestrator_worker_pid);
-      const token = fresh.orchestrator_owner_token!;
-      const receipt = join(orchestratorDir(fresh.run_dir, token), "merge-receipt.json");
-      if (fresh.orchestrator_phase === "applying" && existsSync(receipt)) {
-        // The decision was applied; only the phase close is missing.
-        store.finishOrchestrator(fresh.run_id, clock.now());
-        report.orchestratorFinished.push(fresh.run_id);
-      } else {
-        store.releaseOrchestratorToPending(fresh.run_id, token, clock.now());
-        report.orchestratorReleased.push(fresh.run_id);
-      }
-    }
+  const fresh = store.getRun(run.run_id);
+  if (!fresh || (fresh.orchestrator_phase !== "owned" && fresh.orchestrator_phase !== "applying")) return;
+  if (orchestratorWrapperAlive(fresh)) {
+    report.skipped.push(`${run.run_id} (orchestrator wrapper alive)`);
+    return;
   }
+  if (!(await terminateOrchestratorGroup(store, fresh, clock))) {
+    report.skipped.push(`${run.run_id} (orchestrator process death unconfirmed)`);
+    return;
+  }
+  const reconciled = await recoverOrchestratorDecision({ store, chain: bundle.chain, run: fresh, clock });
+  if (reconciled === "released") report.orchestratorReleased.push(run.run_id);
+  else if (reconciled === "finished") report.orchestratorFinished.push(run.run_id);
+  else report.skipped.push(`${run.run_id} (orchestrator evidence protected)`);
 }
 
 async function recoverRunningAttempt(input: {
@@ -122,27 +140,31 @@ async function recoverRunningAttempt(input: {
   clock: Clock;
   report: RecoveryReport;
 }): Promise<void> {
-  const { store, inst, run, attempt, bundle, clock, report } = input;
-  if (workerIdentityAlive(attempt)) {
+  const { store, run, attempt, bundle, clock, report } = input;
+  if (wrapperIdentityAlive(attempt)) {
     report.skipped.push(`${run.run_id}/${attempt.node_id} #${attempt.attempt} (worker alive)`);
     return;
   }
+  if (!(await terminateAttemptGroups(store, attempt, clock))) {
+    report.skipped.push(`${run.run_id}/${attempt.node_id} #${attempt.attempt} (process death unconfirmed)`);
+    return;
+  }
 
-  // Stale lease: terminate-and-confirm the recorded process group first.
-  await killRecordedGroup(attempt.worker_process_group);
-
-  // A dead worker is the only automatically retryable technical interruption.
+  const ownerToken = store.getAttempt(run.run_id, attempt.node_id, attempt.attempt)?.owner_token;
+  if (!ownerToken) {
+    report.skipped.push(`${run.run_id}/${attempt.node_id} #${attempt.attempt} (owner missing)`);
+    return;
+  }
   const failed = store.failAttempt({
     runId: run.run_id,
     nodeId: attempt.node_id,
     attempt: attempt.attempt,
-    ownerToken: null,
+    ownerToken,
     failureKind: "interrupted",
-    protectForOrchestration: false, // a dead worker auto-retries within policy
+    protectForOrchestration: false,
     now: clock.now(),
   });
   if (!failed.failed) return;
-
 
   const retried = store.createRetryAttempt({
     runId: run.run_id,
@@ -154,12 +176,18 @@ async function recoverRunningAttempt(input: {
     now: clock.now(),
   });
   if (retried) {
-    scaffoldPacket(attemptDir(run.run_dir, retried.execution_seq, retried.node_id), retried.attempt, bundle.chain.next.get(attempt.node_id) ?? null);
+    scaffoldPacket(
+      attemptDir(run.run_dir, retried.execution_seq, retried.node_id),
+      retried.attempt,
+      bundle.chain.next.get(attempt.node_id) ?? null,
+    );
     report.interruptedRetried.push(`${run.run_id}/${attempt.node_id} #${retried.attempt}`);
   } else {
-    // Bound exhausted: protect for orchestration.
     store.db
-      .query("UPDATE runs SET orchestrator_phase = 'pending', orchestrator_owner_token = NULL, updated_at = ? WHERE run_id = ? AND orchestrator_phase = 'idle'")
+      .query(
+        `UPDATE runs SET orchestrator_phase = 'pending', orchestrator_owner_token = NULL, updated_at = ?
+         WHERE run_id = ? AND orchestrator_phase = 'idle' AND desired_state = 'running'`,
+      )
       .run(clock.now().toISOString(), run.run_id);
     report.interruptedProtected.push(`${run.run_id}/${attempt.node_id}`);
   }
@@ -175,18 +203,25 @@ async function recoverFinishingAttempt(input: {
   report: RecoveryReport;
 }): Promise<void> {
   const { store, inst, run, attempt, bundle, clock, report } = input;
-  if (workerIdentityAlive(attempt)) {
+  if (wrapperIdentityAlive(attempt)) {
     report.skipped.push(`${run.run_id}/${attempt.node_id} #${attempt.attempt} (finishing owner alive)`);
     return;
   }
+  if (!(await terminateAttemptGroups(store, attempt, clock))) {
+    report.skipped.push(`${run.run_id}/${attempt.node_id} #${attempt.attempt} (process death unconfirmed)`);
+    return;
+  }
 
-  // Terminate-and-confirm, then transfer ownership to a recovery owner.
-  await killRecordedGroup(attempt.worker_process_group);
+  const prior = store.getAttempt(run.run_id, attempt.node_id, attempt.attempt)?.owner_token;
+  if (!prior) {
+    report.skipped.push(`${run.run_id}/${attempt.node_id} #${attempt.attempt} (owner missing)`);
+    return;
+  }
   const newToken = store.transferFinishingOwner({
     runId: run.run_id,
     nodeId: attempt.node_id,
     attempt: attempt.attempt,
-    priorOwnerToken: attempt.owner_token!,
+    priorOwnerToken: prior,
     now: clock.now(),
   });
   if (!newToken) {
@@ -194,51 +229,33 @@ async function recoverFinishingAttempt(input: {
     return;
   }
 
-  // Verify the receipt — or idempotently perform the missing merge — then
-  // finalize from durable evidence without rerunning the node.
   const attemptFolder = attemptDir(run.run_dir, attempt.execution_seq, attempt.node_id);
-  let receipt = verifyMergeReceipt(attemptFolder);
-  if (!receipt) {
-    const packetFile = packetPath(attemptFolder);
-    try {
-      validatePacket(packetFile, attempt.node_id, attempt.attempt, bundle.chain.next.get(attempt.node_id) ?? null);
-    } catch (e) {
-      if (!(e instanceof WorklogIntegrityError)) throw e;
-      // The packet cannot be trusted for merge: fail as worklog_integrity
-      // and let the orchestrator judge.
-      store.failAttempt({
-        runId: run.run_id,
-        nodeId: attempt.node_id,
-        attempt: attempt.attempt,
-        ownerToken: null,
-        failureKind: "worklog_integrity",
-        now: clock.now(),
-      });
-      return;
-    }
-    receipt = mergePacket({
-      runDir: run.run_dir,
+  const integrityFail = (message: string): void => {
+    const fresh = store.getAttempt(run.run_id, attempt.node_id, attempt.attempt);
+    if (fresh?.owner_token !== newToken) return;
+    store.failAttempt({
       runId: run.run_id,
       nodeId: attempt.node_id,
       attempt: attempt.attempt,
-      attemptFolder,
-      successorId: bundle.chain.next.get(attempt.node_id) ?? null,
       ownerToken: newToken,
+      failureKind: "worklog_integrity",
+      validatorReason: message,
       now: clock.now(),
     });
-  }
+  };
 
-  // Node output from the packet — durable evidence, never a rerun.
-  const packetFile = packetPath(attemptFolder);
-  const packet = readFileSync(packetFile, "utf8");
-  const usesWorkflowOutput = packet.includes("<workflow-output>");
-  const opening = usesWorkflowOutput ? "<workflow-output>" : /<next-node-output id="[^"]*">/.exec(packet)?.[0] ?? "";
-  const closing = usesWorkflowOutput ? "</workflow-output>" : "</next-node-output>";
-  let output = extractMarker(packet, opening, closing);
-  if (output.trim() === "") output = packet;
-  mkdirSync(attemptFolder, { recursive: true });
-  const outputFile = join(attemptFolder, "output");
-  writeFileSync(outputFile, output, "utf8");
+  // S9: the finishing row bound the output path and validator verdict at
+  // running → finishing; recovery consumes those fields as-is. A missing
+  // row-bound output file is a fail-closed integrity fault, never a rerun.
+  const finishing = store.getAttempt(run.run_id, attempt.node_id, attempt.attempt)!;
+  if (!finishing.node_output_path) {
+    integrityFail(`finishing attempt ${attempt.node_id} #${attempt.attempt} has no bound output path`);
+    return;
+  }
+  if (!existsSync(finishing.node_output_path)) {
+    integrityFail(`bound output file for ${attempt.node_id} #${attempt.attempt} is missing at ${finishing.node_output_path}`);
+    return;
+  }
 
   const successorId = bundle.chain.next.get(attempt.node_id) ?? null;
   const successor = successorId
@@ -252,49 +269,150 @@ async function recoverFinishingAttempt(input: {
         };
       })()
     : null;
+
+  const lock = new RunLock(run.run_dir);
   try {
+    await lock.acquire();
+    // S10: the marked-block receipt makes this idempotent — a block present
+    // without a receipt is verified and the receipt recreated, never re-appended.
+    mergePacket({
+      runDir: run.run_dir,
+      runId: run.run_id,
+      nodeId: attempt.node_id,
+      attempt: attempt.attempt,
+      attemptFolder,
+      successorId,
+      ownerToken: newToken,
+      now: clock.now(),
+    });
     store.completeAttempt({
       runId: run.run_id,
       nodeId: attempt.node_id,
       attempt: attempt.attempt,
       ownerToken: newToken,
-      nodeOutputPath: outputFile,
-      validatorStatus: attempt.validator_status,
-      validatorReason: attempt.validator_reason,
       now: clock.now(),
       successor,
     });
-    report.finishingRecovered.push(`${run.run_id}/${attempt.node_id} #${attempt.attempt}`);
-  } catch {
-    report.skipped.push(`${run.run_id}/${attempt.node_id} #${attempt.attempt} (completion guard rejected)`);
+  } catch (e) {
+    if (e instanceof WorklogIntegrityError) {
+      integrityFail(e.message);
+      return;
+    }
+    if (e instanceof GuardRejected) {
+      report.skipped.push(`${run.run_id}/${attempt.node_id} #${attempt.attempt} (completion guard rejected)`);
+      return;
+    }
+    throw e;
+  } finally {
+    lock.release();
+  }
+
+  if (successorId) {
+    const row = store.getAttempt(run.run_id, successorId, 1);
+    if (row) {
+      scaffoldPacket(
+        attemptDir(run.run_dir, row.execution_seq, row.node_id),
+        row.attempt,
+        bundle.chain.next.get(successorId) ?? null,
+      );
+    }
+  }
+  report.finishingRecovered.push(`${run.run_id}/${attempt.node_id} #${attempt.attempt}`);
+}
+
+async function reconcileStoppedRun(store: Store, run: RunRow, clock: Clock, report: RecoveryReport): Promise<void> {
+  if (!(await terminateAllRunGroups(store, run, clock))) {
+    report.skipped.push(`${run.run_id} (stopped; process death unconfirmed)`);
+    return;
+  }
+  if (!store.finalizeStoppedRun({ runId: run.run_id, now: clock.now() })) {
+    report.skipped.push(`${run.run_id} (stopped; cancellation still protected)`);
   }
 }
 
-/**
- * Wrapper identity check — the claimer that collects evidence. The harness
- * child being alive is irrelevant once its wrapper is gone: nobody will
- * collect its result. Pid liveness plus matching process-start identity.
- */
-function workerIdentityAlive(attempt: AttemptRow): boolean {
-  const pid = attempt.wrapper_pid ?? attempt.worker_pid;
-  const startId = attempt.wrapper_process_start_id ?? attempt.worker_process_start_id;
-  if (pid === null) return false;
-  if (!isProcessAlive(pid)) return false;
-  if (!startId) return true; // identity unknown; assume alive
-  return processStartId(pid) === startId;
+/** Reconcile one already-persisted stop intent; used by CLI and recovery. */
+export async function reconcileStoppedIntent(input: {
+  store: Store; runId: string; clock: Clock;
+}): Promise<boolean> {
+  const run = input.store.getRun(input.runId);
+  if (!run || run.desired_state !== "stopped") return false;
+  if (!(await terminateAllRunGroups(input.store, run, input.clock))) return false;
+  return input.store.finalizeStoppedRun({ runId: run.run_id, now: input.clock.now() });
 }
 
-function orchestratorOwnerDead(run: RunRow): boolean {
-  if (run.orchestrator_worker_pid === null) return true;
-  return !isProcessAlive(run.orchestrator_worker_pid);
+async function terminateAllRunGroups(store: Store, run: RunRow, clock: Clock): Promise<boolean> {
+  for (const attempt of store.listAttempts(run.run_id)) {
+    if (!(await terminateAttemptGroups(store, attempt, clock))) return false;
+  }
+  const fresh = store.getRun(run.run_id);
+  return fresh ? terminateOrchestratorGroup(store, fresh, clock) : false;
 }
 
-async function killRecordedGroup(pgid: number | null): Promise<void> {
-  if (pgid === null) return;
-  await terminateProcessGroup(pgid);
+async function terminateAttemptGroups(store: Store, attempt: AttemptRow, clock: Clock): Promise<boolean> {
+  for (const role of ["validator", "worker"] as const) {
+    const fresh = store.getAttempt(attempt.run_id, attempt.node_id, attempt.attempt);
+    if (!fresh) return false;
+    const pid = role === "worker" ? fresh.worker_pid : fresh.validator_pid;
+    const startId = role === "worker" ? fresh.worker_process_start_id : fresh.validator_process_start_id;
+    const pgid = role === "worker" ? fresh.worker_process_group : fresh.validator_process_group;
+    if (pgid === null) continue;
+    if (pid === null || !startId) return false;
+    if (!(await terminateRecordedGroup(pid, startId, pgid))) return false;
+    if (!store.confirmAttemptProcessStopped({
+      runId: fresh.run_id,
+      nodeId: fresh.node_id,
+      attempt: fresh.attempt,
+      role,
+      pid,
+      startId,
+      pgid,
+      now: clock.now(),
+    })) {
+      const after = store.getAttempt(fresh.run_id, fresh.node_id, fresh.attempt);
+      const remaining = role === "worker" ? after?.worker_process_group : after?.validator_process_group;
+      if (remaining !== null) return false;
+    }
+  }
+  return true;
 }
 
-/** True when the run row is beyond help. */
-export function runIsTerminal(run: RunRow): boolean {
-  return isTerminal(run.status);
+async function terminateOrchestratorGroup(store: Store, run: RunRow, clock: Clock): Promise<boolean> {
+  const fresh = store.getRun(run.run_id);
+  if (!fresh || fresh.orchestrator_process_group === null) return true;
+  if (fresh.orchestrator_worker_pid === null || !fresh.orchestrator_worker_process_start_id) return false;
+  if (!(await terminateRecordedGroup(
+    fresh.orchestrator_worker_pid,
+    fresh.orchestrator_worker_process_start_id,
+    fresh.orchestrator_process_group,
+  ))) return false;
+  if (store.confirmOrchestratorProcessStopped({
+    runId: fresh.run_id,
+    childPid: fresh.orchestrator_worker_pid,
+    childStartId: fresh.orchestrator_worker_process_start_id,
+    childPgid: fresh.orchestrator_process_group,
+    now: clock.now(),
+  })) return true;
+  return store.getRun(fresh.run_id)?.orchestrator_process_group === null;
+}
+
+async function terminateRecordedGroup(pid: number, startId: string, pgid: number): Promise<boolean> {
+  const current = processStartId(pid);
+  // A live PID with another start identity may be an unrelated reused PID.
+  // Never signal its group and never call that uncertainty "dead".
+  if (current !== null && current !== startId) return false;
+  return terminateProcessGroup(pgid);
+}
+
+function wrapperIdentityAlive(attempt: AttemptRow): boolean {
+  const pid = attempt.wrapper_pid;
+  const startId = attempt.wrapper_process_start_id;
+  if (pid === null || !isProcessAlive(pid)) return false;
+  return startId ? processStartId(pid) === startId : true;
+}
+
+function orchestratorWrapperAlive(run: RunRow): boolean {
+  const pid = run.orchestrator_wrapper_pid;
+  const startId = run.orchestrator_wrapper_process_start_id;
+  if (pid === null || !isProcessAlive(pid)) return false;
+  return startId ? processStartId(pid) === startId : true;
 }

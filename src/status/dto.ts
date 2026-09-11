@@ -1,4 +1,5 @@
 import type { Store, WorkflowRow, RunRow, AttemptRow } from "../store/store.js";
+import { deriveNodeStatus } from "./node-status.js";
 
 /**
  * Stable versioned status DTO — the viewer contract (POC-C). Shape is version
@@ -53,8 +54,11 @@ export interface StatusDto {
   workflows: WorkflowStatusDto[];
 }
 
-export function buildStatusDto(store: Store, now: Date): StatusDto {
-  const workflows = store.listWorkflows().map((wf) => buildWorkflowDto(store, wf, now));
+export function buildStatusDto(store: Store, now: Date, workflowId?: string): StatusDto {
+  const workflows = store
+    .listWorkflows()
+    .filter((wf) => !workflowId || wf.workflow_id === workflowId)
+    .map((wf) => buildWorkflowDto(store, wf, now));
   return { version: STATUS_DTO_VERSION, workflows };
 }
 
@@ -96,7 +100,7 @@ export function buildRunDto(store: Store, run: RunRow): RunStatusDto {
 }
 
 function buildNodeDto(attempts: AttemptRow[], id: string): NodeStatusDto {
-  const status = nodeStatusFromAttempts(attempts);
+  const status = deriveNodeStatus(attempts);
   return {
     id,
     status,
@@ -112,15 +116,4 @@ function buildNodeDto(attempts: AttemptRow[], id: string): NodeStatusDto {
         blocker: a.block_kind,
       })),
   };
-}
-
-/** Node status derived from its attempts; live attempt dominates. */
-function nodeStatusFromAttempts(attempts: AttemptRow[]): string {
-  const live = attempts.find((a) => ["pending", "running", "finishing"].includes(a.status));
-  if (live) return live.status === "pending" ? "pending" : "running";
-  if (attempts.some((a) => a.status === "blocked")) return "blocked";
-  if (attempts.some((a) => a.status === "completed")) return "completed";
-  if (attempts.some((a) => a.status === "failed")) return "failed";
-  if (attempts.some((a) => a.status === "cancelled")) return "cancelled";
-  return "pending";
 }
