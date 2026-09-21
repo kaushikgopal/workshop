@@ -22,6 +22,13 @@ defaults:
 
     model: "openai-codex/gpt-5.3-codex:medium"
 
+orchestrator:
+  agent:
+    harness:
+      command: 'pi --print --mode json --approve --no-session --model "$WORKSHOP_MODEL_WITH_THINKING" -- "$(cat "$WORKSHOP_PROMPT_FILE")"'
+    model: "instacart-openai/gpt-5.6-luna:low"
+  timeout: 5m
+
 environment:
   preflight:
     command: 'command -v pi >/dev/null'
@@ -41,19 +48,29 @@ nodes:
       agent:
         instructions: |
           Read your assigned work packet and the previous node handoff.
-          Generate one original Hemingway-inspired sentence.
+          Before generating, read .workshop/config/workflows/hemingway.quotes.md if it exists.
+          Generate one original Hemingway-inspired sentence that is materially distinct
+          from every archived line: do not repeat or closely paraphrase a prior line's
+          central subject/situation, concrete imagery, key wording, or sentence
+          structure; changing only synonyms is insufficient.
           Do not claim that it is a real Hemingway quotation.
           Record progress only in your assigned packet file.
           Keep the packet's scaffolded headings (#### Attempt, ##### Progress,
           ##### Decisions, ##### Validation, ##### Blockers) intact.
-          Put the final sentence inside the <workflow-output> block.
+          Put the final sentence between the packet's scaffolded output marker lines.
 
     validator:
       agent:
         model: "openai-codex/gpt-5.3-codex:high"
         instructions: |
-          Pass only if the workflow output contains one original sentence,
-          does not attribute it to Hemingway, and is valid Markdown.
+          Read .workshop/config/workflows/hemingway.quotes.md if it exists and
+          independently compare the candidate against every archived line before passing.
+          Pass only if the workflow output is one original sentence, does not
+          attribute it to Hemingway, is valid Markdown, and is materially distinct
+          from every archived line on the same dimensions: central subject/situation,
+          concrete imagery, key wording, sentence structure.
+          Fail a same-scene, same-image, or same-structure paraphrase even when
+          synonyms differ.
 
     max_attempts: 2
     next: node-append-quote

@@ -12,7 +12,6 @@ import {
 import { loadAndValidateDefinition, startWorkflow } from "../src/execute.js";
 import { findInstallation, ensureDirs } from "../src/config.js";
 import { SystemClock } from "../src/util/clock.js";
-import { attemptDir, packetPath } from "../src/worklog/worklog.js";
 
 const MOCK = mockAgentHarness();
 
@@ -198,8 +197,11 @@ describe("gate 4 — scaffolding", () => {
     }
     expect(log).toContain("preflight"); // environment observation recorded
 
-    // First packet scaffolded with the authorized handoff marker.
-    const firstPacket = packetPath(attemptDir(join(inst.stateDir, "runs", started.runId), 1, "node-cmd"));
+    // First packet scaffolded in the ordered-node layout: one-based chain
+    // position prefixes the node folder, the one-based attempt the child.
+    const firstPacket = join(
+      inst.stateDir, "runs", started.runId, "nodes", "001-node-cmd", "attempt-001", "packet.md",
+    );
     expect(existsSync(firstPacket)).toBe(true);
     const packet = readFileSync(firstPacket, "utf8");
     expect(packet).toContain("#### Attempt 1");
@@ -424,7 +426,7 @@ describe("prompt hardening — marker preservation", () => {
     const runId = r.stdout.match(/\S+-\d{8}-\d{3}/)![0];
 
     const prompt = readFileSync(
-      join(inst.root, ".workshop/state/runs", runId, "attempts", "002-node-agent", "prompt"),
+      join(inst.root, ".workshop/state/runs", runId, "nodes", "002-node-agent", "attempt-001", "prompt"),
       "utf8",
     );
     expect(prompt).toContain("never delete, rename, or move");

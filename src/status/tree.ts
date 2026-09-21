@@ -28,20 +28,37 @@ function glyph(status: string): string {
   return GLYPH[status] ?? "○";
 }
 
-function clock(iso: string | null): string {
-  if (!iso) return "";
-  return iso.slice(11, 19); // HH:MM:SS UTC
+function twoDigits(n: number): string {
+  return String(n).padStart(2, "0");
 }
 
-/** `next <UTC clock> (in <relative>)` for the activation line. Shows the UTC
- *  date when the due time falls on another day. Overlap suppression may skip
- *  a due time while a run is unresolved, so this is the schedule's next
- *  admission, not a guaranteed start. */
+/** Machine-local `HH:MM:SS`. Date getters, not `toLocaleTimeString`, so the
+ *  output never varies with locale and never produces a `24:00` hour. */
+function localClock(iso: string): string {
+  const d = new Date(iso);
+  return `${twoDigits(d.getHours())}:${twoDigits(d.getMinutes())}:${twoDigits(d.getSeconds())}`;
+}
+
+/** Machine-local `YYYY-MM-DD`. */
+function localDate(d: Date): string {
+  return `${d.getFullYear()}-${twoDigits(d.getMonth() + 1)}-${twoDigits(d.getDate())}`;
+}
+
+function clock(iso: string | null): string {
+  if (!iso) return "";
+  return localClock(iso);
+}
+
+/** `next <local clock> (in <relative>)` for the activation line. Shows the
+ *  local date when the due time falls on another local calendar day. Overlap
+ *  suppression may skip a due time while a run is unresolved, so this is the
+ *  schedule's next admission, not a guaranteed start. */
 function nextRunFragment(iso: string): string {
+  const due = new Date(iso);
   const now = new Date();
-  const sameDay = iso.slice(0, 10) === now.toISOString().slice(0, 10);
-  const when = sameDay ? iso.slice(11, 19) : `${iso.slice(0, 10)} ${iso.slice(11, 19)}`;
-  return `next ${when} (${untilDue(new Date(iso).getTime() - now.getTime())})`;
+  const sameDay = localDate(due) === localDate(now);
+  const when = sameDay ? localClock(iso) : `${localDate(due)} ${localClock(iso)}`;
+  return `next ${when} (${untilDue(due.getTime() - now.getTime())})`;
 }
 
 function untilDue(ms: number): string {

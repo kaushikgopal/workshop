@@ -35,19 +35,37 @@ export function worklogPath(runDir: string): string {
   return join(runDir, "WORKSHOP_LOG.md");
 }
 
-/**
- * Attempt-scoped layout: chronological per-run execution folders under
- * attempts/ — attempts/001-node-timestamp/, attempts/002-node-generate-line/.
- * Everything about one execution lives there: packet, streams, output,
- * prompt, validation/, and its merge receipt. The sequence is per run, not
- * per node; a node's own attempt number stays in the DB and packet content.
- */
-function attemptFolderName(executionSeq: number, nodeId: string): string {
-  return `${String(executionSeq).padStart(3, "0")}-${nodeId}`;
+/** Three-digit zero-padding is the layout's only width (001, 002, …). */
+function pad3(value: number): string {
+  return String(value).padStart(3, "0");
 }
 
-export function attemptDir(runDir: string, executionSeq: number, nodeId: string): string {
-  return join(runDir, "attempts", attemptFolderName(executionSeq, nodeId));
+/**
+ * Attempt-scoped layout: node evidence grouped under nodes/, one folder per
+ * chain node — nodes/001-node-timestamp/attempt-001/. The node folder prefix
+ * is the one-based zero-padded chain position (chain_position + 1); the child
+ * folder is the one-based zero-padded node attempt, so chain position and a
+ * node's retry count have distinct visible meanings. The global execution
+ * order stays in SQLite (execution_seq) — never in a path. Everything about
+ * one attempt lives in its folder: packet, streams, output, prompt,
+ * validation/, and its merge receipt.
+ */
+export function attemptDir(
+  runDir: string,
+  chainPosition: number,
+  nodeId: string,
+  attempt: number,
+): string {
+  return join(runDir, "nodes", `${pad3(chainPosition + 1)}-${nodeId}`, `attempt-${pad3(attempt)}`);
+}
+
+/**
+ * An existing attempt's folder is wherever its persisted packet_path puts it.
+ * The stored path is authoritative: pre-layout evidence under attempts/ is
+ * read, repaired, and logged in place — never re-derived from this layout.
+ */
+export function attemptFolderOfPacket(packetFile: string): string {
+  return dirname(packetFile);
 }
 
 export function packetPath(attemptFolder: string): string {
@@ -142,8 +160,34 @@ export interface PacketCheck {
 }
 
 /**
+ * The live structural marker pair. Only lines whose trimmed content is
+ * exactly the authorized marker are structural delimiters — a packet may
+ * quote the literal marker text inside ordinary prose (the first real
+ * Hemingway packet did), and quoted prose must never count as structure.
+ * A live pair is exactly one standalone opening line strictly before
+ * exactly one standalone closing line; anything else fails closed.
+ */
+function markerPair(
+  content: string,
+  marker: { opening: string; closing: string },
+): { live: true; openingLine: number; closingLine: number } | { live: false; openings: number; closings: number } {
+  const openings: number[] = [];
+  const closings: number[] = [];
+  for (const [line, text] of content.split("\n").entries()) {
+    const trimmed = text.trim();
+    if (trimmed === marker.opening) openings.push(line);
+    else if (trimmed === marker.closing) closings.push(line);
+  }
+  if (openings.length === 1 && closings.length === 1 && openings[0]! < closings[0]!) {
+    return { live: true, openingLine: openings[0]!, closingLine: closings[0]! };
+  }
+  return { live: false, openings: openings.length, closings: closings.length };
+}
+
+/**
  * Validate a finished packet before merge. Ownership is the gate:
- * - exactly one authorized marker with its closing tag (spec §8);
+ * - exactly one standalone authorized opening line whose closing line
+ *   follows it (spec §8); marker text quoted in prose never counts;
  * - no headings that own runtime sections (#, ##, ###).
  * Formatting drift inside the attempt block — dropped or extra ####/#####
  * headings — is tolerated; the merge normalizes the attempt heading.
@@ -160,41 +204,48 @@ export function validatePacket(packetFile: string, nodeId: string, attempt: numb
     }
   }
 
-  const openingCount = countOccurrences(content, marker.opening);
-  const closingCount = countOccurrences(content, marker.closing);
-  if (openingCount !== 1 || closingCount !== 1) {
+  const pair = markerPair(content, marker);
+  if (!pair.live) {
     throw new WorklogIntegrityError(
-      `packet for ${nodeId} #${attempt} must contain exactly its scaffolded ${marker.opening} marker ` +
-        `(found ${openingCount} openings, ${closingCount} closings)`,
+      `packet for ${nodeId} #${attempt} must contain exactly one standalone ${marker.opening} marker ` +
+        `followed by its ${marker.closing} closing line ` +
+        `(found ${pair.openings} standalone openings, ${pair.closings} standalone closings)`,
     );
   }
 }
 
-/** Escape extra reserved marker openings/closings so only the authorized pair is live. */
+/**
+ * Escape every reserved marker occurrence except the one live standalone
+ * authorized pair, whose lines survive verbatim: prose may quote markers,
+ * unauthorized marker lines may exist, but only the structural pair may
+ * stay live after a merge.
+ */
 export function escapeReservedMarkers(content: string, keep: { opening: string; closing: string }): string {
-  // Pull the authorized pair out of the escaping pass with placeholders,
-  // then escape every other reserved marker occurrence.
-  const OPEN = "\u0000workshop-keep-open\u0000";
-  const CLOSE = "\u0000workshop-keep-close\u0000";
-  let out = content.replace(keep.opening, OPEN).replace(keep.closing, CLOSE);
-  out = out
+  const pair = markerPair(content, keep);
+  const liveLines = pair.live ? new Set([pair.openingLine, pair.closingLine]) : new Set<number>();
+  return content
+    .split("\n")
+    .map((line, i) => (liveLines.has(i) ? line : escapeReservedMarkerLine(line)))
+    .join("\n");
+}
+
+/** Escape every reserved marker occurrence on one non-structural line. */
+function escapeReservedMarkerLine(line: string): string {
+  return line
     .replaceAll("<workflow-output>", "\\<workflow-output>")
     .replaceAll("</workflow-output>", "\\</workflow-output>")
     .replace(/<next-node-output id="[^"]*">/g, (m) => `\\${m}`)
     .replaceAll("</next-node-output>", "\\</next-node-output>")
     // Runtime merge markers: packet prose must never mint a live one.
     .replace(/<!-- workshop:merge (?:begin|end)/g, (m) => `\\${m}`);
-  return out.replaceAll(OPEN, keep.opening).replaceAll(CLOSE, keep.closing);
 }
 
-/** Pull the text inside a marker pair, trimmed. */
+/** Pull the text between the live standalone marker pair, trimmed. */
 export function extractMarker(content: string, opening: string, closing: string): string {
-  const start = content.indexOf(opening);
-  if (start === -1) return "";
-  const from = start + opening.length;
-  const end = content.indexOf(closing, from);
-  if (end === -1) return "";
-  return content.slice(from, end).trim();
+  const pair = markerPair(content, { opening, closing });
+  if (!pair.live) return "";
+  const lines = content.split("\n");
+  return lines.slice(pair.openingLine + 1, pair.closingLine).join("\n").trim();
 }
 
 export function sha256File(path: string): string {
@@ -624,16 +675,6 @@ function sectionFor(log: string, nodeHeading: string): string {
     ? nodeIdx + nodeHeading.length + 1 + (nextHeading.index ?? 0)
     : log.length;
   return log.slice(nodeIdx, end);
-}
-
-function countOccurrences(haystack: string, needle: string): number {
-  let count = 0;
-  let idx = haystack.indexOf(needle);
-  while (idx !== -1) {
-    count++;
-    idx = haystack.indexOf(needle, idx + needle.length);
-  }
-  return count;
 }
 
 /** Create missing pristine evidence; refuse any existing byte mismatch. */

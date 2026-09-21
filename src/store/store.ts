@@ -482,20 +482,20 @@ export class Store {
     return (row?.m ?? 0) + 1;
   }
 
-  /** The attempt folder derives from the run row's directory + execution number. */
-  private packetPathFor(runId: string, executionSeq: number, nodeId: string): string {
+  /** The packet path is minted once per row from the ordered-node layout. */
+  private packetPathFor(runId: string, chainPosition: number, nodeId: string, attempt: number): string {
     const run = this.getRun(runId);
     if (!run) throw new GuardRejected(`no run "${runId}"`);
-    return join(attemptDir(run.run_dir, executionSeq, nodeId), "packet.md");
+    return join(attemptDir(run.run_dir, chainPosition, nodeId, attempt), "packet.md");
   }
 
-  /** One pending-attempt insert; the packet path derives from the run row. */
+  /** One pending-attempt insert; the packet path comes from packetPathFor. */
   private insertPendingAttempt(input: {
     runId: string; nodeId: string; attempt: number; resolvedMaxAttempts: number;
     resolvedTimeoutMs: number | null; chainPosition: number; now: Date;
   }): AttemptRow {
     const seq = this.nextExecutionSeq(input.runId);
-    const packetPath = this.packetPathFor(input.runId, seq, input.nodeId);
+    const packetPath = this.packetPathFor(input.runId, input.chainPosition, input.nodeId, input.attempt);
     this.db
       .query(
         `INSERT INTO node_attempts (run_id, node_id, attempt, status, resolved_max_attempts, resolved_timeout_ms,

@@ -1,5 +1,6 @@
 import { describe, test, expect } from "bun:test";
 import { join } from "node:path";
+import { spawnSync } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
 import {
   makeInstallation,
@@ -7,6 +8,9 @@ import {
   mockAgentHarness,
   dbAttempts,
   dbRuns,
+  REPO_ROOT,
+  type CliResult,
+  type TestInstallation,
 } from "./helpers.js";
 import { openDb } from "../src/store/db.js";
 import { Store, GuardRejected, type AttemptRow } from "../src/store/store.js";
@@ -20,7 +24,7 @@ import { renderTreeStatus } from "../src/status/tree.js";
 import { runtimeCliInvocation } from "../src/util/cli-path.js";
 import {
   RunLock,
-  attemptDir,
+  attemptFolderOfPacket,
   mergePacket,
   packetPath,
   sha256File,
@@ -323,6 +327,111 @@ nodes:
 });
 
 // ---------------------------------------------------------------------------
+// Human status — absolute timestamps render in the machine's local timezone
+// ---------------------------------------------------------------------------
+const NY = "America/New_York";
+
+/** Run the CLI in a subprocess with a controlled TZ; the test process
+ *  environment itself is never mutated, so no state needs restoring. */
+function runCliWithTz(inst: TestInstallation, args: string, tz: string): CliResult {
+  const r = spawnSync("bun", [join(REPO_ROOT, "src/cli.ts"), ...args.split(" ").filter(Boolean)], {
+    cwd: inst.root,
+    encoding: "utf8",
+    timeout: 60_000,
+    env: { ...process.env, TZ: tz },
+  });
+  return { code: r.status ?? -1, stdout: (r.stdout as string) ?? "", stderr: (r.stderr as string) ?? "" };
+}
+
+/** Pin exact UTC instants for the schedule cursor and the run's start. */
+function pinTimestamps(inst: TestInstallation, runId: string, nextIso: string, startedIso: string): void {
+  const db = openDb(inst.dbPath);
+  try {
+    db.query("UPDATE workflows SET next_run_at = ? WHERE workflow_id = 'tzclock'").run(nextIso);
+    db.query("UPDATE runs SET started_at = ? WHERE run_id = ?").run(startedIso, runId);
+  } finally {
+    db.close();
+  }
+}
+
+function tzClockWorkflow(id: string): string {
+  return `version: 1
+id: ${id}
+description: Scheduled workflow that blocks, for timezone rendering.
+schedule:
+  every: 10m
+  max_runs: 5
+defaults:
+  max_attempts: 2
+  timeout: 1m
+  agent:
+    harness:
+      command: '${MOCK}'
+    model: "mock/mock-model:low"
+nodes:
+  node-blocker:
+    run:
+      agent:
+        instructions: |
+          MOCK:block
+    next: null
+`;
+}
+
+describe("human status renders absolute timestamps in the machine's local timezone", () => {
+  test("a prior-local-day next shows the local date; run start shows the local clock; JSON keeps UTC", () => {
+    const inst = makeInstallation({ "tzclock": tzClockWorkflow("tzclock") });
+    expect(runCli(inst, "start tzclock").code).toBe(0);
+    const runId = (dbRuns(inst)[0] as { run_id: string }).run_id;
+    // 02:30Z on Jan 1 is 21:30 on Dec 31 in New York — the prior local day.
+    pinTimestamps(inst, runId, "2031-01-01T02:30:00Z", "2026-09-10T15:55:57Z");
+
+    const human = runCliWithTz(inst, "status tzclock", NY);
+    expect(human.code).toBe(0);
+    expect(human.stdout).toContain("next 2030-12-31 21:30:00"); // local date + clock
+    expect(human.stdout).toContain("11:55:57"); // started_at as the local clock
+    expect(human.stdout).not.toContain("15:55:57"); // raw UTC clock of started_at
+    expect(human.stdout).not.toContain("02:30:00"); // raw UTC clock of next
+    expect(human.stdout).not.toContain("2031-01-01"); // raw UTC date of next
+
+    const json = JSON.parse(runCliWithTz(inst, "status --json tzclock", NY).stdout) as {
+      workflows: Array<{ activation: { nextRunAt: string | null } | null; currentRun: { startedAt: string } | null }>;
+    };
+    expect(json.workflows[0]!.activation!.nextRunAt).toBe("2031-01-01T02:30:00Z");
+    expect(json.workflows[0]!.currentRun!.startedAt).toBe("2026-09-10T15:55:57Z");
+  }, 90_000);
+
+  test("a next occurrence renders the New York local clock, with the local date only across local days", () => {
+    const inst = makeInstallation({ "tzclock": tzClockWorkflow("tzclock") });
+    expect(runCli(inst, "start tzclock").code).toBe(0);
+    const runId = (dbRuns(inst)[0] as { run_id: string }).run_id;
+    const dueIso = new Date(Date.now() + 5 * 60_000).toISOString();
+    pinTimestamps(inst, runId, dueIso, "2026-09-10T15:55:57Z");
+
+    // New York renderings of the due instant via Intl with an explicit zone:
+    // the test process's own zone may differ from the CLI subprocess's, and
+    // Intl is an independent formatting oracle for the source's Date getters.
+    const nyDate = (d: Date): string =>
+      new Intl.DateTimeFormat("en-CA", { timeZone: NY, year: "numeric", month: "2-digit", day: "2-digit" }).format(d);
+    const nyClock = (d: Date): string =>
+      new Intl.DateTimeFormat("en-GB", { timeZone: NY, hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" }).format(d);
+    const due = new Date(dueIso);
+    const sameLocalDay = nyDate(due) === nyDate(new Date());
+    const when = sameLocalDay ? nyClock(due) : `${nyDate(due)} ${nyClock(due)}`;
+
+    const human = runCliWithTz(inst, "status tzclock", NY);
+    expect(human.code).toBe(0);
+    expect(human.stdout).toContain(`next ${when} (`);
+    if (sameLocalDay) {
+      expect(human.stdout).not.toContain(`next ${nyDate(due)} ${nyClock(due)}`); // no date prefix
+    } else {
+      expect(human.stdout).not.toContain(`next ${nyClock(due)} (`); // not clock-only
+    }
+    expect(human.stdout).not.toContain(`next ${dueIso.slice(11, 19)} (`); // raw UTC clock
+  }, 90_000);
+});
+
+// ---------------------------------------------------------------------------
 // S7 — logs prints the worklog plus chronological attempt process logs
 // ---------------------------------------------------------------------------
 
@@ -362,11 +471,11 @@ nodes:
     // The worklog itself.
     expect(logs.stdout).toContain("## Run outcome");
     // Attempt process logs, in chronological execution order.
-    expect(logs.stdout).toContain("── attempts/001-node-cmd/stdout ──");
+    expect(logs.stdout).toContain("── nodes/001-node-cmd/attempt-001/stdout ──");
     expect(logs.stdout).toContain("cmd process log line");
-    expect(logs.stdout).toContain("── attempts/002-node-agent/stdout ──");
+    expect(logs.stdout).toContain("── nodes/002-node-agent/attempt-001/stdout ──");
     // Validator streams are included when present.
-    expect(logs.stdout).toContain("── attempts/002-node-agent/validation/stdout ──");
+    expect(logs.stdout).toContain("── nodes/002-node-agent/attempt-001/validation/stdout ──");
     expect(logs.stdout).toContain("validator-stream-evidence");
     // Chronological order across attempts.
     expect(logs.stdout.indexOf("001-node-cmd")).toBeLessThan(logs.stdout.indexOf("002-node-agent"));
@@ -374,7 +483,7 @@ nodes:
     // --follow on a terminal run still terminates (no new public flag).
     const followed = runCli(inst, "logs logged --follow", 30_000);
     expect(followed.code).toBe(0);
-    expect(followed.stdout).toContain("── attempts/001-node-cmd/stdout ──");
+    expect(followed.stdout).toContain("── nodes/001-node-cmd/attempt-001/stdout ──");
   }, 90_000);
 });
 
@@ -530,7 +639,7 @@ describe("Q6 — merge receipt validation", () => {
     const store = new Store(openDb(real.dbPath));
     const run = store.getRun(started.runId)!;
     const claim = store.claimAttempt({ runId: run.run_id, nodeId: "node-a", attempt: 1, now: new Date(), maxConcurrentRuns: 99 });
-    const folder = attemptDir(run.run_dir, 1, "node-a");
+    const folder = attemptFolderOfPacket(store.getAttempt(run.run_id, "node-a", 1)!.packet_path);
     writeFileSync(
       packetPath(folder),
       `#### Attempt 1\n\n##### Progress\n\nDone.\n\n<next-node-output id="node-b">\nhandoff text\n</next-node-output>\n`,

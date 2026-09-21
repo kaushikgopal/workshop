@@ -8,7 +8,7 @@ import { attemptEnv } from "./runner/env.js";
 import { spawnTracked, type TrackedProcess } from "./runner/spawn.js";
 import {
   WorklogIntegrityError,
-  attemptDir,
+  attemptFolderOfPacket,
   atomicWriteFileSync,
   fsyncFileSync,
   orchestratorDir,
@@ -363,7 +363,7 @@ async function applyDecision(input: {
       const retry = store.getAttempt(run.run_id, effectNodeId, effectAttempt);
       if (!retry) throw new WorklogIntegrityError("committed orchestrator retry row is missing");
       scaffoldPacket(
-        attemptDir(run.run_dir, retry.execution_seq, retry.node_id),
+        attemptFolderOfPacket(retry.packet_path),
         retry.attempt,
         chain.next.get(retry.node_id) ?? null,
       );
@@ -504,7 +504,7 @@ needs judgment. Decide once: retry, block, or fail.
 - Run: ${input.run.run_id} (status ${input.run.status})
 - Definition snapshot: ${join(input.run.run_dir, "definition.yaml")}
 - Worklog (read-only): ${input.run.worklog_path}
-- Attempt evidence lives under ${join(input.run.run_dir, "attempts")}
+- Attempt evidence lives under ${join(input.run.run_dir, "nodes")} (a run started before the ordered-node layout may keep it under "attempts")
 
 ## Rules
 

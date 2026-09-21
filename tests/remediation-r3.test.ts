@@ -1,23 +1,28 @@
 import { describe, test, expect } from "bun:test";
-import { readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { makeInstallation, runCli, dbRuns, readWorklog } from "./helpers.js";
 import { openDb } from "../src/store/db.js";
 import { Store } from "../src/store/store.js";
-import { loadAndValidateDefinition, startWorkflow } from "../src/execute.js";
+import { loadAndValidateDefinition, runChain, startWorkflow } from "../src/execute.js";
 import { findInstallation, ensureDirs } from "../src/config.js";
 import { recoverInstallation } from "../src/recovery.js";
+import { runtimeCliInvocation } from "../src/util/cli-path.js";
 import { SystemClock } from "../src/util/clock.js";
 import { processStartId } from "../src/util/process.js";
 import {
   RunLock,
-  attemptDir,
+  attemptFolderOfPacket,
   atomicWriteFileSync,
+  authorizedMarker,
+  extractMarker,
   mergePacket,
   packetPath,
   sha256File,
   sha256String,
+  validatePacket,
+  WorklogIntegrityError,
 } from "../src/worklog/worklog.js";
 
 const chainYaml = (id: string): string => `version: 1
@@ -58,7 +63,7 @@ describe("R3 packet replay — receipt loss", () => {
     const store = new Store(openDb(real.dbPath));
     const run = store.getRun(started.runId)!;
     const claim = store.claimAttempt({ runId: run.run_id, nodeId: "node-a", attempt: 1, now: new Date(), maxConcurrentRuns: 99 });
-    const folder = attemptDir(run.run_dir, 1, "node-a");
+    const folder = attemptFolderOfPacket(store.getAttempt(run.run_id, "node-a", 1)!.packet_path);
     writeFileSync(
       packetPath(folder),
       `#### Attempt 1\n\n##### Progress\n\nDone.\n\n<next-node-output id="node-b">\nhandoff text\n</next-node-output>\n`,
@@ -232,4 +237,175 @@ nodes:
     expect(processStartId(leaderPid)).toBeNull(); // the recorded group is gone
     child.kill("SIGKILL");
   }, 60_000);
+});
+
+// ---------------------------------------------------------------------------
+// Hemingway smoke — standalone marker lines are the only structural delimiters
+// ---------------------------------------------------------------------------
+
+const HEMINGWAY_SENTENCE =
+  "The rain came early to the harbor, and the old men drank their coffee slowly because the fish did not care when they started.";
+
+/** The real failed packet: the authorized pair quoted in inline-code prose plus one live standalone pair. */
+const hemingwayPacket = `#### Attempt 1
+
+##### Progress
+
+Generated one original Hemingway-inspired sentence and placed it in the next-node-output marker.
+
+##### Validation
+
+- Marker pair \`<next-node-output id="node-append-quote">\` / \`</next-node-output>\` preserved intact with the sentence between them.
+
+##### Blockers
+
+None.
+
+<next-node-output id="node-append-quote">
+${HEMINGWAY_SENTENCE}
+</next-node-output>
+`;
+
+const hemingwayYaml = (id: string): string => `version: 1
+id: ${id}
+description: Two command nodes shaped like the Hemingway chain.
+nodes:
+  node-generate-line:
+    run:
+      command: echo line
+    next: node-append-quote
+  node-append-quote:
+    run:
+      command: echo quote
+    next: null
+`;
+
+/** Start the Hemingway-shaped chain and return the first attempt's packet location. */
+async function startGenerateLineAttempt(definitions: Record<string, string>) {
+  const inst = makeInstallation(definitions);
+  const real = findInstallation(inst.root);
+  ensureDirs(real);
+  const loaded = loadAndValidateDefinition(join(inst.workflowsDir, "hemingway.yaml"));
+  const started = await startWorkflow({ inst: real, loaded });
+  const store = new Store(openDb(real.dbPath));
+  const run = store.getRun(started.runId)!;
+  const folder = attemptFolderOfPacket(store.getAttempt(run.run_id, "node-generate-line", 1)!.packet_path);
+  return { inst, run, folder, packetFile: packetPath(folder) };
+}
+
+describe("Hemingway smoke — standalone marker lines", () => {
+  test("the real packet — markers quoted in prose plus one standalone pair — validates, extracts, and merges with prose escaped", async () => {
+    const { inst, run, folder, packetFile } = await startGenerateLineAttempt({ "hemingway": hemingwayYaml("hemingway") });
+    writeFileSync(packetFile, hemingwayPacket, "utf8");
+
+    // Validation counts standalone marker lines only: the pair quoted in
+    // the packet's prose must not reject it as duplicated markers.
+    validatePacket(packetFile, "node-generate-line", 1, "node-append-quote");
+
+    // Output extraction finds the standalone pair, not the prose occurrence.
+    const marker = authorizedMarker("node-append-quote");
+    expect(extractMarker(hemingwayPacket, marker.opening, marker.closing)).toBe(HEMINGWAY_SENTENCE);
+
+    const lock = new RunLock(run.run_dir);
+    await lock.acquire();
+    try {
+      mergePacket({
+        runDir: run.run_dir, runId: run.run_id, nodeId: "node-generate-line", attempt: 1,
+        attemptFolder: folder, successorId: "node-append-quote", now: new Date(),
+      });
+    } finally {
+      lock.release();
+    }
+
+    const worklog = readWorklog(inst, run.run_id);
+    expect(worklog).toContain(HEMINGWAY_SENTENCE);
+    // The quoted prose pair is escaped (inert); the structural pair stays live.
+    expect(worklog).toContain('\\<next-node-output id="node-append-quote">');
+    expect(worklog).toContain('\\</next-node-output>');
+    expect(worklog).toContain('\n<next-node-output id="node-append-quote">\nThe rain came early');
+    expect(worklog).toContain('\n</next-node-output>\n');
+  }, 30_000);
+
+  test("a second standalone authorized opening or closing still rejects", async () => {
+    const { folder, packetFile } = await startGenerateLineAttempt({ "hemingway": hemingwayYaml("hemingway") });
+    const marker = authorizedMarker("node-append-quote");
+
+    writeFileSync(packetFile, hemingwayPacket + `${marker.opening}\n`, "utf8");
+    expect(() => validatePacket(packetFile, "node-generate-line", 1, "node-append-quote")).toThrow(WorklogIntegrityError);
+
+    writeFileSync(packetFile, hemingwayPacket + `${marker.closing}\n`, "utf8");
+    expect(() => validatePacket(packetFile, "node-generate-line", 1, "node-append-quote")).toThrow(WorklogIntegrityError);
+  }, 30_000);
+});
+// ---------------------------------------------------------------------------
+// Ordered-node artifact layout — nodes/<chain-position>-<node-id>/attempt-<n>
+// ---------------------------------------------------------------------------
+
+describe("Ordered-node artifact layout", () => {
+  test("first attempts land per node folder, a retry lands as attempt-002 in the same node folder, and execution order stays chronological", async () => {
+    const inst = makeInstallation({ "chain": chainYaml("chain") });
+    const real = findInstallation(inst.root);
+    ensureDirs(real);
+    const loaded = loadAndValidateDefinition(join(inst.workflowsDir, "chain.yaml"));
+    const started = await startWorkflow({ inst: real, loaded });
+    const store = new Store(openDb(real.dbPath));
+    const run = store.getRun(started.runId)!;
+
+    // First attempt of the first node: chain position 0 → nodes/001-node-a.
+    const first = store.getAttempt(run.run_id, "node-a", 1)!;
+    expect(first.packet_path).toBe(join(run.run_dir, "nodes", "001-node-a", "attempt-001", "packet.md"));
+
+    // A retry of the same node stays in that node folder as attempt-002;
+    // the chain-position prefix and the attempt number never mix meanings.
+    store.db.query("UPDATE node_attempts SET status = 'failed' WHERE run_id = ? AND node_id = 'node-a'").run(run.run_id);
+    const retry = store.createRetryAttempt({
+      runId: run.run_id, nodeId: "node-a", previousAttempt: 1, resolvedMaxAttempts: 2,
+      resolvedTimeoutMs: 60_000, chainPosition: 0, now: new Date(),
+    })!;
+    expect(retry.packet_path).toBe(join(run.run_dir, "nodes", "001-node-a", "attempt-002", "packet.md"));
+
+    // Running the chain completes node-a #2 and persists node-b #1 in the
+    // second node folder — the physical layout never reorders execution.
+    expect((await runChain({ store, inst: real, loaded, runId: run.run_id, cliPath: runtimeCliInvocation() })).status).toBe("completed");
+    const second = store.getAttempt(run.run_id, "node-b", 1)!;
+    expect(second.packet_path).toBe(join(run.run_dir, "nodes", "002-node-b", "attempt-001", "packet.md"));
+    expect(existsSync(second.packet_path)).toBe(true);
+
+    // Chronology stays SQLite's: the run's spine orders by execution_seq.
+    const chronological = [first, retry, second].sort((a, b) => a.execution_seq - b.execution_seq);
+    expect(chronological.map((a) => `${a.node_id}#${a.attempt}`)).toEqual(["node-a#1", "node-a#2", "node-b#1"]);
+  }, 30_000);
+
+  test("a legacy stored packet_path is repaired, executed, and merged in place — never re-derived from the new layout", async () => {
+    const inst = makeInstallation({ "chain": chainYaml("chain") });
+    const real = findInstallation(inst.root);
+    ensureDirs(real);
+    const loaded = loadAndValidateDefinition(join(inst.workflowsDir, "chain.yaml"));
+    const started = await startWorkflow({ inst: real, loaded });
+    const store = new Store(openDb(real.dbPath));
+    const run = store.getRun(started.runId)!;
+
+    // Simulate a pre-layout pending row: its stored path points at the old
+    // attempts/ folder, and that stored path stays authoritative.
+    const legacyFolder = join(run.run_dir, "attempts", "001-node-a");
+    const legacyPacket = join(legacyFolder, "packet.md");
+    store.db
+      .query("UPDATE node_attempts SET packet_path = ? WHERE run_id = ? AND node_id = 'node-a' AND attempt = 1")
+      .run(legacyPacket, run.run_id);
+    // Admission had already scaffolded the new-layout folder; a genuinely
+    // pre-layout run directory never had one.
+    rmSync(join(run.run_dir, "nodes"), { recursive: true });
+
+    expect((await runChain({ store, inst: real, loaded, runId: run.run_id, cliPath: runtimeCliInvocation() })).status).toBe("completed");
+
+    // The packet was repaired and its evidence merged at the stored path…
+    expect(existsSync(legacyPacket)).toBe(true);
+    expect(existsSync(join(legacyFolder, "merge-receipt.json"))).toBe(true);
+    expect(readWorklog(inst, run.run_id)).toContain('<next-node-output id="node-b">\nA\n</next-node-output>');
+    // …while the freshly created successor row still uses the new layout.
+    expect(store.getAttempt(run.run_id, "node-b", 1)!.packet_path).toBe(
+      join(run.run_dir, "nodes", "002-node-b", "attempt-001", "packet.md"),
+    );
+    expect(existsSync(join(run.run_dir, "nodes", "001-node-a"))).toBe(false);
+  }, 30_000);
 });

@@ -7,7 +7,7 @@ import { canonicalHash } from "./definition/hash.js";
 import { validateChain, unresolvedAgentSites, type ChainInfo } from "./definition/validate.js";
 import { openDb } from "./store/db.js";
 import { Store, isTerminal, type RunRow } from "./store/store.js";
-import { attemptDir, atomicWriteFileSync, scaffoldPacket } from "./worklog/worklog.js";
+import { attemptFolderOfPacket, atomicWriteFileSync, scaffoldPacket } from "./worklog/worklog.js";
 import { executeAttempt, resolveNode } from "./runner/attempt.js";
 import { parseTimeout } from "./util/duration.js";
 import { SystemClock, type Clock } from "./util/clock.js";
@@ -227,8 +227,8 @@ export function scaffoldFirstAttempt(input: {
     chainPosition: loaded.chain.order.indexOf(startNode),
     now,
   });
-  const run = store.getRun(runId)!;
-  scaffoldPacket(attemptDir(run.run_dir, fresh.execution_seq, fresh.node_id), fresh.attempt, loaded.chain.next.get(startNode) ?? null);
+  // Scaffold from the fresh row's persisted path — the store minted it.
+  scaffoldPacket(attemptFolderOfPacket(fresh.packet_path), fresh.attempt, loaded.chain.next.get(startNode) ?? null);
 }
 
 export function runDirOf(inst: Installation, runId: string): string {

@@ -11,7 +11,7 @@ import { openDb } from "../src/store/db.js";
 import { CapacityRejected, Store } from "../src/store/store.js";
 import { FakeClock, SystemClock } from "../src/util/clock.js";
 import { runtimeCliInvocation } from "../src/util/cli-path.js";
-import { attemptDir, packetPath, worklogTemplate } from "../src/worklog/worklog.js";
+import { worklogTemplate } from "../src/worklog/worklog.js";
 import { dbAttempts, dbRuns, makeInstallation } from "./helpers.js";
 
 function workflow(id: string, command = "echo done", schedule = ""): string {
@@ -263,7 +263,7 @@ describe("R2 pending packet repair", () => {
       const store = new Store(openDb(inst.dbPath));
       store.db.query("UPDATE node_attempts SET status = 'failed' WHERE run_id = ?").run(ctx.started.runId);
       const retry = store.createRetryAttempt({ runId: ctx.started.runId, nodeId: "node-only", previousAttempt: 1, resolvedMaxAttempts: 2, resolvedTimeoutMs: 60_000, chainPosition: 0, now: new Date() })!;
-      expect(existsSync(packetPath(attemptDir(store.getRun(ctx.started.runId)!.run_dir, retry.execution_seq, retry.node_id)))).toBe(false);
+      expect(existsSync(retry.packet_path)).toBe(false); // pending retries scaffold at run time
       expect((await runChain({ store, inst, loaded: ctx.loaded, runId: ctx.started.runId, cliPath: runtimeCliInvocation() })).status).toBe("completed");
     }
   });

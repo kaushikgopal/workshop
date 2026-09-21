@@ -11,7 +11,7 @@ import {
   WorklogIntegrityError,
   atomicWriteFileSync,
   fsyncFileSync,
-  attemptDir,
+  attemptFolderOfPacket,
   authorizedMarker,
   extractMarker as extractMarkerText,
   mergePacket,
@@ -150,7 +150,11 @@ export async function executeAttempt(input: {
 
   const successorId = chain.next.get(nodeId) ?? null;
   const now = () => clock.now();
-  const folder = attemptDir(run.run_dir, attempt.execution_seq, nodeId);
+  // The row's persisted packet_path is authoritative: new rows point at the
+  // ordered-node layout, legacy rows at their original attempts/ folder. The
+  // packet below repairs in place at the stored path — nothing is re-derived
+  // or moved.
+  const folder = attemptFolderOfPacket(attempt.packet_path);
   const packetFile = packetPath(folder);
 
   // Serialize pristine packet verification with the claim. A losing launcher
@@ -162,11 +166,6 @@ export async function executeAttempt(input: {
     const fresh = store.getAttempt(run.run_id, nodeId, attemptNo);
     if (!fresh || fresh.status !== "pending") {
       return { status: "cancelled", detail: "attempt is no longer pending" };
-    }
-    if (fresh.packet_path !== packetFile) {
-      const detail = `pending attempt packet path ${fresh.packet_path} does not match ${packetFile}`;
-      store.failPendingPacketIntegrity({ runId: run.run_id, nodeId, attempt: attemptNo, error: detail, now: now() });
-      return { status: "cancelled", detail };
     }
     try {
       // Repairs row→file crash gaps for first, successor, and retry attempts.
@@ -525,7 +524,7 @@ export async function executeAttempt(input: {
     // Scaffold the persisted successor's packet from its own row.
     if (successorId) {
       const row = store.getAttempt(run.run_id, successorId, 1)!;
-      scaffoldPacket(attemptDir(run.run_dir, row.execution_seq, row.node_id), row.attempt, chain.next.get(successorId) ?? null);
+      scaffoldPacket(attemptFolderOfPacket(row.packet_path), row.attempt, chain.next.get(successorId) ?? null);
     }
 
     return { status: "completed" };

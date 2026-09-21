@@ -12,7 +12,7 @@ import { isProcessAlive, processStartId, terminateProcessGroup } from "./util/pr
 import type { Clock } from "./util/clock.js";
 import {
   WorklogIntegrityError,
-  attemptDir,
+  attemptFolderOfPacket,
   mergePacket,
   scaffoldPacket,
   RunLock,
@@ -177,7 +177,7 @@ async function recoverRunningAttempt(input: {
   });
   if (retried) {
     scaffoldPacket(
-      attemptDir(run.run_dir, retried.execution_seq, retried.node_id),
+      attemptFolderOfPacket(retried.packet_path),
       retried.attempt,
       bundle.chain.next.get(attempt.node_id) ?? null,
     );
@@ -229,7 +229,7 @@ async function recoverFinishingAttempt(input: {
     return;
   }
 
-  const attemptFolder = attemptDir(run.run_dir, attempt.execution_seq, attempt.node_id);
+  const attemptFolder = attemptFolderOfPacket(attempt.packet_path);
   const integrityFail = (message: string): void => {
     const fresh = store.getAttempt(run.run_id, attempt.node_id, attempt.attempt);
     if (fresh?.owner_token !== newToken) return;
@@ -311,7 +311,7 @@ async function recoverFinishingAttempt(input: {
     const row = store.getAttempt(run.run_id, successorId, 1);
     if (row) {
       scaffoldPacket(
-        attemptDir(run.run_dir, row.execution_seq, row.node_id),
+        attemptFolderOfPacket(row.packet_path),
         row.attempt,
         bundle.chain.next.get(successorId) ?? null,
       );

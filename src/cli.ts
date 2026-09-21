@@ -9,7 +9,7 @@ import { buildStatusDto, STATUS_DTO_VERSION } from "./status/dto.js";
 import { renderTreeStatus } from "./status/tree.js";
 import { resolveNode } from "./runner/attempt.js";
 import { deriveNodeStatus } from "./status/node-status.js";
-import { attemptDir } from "./worklog/worklog.js";
+import { attemptFolderOfPacket } from "./worklog/worklog.js";
 import { isTerminal } from "./store/store.js";
 import { blockKindFor } from "./runner/attempt.js";
 import { SystemClock } from "./util/clock.js";
@@ -288,9 +288,9 @@ async function cmdResume(args: string[]): Promise<void> {
       const loaded = loadAndValidateDefinition(join(run.run_dir, "definition.yaml"));
       const fresh = store.resumeBlockedRun({ runId: run.run_id, now });
       if (!fresh) die("blocked run has no blocked attempt");
-      const { scaffoldPacket, attemptDir } = await import("./worklog/worklog.js");
+      const { scaffoldPacket, attemptFolderOfPacket } = await import("./worklog/worklog.js");
       scaffoldPacket(
-        attemptDir(run.run_dir, fresh.execution_seq, fresh.node_id),
+        attemptFolderOfPacket(fresh.packet_path),
         fresh.attempt,
         loaded.chain.next.get(fresh.node_id) ?? null,
       );
@@ -339,8 +339,8 @@ async function recreateMissingSuccessor(
     chainPosition: loaded.chain.order.indexOf(nextId),
     now,
   });
-  const { scaffoldPacket, attemptDir } = await import("./worklog/worklog.js");
-  scaffoldPacket(attemptDir(run.run_dir, fresh.execution_seq, fresh.node_id), fresh.attempt, loaded.chain.next.get(nextId) ?? null);
+  const { scaffoldPacket, attemptFolderOfPacket } = await import("./worklog/worklog.js");
+  scaffoldPacket(attemptFolderOfPacket(fresh.packet_path), fresh.attempt, loaded.chain.next.get(nextId) ?? null);
 }
 
 function cmdStatus(args: string[]): void {
@@ -432,7 +432,7 @@ async function cmdLogs(args: string[]): Promise<void> {
   // labeled block per stream (agent/validator stdout + stderr).
   const attempts = store.listAttempts(run.run_id).sort((a, b) => a.execution_seq - b.execution_seq);
   for (const attempt of attempts) {
-    const folder = attemptDir(run.run_dir, attempt.execution_seq, attempt.node_id);
+    const folder = attemptFolderOfPacket(attempt.packet_path);
     for (const stream of attemptStreamFiles(folder)) {
       const relative = stream.slice(run.run_dir.length + 1);
       process.stdout.write(`\n── ${relative} ──\n`);

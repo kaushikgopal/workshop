@@ -187,5 +187,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 
 function validateDir(inst: ReturnType<typeof makeInstallation>, runId: string, nodeId: string, attempt: number): string {
-  return join(inst.root, ".workshop/state/runs", runId, "attempts", `${String(attempt).padStart(3, "0")}-${nodeId}`, "validation");
+  // node-out is the workflow's first node: chain position 0 → prefix 001.
+  const pad = (n: number) => String(n).padStart(3, "0");
+  return join(inst.root, ".workshop/state/runs", runId, "nodes", `${pad(1)}-${nodeId}`, `attempt-${pad(attempt)}`, "validation");
 }
