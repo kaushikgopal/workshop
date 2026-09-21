@@ -409,3 +409,73 @@ describe("Ordered-node artifact layout", () => {
     expect(existsSync(join(run.run_dir, "nodes", "001-node-a"))).toBe(false);
   }, 30_000);
 });
+
+// ---------------------------------------------------------------------------
+// S12 — orchestrator replay: a second decision on the same run
+// ---------------------------------------------------------------------------
+
+describe("R3 orchestrator replay — repeated decisions", () => {
+  test("a later decision accumulates after the first instead of parking the run", async () => {
+    const inst = makeInstallation({ "chain": chainYaml("chain") });
+    const real = findInstallation(inst.root);
+    ensureDirs(real);
+    const loaded = loadAndValidateDefinition(join(inst.workflowsDir, "chain.yaml"));
+    const started = await startWorkflow({ inst: real, loaded });
+    const store = new Store(openDb(real.dbPath));
+    const run = store.getRun(started.runId)!;
+    const { orchestratorResultFile } = await import("../src/orchestrator.js");
+
+    // Stage a dead applying owner whose normalized result is durable on disk.
+    const stage = (token: string, result: { decision: string; reason: string; notes: string | null }): void => {
+      const resultPath = orchestratorResultFile(run.run_dir, token);
+      atomicWriteFileSync(resultPath, JSON.stringify(result, null, 2) + "\n");
+      store.tx(() => {
+        store.db
+          .query(
+            `UPDATE runs SET orchestrator_phase = 'applying', orchestrator_owner_token = ?,
+               orchestrator_wrapper_pid = 999999, orchestrator_wrapper_process_start_id = 'gone',
+               orchestrator_worker_pid = NULL, orchestrator_worker_process_start_id = NULL,
+               orchestrator_process_group = NULL, orchestrator_result_path = ?
+             WHERE run_id = ?`,
+          )
+          .run(token, resultPath, run.run_id);
+      });
+    };
+    const decisionBlocks = (): number => countOccurrences(readWorklog(inst, run.run_id), "workshop:decision begin");
+
+    // A second judgment arrives only after the first left the run unresolved,
+    // so both recoveries see the same run.
+    stage("tok-first-decision", { decision: "block", reason: "needs an operator", notes: null });
+    await recoverInstallation({ store, inst: real, clock: new SystemClock() });
+    expect(store.getRun(run.run_id)!.block_kind).toBe("orchestrator");
+    expect(decisionBlocks()).toBe(1);
+
+    // The same owner and result again: already merged, so nothing is written.
+    stage("tok-first-decision", { decision: "block", reason: "needs an operator", notes: null });
+    const replay = await recoverInstallation({ store, inst: real, clock: new SystemClock() });
+    expect(replay.orchestratorFinished).toContain(run.run_id);
+    expect(decisionBlocks()).toBe(1);
+
+    // A different decision must accumulate instead of parking the run in a
+    // protected applying phase.
+    stage("tok-second-decision", { decision: "fail", reason: "second judgment", notes: "nothing left to retry" });
+    const second = await recoverInstallation({ store, inst: real, clock: new SystemClock() });
+    expect(second.orchestratorFinished).toContain(run.run_id);
+
+    const after = store.getRun(run.run_id)!;
+    expect(after.status).toBe("failed");
+    expect(after.orchestrator_phase).toBe("idle");
+    expect(after.orchestrator_owner_token).toBeNull();
+
+    const worklog = readWorklog(inst, run.run_id);
+    expect(countOccurrences(worklog, "workshop:decision begin")).toBe(2);
+    expect(countOccurrences(worklog, "workshop:decision end")).toBe(2);
+    // Both decisions survive, oldest first, and the next section is intact.
+    expect(worklog.indexOf("orchestrator block: needs an operator")).toBeGreaterThan(-1);
+    expect(worklog.indexOf("orchestrator block: needs an operator")).toBeLessThan(
+      worklog.indexOf("orchestrator fail: second judgment"),
+    );
+    expect(worklog).toContain("notes: nothing left to retry");
+    expect(worklog).toContain("\n## Work packets\n");
+  }, 30_000);
+});

@@ -392,8 +392,11 @@ function verifyNormalizedResult(run: RunRow, ownerToken: string): OrchestratorRe
 
 /**
  * Idempotent decision prose under the worklog's global decision log, inside
- * one marker pair keyed by owner token digest + result digest. An existing
- * exact block is a no-op; any other decision-marker shape is corruption.
+ * one marker pair keyed by owner token digest + result digest. A run may need
+ * judgment more than once — a retry that fails again protects the run a second
+ * time — so the section accumulates one block per ownership decision, in
+ * decision order. An existing exact block is a no-op; a half-merged pair or a
+ * duplicate copy of this same decision is corruption.
  */
 function mergeDecisionProse(run: RunRow, ownerToken: string, result: OrchestratorResult, now: Date): void {
   const ownerSha = sha256String(ownerToken);
@@ -409,7 +412,7 @@ function mergeDecisionProse(run: RunRow, ownerToken: string, result: Orchestrato
   const exactEnds = countOccurrences(worklog, marker.end);
   const anyBegins = countOccurrences(worklog, "<!-- workshop:decision begin");
   const anyEnds = countOccurrences(worklog, "<!-- workshop:decision end");
-  if (exactBegins !== exactEnds || anyBegins !== anyEnds || (exactBegins === 1 && anyBegins !== 1)) {
+  if (exactBegins !== exactEnds || anyBegins !== anyEnds || exactBegins > 1) {
     throw new WorklogIntegrityError(`orchestrator decision markers for ${run.run_id} disagree with the durable result`);
   }
 
@@ -423,15 +426,19 @@ function mergeDecisionProse(run: RunRow, ownerToken: string, result: Orchestrato
     }
     return; // same decision already merged
   }
-  if (anyBegins > 0) {
-    throw new WorklogIntegrityError(`worklog already holds a different orchestrator decision block for ${run.run_id}`);
-  }
 
+  // Append after the decisions already in the log so the section reads in
+  // decision order. Insertion stops at the next section heading, so the
+  // runtime-owned sections below are never touched.
   const heading = "## Global decision log\n";
   const idx = worklog.indexOf(heading);
   if (idx === -1) throw new WorklogIntegrityError(`worklog for ${run.run_id} is missing the global decision log`);
-  const at = idx + heading.length;
-  atomicWriteFileSync(run.worklog_path, `${worklog.slice(0, at)}\n${block}\n${worklog.slice(at)}`);
+  const sectionStart = idx + heading.length;
+  const nextHeading = worklog.slice(sectionStart).search(/\n## /);
+  const sectionEnd = nextHeading === -1 ? worklog.length : sectionStart + nextHeading;
+  const merged = worklog.slice(sectionStart, sectionEnd).replace(/\s+$/, "");
+  const section = merged.length === 0 ? `\n${block}\n` : `${merged}\n\n${block}\n`;
+  atomicWriteFileSync(run.worklog_path, worklog.slice(0, sectionStart) + section + worklog.slice(sectionEnd));
 }
 
 function decisionMarkers(ownerSha256: string, resultSha256: string): { begin: string; end: string } {

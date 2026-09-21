@@ -236,8 +236,9 @@ function escapeReservedMarkerLine(line: string): string {
     .replaceAll("</workflow-output>", "\\</workflow-output>")
     .replace(/<next-node-output id="[^"]*">/g, (m) => `\\${m}`)
     .replaceAll("</next-node-output>", "\\</next-node-output>")
-    // Runtime merge markers: packet prose must never mint a live one.
-    .replace(/<!-- workshop:merge (?:begin|end)/g, (m) => `\\${m}`);
+    // Runtime merge and decision markers: packet prose must never mint a live
+    // one, or a quoted marker would corrupt the merged log's marker counts.
+    .replace(/<!-- workshop:(?:merge|decision) (?:begin|end)/g, (m) => `\\${m}`);
 }
 
 /** Pull the text between the live standalone marker pair, trimmed. */
