@@ -12,6 +12,11 @@ export const durationString = z
 
 export const timeoutValue = z.union([durationString, z.literal("unlimited")]);
 
+export const byteSizeValue = z.union([
+  z.string().regex(/^[1-9][0-9]*(kb|mb)?$/, "expected a positive byte size with optional kb|mb, e.g. 256kb"),
+  z.literal("unlimited"),
+]);
+
 export const modelString = z
   .string()
   .regex(
@@ -53,6 +58,7 @@ export const nodeSchema = z.strictObject({
   run: runUnion,
   validator: validatorUnion.optional(),
   timeout: timeoutValue.optional(),
+  stream_cap: byteSizeValue.optional(),
   max_attempts: z.number().int().min(1).optional(),
   next: z.union([nodeSlug, z.null()]).optional(),
 });
@@ -107,6 +113,7 @@ export const machineConfigSchema = z.strictObject({
   shell: z.string().min(1).optional(),
   max_concurrent_runs: z.number().int().min(1).optional(),
   default_timeout: durationString.optional(),
+  stream_cap: byteSizeValue.optional(),
   agent: z
     .strictObject({
       harness: harnessBlock.optional(),

@@ -3,6 +3,7 @@ import { dirname, join, resolve } from "node:path";
 import { parseStrictYaml } from "./definition/parse.js";
 import { machineConfigSchema, type MachineConfig } from "./definition/schema.js";
 import { parseDuration } from "./util/duration.js";
+import { DEFAULT_STREAM_CAP_BYTES, parseByteSize, type StreamCap } from "./util/retention.js";
 
 export interface Installation {
   /** Directory containing .workshop/ */
@@ -17,6 +18,8 @@ export interface Installation {
   shell: string;
   maxConcurrentRuns: number;
   defaultTimeoutMs: number;
+  /** Byte cap for one captured raw stream; "unlimited" opts out. */
+  streamCapBytes: StreamCap;
   agentModel: string | undefined;
   agentHarnessCommand: string | undefined;
   /** Raw machine agent block for agent resolution. */
@@ -66,6 +69,7 @@ export function loadInstallation(root: string): Installation {
     shell: cfg.shell ?? "/bin/bash",
     maxConcurrentRuns: cfg.max_concurrent_runs ?? 1,
     defaultTimeoutMs: cfg.default_timeout ? parseDuration(cfg.default_timeout) : 10 * 60_000,
+    streamCapBytes: cfg.stream_cap ? parseByteSize(cfg.stream_cap) : DEFAULT_STREAM_CAP_BYTES,
     agentModel: cfg.agent?.model,
     agentHarnessCommand: cfg.agent?.harness?.command,
     machineAgent: cfg.agent,

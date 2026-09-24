@@ -14,6 +14,7 @@ import { isTerminal } from "./store/store.js";
 import { blockKindFor } from "./runner/attempt.js";
 import { SystemClock } from "./util/clock.js";
 import { runtimeCliInvocation } from "./util/cli-path.js";
+import { readTruncationRecord } from "./util/retention.js";
 import { DaemonLockHeld } from "./daemon.js";
 
 /**
@@ -435,7 +436,13 @@ async function cmdLogs(args: string[]): Promise<void> {
     const folder = attemptFolderOfPacket(attempt.packet_path);
     for (const stream of attemptStreamFiles(folder)) {
       const relative = stream.slice(run.run_dir.length + 1);
-      process.stdout.write(`\n── ${relative} ──\n`);
+      // A capped stream says so in its header: the bytes it lost are recorded
+      // beside it, never dropped silently.
+      const truncation = readTruncationRecord(stream);
+      const note = truncation
+        ? ` (truncated: ${truncation.totalBytes} bytes → ${truncation.keptHeadBytes} head + ${truncation.keptTailBytes} tail)`
+        : "";
+      process.stdout.write(`\n── ${relative} ──${note}\n`);
       process.stdout.write(readFileSync(stream, "utf8"));
     }
   }

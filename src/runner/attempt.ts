@@ -24,6 +24,7 @@ import {
 } from "../worklog/worklog.js";
 import { attemptEnv, renderAgentPrompt } from "./env.js";
 import { spawnTracked, type TrackedProcess } from "./spawn.js";
+import { capStreams, parseByteSize, type StreamCap } from "../util/retention.js";
 
 /**
  * The attempt runner. One execution of one node:
@@ -44,6 +45,7 @@ export type NodeValidator =
 export interface NodeResolved {
   maxAttempts: number;
   timeoutMs: number | null; // null = unlimited
+  streamCapBytes: StreamCap;
   run: NodeRun;
   validator: NodeValidator | null;
 }
@@ -52,7 +54,7 @@ export interface NodeResolved {
 export function resolveNode(
   def: WorkflowDefinition,
   nodeId: string,
-  inst: { defaultTimeoutMs: number; machineAgent: { harness?: { command: string }; model?: string } | undefined },
+  inst: { defaultTimeoutMs: number; streamCapBytes: StreamCap; machineAgent: { harness?: { command: string }; model?: string } | undefined },
 ): NodeResolved {
   const node: NodeDefinition = def.nodes[nodeId]!;
   if (!node) throw new Error(`no node "${nodeId}" in definition`);
@@ -104,7 +106,7 @@ export function resolveNode(
     }
   }
 
-  return { maxAttempts, timeoutMs, run, validator };
+  return { maxAttempts, timeoutMs, streamCapBytes: node.stream_cap ? parseByteSize(node.stream_cap) : inst.streamCapBytes, run, validator };
 }
 
 export interface AttemptOutcome {
@@ -241,6 +243,26 @@ export async function executeAttempt(input: {
     return store.getAttempt(run.run_id, nodeId, attemptNo)?.worker_process_group === null;
   };
 
+  /**
+   * Bound the raw capture once every reader is done with it. Command nodes
+   * consume stdout to build their packet and their extracted output, so this
+   * runs only at a terminal transition — never while evidence is still being
+   * derived from the stream. Death must already be confirmed: capping a stream
+   * whose writer may still be alive would truncate a live process's output.
+   */
+  const capAttemptStreams = (): void => {
+    capStreams(
+      [
+        paths.stdoutFile,
+        paths.stderrFile,
+        join(folder, "validation", "stdout"),
+        join(folder, "validation", "stderr"),
+      ],
+      resolved.streamCapBytes,
+      now(),
+    );
+  };
+
   const fail = async (failureKind: FailureKind, detail: string, validatorReason?: string | null): Promise<AttemptOutcome> => {
     stopHeartbeat();
     if (proc) {
@@ -257,6 +279,7 @@ export async function executeAttempt(input: {
       });
       if (!result.failed) return { status: "cancelled", detail: "attempt already left running state" };
       await mergeFailureEvidence(failureKind);
+      capAttemptStreams();
       return { status: "failed", failureKind, detail };
     } catch (e) {
       if (e instanceof GuardRejected) return { status: "cancelled", detail: `lost ownership: ${e.message}` };
@@ -474,7 +497,8 @@ export async function executeAttempt(input: {
     }
 
     // Owner-fenced finishing: evidence is durable and flushed; the merge is
-    // fenced next.
+    // fenced next. Every reader has consumed the raw streams by here.
+    capAttemptStreams();
     try {
       store.claimFinishing({
         runId: run.run_id, nodeId, attempt: attemptNo, ownerToken,

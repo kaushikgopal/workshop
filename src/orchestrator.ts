@@ -19,6 +19,7 @@ import {
 } from "./worklog/worklog.js";
 import type { Clock } from "./util/clock.js";
 import { parseTimeout } from "./util/duration.js";
+import { capStreams, type StreamCap } from "./util/retention.js";
 
 /**
  * One fresh orchestrator invocation owns pending → owned. The child identity
@@ -153,7 +154,7 @@ export async function invokeOrchestrator(input: {
 
   const outcome = await raceDeadline(proc, orchestratorTimeoutMs(def, inst));
   clearInterval(heartbeat);
-  if (!(await retireOrchestratorProcess(store, run.run_id, ownerToken, proc, clock, stdoutFile, stderrFile))) {
+  if (!(await retireOrchestratorProcess(store, run.run_id, ownerToken, proc, clock, stdoutFile, stderrFile, inst.streamCapBytes))) {
     return; // death unconfirmed: ownership stays protected for recovery
   }
 
@@ -250,12 +251,16 @@ async function retireOrchestratorProcess(
   clock: Clock,
   stdoutFile: string,
   stderrFile: string,
+  streamCapBytes: StreamCap,
 ): Promise<boolean> {
   // Descendants may outlive the leader; publication, release, and recovery
   // all stop here unless the whole PGID is confirmed dead.
   if (!(await proc.kill())) return false;
   if (existsSync(stdoutFile)) fsyncFileSync(stdoutFile);
   if (existsSync(stderrFile)) fsyncFileSync(stderrFile);
+  // Nothing reads an orchestrator's raw streams — its result file is the
+  // evidence — so bound the capture here, after confirmed death.
+  capStreams([stdoutFile, stderrFile], streamCapBytes, clock.now());
   const cleared = store.clearOrchestratorIdentity({
     runId,
     ownerToken,
