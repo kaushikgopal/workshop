@@ -11,6 +11,7 @@ import { glyph, localClock } from "./status/format.js";
 import { buildRunsFeed, DEFAULT_RUNS_LIMIT } from "./status/runs-feed.js";
 import type { ViewerSource } from "./tui-source.js";
 import { resolveNode } from "./runner/attempt.js";
+import { unresolvedAgentSites } from "./definition/resolve.js";
 import { deriveNodeStatus } from "./status/node-status.js";
 import { attemptFolderOfPacket } from "./worklog/worklog.js";
 import { isTerminal } from "./store/store.js";
@@ -19,7 +20,7 @@ import { SystemClock } from "./util/clock.js";
 import { runtimeCliInvocation } from "./util/cli-path.js";
 import { readTruncationRecord } from "./util/retention.js";
 import { DaemonLockHeld } from "./daemon.js";
-import { die, errorText, requireArg } from "./cli-io.js";
+import { die, errorText, requireArg } from "./cli-errors.js";
 import { cmdDiagram, cmdLogs, cmdNode, cmdRuns, cmdStatus } from "./cli-inspect.js";
 
 /**
@@ -158,7 +159,6 @@ function preflightWarnings(def: import("./definition/schema.js").WorkflowDefinit
   // validate checks the definition only; agent-resolution is also a start
   // failure, so it is reported here as a warning-level diagnosis.
   const warnings: string[] = [];
-  const { unresolvedAgentSites } = require("./definition/validate.js") as typeof import("./definition/validate.js");
   for (const site of unresolvedAgentSites(def, inst.machineAgent)) {
     warnings.push(`agent site cannot resolve harness/model: ${site} (start will fail)`);
   }

@@ -2,12 +2,9 @@ import { describe, test, expect } from "bun:test";
 import { ZodError } from "zod";
 import { parseStrictYaml, DefinitionError } from "../src/definition/parse.js";
 import { workflowSchema, type WorkflowDefinition } from "../src/definition/schema.js";
-import {
-  parseModel,
-  resolveAgent,
-  unresolvedAgentSites,
-  validateChain,
-} from "../src/definition/validate.js";
+import { parseModel } from "../src/definition/model.js";
+import { resolveAgent, unresolvedAgentSites } from "../src/definition/resolve.js";
+import { validateChain } from "../src/definition/chain.js";;
 
 /**
  * Definition-layer unit tests.

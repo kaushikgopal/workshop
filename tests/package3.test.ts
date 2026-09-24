@@ -7,7 +7,8 @@ import { openDb } from "../src/store/db.js";
 import { Store, GuardRejected } from "../src/store/store.js";
 import { loadAndValidateDefinition, startWorkflow, runChain } from "../src/execute.js";
 import { findInstallation, ensureDirs } from "../src/config.js";
-import { recoverInstallation, loadSnapshot } from "../src/recovery.js";
+import { recoverInstallation } from "../src/recovery.js";
+import { loadSnapshot } from "../src/definition/snapshot.js";
 import { SystemClock } from "../src/util/clock.js";
 
 const MOCK = mockAgentHarness();

@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { findInstallation, workflowPath, type Installation } from "./config.js";
-import { die, requireArg } from "./cli-io.js";
+import { die, requireArg } from "./cli-errors.js";
 import { loadAndValidateDefinition } from "./execute.js";
 import { openDb } from "./store/db.js";
 import { Store, isTerminal, type AttemptRow } from "./store/store.js";

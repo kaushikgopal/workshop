@@ -1,4 +1,4 @@
-import type { ParsedModel } from "../definition/validate.js";
+import { ParsedModel } from "../definition/model.js";;
 import { readFileSync } from "node:fs";
 import { authorizedMarker, packetTemplate } from "../worklog/worklog.js";
 

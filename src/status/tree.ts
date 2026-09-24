@@ -1,7 +1,7 @@
 import type { Store, WorkflowRow, RunRow, AttemptRow } from "../store/store.js";
 import { isTerminal } from "../store/store.js";
 import { deriveNodeStatus } from "./node-status.js";
-import { loadSnapshot } from "../recovery.js";
+import { loadSnapshot } from "../definition/snapshot.js";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { glyph, localClock, localDate } from "./format.js";

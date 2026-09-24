@@ -4,7 +4,7 @@ import type { Installation } from "./config.js";
 import { canonicalHash } from "./definition/hash.js";
 import { parseStrictYaml } from "./definition/parse.js";
 import { workflowSchema, type WorkflowDefinition } from "./definition/schema.js";
-import { validateChain, type ChainInfo } from "./definition/validate.js";
+import { validateChain, type ChainInfo } from "./definition/chain.js";;
 import { GuardRejected, type RunRow, type Store } from "./store/store.js";
 import { parseDuration } from "./util/duration.js";
 import { ensurePristineFile, WorklogIntegrityError, worklogTemplate } from "./worklog/worklog.js";

@@ -1,8 +1,9 @@
 import { existsSync, readFileSync } from "node:fs";
 import type { Installation } from "./config.js";
 import { canonicalHash } from "./definition/hash.js";
-import { validateChain, type ChainInfo } from "./definition/validate.js";
-import { workflowSchema, type WorkflowDefinition } from "./definition/schema.js";
+import type { ChainInfo } from "./definition/chain.js";
+import type { WorkflowDefinition } from "./definition/schema.js";
+import { loadSnapshot, type SnapshotBundle } from "./definition/snapshot.js";
 import { parseStrictYaml } from "./definition/parse.js";
 import { resolveNode } from "./runner/attempt.js";
 import type { Store } from "./store/store.js";
@@ -24,17 +25,6 @@ import { recoverOrchestratorDecision } from "./orchestrator.js";
  * never grants reclaim by itself. False/unknown death confirmation preserves
  * ownership and process identity, so a replacement cannot overlap old work.
  */
-
-export interface SnapshotBundle {
-  def: WorkflowDefinition;
-  chain: ChainInfo;
-}
-
-export function loadSnapshot(snapshotPath: string): SnapshotBundle {
-  const raw = parseStrictYaml(readFileSync(snapshotPath, "utf8"), snapshotPath);
-  const def = workflowSchema.parse(raw);
-  return { def, chain: validateChain(def) };
-}
 
 export interface RecoveryReport {
   interruptedRetried: string[];
