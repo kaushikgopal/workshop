@@ -33,21 +33,3 @@ export function parseTimeout(raw: string | undefined): Timeout {
   if (raw === "unlimited") return { kind: "unlimited" };
   return { kind: "limited", ms: parseDuration(raw) };
 }
-
-export function isUnlimited(t: Timeout): boolean {
-  return t.kind === "unlimited";
-}
-
-export function formatDuration(ms: number): string {
-  const units: Array<[number, string]> = [
-    [604_800_000, "w"],
-    [86_400_000, "d"],
-    [3_600_000, "h"],
-    [60_000, "m"],
-    [1000, "s"],
-  ];
-  for (const [unit, suffix] of units) {
-    if (ms % unit === 0) return `${ms / unit}${suffix}`;
-  }
-  return `${ms}ms`;
-}

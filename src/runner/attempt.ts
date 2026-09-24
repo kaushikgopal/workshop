@@ -327,7 +327,6 @@ export async function executeAttempt(input: {
         attempt: attemptNo,
         attemptFolder: folder,
         successorId,
-        ownerToken,
         now: now(),
       });
     } catch (e) {
@@ -529,7 +528,7 @@ export async function executeAttempt(input: {
       await lock.acquire();
       mergePacket({
         runDir: run.run_dir, runId: run.run_id, nodeId, attempt: attemptNo,
-        attemptFolder: folder, successorId, ownerToken, now: now(),
+        attemptFolder: folder, successorId, now: now(),
       });
     } catch (e) {
       if (e instanceof WorklogIntegrityError) return await fail("worklog_integrity", e.message);

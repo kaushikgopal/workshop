@@ -80,7 +80,7 @@ describe("R3 packet replay — receipt loss", () => {
     try {
       mergePacket({
         runDir: run.run_dir, runId: run.run_id, nodeId: "node-a", attempt: 1,
-        attemptFolder: folder, successorId: "node-b", ownerToken: claim.ownerToken, now: new Date(),
+        attemptFolder: folder, successorId: "node-b", now: new Date(),
       });
     } finally {
       lock.release();

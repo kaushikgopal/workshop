@@ -20,8 +20,6 @@ export interface Installation {
   defaultTimeoutMs: number;
   /** Byte cap for one captured raw stream; "unlimited" opts out. */
   streamCapBytes: StreamCap;
-  agentModel: string | undefined;
-  agentHarnessCommand: string | undefined;
   /** Raw machine agent block for agent resolution. */
   machineAgent: { harness?: { command: string }; model?: string } | undefined;
 }
@@ -70,8 +68,6 @@ export function loadInstallation(root: string): Installation {
     maxConcurrentRuns: cfg.max_concurrent_runs ?? 1,
     defaultTimeoutMs: cfg.default_timeout ? parseDuration(cfg.default_timeout) : 10 * 60_000,
     streamCapBytes: cfg.stream_cap ? parseByteSize(cfg.stream_cap) : DEFAULT_STREAM_CAP_BYTES,
-    agentModel: cfg.agent?.model,
-    agentHarnessCommand: cfg.agent?.harness?.command,
     machineAgent: cfg.agent,
   };
 }

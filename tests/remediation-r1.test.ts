@@ -661,7 +661,6 @@ describe("Q6 — merge receipt validation", () => {
         attempt: 1,
         attemptFolder: folder,
         successorId: "node-b",
-        ownerToken: claim.ownerToken,
         now: new Date(),
       });
     } finally {

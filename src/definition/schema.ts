@@ -124,12 +124,3 @@ export const machineConfigSchema = z.strictObject({
 
 export type MachineConfig = Required<Pick<z.infer<typeof machineConfigSchema>, never>> &
   z.infer<typeof machineConfigSchema>;
-
-/** Every machine default, applied. Used after loading the user's config. */
-export const machineDefaults = {
-  shell: "/bin/bash",
-  maxConcurrentRuns: 1,
-  defaultTimeoutMs: 10 * 60_000,
-  agentModel: undefined as string | undefined,
-  agentHarnessCommand: undefined as string | undefined,
-};

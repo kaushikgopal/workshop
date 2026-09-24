@@ -115,16 +115,6 @@ ${nodeSections}## Run outcome
 `;
 }
 
-export function scaffoldWorklog(
-  runDir: string,
-  workflowId: string,
-  description: string,
-  nodeIds: string[],
-): string {
-  const content = worklogTemplate(workflowId, description, nodeIds);
-  return atomicWriteFileSync(worklogPath(runDir), content);
-}
-
 /** The scaffold content for one attempt's packet file. */
 export function packetTemplate(attempt: number, marker: { opening: string; closing: string }): string {
   return `#### Attempt ${attempt}
@@ -340,8 +330,6 @@ export function mergePacket(input: {
   attempt: number;
   attemptFolder: string;
   successorId: string | null;
-  /** Legacy parameter: v2 receipts no longer record owner tokens. */
-  ownerToken?: string;
   now: Date;
 }): MergeReceipt {
   const logPath = worklogPath(input.runDir);

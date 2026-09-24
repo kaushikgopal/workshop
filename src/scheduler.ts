@@ -59,8 +59,3 @@ export function admitDueOccurrences(input: {
   }
   return out;
 }
-
-/** Fixed-rate next occurrence from the activation cadence. */
-export function nextRunAt(every: string, from: Date): string {
-  return toIso(new Date(from.getTime() + parseDuration(every)));
-}

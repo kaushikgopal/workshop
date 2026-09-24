@@ -282,7 +282,6 @@ async function recoverFinishingAttempt(input: {
       attempt: attempt.attempt,
       attemptFolder,
       successorId,
-      ownerToken: newToken,
       now: clock.now(),
     });
     store.completeAttempt({

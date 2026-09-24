@@ -132,7 +132,3 @@ export function unresolvedAgentSites(def: WorkflowDefinition, machine: Resolutio
   }
   return unresolved;
 }
-
-export function describeNode(node: NodeDefinition): string {
-  return "agent" in node.run ? "agent" : "command";
-}

@@ -1,4 +1,4 @@
-import { parseDocument, visit, isAlias, isMap, Lexer, type Document } from "yaml";
+import { parseDocument, visit, isAlias, Lexer, type Document } from "yaml";
 
 /** Definition files that fail strict parsing carry this error type. */
 export class DefinitionError extends Error {
@@ -78,6 +78,3 @@ function rejectMergeKeys(value: unknown, label: string): void {
     }
   }
 }
-
-/** Re-exported so callers can check map-ness without importing yaml everywhere. */
-export { isMap };
