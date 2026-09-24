@@ -235,9 +235,11 @@ export function mountViewer(renderer: CliRenderer, opts: { rows?: number; runsRo
 
   main.add(chain.box);
   main.add(log.box);
+  // Order is the reading order: what happened (the feed), then the detail of
+  // the run you picked from it.
   root.add(header);
-  root.add(main);
   root.add(runs.box);
+  root.add(main);
   root.add(footer);
   renderer.root.add(root);
 

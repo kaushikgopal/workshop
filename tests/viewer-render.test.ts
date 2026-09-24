@@ -113,6 +113,22 @@ describe("viewer frame — what an operator actually sees", () => {
     expect(frame).toContain("f follow");
   });
 
+  test("the feed sits above the detail panes, in reading order", async () => {
+    const { renderer, renderOnce, captureCharFrame } = await createTestRenderer({ width: 100, height: 24 });
+    mountViewer(renderer, { rows: 6, runsRows: 6 }).paint(model);
+    await renderOnce();
+    const rows = captureCharFrame().split("\n");
+    const runsTitle = rows.findIndex((row) => row.includes("runs · 3"));
+    const chainTitle = rows.findIndex((row) => row.includes("chain · "));
+    const logTitle = rows.findIndex((row) => row.includes("log · "));
+    const header = rows.findIndex((row) => row.includes("WORKSHOP"));
+    const footer = rows.findIndex((row) => row.includes("q quit"));
+    expect(header).toBeLessThan(runsTitle);
+    expect(runsTitle).toBeLessThan(chainTitle);
+    expect(chainTitle).toBe(logTitle); // side by side, below the feed
+    expect(Math.max(chainTitle, logTitle)).toBeLessThan(footer);
+  });
+
   test("a poll failure is reported in the header rather than blanking the panes", async () => {
     const { renderer, renderOnce, captureCharFrame } = await createTestRenderer({ width: 100, height: 24 });
     const mount = mountViewer(renderer, { rows: 6 });
