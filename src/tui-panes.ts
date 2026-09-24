@@ -1,4 +1,4 @@
-import { glyph, localClock } from "./status/tree.js";
+import { glyph, localClock } from "./status/format.js";
 import type { StatusDto, NodeStatusDto, AttemptStatusDto } from "./status/dto.js";
 import type { RunsFeed, RunsFeedEntry } from "./status/runs-feed.js";
 

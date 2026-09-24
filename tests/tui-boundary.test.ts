@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test";
-import { readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { REPO_ROOT } from "./helpers.js";
 
@@ -86,19 +86,54 @@ describe("TUI boundary — naming says what a file is for", () => {
     expect(cli).toContain('await import("./tui-app.js")');
   });
 
-  test("the viewer never reaches past the CLI contract", () => {
-    // The spec's rule, made checkable: the viewer consumes projections, so it
-    // must not touch the store, the database, run evidence, or the filesystem.
-    const forbidden = [/node:fs/, /\/store\//, /store\.js/, /db\.js/, /worklog\//, /execute\.js/, /recovery\.js/, /daemon\.js/];
-    for (const file of tui) {
-      for (const spec of allImports(readFileSync(file, "utf8"))) {
-        for (const pattern of forbidden) {
-          expect(`${relative(file)} imports ${spec}`).not.toMatch(
-            new RegExp(`imports .*${pattern.source.replace(/\\\//g, "/")}`),
-          );
-        }
+  test("the viewer never reaches past the CLI contract, transitively", () => {
+    // The spec's rule: the viewer consumes projections, so it must not touch the
+    // store, the database, run evidence, or the filesystem.
+    //
+    // Checking only direct specifiers let a real violation hide: the panes
+    // imported a formatting helper from `status/tree.ts`, which imports the
+    // store, the recovery module, and `node:fs` — so loading the viewer loaded
+    // SQLite. Type-only imports are erased and load nothing, so only value
+    // imports are followed.
+    const forbiddenSpec = /^node:(fs|child_process|sqlite)$/;
+    const forbiddenPath = /\/(store\/(store|db)|worklog\/worklog|execute|recovery|daemon|admission|orchestrator)\.ts$/;
+
+    /** Resolve a relative specifier to a source file, or null when external. */
+    const resolve = (from: string, spec: string): string | null => {
+      if (!spec.startsWith(".")) return null;
+      const base = join(from, "..", spec.replace(/\.js$/, ".ts"));
+      return existsSync(base) ? base : null;
+    };
+
+    const violations: string[] = [];
+    const visited = new Set<string>();
+    const queue: string[] = [...tui];
+    while (queue.length > 0) {
+      const file = queue.shift()!;
+      if (visited.has(file)) continue;
+      visited.add(file);
+      for (const spec of importsOf(readFileSync(file, "utf8")).value) {
+        const via = `${relative(file)} imports ${spec}`;
+        const target = resolve(file, spec);
+        if (forbiddenSpec.test(spec) || (target && forbiddenPath.test(target))) violations.push(via);
+        if (target) queue.push(target);
       }
     }
+    // A walk that resolved nothing would pass vacuously.
+    expect(visited.size).toBeGreaterThan(1);
+    expect(violations).toEqual([]);
+  });
+
+  test("the viewer's reachable graph is exactly the pure projections", () => {
+    // A guard on the guard: if the walk silently stopped resolving anything,
+    // the assertion above would pass vacuously.
+    const reachable = relative(join(REPO_ROOT, "src/tui-panes.ts"));
+    expect(reachable).toContain("tui-panes.ts");
+    // The panes load the formatter and nothing that reads: prove the formatter
+    // itself has no imports, which is the property that makes the graph clean.
+    const format = readFileSync(join(REPO_ROOT, "src/status/format.ts"), "utf8");
+    expect(importsOf(format).value).toEqual([]);
+    expect(importsOf(format).typeOnly).toEqual([]);
   });
 
   test("the viewer's data arrives through the source interface, not a store handle", () => {

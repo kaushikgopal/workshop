@@ -4,6 +4,7 @@ import { deriveNodeStatus } from "./node-status.js";
 import { loadSnapshot } from "../recovery.js";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
+import { glyph, localClock, localDate } from "./format.js";
 
 /**
  * Tree status — the human view of the same truth the JSON DTO exposes.
@@ -12,38 +13,6 @@ import { join } from "node:path";
  * into a count; unresolved runs and the most recent run always render.
  * Long lines word-wrap with hanging indents and a continuous spine.
  */
-
-const GLYPH: Record<string, string> = {
-  pending: "○",
-  running: "◎",
-  finishing: "◑",
-  blocked: "⊘",
-  failed: "✗",
-  completed: "◉",
-  cancelled: "·",
-  queued: "○",
-};
-
-/** Shared so every human surface renders status and local time the same way. */
-export function glyph(status: string): string {
-  return GLYPH[status] ?? "○";
-}
-
-function twoDigits(n: number): string {
-  return String(n).padStart(2, "0");
-}
-
-/** Machine-local `HH:MM:SS`. Date getters, not `toLocaleTimeString`, so the
- *  output never varies with locale and never produces a `24:00` hour. */
-export function localClock(iso: string): string {
-  const d = new Date(iso);
-  return `${twoDigits(d.getHours())}:${twoDigits(d.getMinutes())}:${twoDigits(d.getSeconds())}`;
-}
-
-/** Machine-local `YYYY-MM-DD`. */
-export function localDate(d: Date): string {
-  return `${d.getFullYear()}-${twoDigits(d.getMonth() + 1)}-${twoDigits(d.getDate())}`;
-}
 
 function clock(iso: string | null): string {
   if (!iso) return "";
