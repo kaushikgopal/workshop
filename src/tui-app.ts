@@ -287,7 +287,7 @@ export async function runViewer(opts: RunViewerOptions): Promise<void> {
 
   const refresh = async (): Promise<void> => {
     try {
-      const { status, runs: feed } = await opts.source.snapshot();
+      const { status, runs: feed } = await opts.source.snapshot(workflowId);
       lastStatus = status;
 
       // No workflow chosen yet: the picker is just another frame.
@@ -303,7 +303,7 @@ export async function runViewer(opts: RunViewerOptions): Promise<void> {
       runIds = scoped.runs.map((r) => r.id);
       if (state.follow && runIds[0]) state.selectedRunId = runIds[0];
       if (!state.selectedRunId && runIds[0]) state.selectedRunId = runIds[0];
-      const logText = await opts.source.log(state.collated ? null : state.selectedRunId);
+      const logText = await opts.source.log(workflowId, state.collated ? null : state.selectedRunId);
       pollError = null;
       mount.paint(
         buildViewerModel({
@@ -327,31 +327,80 @@ export async function runViewer(opts: RunViewerOptions): Promise<void> {
     }
   };
 
+  const timer = setInterval(() => void refresh(), opts.refreshMs ?? 1000);
+
+  const shutdown = makeShutdown({
+    clear: () => clearInterval(timer),
+    detach: () => {
+      process.off("SIGINT", onSignal);
+      process.off("SIGTERM", onSignal);
+    },
+    stop: () => renderer.stop(),
+    destroy: () => renderer.destroy(),
+    exit: (code) => process.exit(code),
+  });
+  function onSignal(): void {
+    shutdown();
+  }
+
   renderer.keyInput.on("keypress", (key) => {
     if (!workflowId) {
       const ids = lastStatus?.workflows.map((w) => w.id) ?? [];
       const name = key.name.toLowerCase();
-      if (name === "q" || (key.ctrl && name === "c")) {
-        renderer.destroy();
-        return;
-      }
+      if (name === "q" || (key.ctrl && name === "c")) return shutdown();
       if (name === "j" || name === "down") cursor = Math.min(ids.length - 1, cursor + 1);
       else if (name === "k" || name === "up") cursor = Math.max(0, cursor - 1);
-      else if (name === "enter" || name === "return") workflowId = ids[cursor] ?? null;
+      else if (name === "enter" || name === "return") {
+        workflowId = ids[cursor] ?? null;
+        // A fresh workflow starts with a fresh selection rather than carrying
+        // the previous one's run id into a feed that never had it.
+        state.selectedRunId = null;
+        state.follow = true;
+        state.collated = false;
+      }
       void refresh();
       return;
     }
     const action = reduceKey(state, { name: key.name, ctrl: key.ctrl }, runIds);
-    if (action === "quit") {
-      renderer.destroy();
-      return;
-    }
+    if (action === "quit") return shutdown();
     void refresh();
   });
 
-  const timer = setInterval(() => void refresh(), opts.refreshMs ?? 1000);
-  process.once("SIGINT", () => clearInterval(timer));
-  process.once("SIGTERM", () => clearInterval(timer));
+  process.once("SIGINT", onSignal);
+  process.once("SIGTERM", onSignal);
   renderer.start();
   await refresh();
+}
+
+/**
+ * One shutdown path for every way out: a keypress, a signal, or Ctrl+C handled
+ * by the renderer.
+ *
+ * Quitting is not just destroying the renderer — the poll timer keeps the
+ * event loop alive, so the process outlives the interface and the operator has
+ * to interrupt it a second time. The once-guard matters too: quitting twice is
+ * easy to do, and a second exit would land while the terminal is restoring.
+ */
+export function makeShutdown(deps: {
+  clear: () => void;
+  detach: () => void;
+  stop: () => void;
+  destroy: () => void;
+  exit: (code: number) => void;
+}): () => void {
+  let done = false;
+  return () => {
+    if (done) return;
+    done = true;
+    deps.clear();
+    deps.detach();
+    try {
+      deps.stop();
+    } catch {
+      /* the renderer may already be stopping */
+    }
+    deps.destroy();
+    // Let the terminal-restoring writes reach the tty before the process goes.
+    setTimeout(() => deps.exit(0), 0);
+  };
 }

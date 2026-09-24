@@ -440,9 +440,9 @@ function attemptStreamFiles(attemptFolder: string): string[] {
  * on the projections, never on the store: `status --json` and `runs --json` are
  * the same builders this calls, and the log is the run's worklog.
  */
-function viewerSourceFor(inst: Installation, store: Store, workflowId: string | null): ViewerSource {
+function viewerSourceFor(inst: Installation, store: Store): ViewerSource {
   return {
-    async snapshot() {
+    async snapshot(workflowId) {
       return {
         // With no workflow chosen yet, every workflow is offered to the picker.
         status: buildStatusDto(store, new Date(), workflowId ?? undefined),
@@ -456,7 +456,7 @@ function viewerSourceFor(inst: Installation, store: Store, workflowId: string | 
         }),
       };
     },
-    async log(runId: string | null) {
+    async log(workflowId, runId) {
       if (runId === null) {
         const every = workflowId ? store.listRuns(workflowId) : [];
         return every.map((r) => `\n━━ run ${r.run_id} — ${r.status} ━━\n${readFileSync(r.worklog_path, "utf8")}`).join("");
@@ -486,7 +486,7 @@ async function cmdWatch(args: string[]): Promise<void> {
   if (workflowId && !store.getWorkflow(workflowId)) die(`no workflow "${workflowId}"`);
   if (!workflowId && store.listWorkflows().length === 0) die("no workflows configured");
   const { runViewer } = await import("./tui-app.js");
-  await runViewer({ workflowId, source: viewerSourceFor(inst, store, workflowId) });
+  await runViewer({ workflowId, source: viewerSourceFor(inst, store) });
 }
 
 function cmdRuns(args: string[]): void {

@@ -1,6 +1,6 @@
 import { describe, test, expect } from "bun:test";
 import { createTestRenderer } from "@opentui/core/testing";
-import { mountViewer, reduceKey, type ViewerState } from "../src/tui-app.js";
+import { makeShutdown, mountViewer, reduceKey, type ViewerState } from "../src/tui-app.js";
 import { buildViewerModel, pickerModel } from "../src/tui-panes.js";
 import type { StatusDto } from "../src/status/dto.js";
 import { buildRunsFeed, type RunsFeed } from "../src/status/runs-feed.js";
@@ -281,5 +281,48 @@ describe("viewer frame — picker and a scrolled feed", () => {
     expect(selectedRow).toContain("007");
     // And the title says which slice is shown, so the viewport is never a mystery.
     expect(frame).toMatch(/runs · 20 · \d+–\d+\/20/);
+  });
+});
+
+describe("viewer shutdown — quitting must actually quit", () => {
+  const spy = () => {
+    const calls: string[] = [];
+    return {
+      calls,
+      deps: {
+        clear: () => calls.push("clear"),
+        detach: () => calls.push("detach"),
+        stop: () => calls.push("stop"),
+        destroy: () => calls.push("destroy"),
+        exit: (code: number) => calls.push(`exit:${code}`),
+      },
+    };
+  };
+
+  test("q takes down the poll loop, the renderer, and the process", async () => {
+    const { calls, deps } = spy();
+    makeShutdown(deps)();
+    // The exit waits a tick so the terminal-restoring writes land first.
+    expect(calls).toEqual(["clear", "detach", "stop", "destroy"]);
+    await new Promise((r) => setTimeout(r, 1));
+    expect(calls).toEqual(["clear", "detach", "stop", "destroy", "exit:0"]);
+  });
+
+  test("quitting twice does not exit twice mid-restore", async () => {
+    const { calls, deps } = spy();
+    const shutdown = makeShutdown(deps);
+    shutdown();
+    shutdown();
+    await new Promise((r) => setTimeout(r, 1));
+    expect(calls.filter((c) => c.startsWith("exit:"))).toEqual(["exit:0"]);
+    expect(calls.filter((c) => c === "destroy")).toEqual(["destroy"]);
+  });
+
+  test("a renderer that is already stopping does not block the exit", async () => {
+    const { calls, deps } = spy();
+    makeShutdown({ ...deps, stop: () => { throw new Error("already stopped"); } })();
+    await new Promise((r) => setTimeout(r, 1));
+    expect(calls).toContain("destroy");
+    expect(calls).toContain("exit:0");
   });
 });
