@@ -1,9 +1,9 @@
-import { glyph, localClock } from "../status/tree.js";
-import type { StatusDto, NodeStatusDto, AttemptStatusDto } from "../status/dto.js";
-import type { RunsFeed, RunsFeedEntry } from "../status/runs-feed.js";
+import { glyph, localClock } from "./status/tree.js";
+import type { StatusDto, NodeStatusDto, AttemptStatusDto } from "./status/dto.js";
+import type { RunsFeed, RunsFeedEntry } from "./status/runs-feed.js";
 
 /**
- * The viewer's panes as plain data.
+ * TUI-only: the viewer's panes as plain data.
  *
  * Every pane is produced here from the CLI's own surfaces — the status DTO, the
  * runs feed, and log text — so the terminal binding stays a thin renderer and

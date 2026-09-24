@@ -1,8 +1,8 @@
-import type { StatusDto } from "../status/dto.js";
-import type { RunsFeed } from "../status/runs-feed.js";
+import type { StatusDto } from "./status/dto.js";
+import type { RunsFeed } from "./status/runs-feed.js";
 
 /**
- * Where the viewer gets its data.
+ * TUI-only: where the viewer gets its data.
  *
  * The viewer must stay disposable: it consumes the same projections the CLI
  * publishes, so swapping OpenTUI for HTML replaces the binding rather than the

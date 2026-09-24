@@ -1,7 +1,7 @@
 import { describe, test, expect } from "bun:test";
 import { createTestRenderer } from "@opentui/core/testing";
-import { mountViewer, reduceKey, type ViewerState } from "../src/viewer/app.js";
-import { buildViewerModel, pickerModel } from "../src/viewer/panes.js";
+import { mountViewer, reduceKey, type ViewerState } from "../src/tui-app.js";
+import { buildViewerModel, pickerModel } from "../src/tui-panes.js";
 import type { StatusDto } from "../src/status/dto.js";
 import { buildRunsFeed, type RunsFeed } from "../src/status/runs-feed.js";
 

@@ -1,6 +1,6 @@
 import { describe, test, expect } from "bun:test";
 import { buildRunsFeed, DEFAULT_RUNS_LIMIT, RUNS_DTO_VERSION } from "../src/status/runs-feed.js";
-import { buildViewerModel, failureLabel, nodeLines, pickerModel, windowRuns } from "../src/viewer/panes.js";
+import { buildViewerModel, failureLabel, nodeLines, pickerModel, windowRuns } from "../src/tui-panes.js";
 import type { StatusDto, NodeStatusDto } from "../src/status/dto.js";
 import type { RunRow } from "../src/store/store.js";
 

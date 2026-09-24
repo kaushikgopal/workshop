@@ -8,11 +8,15 @@ import {
   type RenderContext,
   type StyledText,
 } from "@opentui/core";
-import { buildViewerModel, pickerModel, type ViewerModel } from "./panes.js";
-import type { ViewerSource } from "./source.js";
-import type { StatusDto } from "../status/dto.js";
+import { buildViewerModel, pickerModel, type ViewerModel } from "./tui-panes.js";
+import type { ViewerSource } from "./tui-source.js";
+import type { StatusDto } from "./status/dto.js";
 
 /**
+ * TUI-only: the terminal binding. Nothing in the runtime imports this — the
+ * `watch` command loads it lazily — and it must stay that way, so the runtime
+ * never depends on a terminal library.
+ *
  * The terminal binding. Everything above this file (the projections, the pane
  * model) is transport-independent, so this is the only place that knows about a
  * terminal library — and the only part a swap to HTML would replace.

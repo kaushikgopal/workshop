@@ -8,7 +8,7 @@ import { Store, GuardRejected, type AttemptRow } from "./store/store.js";
 import { buildNodesForRun, buildStatusDto, STATUS_DTO_VERSION } from "./status/dto.js";
 import { glyph, localClock, renderTreeStatus } from "./status/tree.js";
 import { buildRunsFeed, DEFAULT_RUNS_LIMIT } from "./status/runs-feed.js";
-import type { ViewerSource } from "./viewer/source.js";
+import type { ViewerSource } from "./tui-source.js";
 import { resolveNode } from "./runner/attempt.js";
 import { deriveNodeStatus } from "./status/node-status.js";
 import { attemptFolderOfPacket } from "./worklog/worklog.js";
@@ -485,7 +485,7 @@ async function cmdWatch(args: string[]): Promise<void> {
   const store = new Store(openDb(inst.dbPath));
   if (workflowId && !store.getWorkflow(workflowId)) die(`no workflow "${workflowId}"`);
   if (!workflowId && store.listWorkflows().length === 0) die("no workflows configured");
-  const { runViewer } = await import("./viewer/app.js");
+  const { runViewer } = await import("./tui-app.js");
   await runViewer({ workflowId, source: viewerSourceFor(inst, store, workflowId) });
 }
 
