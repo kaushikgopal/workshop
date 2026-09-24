@@ -143,7 +143,19 @@ export async function tick(input: { inst: Installation; clock?: Clock }): Promis
         runId: run.run_id,
         clock,
         cliPath: runtimeCliInvocation(),
-      }).then(() => undefined),
+      })
+        // A chain that throws must not take the guardian with it: the CLI's
+        // `unhandledRejection` handler exits the process, so one bad run would
+        // stop recurrence and recovery for every workflow in the installation.
+        // Attempt state is durable, so the next tick reconciles whatever this
+        // left behind.
+        .catch((e: unknown) => {
+          process.stderr.write(
+            `workshop: chain ${run.run_id} failed: ${e instanceof Error ? e.message : String(e)}\n`,
+          );
+          return undefined;
+        })
+        .then(() => undefined),
     );
   }
 

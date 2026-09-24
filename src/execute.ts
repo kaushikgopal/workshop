@@ -245,7 +245,7 @@ function appendEnvironmentObservation(inst: Installation, runId: string, observa
     if (idx === -1) return;
     const at = idx + marker.length;
     const updated = `${content.slice(0, at)}\n- ${new Date().toISOString()} — ${observation}\n${content.slice(at)}`;
-    writeFileSync(logPath, updated, "utf8");
+    atomicWriteFileSync(logPath, updated);
   } catch {
     /* observation is best-effort; SQLite remains authoritative */
   }

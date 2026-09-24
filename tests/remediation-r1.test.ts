@@ -14,7 +14,7 @@ import {
 } from "./helpers.js";
 import { openDb } from "../src/store/db.js";
 import { Store, GuardRejected, type AttemptRow } from "../src/store/store.js";
-import { loadAndValidateDefinition, startWorkflow } from "../src/execute.js";
+import { loadAndValidateDefinition, runChain, startWorkflow } from "../src/execute.js";
 import { findInstallation, ensureDirs } from "../src/config.js";
 import { recoverInstallation } from "../src/recovery.js";
 import { SystemClock } from "../src/util/clock.js";
@@ -759,5 +759,54 @@ nodes:
     const report = await recoverInstallation({ store, inst: real, clock: new SystemClock() });
     expect(report.finishingRecovered).toContain(`${runId}/node-a #1`);
     expect(store.getAttempt(runId, "node-a", 1)!.status).toBe("completed");
+  }, 30_000);
+});
+
+// ---------------------------------------------------------------------------
+// A run paused mid-attempt: the completion must not crash the runner
+// ---------------------------------------------------------------------------
+
+describe("pause during an attempt", () => {
+  test("the attempt completes, the run pauses, and no successor row is asserted into existence", async () => {
+    // `completeAttempt` deliberately withholds the successor row while the run
+    // is paused; the runner used to assert that row existed and threw a
+    // TypeError *after* committing the completion, on the documented flow
+    // "pause lets the current node finish, then stops before its successor".
+    const inst = makeInstallation({
+      "slow": `version: 1
+id: slow
+description: Two nodes, the first slow enough to pause during.
+nodes:
+  node-a:
+    run:
+      command: sleep 2
+    next: node-b
+  node-b:
+    run:
+      command: echo b
+    next: null
+`,
+    });
+    const real = findInstallation(inst.root);
+    const loaded = loadAndValidateDefinition(join(inst.workflowsDir, "slow.yaml"));
+    const store = new Store(openDb(real.dbPath));
+    const started = await startWorkflow({ inst: real, loaded });
+
+    // Pause while node-a is still running.
+    const chain = runChain({ store, inst: real, loaded, runId: started.runId, cliPath: runtimeCliInvocation() });
+    await new Promise((r) => setTimeout(r, 400));
+    const run = store.getRun(started.runId)!;
+    store.setDesiredState(run.run_id, "paused", new Date());
+
+    // The chain resolves rather than rejecting: the runner must not treat an
+    // absent successor as an internal error.
+    const outcome = await chain.then(() => "resolved").catch((e: unknown) => `threw: ${e instanceof Error ? e.message : String(e)}`);
+
+    const after = store.getRun(started.runId)!;
+    expect(after.status).toBe("paused");
+    expect(store.getAttempt(started.runId, "node-a", 1)!.status).toBe("completed");
+    // No successor was created, which is the pause contract.
+    expect(store.getAttempt(started.runId, "node-b", 1)).toBeNull();
+    expect(outcome).toBe("resolved");
   }, 30_000);
 });

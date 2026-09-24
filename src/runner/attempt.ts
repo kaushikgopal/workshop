@@ -545,10 +545,16 @@ export async function executeAttempt(input: {
       if (e instanceof GuardRejected) return { status: "cancelled", detail: e.message };
       throw e;
     }
-    // Scaffold the persisted successor's packet from its own row.
+    // Scaffold the persisted successor's packet from its own row. A run paused
+    // mid-attempt has no successor row: `completeAttempt` withholds it on
+    // purpose, and `resume` recreates it from the snapshot. So the row is
+    // genuinely optional here — asserting it away crashed the runner on the
+    // documented pause path, after the completion had already been committed.
     if (successorId) {
-      const row = store.getAttempt(run.run_id, successorId, 1)!;
-      scaffoldPacket(attemptFolderOfPacket(row.packet_path), row.attempt, chain.next.get(successorId) ?? null);
+      const row = store.getAttempt(run.run_id, successorId, 1);
+      if (row) {
+        scaffoldPacket(attemptFolderOfPacket(row.packet_path), row.attempt, chain.next.get(successorId) ?? null);
+      }
     }
 
     return { status: "completed" };
