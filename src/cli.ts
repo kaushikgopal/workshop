@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { loadAndValidateDefinition, startWorkflow, runChain, preflightIfNeeded, scaffoldFirstAttempt } from "./execute.js";
 import { openDb } from "./store/db.js";
 import { Store, GuardRejected, type AttemptRow } from "./store/store.js";
-import { buildStatusDto, STATUS_DTO_VERSION } from "./status/dto.js";
+import { buildNodesForRun, buildStatusDto, STATUS_DTO_VERSION } from "./status/dto.js";
 import { glyph, localClock, renderTreeStatus } from "./status/tree.js";
 import { buildRunsFeed, DEFAULT_RUNS_LIMIT } from "./status/runs-feed.js";
 import type { ViewerSource } from "./viewer/source.js";
@@ -70,9 +70,10 @@ Commands:
       List the workflow's occurrences, newest first, with status and timing;
       --json emits the versioned runs feed.
 
-  workshop watch <workflow-id>
+  workshop watch [<workflow-id>]
       Follow one workflow live: its chain, its log stream, and its occurrences,
-      refreshed as the run progresses.
+      refreshed as the run progresses. Omit the id to pick from the configured
+      workflows first.
 
 
 
@@ -439,17 +440,25 @@ function attemptStreamFiles(attemptFolder: string): string[] {
  * on the projections, never on the store: `status --json` and `runs --json` are
  * the same builders this calls, and the log is the run's worklog.
  */
-function viewerSourceFor(inst: Installation, store: Store, workflowId: string): ViewerSource {
+function viewerSourceFor(inst: Installation, store: Store, workflowId: string | null): ViewerSource {
   return {
     async snapshot() {
       return {
-        status: buildStatusDto(store, new Date(), workflowId),
-        runs: buildRunsFeed({ workflowId, runs: store.listRuns(workflowId), all: false }),
+        // With no workflow chosen yet, every workflow is offered to the picker.
+        status: buildStatusDto(store, new Date(), workflowId ?? undefined),
+        // The picker draws only the workflow list, so an empty feed is honest
+        // until a workflow is chosen. Per-workflow runs arrive after that.
+        runs: buildRunsFeed({
+          workflowId: workflowId ?? "",
+          runs: workflowId ? store.listRuns(workflowId) : [],
+          all: false,
+          nodes: (runId) => buildNodesForRun(store, runId),
+        }),
       };
     },
     async log(runId: string | null) {
       if (runId === null) {
-        const every = store.listRuns(workflowId);
+        const every = workflowId ? store.listRuns(workflowId) : [];
         return every.map((r) => `\n━━ run ${r.run_id} — ${r.status} ━━\n${readFileSync(r.worklog_path, "utf8")}`).join("");
       }
       const run = store.getRun(runId);
@@ -470,11 +479,12 @@ function viewerSourceFor(inst: Installation, store: Store, workflowId: string): 
  * same contract without this code changing.
  */
 async function cmdWatch(args: string[]): Promise<void> {
-  if (args.length === 0) die("missing <workflow-id> argument");
-  const workflowId = requireArg(args.filter((a) => !a.startsWith("--")), "workflow-id");
+  // Omitting the workflow opens the picker instead of guessing which one.
+  const workflowId = args.find((a) => !a.startsWith("--")) ?? null;
   const inst = findInstallation();
   const store = new Store(openDb(inst.dbPath));
-  if (!store.getWorkflow(workflowId)) die(`no workflow "${workflowId}"`);
+  if (workflowId && !store.getWorkflow(workflowId)) die(`no workflow "${workflowId}"`);
+  if (!workflowId && store.listWorkflows().length === 0) die("no workflows configured");
   const { runViewer } = await import("./viewer/app.js");
   await runViewer({ workflowId, source: viewerSourceFor(inst, store, workflowId) });
 }
@@ -488,7 +498,13 @@ function cmdRuns(args: string[]): void {
   // An unknown workflow is a typo; a known workflow with no runs is simply young.
   if (!store.getWorkflow(workflowId)) die(`no workflow "${workflowId}"`);
   const rows = store.listRuns(workflowId); // seq ascending
-  const feed = buildRunsFeed({ workflowId, runs: rows, all, limit: DEFAULT_RUNS_LIMIT });
+  const feed = buildRunsFeed({
+    workflowId,
+    runs: rows,
+    all,
+    limit: DEFAULT_RUNS_LIMIT,
+    nodes: (runId) => buildNodesForRun(store, runId),
+  });
 
   if (json) {
     process.stdout.write(`${JSON.stringify(feed, null, 2)}\n`);

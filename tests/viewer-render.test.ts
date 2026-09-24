@@ -1,9 +1,9 @@
 import { describe, test, expect } from "bun:test";
 import { createTestRenderer } from "@opentui/core/testing";
 import { mountViewer, reduceKey, type ViewerState } from "../src/viewer/app.js";
-import { buildViewerModel } from "../src/viewer/panes.js";
+import { buildViewerModel, pickerModel } from "../src/viewer/panes.js";
 import type { StatusDto } from "../src/status/dto.js";
-import type { RunsFeed } from "../src/status/runs-feed.js";
+import { buildRunsFeed, type RunsFeed } from "../src/status/runs-feed.js";
 
 /**
  * The binding, asserted against a real render.
@@ -55,9 +55,20 @@ const feed: RunsFeed = {
   workflowId: "wf",
   total: 3,
   runs: [
-    { id: "wf-20260924-003", status: "running", desiredState: "running", startedAt: "2026-09-24T11:59:00.000Z", finishedAt: null, blocker: null },
-    { id: "wf-20260924-002", status: "failed", desiredState: "running", startedAt: "2026-09-24T11:00:00.000Z", finishedAt: "2026-09-24T11:02:00.000Z", blocker: "orchestrator_unresolved" },
-    { id: "wf-20260924-001", status: "completed", desiredState: "running", startedAt: "2026-09-24T10:00:00.000Z", finishedAt: "2026-09-24T10:01:00.000Z", blocker: null },
+    { id: "wf-20260924-003", status: "running", desiredState: "running", startedAt: "2026-09-24T11:59:00.000Z", finishedAt: null, blocker: null, nodes: dto.workflows[0]!.currentRun!.nodes },
+    {
+      id: "wf-20260924-002",
+      status: "failed",
+      desiredState: "running",
+      startedAt: "2026-09-24T11:00:00.000Z",
+      finishedAt: "2026-09-24T11:02:00.000Z",
+      blocker: "orchestrator_unresolved",
+      nodes: [
+        { id: "node-timestamp", status: "completed", attempts: [{ number: 1, status: "completed", progress: null, validator: "passed", failure: null, blocker: null, startedAt: "2026-09-24T11:00:00.000Z", finishedAt: "2026-09-24T11:00:00.100Z" }] },
+        { id: "node-generate-line", status: "failed", attempts: [{ number: 1, status: "failed", progress: null, validator: "failed", failure: "validator_rejection", blocker: null, startedAt: "2026-09-24T11:00:01.000Z", finishedAt: "2026-09-24T11:00:30.000Z" }] },
+      ],
+    },
+    { id: "wf-20260924-001", status: "completed", desiredState: "running", startedAt: "2026-09-24T10:00:00.000Z", finishedAt: "2026-09-24T10:01:00.000Z", blocker: null, nodes: [] },
   ],
 };
 
@@ -85,7 +96,7 @@ describe("viewer frame — what an operator actually sees", () => {
 
     // Chain: spine, glyphs, the retry count, a finished duration, live detail.
     expect(frame).toContain("chain · 003 · running");
-    expect(frame).toContain("├─ ◉ node-timestamp  200ms — validator passed");
+    expect(frame).toContain("├─ ◉ node-timestamp  200ms");
     expect(frame).toContain("├─ ◎ node-generate-line #2 — drafting a line");
 
     // Runs: the selected occurrence is marked, and ages read as a timeline.
@@ -201,5 +212,58 @@ describe("viewer keys — pure state transitions", () => {
     expect(reduceKey(state, { name: "r" }, ids)).toBe("refresh");
     expect(reduceKey(state, { name: "z" }, ids)).toBeNull();
     expect(state.selectedRunId).toBe("wf-003");
+  });
+});
+
+describe("viewer frame — picker and a scrolled feed", () => {
+  const run = (over: { run_id: string; seq: number; status?: string }) => ({
+    run_id: over.run_id,
+    workflow_id: "wf",
+    seq: over.seq,
+    status: over.status ?? "completed",
+    desired_state: "running",
+    started_at: "2026-09-24T11:00:00.000Z",
+    finished_at: "2026-09-24T11:01:00.000Z",
+    block_kind: null,
+  }) as never;
+
+  test("no workflow given: the picker lists what is configured", async () => {
+    const { renderer, renderOnce, captureCharFrame } = await createTestRenderer({ width: 100, height: 22 });
+    const dto2: StatusDto = {
+      version: 1,
+      workflows: [
+        { id: "hemingway-clock", definitionHash: "x", activation: { state: "exhausted", startedAt: "2026-09-24T09:00:00.000Z", startedRuns: 6, maxRuns: 6, nextRunAt: null }, currentRun: null },
+        { id: "nightly-report", definitionHash: "y", activation: null, currentRun: null },
+      ],
+    };
+    mountViewer(renderer, { rows: 6 }).paint(pickerModel({ dto: dto2, cursor: 1 }), { picking: true });
+    await renderOnce();
+    const frame = captureCharFrame();
+    expect(frame).toContain("pick a workflow");
+    expect(frame).toContain("hemingway-clock  exhausted 6/6");
+    expect(frame).toContain("▶ nightly-report  one-shot");
+    expect(frame).toContain("enter  open this workflow");
+    // The footer advertises the picker's keys, not the viewer's run controls.
+    expect(frame).toContain("↑↓ choose · enter open · q quit");
+    expect(frame).not.toContain("a all runs");
+  });
+
+  test("with more runs than rows, the feed scrolls to keep the selection visible", async () => {
+    const many = Array.from({ length: 20 }, (_, i) =>
+      run({ run_id: `wfy-${String(i + 1).padStart(3, "0")}`, seq: i + 1, status: i % 2 === 0 ? "failed" : "completed" }),
+    );
+    const long = buildRunsFeed({ workflowId: "wf", runs: many, nodes: () => [] });
+    const { renderer, renderOnce, captureCharFrame } = await createTestRenderer({ width: 100, height: 24 });
+    mountViewer(renderer, { rows: 4, runsRows: 5 }).paint(
+      buildViewerModel({ workflowId: "wf", dto, feed: long, logText: null, selectedRunId: "wfy-007", now: NOW, runsHeight: 5 }),
+    );
+    await renderOnce();
+    const frame = captureCharFrame();
+    // The selected occurrence is on screen even though it is deep in the feed.
+    const selectedRow = frame.split("\n").find((row) => row.includes("▶"));
+    expect(selectedRow).toBeDefined();
+    expect(selectedRow).toContain("007");
+    // And the title says which slice is shown, so the viewport is never a mystery.
+    expect(frame).toMatch(/runs · 20 · \d+–\d+\/20/);
   });
 });

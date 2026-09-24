@@ -84,13 +84,23 @@ export function buildWorkflowDto(store: Store, wf: WorkflowRow, _now: Date): Wor
   };
 }
 
-export function buildRunDto(store: Store, run: RunRow): RunStatusDto {
-  const attempts = store.listAttempts(run.run_id);
-  // Arrays are ordered by chain position, then attempt number.
+/**
+ * One run's chain, in chain order. Shared by the current-run DTO and the runs
+ * feed so a viewer can draw the chain of a run that is already terminal —
+ * which is what you want when you are looking at a failure rather than
+ * watching a live run.
+ */
+export function buildNodesForRun(store: Store, runId: string): NodeStatusDto[] {
+  const attempts = store.listAttempts(runId);
   const nodeIds: string[] = [];
   for (const a of attempts.slice().sort((x, y) => x.chain_position - y.chain_position || x.attempt - y.attempt)) {
     if (!nodeIds.includes(a.node_id)) nodeIds.push(a.node_id);
   }
+  return nodeIds.map((id) => buildNodeDto(attempts.filter((a) => a.node_id === id), id));
+}
+
+export function buildRunDto(store: Store, run: RunRow): RunStatusDto {
+  // Arrays are ordered by chain position, then attempt number.
   return {
     id: run.run_id,
     status: run.status,
@@ -98,7 +108,7 @@ export function buildRunDto(store: Store, run: RunRow): RunStatusDto {
     orchestratorPhase: run.orchestrator_phase,
     startedAt: run.started_at,
     blocker: run.block_kind,
-    nodes: nodeIds.map((id) => buildNodeDto(attempts.filter((a) => a.node_id === id), id)),
+    nodes: buildNodesForRun(store, run.run_id),
   };
 }
 

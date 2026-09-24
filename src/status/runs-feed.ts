@@ -1,4 +1,5 @@
 import type { RunRow } from "../store/store.js";
+import type { NodeStatusDto } from "./dto.js";
 
 /**
  * The runs feed — a workflow's occurrences as a viewer reads them.
@@ -22,6 +23,13 @@ export interface RunsFeedEntry {
   startedAt: string;
   finishedAt: string | null;
   blocker: string | null;
+  /**
+   * The run's chain. Carried here rather than read on demand because the status
+   * DTO only holds the unresolved run — without this a viewer can show nothing
+   * about a run that already finished, which is exactly the run you inspect
+   * after a failure.
+   */
+  nodes: NodeStatusDto[];
 }
 
 export interface RunsFeed {
@@ -43,6 +51,8 @@ export function buildRunsFeed(input: {
   runs: RunRow[];
   all?: boolean;
   limit?: number;
+  /** Chain lookup, injected so the feed stays pure and testable. */
+  nodes?: (runId: string) => NodeStatusDto[];
 }): RunsFeed {
   const newestFirst = [...input.runs].reverse();
   const capped = input.all ? newestFirst : newestFirst.slice(0, input.limit ?? DEFAULT_RUNS_LIMIT);
@@ -57,6 +67,7 @@ export function buildRunsFeed(input: {
       startedAt: run.started_at,
       finishedAt: run.finished_at,
       blocker: run.block_kind,
+      nodes: input.nodes?.(run.run_id) ?? [],
     })),
   };
 }

@@ -62,7 +62,15 @@ describe("workshop runs — the occurrences feed", () => {
       version: number;
       workflowId: string;
       total: number;
-      runs: Array<{ id: string; status: string; desiredState: string; startedAt: string; finishedAt: string | null; blocker: string | null }>;
+      runs: Array<{
+        id: string;
+        status: string;
+        desiredState: string;
+        startedAt: string;
+        finishedAt: string | null;
+        blocker: string | null;
+        nodes: Array<{ id: string; status: string }>;
+      }>;
     };
     expect(feed.version).toBe(1);
     expect(feed.workflowId).toBe("twice");
@@ -74,8 +82,11 @@ describe("workshop runs — the occurrences feed", () => {
       expect(run.blocker).toBeNull();
       expect(run.startedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
       expect(run.finishedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+      // Each occurrence carries its chain, so a finished run stays inspectable.
+      expect(run.nodes.map((n) => n.id)).toEqual(["node-a"]);
+      expect(run.nodes[0]!.status).toBe("completed");
       expect(Object.keys(run).sort()).toEqual(
-        ["blocker", "desiredState", "finishedAt", "id", "startedAt", "status"].sort(),
+        ["blocker", "desiredState", "finishedAt", "id", "nodes", "startedAt", "status"].sort(),
       );
     }
   });

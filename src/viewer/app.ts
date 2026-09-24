@@ -8,8 +8,9 @@ import {
   type RenderContext,
   type StyledText,
 } from "@opentui/core";
-import { buildViewerModel, type ViewerModel } from "./panes.js";
+import { buildViewerModel, pickerModel, type ViewerModel } from "./panes.js";
 import type { ViewerSource } from "./source.js";
+import type { StatusDto } from "../status/dto.js";
 
 /**
  * The terminal binding. Everything above this file (the projections, the pane
@@ -95,8 +96,14 @@ class Pane {
   readonly box: BoxRenderable;
   private readonly lines: TextRenderable[];
 
-  constructor(ctx: RenderContext, title: string, rows: number, opts: { flexGrow?: number; width?: number } = {}) {
+  constructor(
+    ctx: RenderContext,
+    title: string,
+    rows: number,
+    opts: { flexGrow?: number; width?: number; flexBasis?: number | "auto" } = {},
+  ) {
     this.box = new BoxRenderable(ctx, {
+      flexBasis: opts.flexBasis ?? "auto",
       border: true,
       borderStyle: "rounded",
       borderColor: DIM,
@@ -119,6 +126,7 @@ class Pane {
   setTitle(title: string): void {
     this.box.title = title;
   }
+
 
   set(content: StyledText[]): void {
     for (let i = 0; i < this.lines.length; i++) {
@@ -181,10 +189,13 @@ function glyphStatus(glyph: string): string {
 }
 
 export interface RunViewerOptions {
-  workflowId: string;
+  /** Omit to choose from the configured workflows first. */
+  workflowId?: string | null;
   source: ViewerSource;
   refreshMs?: number;
   rows?: number;
+  /** Rows the runs pane shows; the viewport scrolls to keep the selection. */
+  runsRows?: number;
 }
 
 /**
@@ -198,7 +209,7 @@ export interface RunViewerOptions {
  * one.
  */
 export interface ViewerMount {
-  paint(model: ViewerModel, extra?: { pollError?: string | null; collated?: boolean }): void;
+  paint(model: ViewerModel, extra?: { pollError?: string | null; collated?: boolean; picking?: boolean }): void;
 }
 
 /** One row of chrome: never allowed to wrap into a second. */
@@ -206,14 +217,16 @@ function clipToWidth(text: string, width: number): string {
   return text.length <= width ? text : text.slice(0, Math.max(0, width - 1)) + "…";
 }
 
-export function mountViewer(renderer: CliRenderer, opts: { rows?: number } = {}): ViewerMount {
+export function mountViewer(renderer: CliRenderer, opts: { rows?: number; runsRows?: number } = {}): ViewerMount {
   const rows = opts.rows ?? 12;
   const root = new BoxRenderable(renderer, { flexDirection: "column", width: "100%", height: "100%" });
   const header = new TextRenderable(renderer, { content: "" });
   const main = new BoxRenderable(renderer, { flexDirection: "row", flexGrow: 1, columnGap: 1 });
-  const chain = new Pane(renderer, "chain", rows, { flexGrow: 1 });
-  const log = new Pane(renderer, "log", rows, { flexGrow: 2 });
-  const runs = new Pane(renderer, "runs", 8);
+  // flexBasis 0 makes the shares real: with a content-based basis the pane
+  // holding longer text wins the row, which squeezed the chain pane.
+  const chain = new Pane(renderer, "chain", rows, { flexGrow: 1, flexBasis: 0 });
+  const log = new Pane(renderer, "log", rows, { flexGrow: 2, flexBasis: 0 });
+  const runs = new Pane(renderer, "runs", opts.runsRows ?? 8);
   const footer = new TextRenderable(renderer, { content: t`${fg(DIM)(FOOTER_HINTS)}` });
 
   main.add(chain.box);
@@ -233,8 +246,14 @@ export function mountViewer(renderer: CliRenderer, opts: { rows?: number } = {})
         : t`${fg(ACCENT)("WORKSHOP")}  ${fg(TEXT)(model.header)}${fg(DIM)(tally)}`;
       // The hints matter more than the run id when the terminal is narrow.
       const width = renderer.terminalWidth;
-      const full = `${extra.collated ? "all runs" : (model.selectedRunId ?? "no run")}  ·  ${FOOTER_HINTS}`;
+      const full = extra.picking
+        ? `↑↓ choose · enter open · q quit`
+        : `${extra.collated ? "all runs" : (model.selectedRunId ?? "no run")}  ·  ${FOOTER_HINTS}`;
       footer.content = t`${fg(DIM)(clipToWidth(full, width))}`;
+      // Panes share width by mode: a list needs room for ids, a log needs room
+      // for text. Without this the picker squeezed ids into a third.
+      chain.box.flexGrow = model.layout.left;
+      log.box.flexGrow = model.layout.right;
       chain.setTitle(paneRows.chain.title);
       chain.set(paneRows.chain.rows);
       log.setTitle(paneRows.log.title);
@@ -255,25 +274,44 @@ export async function runViewer(opts: RunViewerOptions): Promise<void> {
   const state: ViewerState = { selectedRunId: null, follow: true, collated: false };
   let pollError: string | null = null;
   let runIds: string[] = [];
-  const mount = mountViewer(renderer, { rows: opts.rows ?? 12 });
+  let workflowId = opts.workflowId ?? null;
+  let cursor = 0;
+  let lastStatus: StatusDto | null = null;
+  const mount = mountViewer(renderer, { rows: opts.rows ?? 12, runsRows: opts.runsRows ?? 8 });
 
   const refresh = async (): Promise<void> => {
     try {
       const { status, runs: feed } = await opts.source.snapshot();
-      runIds = feed.runs.map((r) => r.id);
+      lastStatus = status;
+
+      // No workflow chosen yet: the picker is just another frame.
+      if (!workflowId) {
+        const ids = status.workflows.map((w) => w.id);
+        cursor = Math.max(0, Math.min(ids.length - 1, cursor));
+        pollError = null;
+        mount.paint(pickerModel({ dto: status, cursor }), { picking: true });
+        return;
+      }
+
+      const scoped = { ...feed, workflowId };
+      runIds = scoped.runs.map((r) => r.id);
       if (state.follow && runIds[0]) state.selectedRunId = runIds[0];
       if (!state.selectedRunId && runIds[0]) state.selectedRunId = runIds[0];
       const logText = await opts.source.log(state.collated ? null : state.selectedRunId);
       pollError = null;
       mount.paint(
         buildViewerModel({
-          workflowId: opts.workflowId,
+          workflowId,
           dto: status,
-          feed,
+          feed: scoped,
           logText,
           selectedRunId: state.selectedRunId,
           collated: state.collated,
           streamHeight: opts.rows ?? 12,
+          runsHeight: opts.runsRows ?? 8,
+          // The model drops a detail rather than let a row be cut mid-identifier,
+          // so it needs to know how much room the pane actually has.
+          terminalWidth: renderer.terminalWidth,
         }),
         { pollError, collated: state.collated },
       );
@@ -284,6 +322,19 @@ export async function runViewer(opts: RunViewerOptions): Promise<void> {
   };
 
   renderer.keyInput.on("keypress", (key) => {
+    if (!workflowId) {
+      const ids = lastStatus?.workflows.map((w) => w.id) ?? [];
+      const name = key.name.toLowerCase();
+      if (name === "q" || (key.ctrl && name === "c")) {
+        renderer.destroy();
+        return;
+      }
+      if (name === "j" || name === "down") cursor = Math.min(ids.length - 1, cursor + 1);
+      else if (name === "k" || name === "up") cursor = Math.max(0, cursor - 1);
+      else if (name === "enter" || name === "return") workflowId = ids[cursor] ?? null;
+      void refresh();
+      return;
+    }
     const action = reduceKey(state, { name: key.name, ctrl: key.ctrl }, runIds);
     if (action === "quit") {
       renderer.destroy();
