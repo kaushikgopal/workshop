@@ -1,6 +1,7 @@
 import { ParsedModel } from "../definition/model.js";;
 import { readFileSync } from "node:fs";
-import { authorizedMarker, packetTemplate } from "../worklog/worklog.js";
+import { authorizedMarker } from "../worklog/markers.js";
+import { packetTemplate } from "../worklog/packet.js";
 
 /**
  * The runtime context every attempt process receives. The prompt is never

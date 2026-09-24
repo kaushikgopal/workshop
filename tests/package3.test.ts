@@ -320,7 +320,7 @@ describe("gate 24 — orchestrator phase recovery", () => {
     const store = new Store(openDb(real.dbPath));
 
     const token = "tok1234567890";
-    const { atomicWriteFileSync } = await import("../src/worklog/worklog.js");
+    const { atomicWriteFileSync } = await import("../src/worklog/fs.js");
     const { orchestratorResultFile } = await import("../src/orchestrator.js");
     const run = store.getRun(started.runId)!;
     const resultPath = orchestratorResultFile(run.run_dir, token);

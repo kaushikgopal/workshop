@@ -22,14 +22,10 @@ import { deriveNodeStatus } from "../src/status/node-status.js";
 import { buildStatusDto } from "../src/status/dto.js";
 import { renderTreeStatus } from "../src/status/tree.js";
 import { runtimeCliInvocation } from "../src/util/cli-path.js";
-import {
-  RunLock,
-  attemptFolderOfPacket,
-  mergePacket,
-  packetPath,
-  sha256File,
-  atomicWriteFileSync,
-} from "../src/worklog/worklog.js";
+import { attemptFolderOfPacket, packetPath, sha256File } from "../src/worklog/worklog.js";
+import { atomicWriteFileSync } from "../src/worklog/fs.js";
+import { mergePacket } from "../src/worklog/packet.js";
+import { RunLock } from "../src/worklog/lock.js";
 
 const MOCK = mockAgentHarness();
 

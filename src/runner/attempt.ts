@@ -1,32 +1,22 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Installation } from "../config.js";
-import type { NodeDefinition, WorkflowDefinition } from "../definition/schema.js";
-import { resolveAgent, type AgentResolution } from "../definition/resolve.js";
+import type { WorkflowDefinition } from "../definition/schema.js";
 import { type ChainInfo } from "../definition/chain.js";
-import { type ParsedModel } from "../definition/model.js";;
-import { parseTimeout } from "../util/duration.js";
+import { type ParsedModel } from "../definition/model.js";
 import { type Clock } from "../util/clock.js";
 import type { BlockKind, FailureKind, RunRow, Store } from "../store/store.js";
 import { CapacityRejected, GuardRejected } from "../store/store.js";
-import {
-  WorklogIntegrityError,
-  atomicWriteFileSync,
-  fsyncFileSync,
-  attemptFolderOfPacket,
-  authorizedMarker,
-  extractMarker as extractMarkerText,
-  mergePacket,
-  packetPath,
-  packetTemplate,
-  scaffoldPacket,
-  validatePacket,
-  worklogFingerprint,
-  RunLock,
-} from "../worklog/worklog.js";
+import { capStreams } from "../util/retention.js";
+import { WorklogIntegrityError, attemptFolderOfPacket, packetPath, worklogFingerprint } from "../worklog/worklog.js";
+import { atomicWriteFileSync, fsyncFileSync } from "../worklog/fs.js";
+import { authorizedMarker, validatePacket } from "../worklog/markers.js";
+import { extractMarker as extractMarkerText, mergePacket, packetTemplate, scaffoldPacket } from "../worklog/packet.js";
+import { RunLock } from "../worklog/lock.js";
 import { attemptEnv, renderAgentPrompt } from "./env.js";
-import { spawnTracked, type TrackedProcess } from "./spawn.js";
-import { capStreams, parseByteSize, type StreamCap } from "../util/retention.js";
+import { raceDeadline, spawnTracked, type TrackedProcess } from "./spawn.js";
+import { resolveNode } from "./resolve.js";
+import { runValidator, type ValidatorOutcome } from "./validator.js";
 
 /**
  * The attempt runner. One execution of one node:
@@ -35,81 +25,6 @@ import { capStreams, parseByteSize, type StreamCap } from "../util/retention.js"
  */
 
 const HEARTBEAT_MS = 5000;
-
-export type NodeRun =
-  | { kind: "command"; command: string }
-  | { kind: "agent"; agent: { harness?: { command: string }; model?: string; instructions: string }; resolution: AgentResolution };
-
-export type NodeValidator =
-  | { kind: "command"; command: string; timeoutMs: number | null }
-  | { kind: "agent"; agent: { harness?: { command: string }; model?: string; instructions: string }; resolution: AgentResolution; timeoutMs: number | null };
-
-export interface NodeResolved {
-  maxAttempts: number;
-  timeoutMs: number | null; // null = unlimited
-  streamCapBytes: StreamCap;
-  run: NodeRun;
-  validator: NodeValidator | null;
-}
-
-/** Resolve one node's bounds and execution union. */
-export function resolveNode(
-  def: WorkflowDefinition,
-  nodeId: string,
-  inst: { defaultTimeoutMs: number; streamCapBytes: StreamCap; machineAgent: { harness?: { command: string }; model?: string } | undefined },
-): NodeResolved {
-  const node: NodeDefinition = def.nodes[nodeId]!;
-  if (!node) throw new Error(`no node "${nodeId}" in definition`);
-  const maxAttempts = node.max_attempts ?? def.defaults?.max_attempts ?? 2;
-
-  const timeout = parseTimeout(node.timeout);
-  const defaultTimeout = def.defaults?.timeout ? parseTimeout(def.defaults.timeout) : null;
-  let timeoutMs: number | null;
-  if (timeout.kind === "unlimited") {
-    timeoutMs = null;
-  } else if (timeout.ms >= 0) {
-    timeoutMs = timeout.ms;
-  } else if (defaultTimeout && defaultTimeout.kind === "limited" && defaultTimeout.ms >= 0) {
-    timeoutMs = defaultTimeout.ms;
-  } else if (defaultTimeout?.kind === "unlimited") {
-    timeoutMs = null;
-  } else {
-    timeoutMs = inst.defaultTimeoutMs;
-  }
-
-  let run: NodeRun;
-  if ("command" in node.run) {
-    run = { kind: "command", command: node.run.command };
-  } else {
-    const agent = node.run.agent;
-    const resolution = resolveAgent({ node: agent, workflowDefault: def.defaults?.agent, machine: inst.machineAgent });
-    run = { kind: "agent", agent, resolution };
-  }
-
-  let validator: NodeValidator | null = null;
-  if (node.validator) {
-    if ("command" in node.validator) {
-      const vt = node.validator.timeout ? parseTimeout(node.validator.timeout) : null;
-      validator = {
-        kind: "command",
-        command: node.validator.command,
-        timeoutMs: vt ? (vt.kind === "unlimited" ? null : vt.ms) : inst.defaultTimeoutMs,
-      };
-    } else {
-      const agent = node.validator.agent;
-      const resolution = resolveAgent({ node: agent, workflowDefault: def.defaults?.agent, machine: inst.machineAgent });
-      const vt = node.validator.timeout ? parseTimeout(node.validator.timeout) : null;
-      validator = {
-        kind: "agent",
-        agent,
-        resolution,
-        timeoutMs: vt ? (vt.kind === "unlimited" ? null : vt.ms) : inst.defaultTimeoutMs,
-      };
-    }
-  }
-
-  return { maxAttempts, timeoutMs, streamCapBytes: node.stream_cap ? parseByteSize(node.stream_cap) : inst.streamCapBytes, run, validator };
-}
 
 export interface AttemptOutcome {
   status: "completed" | "failed" | "blocked" | "cancelled";
@@ -564,23 +479,6 @@ export async function executeAttempt(input: {
   }
 }
 
-async function raceDeadline(
-  proc: TrackedProcess,
-  timeoutMs: number | null,
-): Promise<{ kind: "exit"; exit: { code: number | null; signal: NodeJS.Signals | null } } | { kind: "timeout" }> {
-  if (timeoutMs === null) return { kind: "exit", exit: await proc.exit };
-  let timerId: ReturnType<typeof setTimeout> | undefined;
-  const timer = new Promise<"timeout">((resolve) => {
-    timerId = setTimeout(() => resolve("timeout"), timeoutMs);
-  });
-  try {
-    const exit = await Promise.race([proc.exit.then((e) => ({ kind: "exit" as const, exit: e })), timer]);
-    return exit === "timeout" ? { kind: "timeout" } : exit;
-  } finally {
-    clearTimeout(timerId);
-  }
-}
-
 /**
  * Node output for handoff and validation: command stdout, or the agent's
  * marker content; an empty agent marker falls back to the complete packet.
@@ -638,196 +536,6 @@ ${stdout.trimEnd()}
 ${input.marker.closing}
 `;
   atomicWriteFileSync(input.packetFile, content);
-}
-
-/**
- * The normalized validator record both validator kinds converge on: command
- * validators record their exit-code verdict, agent validators the verdict
- * parsed from their validation.json. Atomic and durable (S9).
- */
-function writeValidatorRecord(
-  validationDir: string,
-  record: { kind: "command" | "agent"; status: "passed" | "failed"; reason: string },
-): void {
-  atomicWriteFileSync(join(validationDir, "validator-record.json"), JSON.stringify({ version: 1, ...record }, null, 2) + "\n");
-}
-
-/**
- * Discriminated validator result. A timeout is machinery, not judgment: it is
- * typed `timeout` (spec §10), never a `validator_rejection`.
- */
-type ValidatorOutcome =
-  | { outcome: "passed"; reason: string }
-  | { outcome: "rejected"; reason: string }
-  | { outcome: "timeout"; reason: string }
-  | { outcome: "unconfirmed"; reason: string };
-
-async function runValidator(input: {
-  store: Store;
-  ownerToken: string;
-  clock: Clock;
-  inst: Installation;
-  run: RunRow;
-  nodeId: string;
-  validator: NodeValidator;
-  attemptFolder: string;
-  attemptNo: number;
-  packetFile: string;
-  outputFile: string;
-  stdoutFile: string;
-  stderrFile: string;
-  cliPath: string;
-}): Promise<ValidatorOutcome> {
-  const validationDir = join(input.attemptFolder, "validation");
-  mkdirSync(validationDir, { recursive: true });
-  const validationFile = join(validationDir, "validation.json");
-  const validationStdout = join(validationDir, "stdout");
-  const validationStderr = join(validationDir, "stderr");
-  const normalized = (outcome: "passed" | "rejected", reason: string): ValidatorOutcome => {
-    // The runtime-owned normalized verdict: durable evidence both validator
-    // kinds converge on (command exit code, or the parsed validation.json).
-    writeValidatorRecord(validationDir, {
-      kind: input.validator.kind,
-      status: outcome === "passed" ? "passed" : "failed",
-      reason,
-    });
-    return { outcome, reason };
-  };
-
-  const model = input.validator.kind === "agent" ? input.validator.resolution.model : null;
-  if (
-    input.validator.kind === "agent" &&
-    (!input.validator.resolution.harnessCommand || !input.validator.resolution.model)
-  ) {
-    return normalized("rejected", "validator agent harness/model unresolved");
-  }
-
-  const env = attemptEnv({
-    logPath: input.run.worklog_path,
-    runId: input.run.run_id,
-    nodeId: input.nodeId,
-    attempt: input.attemptNo,
-    promptFile: null,
-    nodeOutputFile: input.outputFile,
-    previousOutputFile: null,
-    packetFile: input.packetFile,
-    stdoutFile: input.stdoutFile,
-    stderrFile: input.stderrFile,
-    ownerToken: "validator-not-an-owner",
-    validationFile,
-    model,
-    cliPath: input.cliPath,
-  });
-
-  let command: string;
-  if (input.validator.kind === "command") {
-    command = input.validator.command;
-  } else {
-    const promptFile = join(validationDir, "prompt.md");
-    atomicWriteFileSync(
-      promptFile,
-      renderValidatorPrompt(input.nodeId, input.validator.agent.instructions, {
-        packetFile: input.packetFile, outputFile: input.outputFile,
-        logPath: input.run.worklog_path, validationFile,
-      }),
-    );
-    env.WORKSHOP_PROMPT_FILE = promptFile;
-    command = input.validator.resolution.harnessCommand!;
-  }
-
-  const proc = spawnTracked({
-    shell: input.inst.shell,
-    command,
-    cwd: input.inst.projectDir,
-    env,
-    stdoutFile: validationStdout,
-    stderrFile: validationStderr,
-  });
-  input.store.recordValidatorIdentity({
-    runId: input.run.run_id, nodeId: input.nodeId, attempt: input.attemptNo, ownerToken: input.ownerToken,
-    childPid: proc.pid, childStartId: proc.startId, childPgid: proc.pgid, now: input.clock.now(),
-  });
-
-
-  const retire = async (): Promise<boolean> => {
-    const confirmed = await proc.kill();
-    if (!confirmed) return false;
-    if (existsSync(validationStdout)) fsyncFileSync(validationStdout);
-    if (existsSync(validationStderr)) fsyncFileSync(validationStderr);
-    const cleared = input.store.clearAttemptProcessIdentity({
-      runId: input.run.run_id, nodeId: input.nodeId, attempt: input.attemptNo, ownerToken: input.ownerToken,
-      role: "validator", pid: proc.pid, startId: proc.startId, pgid: proc.pgid, now: input.clock.now(),
-    });
-    return cleared || input.store.getAttempt(input.run.run_id, input.nodeId, input.attemptNo)?.validator_process_group === null;
-  };
-
-  const exitOrTimeout = await raceDeadline(proc, input.validator.timeoutMs);
-  if (exitOrTimeout.kind === "timeout") {
-    if (!(await retire())) {
-      return { outcome: "unconfirmed", reason: "validator timed out and group death could not be confirmed" };
-    }
-    return { outcome: "timeout", reason: `validator timed out after ${input.validator.timeoutMs}ms` };
-  }
-  const { code } = exitOrTimeout.exit;
-  if (!(await retire())) {
-    return { outcome: "unconfirmed", reason: "validator leader exited but surviving group members remain" };
-  }
-
-  if (input.validator.kind === "command") {
-    return code === 0
-      ? normalized("passed", "command validator exited 0")
-      : normalized("rejected", `command validator exited ${code ?? "null"}`);
-  }
-
-  // The agent wrote this file externally. Flush it before parsing or deriving
-  // the runtime-owned normalized validator record.
-  if (!existsSync(validationFile)) {
-    return normalized("rejected", `validator wrote no validation.json (exit ${code ?? "null"})`);
-  }
-  fsyncFileSync(validationFile);
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(readFileSync(validationFile, "utf8"));
-  } catch (e) {
-    return normalized("rejected", `validation.json is not valid JSON: ${(e as Error).message}`);
-  }
-  const result = parsed as { passed?: unknown; reason?: unknown };
-  if (typeof result.passed !== "boolean") {
-    return normalized("rejected", "validation.json has no boolean 'passed'");
-  }
-  const reason = typeof result.reason === "string" ? result.reason : "";
-  return result.passed
-    ? normalized("passed", reason || "validator passed")
-    : normalized("rejected", reason || "validator failed without a reason");
-}
-
-function renderValidatorPrompt(
-  nodeId: string,
-  instructions: string,
-  ctx: { packetFile: string; outputFile: string; logPath: string; validationFile: string },
-): string {
-  return `# Workshop validator
-
-You are a fresh validator for node ${nodeId}. Judge only what the instructions say.
-
-## Instructions
-
-${instructions}
-
-## Evidence
-
-- Attempt packet: ${ctx.packetFile}
-- Marked node output: ${ctx.outputFile}
-- Worklog: ${ctx.logPath}
-
-## Output contract
-
-Write exactly one JSON object to ${ctx.validationFile}:
-
-{"passed": true, "reason": "<short reason>"}
-
-Missing or invalid validation output counts as failure.
-`;
 }
 
 export function blockKindFor(kind: string): BlockKind | null {

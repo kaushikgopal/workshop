@@ -7,7 +7,8 @@ import { workflowSchema, type WorkflowDefinition } from "./definition/schema.js"
 import { validateChain, type ChainInfo } from "./definition/chain.js";;
 import { GuardRejected, type RunRow, type Store } from "./store/store.js";
 import { parseDuration } from "./util/duration.js";
-import { ensurePristineFile, WorklogIntegrityError, worklogTemplate } from "./worklog/worklog.js";
+import { WorklogIntegrityError, worklogTemplate } from "./worklog/worklog.js";
+import { ensurePristineFile } from "./worklog/fs.js";
 
 export interface AdmissionDefinition {
   def: WorkflowDefinition;

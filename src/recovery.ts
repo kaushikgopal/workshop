@@ -5,19 +5,15 @@ import type { ChainInfo } from "./definition/chain.js";
 import type { WorkflowDefinition } from "./definition/schema.js";
 import { loadSnapshot, type SnapshotBundle } from "./definition/snapshot.js";
 import { parseStrictYaml } from "./definition/parse.js";
-import { resolveNode } from "./runner/attempt.js";
+import { resolveNode } from "./runner/resolve.js";
 import type { Store } from "./store/store.js";
 import { GuardRejected, type AttemptRow, type RunRow } from "./store/store.js";
 import { recoverAdmissions } from "./admission.js";
 import { isProcessAlive, processStartId, terminateProcessGroup } from "./util/process.js";
 import type { Clock } from "./util/clock.js";
-import {
-  WorklogIntegrityError,
-  attemptFolderOfPacket,
-  mergePacket,
-  scaffoldPacket,
-  RunLock,
-} from "./worklog/worklog.js";
+import { WorklogIntegrityError, attemptFolderOfPacket } from "./worklog/worklog.js";
+import { mergePacket, scaffoldPacket } from "./worklog/packet.js";
+import { RunLock } from "./worklog/lock.js";
 import { recoverOrchestratorDecision } from "./orchestrator.js";
 
 /**

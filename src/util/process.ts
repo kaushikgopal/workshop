@@ -17,6 +17,16 @@ export function isProcessAlive(pid: number): boolean {
 }
 
 /**
+ * Claim identities must carry a start id, so an unreadable `ps` row is an
+ * error rather than a null that would weaken the identity check.
+ */
+export function processStartIdOrThrow(pid: number): string {
+  const id = processStartId(pid);
+  if (id === null) throw new Error(`cannot capture process-start identity for pid ${pid}`);
+  return id;
+}
+
+/**
  * Terminate a whole process group and confirm death before returning true.
  * Sends SIGTERM to the group, escalates to SIGKILL after the grace period,
  * then polls until no member of the group remains. Returns false only when

@@ -80,3 +80,21 @@ function captureIdentity(pid: number): { pid: number; pgid: number; startId: str
   }
   throw new Error(`cannot capture process-start identity for pid ${pid}`);
 }
+
+/** Race a tracked process's exit against a deadline; null means wait forever. */
+export async function raceDeadline(
+  proc: TrackedProcess,
+  timeoutMs: number | null,
+): Promise<{ kind: "exit"; exit: { code: number | null; signal: NodeJS.Signals | null } } | { kind: "timeout" }> {
+  if (timeoutMs === null) return { kind: "exit", exit: await proc.exit };
+  let timerId: ReturnType<typeof setTimeout> | undefined;
+  const timer = new Promise<"timeout">((resolve) => {
+    timerId = setTimeout(() => resolve("timeout"), timeoutMs);
+  });
+  try {
+    const exit = await Promise.race([proc.exit.then((e) => ({ kind: "exit" as const, exit: e })), timer]);
+    return exit === "timeout" ? { kind: "timeout" } : exit;
+  } finally {
+    clearTimeout(timerId);
+  }
+}

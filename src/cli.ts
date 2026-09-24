@@ -10,7 +10,7 @@ import { renderTreeStatus } from "./status/tree.js";
 import { glyph, localClock } from "./status/format.js";
 import { buildRunsFeed, DEFAULT_RUNS_LIMIT } from "./status/runs-feed.js";
 import type { ViewerSource } from "./tui-source.js";
-import { resolveNode } from "./runner/attempt.js";
+import { resolveNode } from "./runner/resolve.js";
 import { unresolvedAgentSites } from "./definition/resolve.js";
 import { deriveNodeStatus } from "./status/node-status.js";
 import { attemptFolderOfPacket } from "./worklog/worklog.js";
@@ -292,7 +292,7 @@ async function cmdResume(args: string[]): Promise<void> {
       const loaded = loadAndValidateDefinition(join(run.run_dir, "definition.yaml"));
       const fresh = store.resumeBlockedRun({ runId: run.run_id, now });
       if (!fresh) die("blocked run has no blocked attempt");
-      const { scaffoldPacket, attemptFolderOfPacket } = await import("./worklog/worklog.js");
+      const { scaffoldPacket } = await import("./worklog/packet.js");
       scaffoldPacket(
         attemptFolderOfPacket(fresh.packet_path),
         fresh.attempt,
@@ -333,7 +333,7 @@ async function recreateMissingSuccessor(
   const lastNodeId = completed?.node_id ?? loaded.chain.order[loaded.chain.order.length - 1]!;
   const nextId = loaded.chain.next.get(lastNodeId) ?? null;
   if (!nextId) return;
-  const resolved = (await import("./runner/attempt.js")).resolveNode(loaded.def, nextId, inst);
+  const resolved = (await import("./runner/resolve.js")).resolveNode(loaded.def, nextId, inst);
   const run = store.getRun(runId)!;
   const fresh = store.createSuccessorAttempt({
     runId,
@@ -343,7 +343,7 @@ async function recreateMissingSuccessor(
     chainPosition: loaded.chain.order.indexOf(nextId),
     now,
   });
-  const { scaffoldPacket, attemptFolderOfPacket } = await import("./worklog/worklog.js");
+  const { scaffoldPacket } = await import("./worklog/packet.js");
   scaffoldPacket(attemptFolderOfPacket(fresh.packet_path), fresh.attempt, loaded.chain.next.get(nextId) ?? null);
 }
 

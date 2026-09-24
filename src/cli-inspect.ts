@@ -10,7 +10,7 @@ import { glyph, localClock } from "./status/format.js";
 import { deriveNodeStatus } from "./status/node-status.js";
 import { buildRunsFeed, DEFAULT_RUNS_LIMIT } from "./status/runs-feed.js";
 import { renderTreeStatus } from "./status/tree.js";
-import { resolveNode } from "./runner/attempt.js";
+import { resolveNode } from "./runner/resolve.js";
 import { attemptFolderOfPacket } from "./worklog/worklog.js";
 import { SystemClock } from "./util/clock.js";
 import { readTruncationRecord } from "./util/retention.js";

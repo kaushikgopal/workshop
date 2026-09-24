@@ -11,19 +11,11 @@ import { recoverInstallation } from "../src/recovery.js";
 import { runtimeCliInvocation } from "../src/util/cli-path.js";
 import { SystemClock } from "../src/util/clock.js";
 import { processStartId } from "../src/util/process.js";
-import {
-  RunLock,
-  attemptFolderOfPacket,
-  atomicWriteFileSync,
-  authorizedMarker,
-  extractMarker,
-  mergePacket,
-  packetPath,
-  sha256File,
-  sha256String,
-  validatePacket,
-  WorklogIntegrityError,
-} from "../src/worklog/worklog.js";
+import { attemptFolderOfPacket, packetPath, sha256File, sha256String, WorklogIntegrityError } from "../src/worklog/worklog.js";
+import { atomicWriteFileSync } from "../src/worklog/fs.js";
+import { authorizedMarker, validatePacket } from "../src/worklog/markers.js";
+import { extractMarker, mergePacket } from "../src/worklog/packet.js";
+import { RunLock } from "../src/worklog/lock.js";
 
 const chainYaml = (id: string): string => `version: 1
 id: ${id}
