@@ -1,12 +1,14 @@
 #!/usr/bin/env bun
 import { existsSync, readFileSync } from "node:fs";
-import { findInstallation, ensureDirs, workflowPath } from "./config.js";
+import { findInstallation, ensureDirs, workflowPath, type Installation } from "./config.js";
 import { join } from "node:path";
 import { loadAndValidateDefinition, startWorkflow, runChain, preflightIfNeeded, scaffoldFirstAttempt } from "./execute.js";
 import { openDb } from "./store/db.js";
 import { Store, GuardRejected, type AttemptRow } from "./store/store.js";
 import { buildStatusDto, STATUS_DTO_VERSION } from "./status/dto.js";
-import { renderTreeStatus } from "./status/tree.js";
+import { glyph, localClock, renderTreeStatus } from "./status/tree.js";
+import { buildRunsFeed, DEFAULT_RUNS_LIMIT } from "./status/runs-feed.js";
+import type { ViewerSource } from "./viewer/source.js";
 import { resolveNode } from "./runner/attempt.js";
 import { deriveNodeStatus } from "./status/node-status.js";
 import { attemptFolderOfPacket } from "./worklog/worklog.js";
@@ -59,9 +61,20 @@ Commands:
       Show the run's YAML snapshot properties, resolved agent settings,
       successor, validator, and runtime status.
 
-  workshop logs <workflow-id> [--follow]
+  workshop logs <workflow-id> [--follow | --all]
       Print or follow the workflow's most recent run: its WORKSHOP_LOG.md and
-      process logs.
+      process logs. --all instead collates every run's worklog, oldest first,
+      each under a run header.
+
+  workshop runs <workflow-id> [--all] [--json]
+      List the workflow's occurrences, newest first, with status and timing;
+      --json emits the versioned runs feed.
+
+  workshop watch <workflow-id>
+      Follow one workflow live: its chain, its log stream, and its occurrences,
+      refreshed as the run progresses.
+
+
 
   workshop diagram <workflow-id> [--mermaid]
       Render the current chain and overlay runtime status.
@@ -116,6 +129,10 @@ async function main(): Promise<void> {
     case "stop":
       await cmdStop(args);
       process.exit(0);
+    case "runs":
+      return cmdRuns(args);
+    case "watch":
+      return await cmdWatch(args);
     case "logs":
       return cmdLogs(args);
     case "diagram":
@@ -417,13 +434,104 @@ function attemptStreamFiles(attemptFolder: string): string[] {
   return candidates.filter((p) => existsSync(p));
 }
 
-/** Most recent run by seq; prints its worklog plus its attempt process logs
- *  in chronological execution order, optionally tailing to completion. */
-async function cmdLogs(args: string[]): Promise<void> {
-  const follow = args.includes("--follow");
+/**
+ * The viewer's data source over the CLI's own projections. The viewer depends
+ * on the projections, never on the store: `status --json` and `runs --json` are
+ * the same builders this calls, and the log is the run's worklog.
+ */
+function viewerSourceFor(inst: Installation, store: Store, workflowId: string): ViewerSource {
+  return {
+    async snapshot() {
+      return {
+        status: buildStatusDto(store, new Date(), workflowId),
+        runs: buildRunsFeed({ workflowId, runs: store.listRuns(workflowId), all: false }),
+      };
+    },
+    async log(runId: string | null) {
+      if (runId === null) {
+        const every = store.listRuns(workflowId);
+        return every.map((r) => `\n━━ run ${r.run_id} — ${r.status} ━━\n${readFileSync(r.worklog_path, "utf8")}`).join("");
+      }
+      const run = store.getRun(runId);
+      return run ? readFileSync(run.worklog_path, "utf8") : "(run not found)";
+    },
+  };
+}
+
+/**
+ * The runs feed: every occurrence of one workflow, newest first. The status
+ * DTO carries only the unresolved current run, so the viewer needs this to
+ * render a recurring workflow as the stream of occurrences a human reads.
+ * `--all` lifts the default cap; `--json` emits the versioned shape.
+ */
+/**
+ * The live viewer. It reads the same projections the CLI publishes and never
+ * touches SQLite itself, so a second viewer (HTML, web) can be built from the
+ * same contract without this code changing.
+ */
+async function cmdWatch(args: string[]): Promise<void> {
+  if (args.length === 0) die("missing <workflow-id> argument");
   const workflowId = requireArg(args.filter((a) => !a.startsWith("--")), "workflow-id");
   const inst = findInstallation();
   const store = new Store(openDb(inst.dbPath));
+  if (!store.getWorkflow(workflowId)) die(`no workflow "${workflowId}"`);
+  const { runViewer } = await import("./viewer/app.js");
+  await runViewer({ workflowId, source: viewerSourceFor(inst, store, workflowId) });
+}
+
+function cmdRuns(args: string[]): void {
+  const all = args.includes("--all");
+  const json = args.includes("--json");
+  const workflowId = requireArg(args.filter((a) => !a.startsWith("--")), "workflow-id");
+  const inst = findInstallation();
+  const store = new Store(openDb(inst.dbPath));
+  // An unknown workflow is a typo; a known workflow with no runs is simply young.
+  if (!store.getWorkflow(workflowId)) die(`no workflow "${workflowId}"`);
+  const rows = store.listRuns(workflowId); // seq ascending
+  const feed = buildRunsFeed({ workflowId, runs: rows, all, limit: DEFAULT_RUNS_LIMIT });
+
+  if (json) {
+    process.stdout.write(`${JSON.stringify(feed, null, 2)}\n`);
+    return;
+  }
+
+  if (feed.total === 0) {
+    process.stdout.write(`${workflowId} — no runs yet\n`);
+    return;
+  }
+  const hidden = feed.total - feed.runs.length;
+  process.stdout.write(`${workflowId} — ${feed.total} run(s), newest first\n`);
+  for (const r of feed.runs) {
+    const began = localClock(r.startedAt);
+    const ended = r.finishedAt ? localClock(r.finishedAt) : "";
+    const span = ended ? `${began} → ${ended}` : `since ${began}`;
+    const suffix = r.blocker ? `  (${r.blocker})` : "";
+    process.stdout.write(`  ${glyph(r.status)} ${r.id}  ${r.status}  ${span}${suffix}\n`);
+  }
+  if (hidden > 0) process.stdout.write(`  … ${hidden} older run(s); pass --all to include them\n`);
+}
+
+/** Most recent run by seq; prints its worklog plus its attempt process logs
+ *  in chronological execution order, optionally tailing to completion.
+ *  `--all` instead collates every run's worklog, oldest → newest. */
+async function cmdLogs(args: string[]): Promise<void> {
+  const follow = args.includes("--follow");
+  const all = args.includes("--all");
+  if (follow && all) die("--follow tails the newest run; --all collates every run — pick one");
+  const workflowId = requireArg(args.filter((a) => !a.startsWith("--")), "workflow-id");
+  const inst = findInstallation();
+  const store = new Store(openDb(inst.dbPath));
+
+  if (all) {
+    const every = store.listRuns(workflowId); // seq ascending → oldest first
+    if (every.length === 0) die(`no runs for workflow "${workflowId}"`);
+    for (const r of every) {
+      process.stdout.write(`\n━━ run ${r.run_id} — ${r.status} ━━\n`);
+      process.stdout.write(readFileSync(r.worklog_path, "utf8"));
+    }
+    return;
+  }
+
   const run = store.getMostRecentRun(workflowId);
   if (!run) die(`no runs for workflow "${workflowId}"`);
 

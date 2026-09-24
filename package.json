@@ -8,6 +8,7 @@
     "workshop": "bun src/cli.ts"
   },
   "dependencies": {
+    "@opentui/core": "^0.5.12",
     "yaml": "^2.8.2",
     "zod": "^4.1.13"
   },

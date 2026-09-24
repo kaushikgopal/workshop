@@ -1,0 +1,205 @@
+import { describe, test, expect } from "bun:test";
+import { createTestRenderer } from "@opentui/core/testing";
+import { mountViewer, reduceKey, type ViewerState } from "../src/viewer/app.js";
+import { buildViewerModel } from "../src/viewer/panes.js";
+import type { StatusDto } from "../src/status/dto.js";
+import type { RunsFeed } from "../src/status/runs-feed.js";
+
+/**
+ * The binding, asserted against a real render.
+ *
+ * These drive the same `mountViewer` the app uses and read the captured frame,
+ * so a layout regression fails here rather than in someone's terminal. A test
+ * that rebuilt the tree itself would prove nothing about the binding.
+ */
+
+const NOW = new Date("2026-09-24T12:00:00.000Z");
+
+const dto: StatusDto = {
+  version: 1,
+  workflows: [
+    {
+      id: "wf",
+      definitionHash: "sha256:x",
+      activation: { state: "active", startedAt: "2026-09-24T09:00:00.000Z", startedRuns: 3, maxRuns: 6, nextRunAt: null },
+      currentRun: {
+        id: "wf-20260924-003",
+        status: "running",
+        desiredState: "running",
+        orchestratorPhase: "idle",
+        startedAt: "2026-09-24T11:59:00.000Z",
+        blocker: null,
+        nodes: [
+          {
+            id: "node-timestamp",
+            status: "completed",
+            attempts: [{ number: 1, status: "completed", progress: null, validator: "passed", failure: null, blocker: null, startedAt: "2026-09-24T11:59:00.000Z", finishedAt: "2026-09-24T11:59:00.200Z" }],
+          },
+          {
+            id: "node-generate-line",
+            status: "running",
+            attempts: [
+              { number: 1, status: "failed", progress: null, validator: null, failure: "worklog_integrity", blocker: null, startedAt: "2026-09-24T11:59:00.000Z", finishedAt: "2026-09-24T11:59:00.500Z" },
+              { number: 2, status: "running", progress: "drafting a line", validator: null, failure: null, blocker: null, startedAt: "2026-09-24T11:59:01.000Z", finishedAt: null },
+            ],
+          },
+          { id: "node-append-quote", status: "pending", attempts: [] },
+        ],
+      },
+    },
+  ],
+};
+
+const feed: RunsFeed = {
+  version: 1,
+  workflowId: "wf",
+  total: 3,
+  runs: [
+    { id: "wf-20260924-003", status: "running", desiredState: "running", startedAt: "2026-09-24T11:59:00.000Z", finishedAt: null, blocker: null },
+    { id: "wf-20260924-002", status: "failed", desiredState: "running", startedAt: "2026-09-24T11:00:00.000Z", finishedAt: "2026-09-24T11:02:00.000Z", blocker: "orchestrator_unresolved" },
+    { id: "wf-20260924-001", status: "completed", desiredState: "running", startedAt: "2026-09-24T10:00:00.000Z", finishedAt: "2026-09-24T10:01:00.000Z", blocker: null },
+  ],
+};
+
+const model = buildViewerModel({
+  workflowId: "wf",
+  dto,
+  feed,
+  logText: "# Workflow run: wf\n\n## Goal\n\nGenerate one original line.\n",
+  selectedRunId: "wf-20260924-003",
+  streamHeight: 6,
+  now: NOW,
+});
+
+describe("viewer frame — what an operator actually sees", () => {
+  test("header, chain, runs, log, and keybindings all reach the screen", async () => {
+    const { renderer, renderOnce, captureCharFrame } = await createTestRenderer({ width: 100, height: 24 });
+    mountViewer(renderer, { rows: 6 }).paint(model);
+    await renderOnce();
+    const frame = captureCharFrame();
+
+    // Header: a badged product name, the workflow, activation progress, tally.
+    expect(frame).toContain("WORKSHOP");
+    expect(frame).toContain("wf  active 3/6");
+    expect(frame).toContain("◉1 · ◎1 · ○1");
+
+    // Chain: spine, glyphs, the retry count, a finished duration, live detail.
+    expect(frame).toContain("chain · 003 · running");
+    expect(frame).toContain("├─ ◉ node-timestamp  200ms — validator passed");
+    expect(frame).toContain("├─ ◎ node-generate-line #2 — drafting a line");
+
+    // Runs: the selected occurrence is marked, and ages read as a timeline.
+    expect(frame).toContain("runs · 3");
+    expect(frame).toContain("▶ ◎ 003");
+    expect(frame).toContain("(orchestrator_unresolved)");
+
+    // Log: titled with the run it follows, tail-first.
+    expect(frame).toContain("log · 003");
+    expect(frame).toContain("Generate one original line.");
+
+    // Footer: what the keys do.
+    expect(frame).toContain("q quit");
+    expect(frame).toContain("f follow");
+  });
+
+  test("a poll failure is reported in the header rather than blanking the panes", async () => {
+    const { renderer, renderOnce, captureCharFrame } = await createTestRenderer({ width: 100, height: 24 });
+    const mount = mountViewer(renderer, { rows: 6 });
+    mount.paint(model, { pollError: "database is locked" });
+    await renderOnce();
+    const frame = captureCharFrame();
+    expect(frame).toContain("poll failed: database is locked");
+    // The last good frame is still on screen: a viewer that blanks on a hiccup
+    // is worse than one that shows slightly stale truth.
+    expect(frame).toContain("node-timestamp");
+  });
+
+  test("collated mode says so in the log title and the footer", async () => {
+    const { renderer, renderOnce, captureCharFrame } = await createTestRenderer({ width: 100, height: 24 });
+    const collated = buildViewerModel({ workflowId: "wf", dto, feed, logText: "all runs", collated: true, now: NOW });
+    mountViewer(renderer, { rows: 6 }).paint(collated, { collated: true });
+    await renderOnce();
+    const frame = captureCharFrame();
+    expect(frame).toContain("log · all runs");
+    expect(frame).toContain("all runs  ·");
+  });
+
+  test("a narrow terminal degrades without losing the panes", async () => {
+    const { renderer, renderOnce, captureCharFrame } = await createTestRenderer({ width: 56, height: 20 });
+    mountViewer(renderer, { rows: 4 }).paint(model);
+    await renderOnce();
+    const frame = captureCharFrame();
+    expect(frame).toContain("WORKSHOP");
+    expect(frame).toContain("runs · 3");
+    // Chrome stays one row per element: a wrapping footer would eat the panes.
+    // (The hints themselves may be clipped at this width, so assert on the
+    // row count rather than on any particular hint surviving.)
+    const footerRows = frame.split("\n").filter((row) => row.includes("↑↓ select run"));
+    expect(footerRows.length).toBe(1);
+  });
+
+  test("one long log line cannot push the layout around", async () => {
+    const long = `## Run outcome\n${"x".repeat(400)}\nshort tail line`;
+    const { renderer, renderOnce, captureCharFrame } = await createTestRenderer({ width: 90, height: 20 });
+    const wide = buildViewerModel({ workflowId: "wf", dto, feed, logText: long, now: NOW });
+    mountViewer(renderer, { rows: 4 }).paint(wide);
+    await renderOnce();
+    const frame = captureCharFrame();
+    // Panes keep their positions: a wrapped log line would displace the runs
+    // pane downwards and take the rows with it.
+    expect(frame).toContain("chain · ");
+    expect(frame).toContain("runs · 3");
+    expect(frame).toContain("short tail line");
+    for (const row of frame.split("\n")) expect(row.length).toBeLessThanOrEqual(90);
+  });
+});
+
+describe("viewer keys — pure state transitions", () => {
+  const ids = ["wf-003", "wf-002", "wf-001"]; // newest first, as the feed sorts
+  const fresh = (): ViewerState => ({ selectedRunId: "wf-003", follow: true, collated: false });
+
+  test("j walks back through occurrences and stops at the oldest", () => {
+    const state = fresh();
+    reduceKey(state, { name: "j" }, ids);
+    expect(state.selectedRunId).toBe("wf-002");
+    expect(state.follow).toBe(false); // manual navigation takes over from follow
+    reduceKey(state, { name: "j" }, ids);
+    reduceKey(state, { name: "j" }, ids);
+    expect(state.selectedRunId).toBe("wf-001");
+    reduceKey(state, { name: "down" }, ids);
+    expect(state.selectedRunId).toBe("wf-001");
+  });
+
+  test("k walks forward and stops at the newest", () => {
+    const state: ViewerState = { selectedRunId: "wf-002", follow: false, collated: false };
+    reduceKey(state, { name: "k" }, ids);
+    expect(state.selectedRunId).toBe("wf-003");
+    reduceKey(state, { name: "up" }, ids);
+    expect(state.selectedRunId).toBe("wf-003");
+  });
+
+  test("f re-enables follow and snaps to the newest occurrence", () => {
+    const state: ViewerState = { selectedRunId: "wf-001", follow: false, collated: false };
+    reduceKey(state, { name: "f" }, ids);
+    expect(state.follow).toBe(true);
+    expect(state.selectedRunId).toBe("wf-003");
+  });
+
+  test("a toggles the collated stream and leaves the selection alone", () => {
+    const state = fresh();
+    reduceKey(state, { name: "a" }, ids);
+    expect(state.collated).toBe(true);
+    expect(state.selectedRunId).toBe("wf-003");
+    reduceKey(state, { name: "a" }, ids);
+    expect(state.collated).toBe(false);
+  });
+
+  test("q and ctrl+c quit; r asks for a repaint; other keys are inert", () => {
+    const state = fresh();
+    expect(reduceKey(state, { name: "q" }, ids)).toBe("quit");
+    expect(reduceKey(state, { name: "c", ctrl: true }, ids)).toBe("quit");
+    expect(reduceKey(state, { name: "r" }, ids)).toBe("refresh");
+    expect(reduceKey(state, { name: "z" }, ids)).toBeNull();
+    expect(state.selectedRunId).toBe("wf-003");
+  });
+});

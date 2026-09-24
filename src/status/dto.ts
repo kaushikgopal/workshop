@@ -16,6 +16,9 @@ export interface AttemptStatusDto {
   validator: "passed" | "failed" | null;
   failure: string | null;
   blocker: string | null;
+  /** Wall-clock bounds, so a viewer can show how long an attempt took. */
+  startedAt: string | null;
+  finishedAt: string | null;
 }
 
 export interface NodeStatusDto {
@@ -114,6 +117,8 @@ function buildNodeDto(attempts: AttemptRow[], id: string): NodeStatusDto {
         validator: a.validator_status,
         failure: a.failure_kind,
         blocker: a.block_kind,
+        startedAt: a.started_at,
+        finishedAt: a.finished_at,
       })),
   };
 }

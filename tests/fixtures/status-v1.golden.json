@@ -29,7 +29,9 @@
                 "progress": null,
                 "validator": "passed",
                 "failure": null,
-                "blocker": null
+                "blocker": null,
+                "startedAt": "<iso>",
+                "finishedAt": "<iso>"
               }
             ]
           },
@@ -43,7 +45,9 @@
                 "progress": "<progress-or-null>",
                 "validator": null,
                 "failure": null,
-                "blocker": "agent_requested"
+                "blocker": "agent_requested",
+                "startedAt": "<iso>",
+                "finishedAt": "<iso>"
               }
             ]
           }

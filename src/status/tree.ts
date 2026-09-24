@@ -24,7 +24,8 @@ const GLYPH: Record<string, string> = {
   queued: "○",
 };
 
-function glyph(status: string): string {
+/** Shared so every human surface renders status and local time the same way. */
+export function glyph(status: string): string {
   return GLYPH[status] ?? "○";
 }
 
@@ -34,13 +35,13 @@ function twoDigits(n: number): string {
 
 /** Machine-local `HH:MM:SS`. Date getters, not `toLocaleTimeString`, so the
  *  output never varies with locale and never produces a `24:00` hour. */
-function localClock(iso: string): string {
+export function localClock(iso: string): string {
   const d = new Date(iso);
   return `${twoDigits(d.getHours())}:${twoDigits(d.getMinutes())}:${twoDigits(d.getSeconds())}`;
 }
 
 /** Machine-local `YYYY-MM-DD`. */
-function localDate(d: Date): string {
+export function localDate(d: Date): string {
   return `${d.getFullYear()}-${twoDigits(d.getMonth() + 1)}-${twoDigits(d.getDate())}`;
 }
 
