@@ -108,14 +108,24 @@ cp examples/workflows/hemingway-clock.yaml .workshop/config/workflows/
 bun src/cli.ts start hemingway-clock
 ```
 
-Expected: preflight passes (`pi` on PATH), `node-timestamp` completes with a UTC
-stamp, `node-generate-line` writes one Hemingway-inspired sentence into
-`<workflow-output>` through the mock-free real harness, the fresh validator
-passes it, and the run completes with the sentence in `WORKSHOP_LOG.md`:
+Expected, for a three-node chain: preflight passes (`pi` on PATH),
+`node-timestamp` completes with a UTC stamp; `node-generate-line` reads the
+quote archive, drafts one Hemingway-inspired sentence into its packet's output
+markers through the mock-free real harness, and a fresh agent validator passes
+it only if the sentence is materially distinct from every archived line;
+`node-append-quote` — one attempt only, because appending is not repeat-safe —
+appends the sentence to `hemingway.quotes.md` as a `<quote run-id>` block; and
+the run completes with all of it in `WORKSHOP_LOG.md`:
 
 ```bash
 cat .workshop/state/runs/*/WORKSHOP_LOG.md | tail -40
+cat .workshop/config/workflows/hemingway.quotes.md
 ```
+
+If the validator rejects a paraphrase, a fresh orchestrator agent
+(`instacart-openai/gpt-5.6-luna:low`) judges it and may authorise one retry —
+the decision lands in the run's Global decision log. A rejected sentence that
+exhausts `max_attempts: 2` fails the run instead.
 
 Six occurrences, ten minutes apart, require the daemon; `max_runs: 6` exhausts
 the activation afterward.
