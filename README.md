@@ -1,138 +1,261 @@
 # Workshop
 
-A small TypeScript + Bun runtime for responsibly running one-shot and autonomous
-agent workflows.
+Workshop runs agent workflows on your machine, once or on a schedule, and
+survives crashes while it does.
 
-```text
-Workshop daemon — one deterministic process
-  ├─ polls SQLite
-  ├─ evaluates schedules
-  ├─ prevents overlapping runs
-  ├─ detects interrupted, blocked, or failed work
-  └─ invokes a fresh orchestrator agent only for exception judgment
+A workflow is a YAML file that describes a **chain of steps** (nodes). Each node
+runs either a shell command or an AI agent (Pi, Claude Code, OpenCode, …). Each
+node's output feeds the next node. An optional validator checks each result
+before the chain moves on.
+
+Three things hold all the state:
+
+| Piece | Holds | Who writes it |
+| --- | --- | --- |
+| Workflow YAML | what to do | you |
+| SQLite (`workshop.db`) | where every run stands: status, attempts, owners | the runtime only |
+| `WORKSHOP_LOG.md` (one per run) | what happened, in prose, for agents and humans | the runtime only; agents write their own packet file |
+
+The runtime moves normal work forward without any model. It calls an
+**orchestrator** agent only when an attempt fails and someone must judge what
+to do next.
+
+## A workflow
+
+The bundled example, trimmed
+([full file](examples/workflows/hemingway-clock.yaml)):
+
+```yaml
+id: hemingway-clock
+schedule: { every: 10m, max_runs: 6 }   # omit for a one-shot workflow
+
+defaults:
+  max_attempts: 2
+  agent:
+    harness:
+      command: 'pi --print --model "$WORKSHOP_MODEL_WITH_THINKING" -- "$(cat "$WORKSHOP_PROMPT_FILE")"'
+    model: "openai-codex/gpt-5.3-codex:medium"
+
+nodes:
+  node-timestamp:                       # 1. shell command
+    run: { command: "date -u +%FT%TZ" }
+    validator: { command: 'test -n "$(cat "$WORKSHOP_NODE_OUTPUT_FILE")"' }
+    next: node-generate-line
+
+  node-generate-line:                   # 2. AI agent, checked by a second agent
+    run:
+      agent:
+        instructions: Generate one original Hemingway-inspired sentence …
+    validator:
+      agent:
+        instructions: Pass only if the output is one original sentence …
+    next: node-append-quote
+
+  node-append-quote:                    # 3. shell command, consumes node 2's output
+    run:
+      command: cat "$WORKSHOP_PREVIOUS_OUTPUT_FILE" >> hemingway.quotes.md
+    max_attempts: 1                     # appending twice would duplicate the quote
+    next: null
 ```
 
-Agents read the runtime-owned `WORKSHOP_LOG.md` and write exactly one packet
-file per attempt; SQLite owns lifecycle truth; the daemon advances normal work
-without any model judgment.
+## What happens when you run it
 
-## Layout
+`workshop start hemingway-clock` runs the whole chain in the foreground:
 
-- `src/` — the runtime. Dependencies point one way: the entrypoint and the
-  lifecycle down to `definition/`, `store/`, and `worklog/`; `status/` projects
-  that state back out for humans and viewers; `src/tui-*.ts` is the terminal
-  viewer and the only code that imports a UI library.
-- `tests/` — deterministic mock harness and acceptance tests (`bun test`)
-- `examples/workflows/hemingway-clock.yaml` — the POC example and copyable
-  template
-- `.workshop/` — machine-local state (gitignored): config, SQLite, run dirs
+```mermaid
+sequenceDiagram
+  participant You
+  participant CLI as CLI + runner
+  participant DB as SQLite
+  participant Dir as Run directory
+  participant Proc as Command / agent
 
-```text
-src/
-├─ cli.ts            dispatch, run controls, watch wiring
-├─ cli-inspect.ts    status · runs · logs · diagram · node describe
-├─ cli-errors.ts     die · errorText · requireArg
-├─ admission · execute · daemon · scheduler · orchestrator · recovery
-├─ definition/       parse · schema · chain · model · resolve · snapshot · hash
-├─ store/            types · rows · workflows · runs · attempts · db
-├─ worklog/          worklog · packet · markers · receipt · lock · fs
-├─ runner/           attempt · resolve · validator · env · spawn
-├─ status/           dto · runs-feed · tree · node-status · format
-├─ tui-app · tui-panes · tui-source     the viewer (OpenTUI Core)
-└─ util/             clock · duration · ids · process · retention · cli-path
+  You->>CLI: workshop start hemingway-clock
+  CLI->>CLI: parse + validate YAML
+  CLI->>DB: reserve run
+  CLI->>Dir: freeze definition.yaml, create WORKSHOP_LOG.md
+  CLI->>CLI: run preflight check
+  CLI->>DB: create pending attempt for node 1
+  loop each node in the chain
+    CLI->>DB: claim attempt
+    CLI->>Proc: spawn with WORKSHOP_* env
+    Proc->>Dir: write packet.md (agents) or stdout (commands)
+    CLI->>Proc: run validator
+    CLI->>Dir: merge packet into WORKSHOP_LOG.md
+    CLI->>DB: complete attempt + create next node's attempt
+  end
+  CLI->>You: run → completed
 ```
 
-Two conventions are worth knowing before you add a file. Files that exist only
-for the terminal viewer are named `tui-*` and are loaded lazily, so no other
-command pays for OpenTUI; a test enforces that the runtime never imports one as
-a value. And `status/` is the contract layer: `status --json` and `runs --json`
-are versioned shapes that outside consumers (including the viewer) parse, so a
-viewer never reads SQLite or a run directory.
+Step by step:
 
-## Running
+1. **Load.** `definition/` parses the YAML strictly, checks it with a Zod
+   schema, and confirms the nodes form one linear chain.
+2. **Admit.** `admission.ts` creates the run row in SQLite, then writes a frozen
+   copy of the YAML and an empty worklog into the run directory. The run uses
+   the frozen copy from here on, so editing the YAML mid-run changes nothing.
+   A second `start` while a run is open does nothing.
+3. **Preflight.** The optional `environment.preflight` command (here,
+   `command -v pi`) must exit 0. Workshop caches a pass per definition hash.
+4. **Run each node.** `execute.ts#runChain` loops. For each pending attempt,
+   `runner/attempt.ts` does the work described in the next section.
+5. **Finish.** When the last node completes, the run completes. The final
+   output sits in the worklog under `<workflow-output>`.
 
-```bash
-bun install
-```
+### One attempt, up close
 
-Create a machine-local installation (repo root is the default project dir):
+Each node execution is an **attempt**. `runner/attempt.ts` takes it through a
+fixed sequence:
 
-```bash
-mkdir -p .workshop/config/workflows
-cp examples/workflows/hemingway-clock.yaml .workshop/config/workflows/
-```
+1. **Claim** the attempt in SQLite, which issues an owner token. Only the
+   token's holder may change the attempt, so two runners never overlap.
+2. **Prepare** `packet.md`, a scaffold with headings and one marker pair. For
+   an agent, render `prompt`: the node's instructions plus the contract (read
+   the worklog, write only your packet, put your handoff between the markers).
+3. **Spawn** the command or harness in its own process group, with these
+   variables:
 
-Observe — one run, a workflow's history, or both live:
+   | Variable | Meaning |
+   | --- | --- |
+   | `WORKSHOP_PROMPT_FILE` | the rendered prompt (agents) |
+   | `WORKSHOP_NODE_PACKET_FILE` | the one file an agent may write |
+   | `WORKSHOP_PREVIOUS_OUTPUT_FILE` | the previous node's output |
+   | `WORKSHOP_NODE_OUTPUT_FILE` | this node's extracted output (validators read it) |
+   | `WORKSHOP_LOG` | the run's worklog, read-only |
+   | `WORKSHOP_MODEL`, `WORKSHOP_THINKING`, … | the resolved model, split several ways |
+   | `WORKSHOP_CLI` | lets an agent call `runtime progress` or `runtime block` |
 
-```bash
-bun src/cli.ts help
-bun src/cli.ts validate hemingway-clock
-bun src/cli.ts start hemingway-clock
-bun src/cli.ts status            # human tree view
-bun src/cli.ts status --json     # stable versioned DTO (viewer contract)
-bun src/cli.ts runs hemingway-clock          # occurrences, newest first
-bun src/cli.ts runs hemingway-clock --json   # versioned feed for a viewer
-bun src/cli.ts logs hemingway-clock          # newest run: worklog + process logs
-bun src/cli.ts logs hemingway-clock --all    # every run, oldest first
-bun src/cli.ts watch hemingway-clock         # live TUI: chain, log, occurrences
-bun src/cli.ts diagram hemingway-clock --mermaid
-bun src/cli.ts node describe hemingway-clock node-generate-line
-bun src/cli.ts stop hemingway-clock
-```
+4. **Check integrity.** An agent must leave the worklog untouched and its
+   packet well-formed, marker pair included.
+5. **Extract output.** A command's output is its stdout. An agent's output is
+   the text between `<next-node-output id="…">` markers in its packet (or
+   `<workflow-output>` on the last node).
+6. **Validate**, if the node has a validator. A command validator passes on
+   exit 0; an agent validator writes `validation.json` with `{"passed": …}`.
+7. **Merge** the packet into `WORKSHOP_LOG.md` under a file lock, and write a
+   receipt so a repeated merge does nothing.
+8. **Complete** the attempt and create the next node's pending attempt in one
+   SQLite transaction.
 
-`watch` opens a terminal UI: the occurrences feed on top, the selected run's
-chain and log below it, keybindings along the bottom. Omit the workflow id to
-pick from the configured workflows first. `j`/`k` walk history, `f` re-follows
-the newest occurrence, `a` streams every run's log, `q` quits.
+Attempt states: `pending → running → finishing → completed`, or `failed`,
+`blocked`, `cancelled`.
 
-`workshop start` takes no task payload — the workflow YAML contains or discovers
-the whole task. Starting while a run is unresolved is an idempotent no-op.
+### When something fails
 
-For recurring workflows, run the guardian daemon in a separate terminal:
+A timeout, a non-zero exit, a broken packet, or a validator rejection fails the
+attempt and marks the run as needing judgment. Workshop then starts a fresh
+orchestrator agent. It reads the worklog and the failed attempt's evidence,
+then writes one decision to `result.json`:
+
+- `retry` creates a new attempt for the same node, up to `max_attempts`.
+- `block` pauses the run until you fix something and run `workshop resume`.
+- `fail` ends the run.
+
+Workshop records the decision in the worklog's "Global decision log" and
+applies it. A crash needs no judgment: recovery confirms the old process is
+dead and retries the attempt deterministically.
+
+### Recurring workflows: the daemon
+
+`start` runs only the first occurrence. For a `schedule:`, run the guardian in
+another terminal:
 
 ```bash
 bun src/cli.ts orchestrate
 ```
 
-`workshop start` takes no task payload — the workflow YAML contains or discovers
-the whole task. Starting while a run is unresolved is an idempotent no-op.
+`daemon.ts` is a single process that polls SQLite once a second. Each tick it:
 
-### Manual Pi smoke (the Hemingway clock)
+1. recovers interrupted work (`recovery.ts`),
+2. admits due occurrences, one open run per workflow (`scheduler.ts`),
+3. creates first attempts for queued runs,
+4. runs pending orchestrator judgments,
+5. launches pending attempts within `max_concurrent_runs`, through the same
+   `runChain` the CLI uses.
 
-The example runs with the checked-in defaults (Pi 0.85 +
-`openai-codex/gpt-5.3-codex:medium`):
+## What lands on disk
+
+```text
+.workshop/                          machine-local, gitignored
+├─ config/
+│  ├─ workshop.yaml                 machine defaults (optional)
+│  └─ workflows/<id>.yaml           your workflows
+└─ state/
+   ├─ workshop.db                   SQLite: workflows, runs, node_attempts
+   └─ runs/<run-id>/
+      ├─ definition.yaml            frozen YAML
+      ├─ WORKSHOP_LOG.md            the run's shared log
+      ├─ nodes/002-node-generate-line/attempt-001/
+      │  ├─ prompt  packet.md  stdout  stderr  output
+      │  ├─ validation/             validator prompt, logs, verdict
+      │  └─ merge-receipt.json
+      └─ orchestrator/<token>/      prompt.md  result.json  logs
+```
+
+## Code map
+
+```text
+src/
+├─ cli.ts                 entrypoint: start, stop, pause, resume, watch, runtime
+├─ cli-inspect.ts         read-only commands: status, runs, logs, diagram, node
+├─ admission.ts           step 2: reserve a run, freeze its definition
+├─ execute.ts             steps 3–5: preflight, first attempt, runChain loop
+├─ runner/                one attempt: resolve, env, spawn, validate
+├─ worklog/               packets, markers, locked merges into WORKSHOP_LOG.md
+├─ store/                 SQLite schema and every guarded state transition
+├─ definition/            YAML parsing, schema, chain, model/harness resolution
+├─ orchestrator.ts        failure judgment: retry, block, or fail
+├─ daemon.ts              polling loop for schedules and recovery
+├─ scheduler.ts           which occurrences are due
+├─ recovery.ts            reconcile attempts orphaned by a crash
+├─ status/                versioned JSON views (status --json, runs --json)
+├─ tui-*.ts               the `watch` terminal viewer (OpenTUI)
+└─ util/                  clock, durations, ids, processes, stream caps
+```
+
+Dependencies point one way: commands → lifecycle (`execute`, `runner`,
+`daemon`) → `definition/`, `store/`, `worklog/`. Two rules keep it that way:
+
+- `status/` is the contract for outside readers. `status --json` and
+  `runs --json` have versioned shapes, and the viewer reads those, never SQLite
+  or run directories.
+- Only `tui-*` files import a UI library, and they load lazily. A test fails
+  if runtime code imports one.
+
+## Quick start
 
 ```bash
+bun install
 mkdir -p .workshop/config/workflows
 cp examples/workflows/hemingway-clock.yaml .workshop/config/workflows/
+
+bun src/cli.ts validate hemingway-clock
 bun src/cli.ts start hemingway-clock
-```
-
-Expected, for a three-node chain: preflight passes (`pi` on PATH),
-`node-timestamp` completes with a UTC stamp; `node-generate-line` reads the
-quote archive, drafts one Hemingway-inspired sentence into its packet's output
-markers through the mock-free real harness, and a fresh agent validator passes
-it only if the sentence is materially distinct from every archived line;
-`node-append-quote` — one attempt only, because appending is not repeat-safe —
-appends the sentence to `hemingway.quotes.md` as a `<quote run-id>` block; and
-the run completes with all of it in `WORKSHOP_LOG.md`:
-
-```bash
 cat .workshop/state/runs/*/WORKSHOP_LOG.md | tail -40
-cat .workshop/config/workflows/hemingway.quotes.md
 ```
 
-If the validator rejects a paraphrase, a fresh orchestrator agent
-(`instacart-openai/gpt-5.6-luna:low`) judges it and may authorise one retry —
-the decision lands in the run's Global decision log. A rejected sentence that
-exhausts `max_attempts: 2` fails the run instead.
+The example needs `pi` on your PATH. A successful run stamps the time, writes
+and validates one sentence, and appends it to `hemingway.quotes.md`.
 
-Six occurrences, ten minutes apart, require the daemon; `max_runs: 6` exhausts
-the activation afterward.
+### Commands
 
-## Machine configuration
+| Command | Does |
+| --- | --- |
+| `start <id>` | start a run (and enable its schedule) |
+| `pause` / `resume` / `stop <id>` | control the open run and its schedule |
+| `status [<id>] [--json]` | tree of workflows, runs, nodes, attempts |
+| `runs <id> [--json]` | occurrence history, newest first |
+| `logs <id> [--follow \| --all]` | worklog and process logs |
+| `watch [<id>]` | live TUI: `j`/`k` history, `f` follow, `a` all logs, `q` quit |
+| `diagram <id> [--mermaid]` | the chain with live status |
+| `node describe <id> <node>` | a node's resolved settings and status |
+| `orchestrate` | the daemon |
 
-`.workshop/config/workshop.yaml` sets the runtime defaults. Everything is
+Run any of them as `bun src/cli.ts <command>`.
+
+## Configuration
+
+`.workshop/config/workshop.yaml` holds machine defaults; every field is
 optional:
 
 ```yaml
@@ -144,60 +267,49 @@ agent:
   model: "openai-codex/gpt-5.3-codex:medium"
 ```
 
-Raw process streams are the one thing that grows without bound — an agent's
-stdout is its whole event log — so each capture is capped: a head window and a
-tail window survive, a notice marks the seam, and a `<stream>.truncation.json`
-sidecar records the original size. Packets, extracted outputs, and the worklog
-are never truncated. A node may override with `stream_cap:` of its own.
+Agent settings resolve field by field: node, then workflow `defaults`, then
+machine. Models take the form `<provider>/<model-id>:<thinking-level>`.
 
-## Harness compatibility
+Workshop caps raw stdout and stderr, since an agent's stdout can grow to
+megabytes. It keeps the head and tail and records the original size in a
+`<stream>.truncation.json` sidecar. It never truncates packets, outputs, or the
+worklog. A node may set its own `stream_cap:`.
 
-Workshop is harness-neutral: every agent site resolves to a shell command
-template plus a fully qualified model string
-(`<provider>/<model-id>:<thinking-level>`). The runtime renders the prompt to a
-file and exposes `WORKSHOP_PROMPT_FILE`; harness commands read it with
-`"$(cat "$WORKSHOP_PROMPT_FILE")"`.
+### Harnesses
 
-| Harness         | Command (trusted-local flags)                                                                                                                                                        | Notes                                                                                                          |
-| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------- |
-| Pi 0.85         | `pi --print --mode json --approve --no-session --model "$WORKSHOP_MODEL_WITH_THINKING" -- "$(cat "$WORKSHOP_PROMPT_FILE")"`                                                          | `--approve` auto-approves tool use; the default in the checked-in example.                                     |
-| OpenCode 1.18   | `opencode run --format json --auto --model "$WORKSHOP_MODEL" --variant "$WORKSHOP_THINKING" -- "$(cat "$WORKSHOP_PROMPT_FILE")"`                                                     | `--auto` enables permissions bypass; `--variant` carries the thinking level. Non-gating compatibility example. |
-| Claude Code 2.1 | `claude --print --output-format text --permission-mode auto --no-session-persistence --model "$WORKSHOP_MODEL_ID" --effort "$WORKSHOP_THINKING" -- "$(cat "$WORKSHOP_PROMPT_FILE")"` | `--permission-mode auto` is trusted-local; not a gating check.                                                 |
+Any CLI agent works if a shell command can launch it with a prompt file:
 
-The automated acceptance gates run against the deterministic mock harness
-(`tests/mock/harness.ts`); exactly one manual gate (the Pi smoke above)
-exercises the real model path.
+| Harness | Command |
+| --- | --- |
+| Pi 0.85 | `pi --print --mode json --approve --no-session --model "$WORKSHOP_MODEL_WITH_THINKING" -- "$(cat "$WORKSHOP_PROMPT_FILE")"` |
+| OpenCode 1.18 | `opencode run --format json --auto --model "$WORKSHOP_MODEL" --variant "$WORKSHOP_THINKING" -- "$(cat "$WORKSHOP_PROMPT_FILE")"` |
+| Claude Code 2.1 | `claude --print --output-format text --permission-mode auto --no-session-persistence --model "$WORKSHOP_MODEL_ID" --effort "$WORKSHOP_THINKING" -- "$(cat "$WORKSHOP_PROMPT_FILE")"` |
 
-## POC boundaries
+These flags auto-approve tool use, so run them only on a trusted machine.
 
-Trusted machine-local workflows with the current user's permissions. No sandbox,
-no untrusted intake, no general graphs, no budget system. Starting a workflow
-authorizes its commands, agents, and validators; automatic retry assumes a node
-is repeat-safe (set `max_attempts: 1` for non-repeatable external effects).
+## Scope and status
 
-Delivery stages, in the order they are built:
+Workshop is a proof of concept for trusted, local workflows. It runs with your
+permissions and has no sandbox, no untrusted input, no branching graphs, and
+no budgets. Starting a workflow authorizes every command and agent in it.
+Automatic retry assumes a node is safe to repeat; set `max_attempts: 1` when it
+is not.
 
-| Stage | What it proves | Status |
+| Stage | Proves | Status |
 | --- | --- | --- |
-| POC-A | the runtime: durable chain, worklog, SQLite truth, validators, recovery | done |
-| POC-B | the status viewer, over the CLI's projections | done |
-| POC-C | the `$build-workflow` authoring skill | next |
-| POC-D | notification channels | after that |
-
-Two things are deliberately deferred, with the reasoning in the spec: a
-first-class typed-decision validator kind and typed triage (a `command`
-validator can already shell out to one, and across twelve live runs the
-orchestrator was invoked four times for $0.0023), and durable notification
-delivery (a delivery worth reconciling is a step, so model it as a command
-node).
+| POC-A | runtime: durable chain, worklog, SQLite, validators, recovery | done |
+| POC-B | status viewer over the CLI projections | done |
+| POC-C | `$build-workflow` authoring skill | next |
+| POC-D | notification channels | later |
 
 ## Development
 
 ```bash
-bun test          # acceptance gates against the mock harness
+bun test          # acceptance tests against a mock harness (tests/mock/harness.ts)
 bunx tsc --noEmit # typecheck
 ```
 
-The spec is `.agents/dox/workshop-spec-v3.md`, and the build history — including
-a bug log of every guard that exists because something actually broke — is
-`.agents/dox/2026-09-10-workshop-execution.md`.
+The real-model path has one manual check: the quick start above.
+
+- Spec: `.agents/dox/workshop-spec-v3.md`
+- Build history and bug log: `.agents/dox/2026-09-10-workshop-execution.md`
