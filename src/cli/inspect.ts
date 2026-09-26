@@ -1,29 +1,57 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { findInstallation, workflowPath, type Installation } from "./config.js";
-import { die, requireArg } from "./cli-errors.js";
-import { loadAndValidateDefinition } from "./execute.js";
-import { openDb } from "./store/db.js";
-import { Store, isTerminal, type AttemptRow } from "./store/store.js";
-import { buildNodesForRun, buildStatusDto } from "./status/dto.js";
-import { glyph, localClock } from "./status/format.js";
-import { deriveNodeStatus } from "./status/node-status.js";
-import { buildRunsFeed, DEFAULT_RUNS_LIMIT } from "./status/runs-feed.js";
-import { renderTreeStatus } from "./status/tree.js";
-import { resolveNode } from "./runner/resolve.js";
-import { attemptFolderOfPacket } from "./worklog/worklog.js";
-import { SystemClock } from "./util/clock.js";
-import { readTruncationRecord } from "./util/retention.js";
+import { findInstallation, workflowPath, type Installation } from "../config.js";
+import { die, errorText, requireArg } from "./errors.js";
+import { unresolvedAgentSites } from "../definition/resolve.js";
+import { loadAndValidateDefinition } from "../execute.js";
+import { openDb } from "../store/db.js";
+import { Store, isTerminal, type AttemptRow } from "../store/store.js";
+import { buildNodesForRun, buildStatusDto } from "../status/dto.js";
+import { glyph, localClock } from "../status/format.js";
+import { deriveNodeStatus } from "../status/node-status.js";
+import { buildRunsFeed, DEFAULT_RUNS_LIMIT } from "../status/runs-feed.js";
+import { renderTreeStatus } from "../status/tree.js";
+import { resolveNode } from "../runner/resolve.js";
+import { attemptFolderOfPacket } from "../worklog/worklog.js";
+import { SystemClock } from "../util/clock.js";
+import { readTruncationRecord } from "../util/retention.js";
 
 /**
- * The read-only inspection commands: status, runs, logs, diagram, and node
- * describe.
+ * The read-only inspection commands: validate, status, runs, logs, diagram,
+ * and node describe.
  *
- * Split from `cli.ts` because they are a different job from controlling runs.
+ * Kept apart from the run controls because they are a different job.
  * These only read the projections and print them, so the whole surface can be
  * deleted — or moved behind another entry point — without touching dispatch,
  * lifecycle control, or the viewer's lazy load.
  */
+
+export function cmdValidate(args: string[]): void {
+  const workflowId = requireArg(args, "workflow-id");
+  const inst = findInstallation();
+  const path = workflowPath(inst, workflowId);
+  try {
+    const loaded = loadAndValidateDefinition(path);
+    const warnings = preflightWarnings(loaded.def, inst);
+    process.stdout.write(`ok: ${workflowId} — valid (chain of ${loaded.chain.order.length} node(s))\n`);
+    for (const w of warnings) process.stdout.write(`warning: ${w}\n`);
+  } catch (e) {
+    die(errorText(e));
+  }
+}
+
+function preflightWarnings(def: import("../definition/schema.js").WorkflowDefinition, inst: ReturnType<typeof findInstallation>): string[] {
+  // validate checks the definition only; agent-resolution is also a start
+  // failure, so it is reported here as a warning-level diagnosis.
+  const warnings: string[] = [];
+  for (const site of unresolvedAgentSites(def, inst.machineAgent)) {
+    warnings.push(`agent site cannot resolve harness/model: ${site} (start will fail)`);
+  }
+  if (def.schedule && def.schedule.max_runs <= 0) {
+    warnings.push(`max_runs is ${def.schedule.max_runs} — this workflow runs until stopped (indefinite)`);
+  }
+  return warnings;
+}
 
 export function cmdStatus(args: string[]): void {
   const json = args.includes("--json");
@@ -52,6 +80,12 @@ function attemptStreamFiles(attemptFolder: string): string[] {
   return candidates.filter((p) => existsSync(p));
 }
 
+/**
+ * The runs feed: every occurrence of one workflow, newest first. The status
+ * DTO carries only the unresolved current run, so the viewer needs this to
+ * render a recurring workflow as the stream of occurrences a human reads.
+ * `--all` lifts the default cap; `--json` emits the versioned shape.
+ */
 export function cmdRuns(args: string[]): void {
   const all = args.includes("--all");
   const json = args.includes("--json");

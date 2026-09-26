@@ -106,7 +106,7 @@ describe("gate 13 — crash recovery", () => {
   test("a killed worker recovers only the interrupted node and never repeats a completed predecessor", async () => {
     const inst = makeInstallation({ "crash-chain": twoNodeWorkflow() });
     // Start in the background: node-fast completes, node-slow sleeps 30s.
-    const child = spawn("bun", [join(import.meta.dir, "..", "src/cli.ts"), "start", "crash-chain"], {
+    const child = spawn("bun", [join(import.meta.dir, "..", "src/cli/main.ts"), "start", "crash-chain"], {
       cwd: inst.root,
       stdio: "ignore",
     });
@@ -160,7 +160,7 @@ describe("gate 13 — crash recovery", () => {
     // The chain finishes from the retry attempt.
     const loaded = loadAndValidateDefinition(join(inst.workflowsDir, "crash-chain.yaml"));
     const runId = String(dbRuns(inst)[0]!.run_id);
-    await runChain({ store: new Store(openDb(real.dbPath)), inst: real, loaded, runId, cliPath: "bun /Users/kg/dev/oss/workshop/src/cli.ts" });
+    await runChain({ store: new Store(openDb(real.dbPath)), inst: real, loaded, runId, cliPath: "bun /Users/kg/dev/oss/workshop/src/cli/main.ts" });
     const runs = dbRuns(inst);
     expect(runs[0]!.status).toBe("completed");
   }, 90_000);
@@ -247,7 +247,7 @@ describe("gate 15 — stop fencing", () => {
 
   test("workshop stop kills the recorded process group and cancels the run", async () => {
     const inst = makeInstallation({ "crash-chain": twoNodeWorkflow() });
-    const child = spawn("bun", [join(import.meta.dir, "..", "src/cli.ts"), "start", "crash-chain"], {
+    const child = spawn("bun", [join(import.meta.dir, "..", "src/cli/main.ts"), "start", "crash-chain"], {
       cwd: inst.root,
       stdio: "ignore",
     });
@@ -266,7 +266,7 @@ describe("gate 15 — stop fencing", () => {
     };
     await waitFor(() => pollDb().some((r) => r.node_id === "node-slow" && r.status === "running"));
 
-    const stopped = spawnSync("bun", [join(import.meta.dir, "..", "src/cli.ts"), "stop", "crash-chain"], {
+    const stopped = spawnSync("bun", [join(import.meta.dir, "..", "src/cli/main.ts"), "stop", "crash-chain"], {
       cwd: inst.root,
       encoding: "utf8",
       timeout: 30_000,

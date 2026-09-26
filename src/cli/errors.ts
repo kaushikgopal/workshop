@@ -4,10 +4,9 @@ import { ZodError } from "zod";
  * The CLI's shared edges: what a command does when the operator got it wrong,
  * and how a failure becomes one readable line.
  *
- * Separate from `cli.ts` so the inspection commands can live in their own
- * module without importing the executable's dispatch — the split exists to make
- * the read-only surface deletable on its own, and a circular import back into
- * the dispatcher would undo that.
+ * Separate from `main.ts` so each command module can use them without
+ * importing the executable's dispatch — a circular import back into the
+ * dispatcher would undo the split.
  */
 
 /** Report a usage or runtime failure and stop. Exit code 1 is the CLI's failure. */

@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "test": "bun test",
-    "workshop": "bun src/cli.ts"
+    "workshop": "bun src/cli/main.ts"
   },
   "dependencies": {
     "@opentui/core": "^0.5.12",

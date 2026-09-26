@@ -161,7 +161,7 @@ dead and retries the attempt deterministically.
 another terminal:
 
 ```bash
-bun src/cli.ts orchestrate
+bun src/cli/main.ts orchestrate
 ```
 
 `daemon.ts` is a single process that polls SQLite once a second. Each tick it:
@@ -196,8 +196,13 @@ bun src/cli.ts orchestrate
 
 ```text
 src/
-├─ cli.ts                 entrypoint: start, stop, pause, resume, watch, runtime
-├─ cli-inspect.ts         read-only commands: status, runs, logs, diagram, node
+├─ cli/
+│  ├─ main.ts            entrypoint: argv dispatch and help
+│  ├─ run-controls.ts    start · stop · pause · resume
+│  ├─ inspect.ts         validate · status · runs · logs · diagram · node
+│  ├─ watch.ts           lazy-loads the TUI viewer
+│  ├─ agent-callbacks.ts runtime progress · block, called by agents
+│  └─ errors.ts          die · errorText · requireArg
 ├─ admission.ts           step 2: reserve a run, freeze its definition
 ├─ execute.ts             steps 3–5: preflight, first attempt, runChain loop
 ├─ runner/                one attempt: resolve, env, spawn, validate
@@ -229,8 +234,8 @@ bun install
 mkdir -p .workshop/config/workflows
 cp examples/workflows/hemingway-clock.yaml .workshop/config/workflows/
 
-bun src/cli.ts validate hemingway-clock
-bun src/cli.ts start hemingway-clock
+bun src/cli/main.ts validate hemingway-clock
+bun src/cli/main.ts start hemingway-clock
 cat .workshop/state/runs/*/WORKSHOP_LOG.md | tail -40
 ```
 
@@ -251,7 +256,7 @@ and validates one sentence, and appends it to `hemingway.quotes.md`.
 | `node describe <id> <node>` | a node's resolved settings and status |
 | `orchestrate` | the daemon |
 
-Run any of them as `bun src/cli.ts <command>`.
+Run any of them as `bun src/cli/main.ts <command>`.
 
 ## Configuration
 

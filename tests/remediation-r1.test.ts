@@ -148,9 +148,9 @@ describe("S1 — blocked-run resume", () => {
 describe("S4 — quoted runtime CLI invocation", () => {
   test("the source invocation is one absolute executable path", () => {
     const original = process.argv[1]!;
-    process.argv[1] = "/tmp/obrien's work shop/src/cli.ts";
+    process.argv[1] = "/tmp/obrien's work shop/src/cli/main.ts";
     try {
-      expect(runtimeCliInvocation()).toBe("/tmp/obrien's work shop/src/cli.ts");
+      expect(runtimeCliInvocation()).toBe("/tmp/obrien's work shop/src/cli/main.ts");
     } finally {
       process.argv[1] = original;
     }
@@ -330,7 +330,7 @@ const NY = "America/New_York";
 /** Run the CLI in a subprocess with a controlled TZ; the test process
  *  environment itself is never mutated, so no state needs restoring. */
 function runCliWithTz(inst: TestInstallation, args: string, tz: string): CliResult {
-  const r = spawnSync("bun", [join(REPO_ROOT, "src/cli.ts"), ...args.split(" ").filter(Boolean)], {
+  const r = spawnSync("bun", [join(REPO_ROOT, "src/cli/main.ts"), ...args.split(" ").filter(Boolean)], {
     cwd: inst.root,
     encoding: "utf8",
     timeout: 60_000,

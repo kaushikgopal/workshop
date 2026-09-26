@@ -5,7 +5,7 @@ import type { WorkflowDefinition } from "../definition/schema.js";
 import { type ChainInfo } from "../definition/chain.js";
 import { type ParsedModel } from "../definition/model.js";
 import { type Clock } from "../util/clock.js";
-import type { BlockKind, FailureKind, RunRow, Store } from "../store/store.js";
+import type { FailureKind, RunRow, Store } from "../store/store.js";
 import { CapacityRejected, GuardRejected } from "../store/store.js";
 import { capStreams } from "../util/retention.js";
 import { WorklogIntegrityError, attemptFolderOfPacket, packetPath, worklogFingerprint } from "../worklog/worklog.js";
@@ -536,16 +536,4 @@ ${stdout.trimEnd()}
 ${input.marker.closing}
 `;
   atomicWriteFileSync(input.packetFile, content);
-}
-
-export function blockKindFor(kind: string): BlockKind | null {
-  const valid: BlockKind[] = [
-    "agent_requested",
-    "preflight",
-    "orchestrator",
-    "orchestrator_unresolved",
-    "unknown_external",
-    "operator",
-  ];
-  return valid.includes(kind as BlockKind) ? (kind as BlockKind) : null;
 }

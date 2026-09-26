@@ -72,18 +72,18 @@ describe("TUI boundary — naming says what a file is for", () => {
       allImports(readFileSync(file, "utf8")).some((spec) => spec.includes(`${TUI_PREFIX}`)),
     );
     // `watch` loads the viewer on demand; nothing else may reach for it at all.
-    expect(importers.map(relative)).toEqual(["src/cli.ts"]);
+    expect(importers.map(relative)).toEqual(["src/cli/watch.ts"]);
 
-    const cli = readFileSync(join(REPO_ROOT, "src/cli.ts"), "utf8");
+    const cli = readFileSync(join(REPO_ROOT, "src/cli/watch.ts"), "utf8");
     const { typeOnly, value, dynamic } = importsOf(cli);
     // Nothing the runtime executes may be a TUI module: only the lazily-loaded
     // entry point, plus type-only imports that vanish at compile time.
     expect(value.filter((spec) => spec.includes(TUI_PREFIX))).toEqual([]);
-    expect(dynamic.filter((spec) => spec.includes(TUI_PREFIX))).toEqual(["./tui-app.js"]);
-    expect(typeOnly.filter((spec) => spec.includes(TUI_PREFIX))).toEqual(["./tui-source.js"]);
+    expect(dynamic.filter((spec) => spec.includes(TUI_PREFIX))).toEqual(["../tui-app.js"]);
+    expect(typeOnly.filter((spec) => spec.includes(TUI_PREFIX))).toEqual(["../tui-source.js"]);
     // A static value import would pull OpenTUI into every invocation, including
     // `validate` and `status`.
-    expect(cli).toContain('await import("./tui-app.js")');
+    expect(cli).toContain('await import("../tui-app.js")');
   });
 
   test("the viewer never reaches past the CLI contract, transitively", () => {
