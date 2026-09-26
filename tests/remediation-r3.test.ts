@@ -3,19 +3,27 @@ import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { makeInstallation, runCli, dbRuns, readWorklog } from "./helpers.js";
-import { openDb } from "../src/store/db.js";
-import { Store } from "../src/store/store.js";
-import { loadAndValidateDefinition, runChain, startWorkflow } from "../src/execute.js";
-import { findInstallation, ensureDirs } from "../src/config.js";
-import { recoverInstallation } from "../src/recovery.js";
-import { runtimeCliInvocation } from "../src/util/cli-path.js";
+import { openDb } from "../src/storage/db/open-and-migrate.js";
+import { Store } from "../src/storage/db/store.js";
+import { advanceChain } from "../src/run/advance-chain.js";
+import { startWorkflow } from "../src/run/start-run.js";
+import { loadAndValidateDefinition } from "../src/definition/load-definition.js";
+import { findInstallation, ensureDirs } from "../src/load-installation.js";
+import { recoverInstallation } from "../src/run/recover-after-crash.js";
+import { runtimeCliInvocation } from "../src/attempt/build-attempt-env.js";
 import { SystemClock } from "../src/util/clock.js";
-import { processStartId } from "../src/util/process.js";
-import { attemptFolderOfPacket, packetPath, sha256File, sha256String, WorklogIntegrityError } from "../src/worklog/worklog.js";
-import { atomicWriteFileSync } from "../src/worklog/fs.js";
-import { authorizedMarker, validatePacket } from "../src/worklog/markers.js";
-import { extractMarker, mergePacket } from "../src/worklog/packet.js";
-import { RunLock } from "../src/worklog/lock.js";
+import { processStartId } from "../src/process/identify-process.js";
+import { WorklogIntegrityError } from "../src/worklog/detect-tampering.js";
+import { sha256String } from "../src/util/hash-content.js";
+import { sha256File } from "../src/util/hash-content.js";
+import { locatePacket } from "../src/storage/disk/locate-run-files.js";
+import { attemptDirOfPacket } from "../src/storage/disk/locate-run-files.js";
+import { atomicWriteFileSync } from "../src/storage/disk/write-crash-safe.js";
+import { authorizedMarker } from "../src/worklog/apply-marker-rules.js";
+import { validatePacket } from "../src/worklog/check-packet.js";
+import { mergePacket } from "../src/worklog/merge-packet.js";
+import { extractMarker } from "../src/worklog/check-packet.js";
+import { RunLock } from "../src/storage/disk/lock-run.js";
 
 const chainYaml = (id: string): string => `version: 1
 id: ${id}
@@ -55,9 +63,9 @@ describe("R3 packet replay — receipt loss", () => {
     const store = new Store(openDb(real.dbPath));
     const run = store.getRun(started.runId)!;
     const claim = store.claimAttempt({ runId: run.run_id, nodeId: "node-a", attempt: 1, now: new Date(), maxConcurrentRuns: 99 });
-    const folder = attemptFolderOfPacket(store.getAttempt(run.run_id, "node-a", 1)!.packet_path);
+    const folder = attemptDirOfPacket(store.getAttempt(run.run_id, "node-a", 1)!.packet_path);
     writeFileSync(
-      packetPath(folder),
+      locatePacket(folder),
       `#### Attempt 1\n\n##### Progress\n\nDone.\n\n<next-node-output id="node-b">\nhandoff text\n</next-node-output>\n`,
       "utf8",
     );
@@ -119,7 +127,7 @@ describe("R3 orchestrator replay — prose before DB", () => {
     // A dead applying owner whose normalized result exists and whose prose
     // block was already merged before the DB effect could commit.
     const token = "tok1234567890";
-    const { orchestratorResultFile } = await import("../src/orchestrator.js");
+    const { orchestratorResultFile } = await import("../src/run/orchestrate-failure.js");
     const resultPath = orchestratorResultFile(run.run_dir, token);
     atomicWriteFileSync(resultPath, JSON.stringify({ decision: "block", reason: "durable choice", notes: null }, null, 2) + "\n");
     const marker = {
@@ -281,8 +289,8 @@ async function startGenerateLineAttempt(definitions: Record<string, string>) {
   const started = await startWorkflow({ inst: real, loaded });
   const store = new Store(openDb(real.dbPath));
   const run = store.getRun(started.runId)!;
-  const folder = attemptFolderOfPacket(store.getAttempt(run.run_id, "node-generate-line", 1)!.packet_path);
-  return { inst, run, folder, packetFile: packetPath(folder) };
+  const folder = attemptDirOfPacket(store.getAttempt(run.run_id, "node-generate-line", 1)!.packet_path);
+  return { inst, run, folder, packetFile: locatePacket(folder) };
 }
 
 describe("Hemingway smoke — standalone marker lines", () => {
@@ -358,7 +366,7 @@ describe("Ordered-node artifact layout", () => {
 
     // Running the chain completes node-a #2 and persists node-b #1 in the
     // second node folder — the physical layout never reorders execution.
-    expect((await runChain({ store, inst: real, loaded, runId: run.run_id, cliPath: runtimeCliInvocation() })).status).toBe("completed");
+    expect((await advanceChain({ store, inst: real, loaded, runId: run.run_id, cliPath: runtimeCliInvocation() })).status).toBe("completed");
     const second = store.getAttempt(run.run_id, "node-b", 1)!;
     expect(second.packet_path).toBe(join(run.run_dir, "nodes", "002-node-b", "attempt-001", "packet.md"));
     expect(existsSync(second.packet_path)).toBe(true);
@@ -388,7 +396,7 @@ describe("Ordered-node artifact layout", () => {
     // pre-layout run directory never had one.
     rmSync(join(run.run_dir, "nodes"), { recursive: true });
 
-    expect((await runChain({ store, inst: real, loaded, runId: run.run_id, cliPath: runtimeCliInvocation() })).status).toBe("completed");
+    expect((await advanceChain({ store, inst: real, loaded, runId: run.run_id, cliPath: runtimeCliInvocation() })).status).toBe("completed");
 
     // The packet was repaired and its evidence merged at the stored path…
     expect(existsSync(legacyPacket)).toBe(true);
@@ -415,7 +423,7 @@ describe("R3 orchestrator replay — repeated decisions", () => {
     const started = await startWorkflow({ inst: real, loaded });
     const store = new Store(openDb(real.dbPath));
     const run = store.getRun(started.runId)!;
-    const { orchestratorResultFile } = await import("../src/orchestrator.js");
+    const { orchestratorResultFile } = await import("../src/run/orchestrate-failure.js");
 
     // Stage a dead applying owner whose normalized result is durable on disk.
     const stage = (token: string, result: { decision: string; reason: string; notes: string | null }): void => {

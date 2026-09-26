@@ -1,18 +1,19 @@
 import { describe, test, expect } from "bun:test";
 import { join } from "node:path";
 import { makeInstallation, runCli, readWorklog } from "./helpers.js";
-import { findInstallation } from "../src/config.js";
-import { loadAndValidateDefinition, startWorkflow, runChain } from "../src/execute.js";
-import { openDb } from "../src/store/db.js";
-import { Store } from "../src/store/store.js";
-import { runtimeCliInvocation } from "../src/util/cli-path.js";
+import { findInstallation } from "../src/load-installation.js";
+import { advanceChain } from "../src/run/advance-chain.js";
+import { startWorkflow } from "../src/run/start-run.js";
+import { loadAndValidateDefinition } from "../src/definition/load-definition.js";
+import { openDb } from "../src/storage/db/open-and-migrate.js";
+import { Store } from "../src/storage/db/store.js";
+import { runtimeCliInvocation } from "../src/attempt/build-attempt-env.js";
 
 /**
  * The inspection surfaces a viewer consumes. `status --json` answers "what is
  * true now"; these two answer "what happened", which a recurring workflow needs
  * because the status DTO carries only the unresolved current run.
  */
-
 const oneShot = (id: string): string => `version: 1
 id: ${id}
 description: One command node.
@@ -31,7 +32,7 @@ async function runTimes(inst: ReturnType<typeof makeInstallation>, id: string, t
   const runIds: string[] = [];
   for (let i = 0; i < times; i++) {
     const started = await startWorkflow({ inst: real, loaded });
-    await runChain({ store, inst: real, loaded, runId: started.runId, cliPath: runtimeCliInvocation() });
+    await advanceChain({ store, inst: real, loaded, runId: started.runId, cliPath: runtimeCliInvocation() });
     runIds.push(started.runId);
   }
   return runIds;
@@ -201,7 +202,7 @@ nodes:
     const real = findInstallation(inst.root);
     const loaded = loadAndValidateDefinition(join(inst.workflowsDir, "checked.yaml"));
     const started = await startWorkflow({ inst: real, loaded });
-    await runChain({ store: new Store(openDb(real.dbPath)), inst: real, loaded, runId: started.runId, cliPath: runtimeCliInvocation() });
+    await advanceChain({ store: new Store(openDb(real.dbPath)), inst: real, loaded, runId: started.runId, cliPath: runtimeCliInvocation() });
 
     const r = runCli(inst, "logs checked");
     expect(r.code).toBe(0);

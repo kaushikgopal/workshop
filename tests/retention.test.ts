@@ -3,12 +3,15 @@ import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { makeInstallation, readWorklog, runCli } from "./helpers.js";
-import { findInstallation } from "../src/config.js";
-import { loadAndValidateDefinition, startWorkflow, runChain } from "../src/execute.js";
-import { openDb } from "../src/store/db.js";
-import { Store } from "../src/store/store.js";
-import { runtimeCliInvocation } from "../src/util/cli-path.js";
-import { capStream, parseByteSize, readTruncationRecord } from "../src/util/retention.js";
+import { findInstallation } from "../src/load-installation.js";
+import { advanceChain } from "../src/run/advance-chain.js";
+import { startWorkflow } from "../src/run/start-run.js";
+import { loadAndValidateDefinition } from "../src/definition/load-definition.js";
+import { openDb } from "../src/storage/db/open-and-migrate.js";
+import { Store } from "../src/storage/db/store.js";
+import { runtimeCliInvocation } from "../src/attempt/build-attempt-env.js";
+import { capStream, readTruncationRecord } from "../src/storage/disk/cap-streams.js";
+import { parseByteSize } from "../src/util/parse-units.js";
 
 // ---------------------------------------------------------------------------
 // Cap parsing and one-stream truncation
@@ -96,7 +99,7 @@ describe("retention — through a run", () => {
     const loaded = loadAndValidateDefinition(join(inst.workflowsDir, "big.yaml"));
     const started = await startWorkflow({ inst: real, loaded });
     const store = new Store(openDb(real.dbPath));
-    await runChain({ store, inst: real, loaded, runId: started.runId, cliPath: runtimeCliInvocation() });
+    await advanceChain({ store, inst: real, loaded, runId: started.runId, cliPath: runtimeCliInvocation() });
 
     const run = store.getRun(started.runId)!;
     const attempt = store.listAttempts(run.run_id)[0]!;
@@ -134,7 +137,7 @@ describe("retention — through a run", () => {
     const loaded = loadAndValidateDefinition(yamlPath);
     const started = await startWorkflow({ inst: real, loaded });
     const store = new Store(openDb(real.dbPath));
-    await runChain({ store, inst: real, loaded, runId: started.runId, cliPath: runtimeCliInvocation() });
+    await advanceChain({ store, inst: real, loaded, runId: started.runId, cliPath: runtimeCliInvocation() });
 
     const run = store.getRun(started.runId)!;
     const folder = join(run.run_dir, "nodes", "001-node-a", "attempt-001");
@@ -160,7 +163,7 @@ nodes:
     const loaded = loadAndValidateDefinition(join(inst.workflowsDir, "big.yaml"));
     const started = await startWorkflow({ inst: real, loaded });
     const store = new Store(openDb(real.dbPath));
-    await runChain({ store, inst: real, loaded, runId: started.runId, cliPath: runtimeCliInvocation() });
+    await advanceChain({ store, inst: real, loaded, runId: started.runId, cliPath: runtimeCliInvocation() });
 
     const run = store.getRun(started.runId)!;
     const folder = join(run.run_dir, "nodes", "001-node-a", "attempt-001");

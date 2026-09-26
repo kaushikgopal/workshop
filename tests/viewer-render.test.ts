@@ -1,9 +1,9 @@
 import { describe, test, expect } from "bun:test";
 import { createTestRenderer } from "@opentui/core/testing";
-import { makeShutdown, mountViewer, reduceKey, type ViewerState } from "../src/tui-app.js";
-import { buildViewerModel, pickerModel } from "../src/tui-panes.js";
-import type { StatusDto } from "../src/status/dto.js";
-import { buildRunsFeed, type RunsFeed } from "../src/status/runs-feed.js";
+import { makeShutdown, mountViewer, reduceKey, type ViewerState } from "../src/tui/mount-viewer.js";
+import { buildViewerModel, pickerModel } from "../src/tui/build-panes.js";
+import type { StatusDto } from "../src/views/build-status-json.js";
+import { buildRunsFeed, type RunsFeed } from "../src/views/build-runs-json.js";
 
 /**
  * The binding, asserted against a real render.
@@ -12,7 +12,6 @@ import { buildRunsFeed, type RunsFeed } from "../src/status/runs-feed.js";
  * so a layout regression fails here rather than in someone's terminal. A test
  * that rebuilt the tree itself would prove nothing about the binding.
  */
-
 const NOW = new Date("2026-09-24T12:00:00.000Z");
 
 const dto: StatusDto = {

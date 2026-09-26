@@ -2,7 +2,7 @@ import { describe, test, expect } from "bun:test";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { makeInstallation, runCli, mockAgentHarness, dbRuns } from "./helpers.js";
-import type { StatusDto } from "../src/status/dto.js";
+import type { StatusDto } from "../src/views/build-status-json.js";
 
 const MOCK = mockAgentHarness();
 

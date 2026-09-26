@@ -2,11 +2,14 @@ import { describe, test, expect } from "bun:test";
 import { join } from "node:path";
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { makeInstallation, runCli, mockAgentHarness, dbRuns } from "./helpers.js";
-import { openDb } from "../src/store/db.js";
-import { Store } from "../src/store/store.js";
-import { findInstallation, ensureDirs } from "../src/config.js";
-import { loadAndValidateDefinition, startWorkflow, preflightIfNeeded } from "../src/execute.js";
-import { tick, DaemonLockHeld } from "../src/daemon.js";
+import { openDb } from "../src/storage/db/open-and-migrate.js";
+import { Store } from "../src/storage/db/store.js";
+import { findInstallation, ensureDirs } from "../src/load-installation.js";
+import { startWorkflow } from "../src/run/start-run.js";
+import { checkEnvironment } from "../src/run/check-environment.js";
+import { loadAndValidateDefinition } from "../src/definition/load-definition.js";
+import { tick } from "../src/daemon/reconcile-loop.js";
+import { DaemonLockHeld } from "../src/daemon/acquire-daemon-lock.js";
 import { FakeClock } from "../src/util/clock.js";
 
 const MOCK = mockAgentHarness();
@@ -257,10 +260,10 @@ describe("gate 24 — daemon singleton", () => {
     writeFileSync(fd, JSON.stringify({ pid: process.pid }));
     closeSync(fd);
     // process.pid is alive → second daemon must fail fast.
-    const { runDaemon } = await import("../src/daemon.js");
+    const { reconcileForever } = await import("../src/daemon/reconcile-loop.js");
     let err: unknown = null;
     try {
-      await runDaemon(real);
+      await reconcileForever(real);
     } catch (e) {
       err = e;
     }

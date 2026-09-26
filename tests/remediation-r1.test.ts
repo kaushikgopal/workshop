@@ -12,20 +12,24 @@ import {
   type CliResult,
   type TestInstallation,
 } from "./helpers.js";
-import { openDb } from "../src/store/db.js";
-import { Store, GuardRejected, type AttemptRow } from "../src/store/store.js";
-import { loadAndValidateDefinition, runChain, startWorkflow } from "../src/execute.js";
-import { findInstallation, ensureDirs } from "../src/config.js";
-import { recoverInstallation } from "../src/recovery.js";
+import { openDb } from "../src/storage/db/open-and-migrate.js";
+import { Store, GuardRejected, type AttemptRow } from "../src/storage/db/store.js";
+import { advanceChain } from "../src/run/advance-chain.js";
+import { startWorkflow } from "../src/run/start-run.js";
+import { loadAndValidateDefinition } from "../src/definition/load-definition.js";
+import { findInstallation, ensureDirs } from "../src/load-installation.js";
+import { recoverInstallation } from "../src/run/recover-after-crash.js";
 import { SystemClock } from "../src/util/clock.js";
-import { deriveNodeStatus } from "../src/status/node-status.js";
-import { buildStatusDto } from "../src/status/dto.js";
-import { renderTreeStatus } from "../src/status/tree.js";
-import { runtimeCliInvocation } from "../src/util/cli-path.js";
-import { attemptFolderOfPacket, packetPath, sha256File } from "../src/worklog/worklog.js";
-import { atomicWriteFileSync } from "../src/worklog/fs.js";
-import { mergePacket } from "../src/worklog/packet.js";
-import { RunLock } from "../src/worklog/lock.js";
+import { deriveNodeStatus } from "../src/views/derive-node-status.js";
+import { buildStatusDto } from "../src/views/build-status-json.js";
+import { renderTreeStatus } from "../src/views/render-status-tree.js";
+import { runtimeCliInvocation } from "../src/attempt/build-attempt-env.js";
+import { sha256File } from "../src/util/hash-content.js";
+import { locatePacket } from "../src/storage/disk/locate-run-files.js";
+import { attemptDirOfPacket } from "../src/storage/disk/locate-run-files.js";
+import { atomicWriteFileSync } from "../src/storage/disk/write-crash-safe.js";
+import { mergePacket } from "../src/worklog/merge-packet.js";
+import { RunLock } from "../src/storage/disk/lock-run.js";
 
 const MOCK = mockAgentHarness();
 
@@ -635,9 +639,9 @@ describe("Q6 — merge receipt validation", () => {
     const store = new Store(openDb(real.dbPath));
     const run = store.getRun(started.runId)!;
     const claim = store.claimAttempt({ runId: run.run_id, nodeId: "node-a", attempt: 1, now: new Date(), maxConcurrentRuns: 99 });
-    const folder = attemptFolderOfPacket(store.getAttempt(run.run_id, "node-a", 1)!.packet_path);
+    const folder = attemptDirOfPacket(store.getAttempt(run.run_id, "node-a", 1)!.packet_path);
     writeFileSync(
-      packetPath(folder),
+      locatePacket(folder),
       `#### Attempt 1\n\n##### Progress\n\nDone.\n\n<next-node-output id="node-b">\nhandoff text\n</next-node-output>\n`,
       "utf8",
     );
@@ -705,7 +709,7 @@ nodes:
     const inst = makeInstallation({ "chain": chainYaml("chain") });
     const { store, real, runId, folder } = await mergedFinishingRun(inst);
     // The packet changed after the recorded merge — evidence is untrustworthy.
-    writeFileSync(packetPath(folder), readFileSync(packetPath(folder), "utf8") + "tampered\n", "utf8");
+    writeFileSync(locatePacket(folder), readFileSync(locatePacket(folder), "utf8") + "tampered\n", "utf8");
 
     const report = await recoverInstallation({ store, inst: real, clock: new SystemClock() });
     expect(report.finishingRecovered).toEqual([]);
@@ -749,7 +753,7 @@ nodes:
     const receipt = JSON.parse(readFileSync(join(folder, "merge-receipt.json"), "utf8")) as Record<string, unknown>;
     receipt.sectionSha256 = `sha256:${"0".repeat(64)}`;
     writeFileSync(join(folder, "merge-receipt.json"), JSON.stringify(receipt), "utf8");
-    expect(sha256File(packetPath(folder))).toBe(receipt.packetSha256 as string);
+    expect(sha256File(locatePacket(folder))).toBe(receipt.packetSha256 as string);
 
     const report = await recoverInstallation({ store, inst: real, clock: new SystemClock() });
     expect(report.finishingRecovered).toContain(`${runId}/node-a #1`);
@@ -788,7 +792,7 @@ nodes:
     const started = await startWorkflow({ inst: real, loaded });
 
     // Pause while node-a is still running.
-    const chain = runChain({ store, inst: real, loaded, runId: started.runId, cliPath: runtimeCliInvocation() });
+    const chain = advanceChain({ store, inst: real, loaded, runId: started.runId, cliPath: runtimeCliInvocation() });
     await new Promise((r) => setTimeout(r, 400));
     const run = store.getRun(started.runId)!;
     store.setDesiredState(run.run_id, "paused", new Date());

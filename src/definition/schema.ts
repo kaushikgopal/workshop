@@ -5,7 +5,6 @@ import { z } from "zod";
  * Every object is strict: unknown keys are rejected, execution sites are
  * tagged unions with exactly one member.
  */
-
 export const durationString = z
   .string()
   .regex(/^[1-9][0-9]*[smhdw]$/, "expected a positive integer duration with unit s|m|h|d|w, e.g. 10m");

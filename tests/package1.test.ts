@@ -9,8 +9,9 @@ import {
   dbAttempts,
   REPO_ROOT,
 } from "./helpers.js";
-import { loadAndValidateDefinition, startWorkflow } from "../src/execute.js";
-import { findInstallation, ensureDirs } from "../src/config.js";
+import { startWorkflow } from "../src/run/start-run.js";
+import { loadAndValidateDefinition } from "../src/definition/load-definition.js";
+import { findInstallation, ensureDirs } from "../src/load-installation.js";
 import { SystemClock } from "../src/util/clock.js";
 
 const MOCK = mockAgentHarness();

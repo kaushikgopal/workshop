@@ -1,8 +1,8 @@
 import { describe, test, expect } from "bun:test";
-import { buildRunsFeed, DEFAULT_RUNS_LIMIT, RUNS_DTO_VERSION } from "../src/status/runs-feed.js";
-import { buildViewerModel, failureLabel, nodeLines, pickerModel, windowRuns } from "../src/tui-panes.js";
-import type { StatusDto, NodeStatusDto } from "../src/status/dto.js";
-import type { RunRow } from "../src/store/store.js";
+import { buildRunsFeed, DEFAULT_RUNS_LIMIT, RUNS_DTO_VERSION } from "../src/views/build-runs-json.js";
+import { buildViewerModel, failureLabel, nodeLines, pickerModel, windowRuns } from "../src/tui/build-panes.js";
+import type { StatusDto, NodeStatusDto } from "../src/views/build-status-json.js";
+import type { RunRow } from "../src/storage/db/store.js";
 
 /**
  * The viewer contract: the runs feed's shape, and the panes built from it.
@@ -11,7 +11,6 @@ import type { RunRow } from "../src/store/store.js";
  * be asserted byte for byte here — no TTY, no terminal library, and nothing
  * reaching around the contract into SQLite or a run directory.
  */
-
 const NOW = new Date("2026-09-24T12:00:00.000Z");
 
 const run = (over: Partial<RunRow> & { run_id: string; seq: number }): RunRow =>

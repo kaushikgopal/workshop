@@ -14,7 +14,7 @@ Three things hold all the state:
 | --- | --- | --- |
 | Workflow YAML | what to do | you |
 | SQLite (`workshop.db`) | where every run stands: status, attempts, owners | the runtime only |
-| `WORKSHOP_LOG.md` (one per run) | what happened, in prose, for agents and humans | the runtime only; agents write their own packet file |
+| `WORKLOG.md` (one per run) | what happened, in prose, for agents and humans | the runtime only; agents write their own packet file |
 
 The runtime moves normal work forward without any model. It calls an
 **orchestrator** agent only when an attempt fails and someone must judge what
@@ -73,15 +73,15 @@ sequenceDiagram
   You->>CLI: workshop start hemingway-clock
   CLI->>CLI: parse + validate YAML
   CLI->>DB: reserve run
-  CLI->>Dir: freeze definition.yaml, create WORKSHOP_LOG.md
-  CLI->>CLI: run preflight check
+  CLI->>Dir: freeze definition.yaml, create WORKLOG.md
+  CLI->>CLI: check environment (preflight)
   CLI->>DB: create pending attempt for node 1
   loop each node in the chain
     CLI->>DB: claim attempt
     CLI->>Proc: spawn with WORKSHOP_* env
     Proc->>Dir: write packet.md (agents) or stdout (commands)
-    CLI->>Proc: run validator
-    CLI->>Dir: merge packet into WORKSHOP_LOG.md
+    CLI->>Proc: judge output (validator)
+    CLI->>Dir: merge packet into WORKLOG.md
     CLI->>DB: complete attempt + create next node's attempt
   end
   CLI->>You: run → completed
@@ -91,20 +91,21 @@ Step by step:
 
 1. **Load.** `definition/` parses the YAML strictly, checks it with a Zod
    schema, and confirms the nodes form one linear chain.
-2. **Admit.** `admission.ts` creates the run row in SQLite, then writes a frozen
+2. **Create the run.** `run/create-run.ts` adds the run row to SQLite, then writes a frozen
    copy of the YAML and an empty worklog into the run directory. The run uses
    the frozen copy from here on, so editing the YAML mid-run changes nothing.
    A second `start` while a run is open does nothing.
-3. **Preflight.** The optional `environment.preflight` command (here,
-   `command -v pi`) must exit 0. Workshop caches a pass per definition hash.
-4. **Run each node.** `execute.ts#runChain` loops. For each pending attempt,
-   `runner/attempt.ts` does the work described in the next section.
+3. **Check the environment.** `run/check-environment.ts` executes the optional
+   `environment.preflight` command (here, `command -v pi`), which must exit 0.
+   Workshop caches a pass per definition hash.
+4. **Advance the chain.** `run/advance-chain.ts` loops. For each pending attempt,
+   `attempt/execute-attempt.ts` does the work described in the next section.
 5. **Finish.** When the last node completes, the run completes. The final
    output sits in the worklog under `<workflow-output>`.
 
 ### One attempt, up close
 
-Each node execution is an **attempt**. `runner/attempt.ts` takes it through a
+Each node execution is an **attempt**. `attempt/execute-attempt.ts` takes it through a
 fixed sequence:
 
 1. **Claim** the attempt in SQLite, which issues an owner token. Only the
@@ -121,7 +122,7 @@ fixed sequence:
    | `WORKSHOP_NODE_PACKET_FILE` | the one file an agent may write |
    | `WORKSHOP_PREVIOUS_OUTPUT_FILE` | the previous node's output |
    | `WORKSHOP_NODE_OUTPUT_FILE` | this node's extracted output (validators read it) |
-   | `WORKSHOP_LOG` | the run's worklog, read-only |
+   | `WORKSHOP_WORKLOG_FILE` | the run's worklog, read-only |
    | `WORKSHOP_MODEL`, `WORKSHOP_THINKING`, … | the resolved model, split several ways |
    | `WORKSHOP_CLI` | lets an agent call `runtime progress` or `runtime block` |
 
@@ -130,9 +131,9 @@ fixed sequence:
 5. **Extract output.** A command's output is its stdout. An agent's output is
    the text between `<next-node-output id="…">` markers in its packet (or
    `<workflow-output>` on the last node).
-6. **Validate**, if the node has a validator. A command validator passes on
+6. **Judge**, if the node has a `validator:`. A command validator passes on
    exit 0; an agent validator writes `validation.json` with `{"passed": …}`.
-7. **Merge** the packet into `WORKSHOP_LOG.md` under a file lock, and write a
+7. **Merge** the packet into `WORKLOG.md` under a file lock, and write a
    receipt so a repeated merge does nothing.
 8. **Complete** the attempt and create the next node's pending attempt in one
    SQLite transaction.
@@ -164,14 +165,14 @@ another terminal:
 bun src/cli/main.ts orchestrate
 ```
 
-`daemon.ts` is a single process that polls SQLite once a second. Each tick it:
+`daemon/reconcile-loop.ts` is a single process that polls SQLite once a second. Each tick it:
 
-1. recovers interrupted work (`recovery.ts`),
-2. admits due occurrences, one open run per workflow (`scheduler.ts`),
+1. recovers interrupted work (`run/recover-after-crash.ts`),
+2. creates due occurrences, one open run per workflow (`daemon/create-due-runs.ts`),
 3. creates first attempts for queued runs,
 4. runs pending orchestrator judgments,
 5. launches pending attempts within `max_concurrent_runs`, through the same
-   `runChain` the CLI uses.
+   `advanceChain` the CLI uses.
 
 ## What lands on disk
 
@@ -184,7 +185,7 @@ bun src/cli/main.ts orchestrate
    ├─ workshop.db                   SQLite: workflows, runs, node_attempts
    └─ runs/<run-id>/
       ├─ definition.yaml            frozen YAML
-      ├─ WORKSHOP_LOG.md            the run's shared log
+      ├─ WORKLOG.md                 the run's shared log
       ├─ nodes/002-node-generate-line/attempt-001/
       │  ├─ prompt  packet.md  stdout  stderr  output
       │  ├─ validation/             validator prompt, logs, verdict
@@ -194,38 +195,53 @@ bun src/cli/main.ts orchestrate
 
 ## Code map
 
+Folders follow the domain nouns: a **workflow** definition, a **run** of it,
+and each **attempt** at a node. Filenames lead with a verb that says what the
+file does; `CONTRIBUTING.md` lists the verbs.
+
 ```text
 src/
-├─ cli/
-│  ├─ main.ts            entrypoint: argv dispatch and help
-│  ├─ run-controls.ts    start · stop · pause · resume
-│  ├─ inspect.ts         validate · status · runs · logs · diagram · node
-│  ├─ watch.ts           lazy-loads the TUI viewer
-│  ├─ agent-callbacks.ts runtime progress · block, called by agents
-│  └─ errors.ts          die · errorText · requireArg
-├─ admission.ts           step 2: reserve a run, freeze its definition
-├─ execute.ts             steps 3–5: preflight, first attempt, runChain loop
-├─ runner/                one attempt: resolve, env, spawn, validate
-├─ worklog/               packets, markers, locked merges into WORKSHOP_LOG.md
-├─ store/                 SQLite schema and every guarded state transition
-├─ definition/            YAML parsing, schema, chain, model/harness resolution
-├─ orchestrator.ts        failure judgment: retry, block, or fail
-├─ daemon.ts              polling loop for schedules and recovery
-├─ scheduler.ts           which occurrences are due
-├─ recovery.ts            reconcile attempts orphaned by a crash
-├─ status/                versioned JSON views (status --json, runs --json)
-├─ tui-*.ts               the `watch` terminal viewer (OpenTUI)
-└─ util/                  clock, durations, ids, processes, stream caps
+├─ cli/                  one file per command group; main.ts is the entrypoint
+├─ load-installation.ts  find .workshop/ and read machine defaults
+├─ definition/           YAML → checked WorkflowDefinition
+│  ├─ parse-yaml.ts            strict YAML: no duplicate keys or anchors
+│  ├─ schema.ts                the Zod schema
+│  ├─ check-chain.ts           nodes form one linear chain
+│  ├─ load-definition.ts       the three steps above, from a file or snapshot
+│  ├─ resolve-node-settings.ts node → workflow → machine settings
+│  ├─ parse-model.ts           provider/model:thinking
+│  └─ hash-canonical-json.ts   the definition hash
+├─ run/                  one run, start to finish
+│  ├─ create-run.ts            reserve a run, freeze its definition
+│  ├─ check-environment.ts     preflight, cached per definition hash
+│  ├─ start-run.ts             create, preflight, first attempt
+│  ├─ advance-chain.ts         execute pending attempts until the chain ends
+│  ├─ orchestrate-failure.ts   an agent decides: retry, block, or fail
+│  └─ recover-after-crash.ts   reconcile work orphaned by a crash
+├─ attempt/              one node, once
+│  ├─ execute-attempt.ts       claim → spawn → check → judge → merge → complete
+│  ├─ build-attempt-env.ts     the WORKSHOP_* variables
+│  ├─ render-agent-prompt.ts   node instructions plus the packet contract
+│  └─ judge-output.ts          the node's validator
+├─ daemon/               the `orchestrate` loop: schedules and recovery
+├─ process/              launch, identify, and kill child processes
+├─ worklog/              the packet and marker protocol, merges into WORKLOG.md
+├─ storage/
+│  ├─ db/                      SQLite schema and every guarded transition
+│  └─ disk/                    run-directory paths, crash-safe writes, locks
+├─ views/                versioned JSON and human renderings of state
+├─ tui/                  the `watch` terminal viewer (OpenTUI)
+└─ util/                 clock, ids, hashing, unit parsing
 ```
 
-Dependencies point one way: commands → lifecycle (`execute`, `runner`,
-`daemon`) → `definition/`, `store/`, `worklog/`. Two rules keep it that way:
+Dependencies point one way: `cli/` and `daemon/` → `run/` → `attempt/` →
+`definition/`, `worklog/`, `storage/`, `process/`. Two rules keep it that way:
 
-- `status/` is the contract for outside readers. `status --json` and
+- `views/` is the contract for outside readers. `status --json` and
   `runs --json` have versioned shapes, and the viewer reads those, never SQLite
   or run directories.
-- Only `tui-*` files import a UI library, and they load lazily. A test fails
-  if runtime code imports one.
+- Only `tui/` imports a UI library, and only `cli/watch.ts` loads it, lazily.
+  A test fails if runtime code imports it.
 
 ## Quick start
 
@@ -236,7 +252,7 @@ cp examples/workflows/hemingway-clock.yaml .workshop/config/workflows/
 
 bun src/cli/main.ts validate hemingway-clock
 bun src/cli/main.ts start hemingway-clock
-cat .workshop/state/runs/*/WORKSHOP_LOG.md | tail -40
+cat .workshop/state/runs/*/WORKLOG.md | tail -40
 ```
 
 The example needs `pi` on your PATH. A successful run stamps the time, writes
@@ -314,7 +330,8 @@ bun test          # acceptance tests against a mock harness (tests/mock/harness.
 bunx tsc --noEmit # typecheck
 ```
 
-The real-model path has one manual check: the quick start above.
+The real-model path has one manual check: the quick start above. Read
+`CONTRIBUTING.md` before adding or renaming a file.
 
 - Spec: `.agents/dox/workshop-spec-v3.md`
 - Build history and bug log: `.agents/dox/2026-09-10-workshop-execution.md`

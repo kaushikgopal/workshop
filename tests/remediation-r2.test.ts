@@ -1,17 +1,19 @@
 import { describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { admitManualRun } from "../src/admission.js";
-import { findInstallation, ensureDirs } from "../src/config.js";
-import { tick } from "../src/daemon.js";
-import { executeAttempt } from "../src/runner/attempt.js";
-import { loadAndValidateDefinition, runChain, startWorkflow } from "../src/execute.js";
-import { recoverInstallation } from "../src/recovery.js";
-import { openDb } from "../src/store/db.js";
-import { CapacityRejected, Store } from "../src/store/store.js";
+import { admitManualRun } from "../src/run/create-run.js";
+import { findInstallation, ensureDirs } from "../src/load-installation.js";
+import { tick } from "../src/daemon/reconcile-loop.js";
+import { executeAttempt } from "../src/attempt/execute-attempt.js";
+import { advanceChain } from "../src/run/advance-chain.js";
+import { startWorkflow } from "../src/run/start-run.js";
+import { loadAndValidateDefinition } from "../src/definition/load-definition.js";
+import { recoverInstallation } from "../src/run/recover-after-crash.js";
+import { openDb } from "../src/storage/db/open-and-migrate.js";
+import { CapacityRejected, Store } from "../src/storage/db/store.js";
 import { FakeClock, SystemClock } from "../src/util/clock.js";
-import { runtimeCliInvocation } from "../src/util/cli-path.js";
-import { worklogTemplate } from "../src/worklog/worklog.js";
+import { runtimeCliInvocation } from "../src/attempt/build-attempt-env.js";
+import { worklogTemplate } from "../src/worklog/edit-sections.js";
 import { dbAttempts, dbRuns, makeInstallation } from "./helpers.js";
 
 function workflow(id: string, command = "echo done", schedule = ""): string {
@@ -131,13 +133,13 @@ describe("R2 authoritative run capacity", () => {
     const storeA = new Store(openDb(inst.dbPath));
     const storeB = new Store(openDb(inst.dbPath));
 
-    const running = runChain({ store: storeA, inst, loaded: alpha.loaded, runId: alpha.started.runId, cliPath: runtimeCliInvocation() });
-    const rejected = await runChain({ store: storeB, inst, loaded: beta.loaded, runId: beta.started.runId, cliPath: runtimeCliInvocation() });
+    const running = advanceChain({ store: storeA, inst, loaded: alpha.loaded, runId: alpha.started.runId, cliPath: runtimeCliInvocation() });
+    const rejected = await advanceChain({ store: storeB, inst, loaded: beta.loaded, runId: beta.started.runId, cliPath: runtimeCliInvocation() });
     expect(rejected.status).toBe("queued");
     expect(storeB.getLiveAttempt(beta.started.runId)!.status).toBe("pending");
     await running;
 
-    const completed = await runChain({ store: storeB, inst, loaded: beta.loaded, runId: beta.started.runId, cliPath: runtimeCliInvocation() });
+    const completed = await advanceChain({ store: storeB, inst, loaded: beta.loaded, runId: beta.started.runId, cliPath: runtimeCliInvocation() });
     expect(completed.status).toBe("completed");
   });
 
@@ -148,7 +150,7 @@ describe("R2 authoritative run capacity", () => {
     const gamma = await start(inst, join(temp.workflowsDir, "gamma.yaml"));
     const runner = new Store(openDb(inst.dbPath));
     const contender = new Store(openDb(inst.dbPath));
-    const running = runChain({ store: runner, inst, loaded: alpha.loaded, runId: alpha.started.runId, cliPath: runtimeCliInvocation() });
+    const running = advanceChain({ store: runner, inst, loaded: alpha.loaded, runId: alpha.started.runId, cliPath: runtimeCliInvocation() });
 
     contender.tx(() => {
       contender.db.query("UPDATE node_attempts SET status = 'failed' WHERE run_id = ?").run(beta.started.runId);
@@ -240,7 +242,7 @@ describe("R2 pending packet repair", () => {
       const store = new Store(openDb(inst.dbPath));
       const row = store.getAttempt(ctx.started.runId, "node-only", 1)!;
       rmSync(row.packet_path);
-      expect((await runChain({ store, inst, loaded: ctx.loaded, runId: ctx.started.runId, cliPath: runtimeCliInvocation() })).status).toBe("completed");
+      expect((await advanceChain({ store, inst, loaded: ctx.loaded, runId: ctx.started.runId, cliPath: runtimeCliInvocation() })).status).toBe("completed");
     }
 
     // Successor gap.
@@ -253,7 +255,7 @@ describe("R2 pending packet repair", () => {
       await executeAttempt({ store, inst, def: ctx.loaded.def, chain: ctx.loaded.chain, run, nodeId: "node-only", attemptNo: 1, previousOutputFile: null, clock: new SystemClock(), cliPath: runtimeCliInvocation() });
       const successor = store.getAttempt(ctx.started.runId, "node-two", 1)!;
       rmSync(successor.packet_path);
-      expect((await runChain({ store, inst, loaded: ctx.loaded, runId: ctx.started.runId, cliPath: runtimeCliInvocation() })).status).toBe("completed");
+      expect((await advanceChain({ store, inst, loaded: ctx.loaded, runId: ctx.started.runId, cliPath: runtimeCliInvocation() })).status).toBe("completed");
     }
 
     // Retry gap.
@@ -264,7 +266,7 @@ describe("R2 pending packet repair", () => {
       store.db.query("UPDATE node_attempts SET status = 'failed' WHERE run_id = ?").run(ctx.started.runId);
       const retry = store.createRetryAttempt({ runId: ctx.started.runId, nodeId: "node-only", previousAttempt: 1, resolvedMaxAttempts: 2, resolvedTimeoutMs: 60_000, chainPosition: 0, now: new Date() })!;
       expect(existsSync(retry.packet_path)).toBe(false); // pending retries scaffold at run time
-      expect((await runChain({ store, inst, loaded: ctx.loaded, runId: ctx.started.runId, cliPath: runtimeCliInvocation() })).status).toBe("completed");
+      expect((await advanceChain({ store, inst, loaded: ctx.loaded, runId: ctx.started.runId, cliPath: runtimeCliInvocation() })).status).toBe("completed");
     }
   });
 
@@ -275,7 +277,7 @@ describe("R2 pending packet repair", () => {
     const row = store.getAttempt(ctx.started.runId, "node-only", 1)!;
     writeFileSync(row.packet_path, "foreign packet evidence\n", "utf8");
 
-    await runChain({ store, inst, loaded: ctx.loaded, runId: ctx.started.runId, cliPath: runtimeCliInvocation() });
+    await advanceChain({ store, inst, loaded: ctx.loaded, runId: ctx.started.runId, cliPath: runtimeCliInvocation() });
     expect(readFileSync(row.packet_path, "utf8")).toBe("foreign packet evidence\n");
     expect(store.getRun(ctx.started.runId)!.status).toBe("failed");
   });

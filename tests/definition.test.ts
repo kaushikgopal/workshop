@@ -1,10 +1,10 @@
 import { describe, test, expect } from "bun:test";
 import { ZodError } from "zod";
-import { parseStrictYaml, DefinitionError } from "../src/definition/parse.js";
+import { parseStrictYaml, DefinitionError } from "../src/definition/parse-yaml.js";
 import { workflowSchema, type WorkflowDefinition } from "../src/definition/schema.js";
-import { parseModel } from "../src/definition/model.js";
-import { resolveAgent, unresolvedAgentSites } from "../src/definition/resolve.js";
-import { validateChain } from "../src/definition/chain.js";;
+import { parseModel } from "../src/definition/parse-model.js";
+import { resolveAgent, unresolvedAgentSites } from "../src/definition/resolve-node-settings.js";
+import { validateChain } from "../src/definition/check-chain.js";
 
 /**
  * Definition-layer unit tests.
@@ -16,7 +16,6 @@ import { validateChain } from "../src/definition/chain.js";;
  * every merge key needs an alias to merge from. Pinning the message is what
  * makes the rule real.
  */
-
 const withNodes = (nodes: string): string => `version: 1\nid: x\ndescription: d\nnodes:\n${nodes}`;
 
 const oneNode = (extra = ""): string =>

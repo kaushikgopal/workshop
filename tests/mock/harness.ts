@@ -25,7 +25,7 @@ const required = [
   "WORKSHOP_PROMPT_FILE",
   "WORKSHOP_NODE_PACKET_FILE",
   "WORKSHOP_NODE_OUTPUT_FILE",
-  "WORKSHOP_LOG",
+  "WORKSHOP_WORKLOG_FILE",
   "WORKSHOP_RUN_ID",
   "WORKSHOP_NODE_ID",
   "WORKSHOP_ATTEMPT",
@@ -184,7 +184,7 @@ for (const s of sentinels) {
     sleepSync(parseSleepMs(s.slice("MOCK:sleep=".length)));
   }
   if (s === "MOCK:touch-worklog") {
-    appendFileSync(env.WORKSHOP_LOG!, "\nagent tampered with the worklog\n", "utf8");
+    appendFileSync(env.WORKSHOP_WORKLOG_FILE!, "\nagent tampered with the worklog\n", "utf8");
   }
   if (s === "MOCK:block" || s === "MOCK:block-unknown") {
     const kind = s === "MOCK:block-unknown" ? ["--kind", "unknown_external"] : [];

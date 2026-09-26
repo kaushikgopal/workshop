@@ -1,10 +1,10 @@
 import { readFileSync } from "node:fs";
-import { findInstallation, type Installation } from "../config.js";
-import { openDb } from "../store/db.js";
-import { Store } from "../store/store.js";
-import { buildNodesForRun, buildStatusDto } from "../status/dto.js";
-import { buildRunsFeed } from "../status/runs-feed.js";
-import type { ViewerSource } from "../tui-source.js";
+import { findInstallation, type Installation } from "../load-installation.js";
+import { openDb } from "../storage/db/open-and-migrate.js";
+import { Store } from "../storage/db/store.js";
+import { buildNodesForRun, buildStatusDto } from "../views/build-status-json.js";
+import { buildRunsFeed } from "../views/build-runs-json.js";
+import type { ViewerSource } from "../tui/data-source.js";
 import { die } from "./errors.js";
 
 /**
@@ -51,6 +51,6 @@ export async function cmdWatch(args: string[]): Promise<void> {
   const store = new Store(openDb(inst.dbPath));
   if (workflowId && !store.getWorkflow(workflowId)) die(`no workflow "${workflowId}"`);
   if (!workflowId && store.listWorkflows().length === 0) die("no workflows configured");
-  const { runViewer } = await import("../tui-app.js");
-  await runViewer({ workflowId, source: viewerSourceFor(inst, store) });
+  const { openViewer } = await import("../tui/mount-viewer.js");
+  await openViewer({ workflowId, source: viewerSourceFor(inst, store) });
 }

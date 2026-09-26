@@ -1,6 +1,6 @@
-import { findInstallation } from "../config.js";
-import { openDb } from "../store/db.js";
-import { Store, type BlockKind } from "../store/store.js";
+import { findInstallation } from "../load-installation.js";
+import { openDb } from "../storage/db/open-and-migrate.js";
+import { Store, type BlockKind } from "../storage/db/store.js";
 import { SystemClock } from "../util/clock.js";
 import { die } from "./errors.js";
 

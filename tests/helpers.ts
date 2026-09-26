@@ -53,7 +53,7 @@ export function mockAgentHarness(): string {
 }
 
 export function readWorklog(inst: TestInstallation, runId: string): string {
-  return readFileSync(join(inst.root, ".workshop/state/runs", runId, "WORKSHOP_LOG.md"), "utf8");
+  return readFileSync(join(inst.root, ".workshop/state/runs", runId, "WORKLOG.md"), "utf8");
 }
 
 export function readRunDb(inst: TestInstallation): unknown[] {

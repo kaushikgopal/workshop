@@ -1,18 +1,21 @@
 import { join } from "node:path";
-import { findInstallation, ensureDirs, workflowPath } from "../config.js";
-import { loadAndValidateDefinition, startWorkflow, runChain, preflightIfNeeded, scaffoldFirstAttempt } from "../execute.js";
-import { openDb } from "../store/db.js";
-import { Store } from "../store/store.js";
-import { attemptFolderOfPacket } from "../worklog/worklog.js";
+import { findInstallation, ensureDirs, workflowPath } from "../load-installation.js";
+import { advanceChain } from "../run/advance-chain.js";
+import { scaffoldFirstAttempt } from "../run/start-run.js";
+import { startWorkflow } from "../run/start-run.js";
+import { checkEnvironment } from "../run/check-environment.js";
+import { loadAndValidateDefinition } from "../definition/load-definition.js";
+import { openDb } from "../storage/db/open-and-migrate.js";
+import { Store } from "../storage/db/store.js";
+import { attemptDirOfPacket } from "../storage/disk/locate-run-files.js";
 import { SystemClock } from "../util/clock.js";
-import { runtimeCliInvocation } from "../util/cli-path.js";
+import { runtimeCliInvocation } from "../attempt/build-attempt-env.js";
 import { die, requireArg } from "./errors.js";
 
 /**
  * The operator's run controls: start, stop, pause, and resume. Each one writes
  * durable intent to SQLite first, then acts on it.
  */
-
 export async function cmdStart(args: string[]): Promise<void> {
   const workflowId = requireArg(args, "workflow-id");
   const inst = findInstallation();
@@ -34,7 +37,7 @@ export async function cmdStart(args: string[]): Promise<void> {
 
   // Package 1: execute the chain inline. The daemon (package 4) takes over
   // claiming and recurrence; the same guarded path is reused.
-  const final = await runChain({ store, inst, loaded, runId: started.runId, cliPath: runtimeCliInvocation() });
+  const final = await advanceChain({ store, inst, loaded, runId: started.runId, cliPath: runtimeCliInvocation() });
   process.stdout.write(`run ${final.run_id} → ${final.status}\n`);
   // The runner holds live handles (spawned-process listeners) by design;
   // CLI commands terminate their own process when the work is done.
@@ -69,7 +72,7 @@ export async function cmdStop(args: string[]): Promise<void> {
     store.stopRun({ runId: run.run_id, now });
     store.setActivationState(workflowId, "stopped");
   });
-  const { reconcileStoppedIntent } = await import("../recovery.js");
+  const { reconcileStoppedIntent } = await import("../run/recover-after-crash.js");
   const cancelled = await reconcileStoppedIntent({
     store, runId: run.run_id, clock: new SystemClock(),
   });
@@ -112,7 +115,7 @@ export async function cmdResume(args: string[]): Promise<void> {
   switch (run.block_kind) {
     case "preflight": {
       const loaded = loadAndValidateDefinition(join(run.run_dir, "definition.yaml"));
-      await preflightIfNeeded({ store, inst, loaded, runId: run.run_id, clock: new SystemClock() });
+      await checkEnvironment({ store, inst, loaded, runId: run.run_id, clock: new SystemClock() });
       const after = store.getRun(run.run_id)!;
       if (after.status === "blocked" && after.block_kind === "preflight") {
         die("preflight still blocked — fix the environment first");
@@ -137,9 +140,9 @@ export async function cmdResume(args: string[]): Promise<void> {
       const loaded = loadAndValidateDefinition(join(run.run_dir, "definition.yaml"));
       const fresh = store.resumeBlockedRun({ runId: run.run_id, now });
       if (!fresh) die("blocked run has no blocked attempt");
-      const { scaffoldPacket } = await import("../worklog/packet.js");
+      const { scaffoldPacket } = await import("../worklog/prepare-packet.js");
       scaffoldPacket(
-        attemptFolderOfPacket(fresh.packet_path),
+        attemptDirOfPacket(fresh.packet_path),
         fresh.attempt,
         loaded.chain.next.get(fresh.node_id) ?? null,
       );
@@ -178,7 +181,7 @@ async function recreateMissingSuccessor(
   const lastNodeId = completed?.node_id ?? loaded.chain.order[loaded.chain.order.length - 1]!;
   const nextId = loaded.chain.next.get(lastNodeId) ?? null;
   if (!nextId) return;
-  const resolved = (await import("../runner/resolve.js")).resolveNode(loaded.def, nextId, inst);
+  const resolved = (await import("../definition/resolve-node-settings.js")).resolveNode(loaded.def, nextId, inst);
   const run = store.getRun(runId)!;
   const fresh = store.createSuccessorAttempt({
     runId,
@@ -188,7 +191,7 @@ async function recreateMissingSuccessor(
     chainPosition: loaded.chain.order.indexOf(nextId),
     now,
   });
-  const { scaffoldPacket } = await import("../worklog/packet.js");
-  scaffoldPacket(attemptFolderOfPacket(fresh.packet_path), fresh.attempt, loaded.chain.next.get(nextId) ?? null);
+  const { scaffoldPacket } = await import("../worklog/prepare-packet.js");
+  scaffoldPacket(attemptDirOfPacket(fresh.packet_path), fresh.attempt, loaded.chain.next.get(nextId) ?? null);
 }
 

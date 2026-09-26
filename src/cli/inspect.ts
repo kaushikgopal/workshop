@@ -1,20 +1,20 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { findInstallation, workflowPath, type Installation } from "../config.js";
+import { findInstallation, workflowPath } from "../load-installation.js";
 import { die, errorText, requireArg } from "./errors.js";
-import { unresolvedAgentSites } from "../definition/resolve.js";
-import { loadAndValidateDefinition } from "../execute.js";
-import { openDb } from "../store/db.js";
-import { Store, isTerminal, type AttemptRow } from "../store/store.js";
-import { buildNodesForRun, buildStatusDto } from "../status/dto.js";
-import { glyph, localClock } from "../status/format.js";
-import { deriveNodeStatus } from "../status/node-status.js";
-import { buildRunsFeed, DEFAULT_RUNS_LIMIT } from "../status/runs-feed.js";
-import { renderTreeStatus } from "../status/tree.js";
-import { resolveNode } from "../runner/resolve.js";
-import { attemptFolderOfPacket } from "../worklog/worklog.js";
+import { unresolvedAgentSites } from "../definition/resolve-node-settings.js";
+import { loadAndValidateDefinition } from "../definition/load-definition.js";
+import { openDb } from "../storage/db/open-and-migrate.js";
+import { Store, isTerminal, type AttemptRow } from "../storage/db/store.js";
+import { buildNodesForRun, buildStatusDto } from "../views/build-status-json.js";
+import { glyph, localClock } from "../views/format-for-terminal.js";
+import { deriveNodeStatus } from "../views/derive-node-status.js";
+import { buildRunsFeed, DEFAULT_RUNS_LIMIT } from "../views/build-runs-json.js";
+import { renderTreeStatus } from "../views/render-status-tree.js";
+import { resolveNode } from "../definition/resolve-node-settings.js";
+import { attemptDirOfPacket } from "../storage/disk/locate-run-files.js";
 import { SystemClock } from "../util/clock.js";
-import { readTruncationRecord } from "../util/retention.js";
+import { readTruncationRecord } from "../storage/disk/cap-streams.js";
 
 /**
  * The read-only inspection commands: validate, status, runs, logs, diagram,
@@ -25,7 +25,6 @@ import { readTruncationRecord } from "../util/retention.js";
  * deleted — or moved behind another entry point — without touching dispatch,
  * lifecycle control, or the viewer's lazy load.
  */
-
 export function cmdValidate(args: string[]): void {
   const workflowId = requireArg(args, "workflow-id");
   const inst = findInstallation();
@@ -154,7 +153,7 @@ export async function cmdLogs(args: string[]): Promise<void> {
   // labeled block per stream (agent/validator stdout + stderr).
   const attempts = store.listAttempts(run.run_id).sort((a, b) => a.execution_seq - b.execution_seq);
   for (const attempt of attempts) {
-    const folder = attemptFolderOfPacket(attempt.packet_path);
+    const folder = attemptDirOfPacket(attempt.packet_path);
     for (const stream of attemptStreamFiles(folder)) {
       const relative = stream.slice(run.run_dir.length + 1);
       // A capped stream says so in its header: the bytes it lost are recorded

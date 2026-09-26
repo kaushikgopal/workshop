@@ -3,12 +3,14 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { makeInstallation, runCli, mockAgentHarness, dbAttempts, dbRuns, readWorklog } from "./helpers.js";
-import { openDb } from "../src/store/db.js";
-import { Store, GuardRejected } from "../src/store/store.js";
-import { loadAndValidateDefinition, startWorkflow, runChain } from "../src/execute.js";
-import { findInstallation, ensureDirs } from "../src/config.js";
-import { recoverInstallation } from "../src/recovery.js";
-import { loadSnapshot } from "../src/definition/snapshot.js";
+import { openDb } from "../src/storage/db/open-and-migrate.js";
+import { Store, GuardRejected } from "../src/storage/db/store.js";
+import { advanceChain } from "../src/run/advance-chain.js";
+import { startWorkflow } from "../src/run/start-run.js";
+import { loadAndValidateDefinition } from "../src/definition/load-definition.js";
+import { findInstallation, ensureDirs } from "../src/load-installation.js";
+import { recoverInstallation } from "../src/run/recover-after-crash.js";
+import { loadSnapshot } from "../src/definition/load-definition.js";
 import { SystemClock } from "../src/util/clock.js";
 
 const MOCK = mockAgentHarness();
@@ -141,7 +143,7 @@ describe("gate 13 — crash recovery", () => {
 
     // Recovery: terminate-and-confirm, interrupted node retried, no rerun of node-fast.
     const real = findInstallation(inst.root);
-    const { recoverInstallation: recover } = await import("../src/recovery.js");
+    const { recoverInstallation: recover } = await import("../src/run/recover-after-crash.js");
     const report = await recover({ store: new Store(openDb(real.dbPath)), inst: real, clock: new SystemClock() });
     expect(report.interruptedRetried.length).toBe(1);
     expect(report.interruptedRetried[0]).toContain("node-slow #2");
@@ -160,7 +162,7 @@ describe("gate 13 — crash recovery", () => {
     // The chain finishes from the retry attempt.
     const loaded = loadAndValidateDefinition(join(inst.workflowsDir, "crash-chain.yaml"));
     const runId = String(dbRuns(inst)[0]!.run_id);
-    await runChain({ store: new Store(openDb(real.dbPath)), inst: real, loaded, runId, cliPath: "bun /Users/kg/dev/oss/workshop/src/cli/main.ts" });
+    await advanceChain({ store: new Store(openDb(real.dbPath)), inst: real, loaded, runId, cliPath: "bun /Users/kg/dev/oss/workshop/src/cli/main.ts" });
     const runs = dbRuns(inst);
     expect(runs[0]!.status).toBe("completed");
   }, 90_000);
@@ -199,7 +201,7 @@ nodes:
     // Execute node-a only: the completion transaction persists node-b as
     // pending before any launch — the crash gap leaves durable state.
     const live = store.getLiveAttempt(started.runId)!;
-    await runChain({ store, inst: real, loaded, runId: started.runId, cliPath: "bun x" });
+    await advanceChain({ store, inst: real, loaded, runId: started.runId, cliPath: "bun x" });
     void live;
 
     const attempts = dbAttempts(inst, started.runId);
@@ -304,7 +306,7 @@ describe("gate 24 — orchestrator phase recovery", () => {
         .run(new Date().toISOString(), started.runId);
     });
 
-    const { recoverInstallation: recover } = await import("../src/recovery.js");
+    const { recoverInstallation: recover } = await import("../src/run/recover-after-crash.js");
     const report = await recover({ store, inst: real, clock: new SystemClock() });
     expect(report.orchestratorReleased).toContain(started.runId);
     expect(store.getRun(started.runId)!.orchestrator_phase).toBe("pending");
@@ -320,8 +322,8 @@ describe("gate 24 — orchestrator phase recovery", () => {
     const store = new Store(openDb(real.dbPath));
 
     const token = "tok1234567890";
-    const { atomicWriteFileSync } = await import("../src/worklog/fs.js");
-    const { orchestratorResultFile } = await import("../src/orchestrator.js");
+    const { atomicWriteFileSync } = await import("../src/storage/disk/write-crash-safe.js");
+    const { orchestratorResultFile } = await import("../src/run/orchestrate-failure.js");
     const run = store.getRun(started.runId)!;
     const resultPath = orchestratorResultFile(run.run_dir, token);
     atomicWriteFileSync(
@@ -340,7 +342,7 @@ describe("gate 24 — orchestrator phase recovery", () => {
         .run(token, resultPath, started.runId);
     });
 
-    const { recoverInstallation: recover } = await import("../src/recovery.js");
+    const { recoverInstallation: recover } = await import("../src/run/recover-after-crash.js");
     await recover({ store, inst: real, clock: new SystemClock() });
     // The decision applied from the normalized result file: prose merged, run blocked.
     expect(readWorklog(inst, started.runId)).toContain("orchestrator block: durable choice");

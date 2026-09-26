@@ -15,7 +15,6 @@ import { REPO_ROOT } from "./helpers.js";
  * It waits for each frame instead of sleeping, and strips escape sequences so
  * the assertions read the text a person would see.
  */
-
 const stripAnsi = (raw: string): string =>
   raw
     .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
