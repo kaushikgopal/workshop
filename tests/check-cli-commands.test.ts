@@ -5,15 +5,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import { processStartIdOrThrow } from "../src/process/identify-process.js";
-import { runIdV2Schema } from "../src/run/schema-v2.js";
+import { runIdSchema } from "../src/run/schema.js";
 import { locateServiceSocket } from "../src/service/locate-service-socket.js";
-import { logsDtoV2Schema, runsDtoV2Schema, statusDtoV2Schema } from "../src/views/schema-v2.js";
-import { createV4ViewerSource } from "../src/cli/watch-v4.js";
+import { logsDtoSchema, runsDtoSchema, statusDtoSchema } from "../src/views/schema.js";
+import { createViewerSource } from "../src/cli/watch.js";
 import { REPO_ROOT } from "./helpers.js";
 
 const cliPath = join(REPO_ROOT, "src/cli/main.ts");
 
-const V2_WORKFLOW = [
+const CLOCK_WORKFLOW = [
   "version: 2",
   "id: clock",
   "nodes:",
@@ -80,10 +80,10 @@ describe("CLI commands", () => {
   });
 
   test("a version 1 workflow or machine config fails with a plain schema error", () => {
-    const v1Workflow = V2_WORKFLOW.replace("version: 2", "version: 1");
+    const v1Workflow = CLOCK_WORKFLOW.replace("version: 2", "version: 1");
     const oldWorkflow = makeRoot({ machine: "version: 2\nshell: /bin/bash\n", workflows: { clock: v1Workflow } });
-    const oldMachine = makeRoot({ machine: "version: 1\nshell: /bin/bash\n", workflows: { clock: V2_WORKFLOW } });
-    const unversionedMachine = makeRoot({ machine: "shell: /bin/bash\n", workflows: { clock: V2_WORKFLOW } });
+    const oldMachine = makeRoot({ machine: "version: 1\nshell: /bin/bash\n", workflows: { clock: CLOCK_WORKFLOW } });
+    const unversionedMachine = makeRoot({ machine: "shell: /bin/bash\n", workflows: { clock: CLOCK_WORKFLOW } });
     try {
       const workflow = runCli(oldWorkflow, ["validate", "clock"]);
       expect(workflow.status).toBe(64);
@@ -106,7 +106,7 @@ describe("CLI commands", () => {
   });
 
   test("service start, status, and stop manage one owner idempotently", async () => {
-    const root = makeRoot({ machine: "version: 2\nshell: /bin/bash\n", workflows: { clock: V2_WORKFLOW } });
+    const root = makeRoot({ machine: "version: 2\nshell: /bin/bash\n", workflows: { clock: CLOCK_WORKFLOW } });
     const metadataPath = join(root, ".workshop", "state", "service.json");
     try {
       const absent = runCli(root, ["service", "status", "--json"]);
@@ -261,11 +261,11 @@ describe("CLI commands", () => {
     try {
       const started = runCli(directory, ["start", "clock", "--detach"]);
       expect(started.status).toBe(0);
-      const runId = runIdV2Schema.parse(started.stdout.match(/Started run (\S+)/)?.[1]);
+      const runId = runIdSchema.parse(started.stdout.match(/Started run (\S+)/)?.[1]);
 
       const statusResult = runCli(directory, ["status", "clock", "--json"]);
       expect(statusResult.status).toBe(0);
-      const status = statusDtoV2Schema.parse(JSON.parse(statusResult.stdout));
+      const status = statusDtoSchema.parse(JSON.parse(statusResult.stdout));
       expect(status.installationId).toMatch(/^[0-9a-f-]{36}$/);
       expect(status.workflows[0]?.workflowId).toBe("clock");
       expect(status.workflows[0]?.unresolvedRun?.runId).toBe(runId);
@@ -273,12 +273,12 @@ describe("CLI commands", () => {
       expect(followedLogs.status).toBe(0);
       expect(followedLogs.stdout).toContain("fixture-output");
 
-      let runs = runsDtoV2Schema.parse({ version: 2, workflowId: "clock", total: 0, truncated: false, runs: [] });
+      let runs = runsDtoSchema.parse({ version: 2, workflowId: "clock", total: 0, truncated: false, runs: [] });
       const deadline = Date.now() + 10_000;
       while (Date.now() < deadline) {
         const result = runCli(directory, ["runs", "clock", "--json"]);
         expect(result.status).toBe(0);
-        runs = runsDtoV2Schema.parse(JSON.parse(result.stdout));
+        runs = runsDtoSchema.parse(JSON.parse(result.stdout));
         if (runs.runs[0]?.status === "completed") break;
         await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
       }
@@ -287,7 +287,7 @@ describe("CLI commands", () => {
 
       const logsResult = runCli(directory, ["logs", "clock", "--run", runId!, "--json"]);
       expect(logsResult.status).toBe(0);
-      const logs = logsDtoV2Schema.parse(JSON.parse(logsResult.stdout));
+      const logs = logsDtoSchema.parse(JSON.parse(logsResult.stdout));
       expect(logs.runId).toBe(runId);
       expect(logs.sections.some((section) => section.kind === "capture" && section.content === "fixture-output")).toBe(true);
       const humanRuns = runCli(directory, ["runs", "clock"]);
@@ -297,7 +297,7 @@ describe("CLI commands", () => {
 
       const secondStart = runCli(directory, ["start", "clock"], 15_000);
       expect(secondStart.status).toBe(0);
-      const secondRunId = runIdV2Schema.parse(secondStart.stdout.match(/Started run (\S+)/)?.[1]);
+      const secondRunId = runIdSchema.parse(secondStart.stdout.match(/Started run (\S+)/)?.[1]);
       const allLogsText = runCli(directory, ["logs", "clock", "--all"]);
       expect(allLogsText.status).toBe(0);
       const firstHeader = allLogsText.stdout.indexOf(`━━ run ${runId} — completed ━━`);
@@ -317,8 +317,8 @@ describe("CLI commands", () => {
       expect(mermaidDiagram.stdout).toContain("flowchart LR");
       expect(mermaidDiagram.stdout).toContain('tick["tick [succeeded]"]');
       const socketPath = status.service.socketPath;
-      if (socketPath === null) throw new Error("v4 service socket path is missing");
-      const viewerSource = createV4ViewerSource(socketPath);
+      if (socketPath === null) throw new Error("service socket path is missing");
+      const viewerSource = createViewerSource(socketPath);
       const viewerSnapshot = await viewerSource.snapshot("clock", runId);
       expect(viewerSnapshot.runs.runs.map((run) => run.id)).toEqual([secondRunId, runId]);
       expect(viewerSnapshot.runs.runs.find((run) => run.id === runId)?.nodes.map((node) => [node.id, node.status])).toEqual([["tick", "completed"]]);
@@ -336,20 +336,20 @@ describe("CLI commands", () => {
 
       const laterStatusResult = runCli(directory, ["status", "clock", "--json"]);
       expect(laterStatusResult.status).toBe(0);
-      const laterStatus = statusDtoV2Schema.parse(JSON.parse(laterStatusResult.stdout));
+      const laterStatus = statusDtoSchema.parse(JSON.parse(laterStatusResult.stdout));
       expect(laterStatus.installationId).toBe(status.installationId);
       expect(laterStatus.service.bootId).toBe(status.service.bootId);
 
       const bigStart = runCli(directory, ["start", "big"]);
       if (bigStart.status !== 0) throw new Error(bigStart.stderr);
-      const bigRunId = runIdV2Schema.parse(bigStart.stdout.match(/Started run (\S+)/)?.[1]);
+      const bigRunId = runIdSchema.parse(bigStart.stdout.match(/Started run (\S+)/)?.[1]);
       expect(bigStart.stdout).toContain(`completed ${bigRunId}`);
       const bigDeadline = Date.now() + 10_000;
-      let bigRuns = runsDtoV2Schema.parse({ version: 2, workflowId: "big", total: 0, truncated: false, runs: [] });
+      let bigRuns = runsDtoSchema.parse({ version: 2, workflowId: "big", total: 0, truncated: false, runs: [] });
       while (Date.now() < bigDeadline) {
         const result = runCli(directory, ["runs", "big", "--json"]);
         expect(result.status).toBe(0);
-        bigRuns = runsDtoV2Schema.parse(JSON.parse(result.stdout));
+        bigRuns = runsDtoSchema.parse(JSON.parse(result.stdout));
         if (bigRuns.runs[0]?.status === "completed") break;
         await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
       }
@@ -358,7 +358,7 @@ describe("CLI commands", () => {
       expect(bigRuns.runs[0]?.terminalOutput?.length).toBe(700_000);
       const bigLogsResult = runCli(directory, ["logs", "big", "--run", bigRunId, "--json"]);
       expect(bigLogsResult.status).toBe(0);
-      const bigLogs = logsDtoV2Schema.parse(JSON.parse(bigLogsResult.stdout));
+      const bigLogs = logsDtoSchema.parse(JSON.parse(bigLogsResult.stdout));
       expect(bigLogs.runId).toBe(bigRunId);
       const truncatedCapture = bigLogs.sections.find((section) => section.kind === "capture");
       if (truncatedCapture?.kind !== "capture") throw new Error("truncated worker capture is missing");
@@ -378,10 +378,10 @@ describe("CLI commands", () => {
       expect(bigLogsText.stdout).toMatch(/700000 bytes total; 1024 retained \(683 head \+ 341 tail\), 698976 omitted/);
       const unlimitedStart = runCli(directory, ["start", "unlimited"]);
       expect(unlimitedStart.status).toBe(0);
-      const unlimitedRunId = runIdV2Schema.parse(unlimitedStart.stdout.match(/Started run (\S+)/)?.[1]);
+      const unlimitedRunId = runIdSchema.parse(unlimitedStart.stdout.match(/Started run (\S+)/)?.[1]);
       const unlimitedLogsResult = runCli(directory, ["logs", "unlimited", "--run", unlimitedRunId, "--json"]);
       expect(unlimitedLogsResult.status).toBe(0);
-      const unlimitedLogs = logsDtoV2Schema.parse(JSON.parse(unlimitedLogsResult.stdout));
+      const unlimitedLogs = logsDtoSchema.parse(JSON.parse(unlimitedLogsResult.stdout));
       const unlimitedCapture = unlimitedLogs.sections.find((section) => section.kind === "capture" && section.capture.stream === "stdout");
       if (unlimitedCapture?.kind !== "capture") throw new Error("unlimited stdout capture is missing");
       expect(unlimitedCapture.content).toBe("unlimited-output");
@@ -400,24 +400,24 @@ describe("CLI commands", () => {
       }
       const boundedRunsResult = runCli(directory, ["runs", "big", "--json"]);
       expect(boundedRunsResult.status).toBe(0);
-      const boundedRuns = runsDtoV2Schema.parse(JSON.parse(boundedRunsResult.stdout));
+      const boundedRuns = runsDtoSchema.parse(JSON.parse(boundedRunsResult.stdout));
       expect(boundedRuns.total).toBe(9);
       expect(boundedRuns.runs.length).toBeLessThan(boundedRuns.total);
       expect(boundedRuns.truncated).toBe(true);
       const allRunsResult = runCli(directory, ["runs", "big", "--json", "--all"]);
       expect(allRunsResult.status).toBe(0);
-      const allRuns = runsDtoV2Schema.parse(JSON.parse(allRunsResult.stdout));
+      const allRuns = runsDtoSchema.parse(JSON.parse(allRunsResult.stdout));
       expect(allRuns.total).toBe(9);
       expect(allRuns.runs).toHaveLength(9);
       expect(allRuns.truncated).toBe(false);
 
       const oversizeStart = runCli(directory, ["start", "oversize"]);
       if (oversizeStart.status !== 0) throw new Error(oversizeStart.stderr);
-      const oversizeRunId = runIdV2Schema.parse(oversizeStart.stdout.match(/Started run (\S+)/)?.[1]);
+      const oversizeRunId = runIdSchema.parse(oversizeStart.stdout.match(/Started run (\S+)/)?.[1]);
       expect(oversizeStart.stdout).toContain(`completed ${oversizeRunId}`);
       const oversizeLogsResult = runCli(directory, ["logs", "oversize", "--run", oversizeRunId, "--json"], 30_000);
       expect(oversizeLogsResult.status).toBe(0);
-      const oversizeLogs = logsDtoV2Schema.parse(JSON.parse(oversizeLogsResult.stdout));
+      const oversizeLogs = logsDtoSchema.parse(JSON.parse(oversizeLogsResult.stdout));
       expect(Buffer.byteLength(oversizeLogsResult.stdout, "utf8")).toBeGreaterThan(16 * 1024 * 1024);
       expect(oversizeLogs.runId).toBe(oversizeRunId);
       const completeStdoutSections = oversizeLogs.sections.filter((section) => section.kind === "capture" && section.content?.length === 700_000);

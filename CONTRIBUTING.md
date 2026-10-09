@@ -157,7 +157,7 @@ and validators are not Durable work: they are harness subprocesses launched by
 
 | Durable concept | How Workshop uses it |
 | --- | --- |
-| `Harness` and `Registry` | `service/open-v2-service-runtime.ts` opens one Harness on `state/durable.db`, registers six task definitions and the judge extension, reconciles leftover processes, then calls `harness.resume()`. |
+| `Harness` and `Registry` | `service/open-service-runtime.ts` opens one Harness on `state/durable.db`, registers six task definitions and the judge extension, reconciles leftover processes, then calls `harness.resume()`. |
 | Tasks (`defineTask`) | `WorkflowRun`, `NodeAttempt`, `ProcessExecution`, `CapacityGate`, `ScheduleWakeup`, and `FailureJudgment` (registered as `workshop.workflow-run` and so on). Each task is a set of named phases. A phase ends by committing its next checkpoint, waiting on children, or settling as completed or failed. |
 | Child tasks | A parent creates children with `tx.createTask` and waits for them with `allSettled`. A failed child comes back as data the parent classifies; it does not crash the parent. |
 | Conversations | Admission gives every run its own conversation. The run's tasks and records attach to it, so its history outlives the tasks. Each judgment gets a separate task-owned conversation. |
@@ -196,17 +196,17 @@ Folders and filenames follow [Naming files](#naming-files).
 src/
 ├─ cli/
 │  ├─ main.ts                     entry point: hands argv to the dispatcher
-│  ├─ dispatch-v4-command.ts      help, offline validate, command routing
-│  ├─ dispatch-v4-public-command.ts socket client for every other command
-│  ├─ service-v4.ts               service start | status | stop
-│  └─ watch-v4.ts                 feeds service projections to the viewer
+│  ├─ dispatch-command.ts         help, offline validate, command routing
+│  ├─ dispatch-public-command.ts  socket client for every other command
+│  ├─ service.ts                  service start | status | stop
+│  └─ watch.ts                    feeds service projections to the viewer
 ├─ service/                       one owner process per installation
-│  ├─ serve-v2-service-process.ts process entry: lock, open, serve, shut down
+│  ├─ serve-service-process.ts    process entry: lock, open, serve, shut down
 │  ├─ serve-workshop-service.ts   socket server and request dispatch
-│  ├─ open-v2-service-runtime.ts  Durable Harness, task registry, reconciliation
-│  ├─ project-v2-service-reads.ts status, run pages, and logs
-│  ├─ launch-v2-service-process.ts reuse a healthy service or spawn one
-│  ├─ stop-v2-service-process.ts  verified SIGTERM and bounded wait
+│  ├─ open-service-runtime.ts     Durable Harness, task registry, reconciliation
+│  ├─ project-service-reads.ts    status, run pages, and logs
+│  ├─ launch-service-process.ts   reuse a healthy service or spawn one
+│  ├─ stop-service-process.ts     verified SIGTERM and bounded wait
 │  ├─ acquire-service-lock.ts     kernel lock with process identity
 │  ├─ probe-service-health.ts     checks metadata against the live socket
 │  ├─ locate-service-socket.ts    short private socket path
@@ -221,14 +221,14 @@ src/
 │  ├─ define-failure-judgment-task.ts the judge conversation and decision tool
 │  ├─ define-workshop-records.ts  versioned documents and immutable entries
 │  ├─ commit-service-mutation.ts  receipts that make controls idempotent
-│  ├─ render-v2-worklog.ts        WORKLOG.md from the committed run
+│  ├─ render-worklog.ts           WORKLOG.md from the committed run
 │  ├─ materialize-run-views.ts    rebuilds run files from committed state
 │  └─ open-durable-storage.ts     SQLite with FULL synchronization
 ├─ definition/                    YAML → checked, resolved definition
 │  ├─ parse-yaml.ts               strict YAML: no duplicate keys or anchors
-│  ├─ schema-v2.ts, check-v2-definition.ts, check-chain.ts
-│  ├─ resolve-v2-agent-settings.ts, resolve-v2-workflow-settings.ts
-│  └─ schema-resolved-v2.ts, parse-model.ts, parse-v2-model.ts, hash-canonical-json.ts
+│  ├─ schema.ts, check-definition.ts, check-chain.ts
+│  ├─ resolve-agent-settings.ts, resolve-workflow-settings.ts
+│  └─ schema-resolved.ts, parse-model.ts, hash-canonical-json.ts
 ├─ installation/                  find .workshop/, load config and workflows
 ├─ run/                           run records, outcomes, admission, schedule math
 ├─ attempt/                       result parsing and agent prompts
@@ -241,17 +241,17 @@ src/
 └─ util/                          units, shared schemas
 ```
 
-Three boundaries hold. `tests/check-v2-parity-gaps.test.ts` and
+Three boundaries hold. `tests/check-parity-gaps.test.ts` and
 `tests/tui-boundary.test.ts` enforce the import rules:
 
 - Only the service touches Durable storage. The CLI is a socket client.
-- `views/schema-v2.ts` is the contract for outside readers. The viewer reads
+- `views/schema.ts` is the contract for outside readers. The viewer reads
   those projections, never SQLite or run directories.
 - Only `tui/` imports a UI library, and the CLI loads it lazily.
 
 ### Tests and specs
 
-The tests need no model credentials. `tests/check-v2-service-restart.test.ts`
+The tests need no model credentials. `tests/check-service-restart.test.ts`
 runs the Hemingway workflow with a mock agent through the real CLI and service,
 restarts the service, and checks the same Durable run. The only real-model
 check is the README's [Watch it work](README.md#watch-it-work) walkthrough.

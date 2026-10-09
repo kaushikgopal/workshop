@@ -38,7 +38,7 @@ export interface WorkshopServiceRuntime {
   shutdown(deadlineMs: number): Promise<void>;
 }
 
-export interface StartWorkshopServiceOptions {
+export interface ServeWorkshopServiceOptions {
   readonly stateDirectory: string;
   readonly openRuntime: (metadata: ServiceMetadataV1) => Promise<WorkshopServiceRuntime>;
   readonly shutdownTimeoutMs?: number;
@@ -69,7 +69,7 @@ export class ServiceShutdownError extends Error {
 }
 
 /** Acquire ownership before opening runtime resources, then publish a private health socket. */
-export async function startWorkshopService(options: StartWorkshopServiceOptions): Promise<WorkshopServiceOwner> {
+export async function serveWorkshopService(options: ServeWorkshopServiceOptions): Promise<WorkshopServiceOwner> {
   const timeoutMs = options.shutdownTimeoutMs ?? DEFAULT_SHUTDOWN_TIMEOUT_MS;
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) {
     throw new Error("service shutdown timeout must be a positive safe integer");

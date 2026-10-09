@@ -7,24 +7,24 @@ import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { createRegistry, defineTask, Harness } from "@earendil-works/pi-durable";
 import { canonicalHash } from "../src/definition/hash-canonical-json.js";
-import { checkV2DefinitionText } from "../src/definition/check-v2-definition.js";
-import { resolvedNodeSettingsV2Schema } from "../src/definition/schema-resolved-v2.js";
+import { checkDefinitionText } from "../src/definition/check-definition.js";
+import { resolvedNodeSettingsSchema } from "../src/definition/schema-resolved.js";
 import {
   installationDocumentV1Schema,
-  workflowInstallationIndexV2Schema,
-} from "../src/installation/schema-v2.js";
+  workflowInstallationIndexSchema,
+} from "../src/installation/schema.js";
 import {
   workflowRunDocumentV1Schema,
   workshopEventV1Schema,
   workshopJudgmentV1Schema,
-} from "../src/run/records-v2.js";
+} from "../src/run/records.js";
 import {
   WorkshopEventEntry,
   WorkshopInstallationDoc,
   WorkshopRunDoc,
 } from "../src/storage/durable/define-workshop-records.js";
 import { openDurableStorage } from "../src/storage/durable/open-durable-storage.js";
-import { sha256V2Schema } from "../src/util/schema-v2.js";
+import { sha256Schema } from "../src/util/schema.js";
 
 const HASH = "sha256:" + "a".repeat(64);
 
@@ -61,10 +61,10 @@ function fixtureRun(conversationId: number, workflowTaskId: number, baseDir: str
     "    next: null",
     "",
   ].join("\n");
-  const checked = checkV2DefinitionText(sourceText, "release.yaml");
+  const checked = checkDefinitionText(sourceText, "release.yaml");
   const resolvedSettings = {
     nodes: {
-      "prepare-report": resolvedNodeSettingsV2Schema.parse({
+      "prepare-report": resolvedNodeSettingsSchema.parse({
         run: {
           kind: "command",
           command: "echo prepare",
@@ -150,7 +150,7 @@ describe("Durable storage records", () => {
       kind: "workshop.run", version: 1, scope: "conversation", history: "latest", fork: "initial",
     });
     expect(WorkshopEventEntry.kind).toBe("workshop.event");
-    expect(sha256V2Schema.parse(HASH)).toBe(HASH);
+    expect(sha256Schema.parse(HASH)).toBe(HASH);
     expect(installationDocumentV1Schema.parse({ state: "uninitialized" })).toEqual({ state: "uninitialized" });
     expect(workshopEventV1Schema.parse({
       version: 1,
@@ -164,7 +164,7 @@ describe("Durable storage records", () => {
       canonicalHash: HASH,
       occurredAt: "2026-10-05T12:00:00.000Z",
     }).type).toBe("run_admitted");
-    const index = workflowInstallationIndexV2Schema.parse({
+    const index = workflowInstallationIndexSchema.parse({
       definitionHash: HASH,
       admissionHighWater: 1,
       openRunId: "run-storage-test",
@@ -184,7 +184,7 @@ describe("Durable storage records", () => {
       preflightCache: {},
     });
     expect(String(index.openRunId)).toBe("run-storage-test");
-    expect(() => workflowInstallationIndexV2Schema.parse({ ...index, openRunId: null }))
+    expect(() => workflowInstallationIndexSchema.parse({ ...index, openRunId: null }))
       .toThrow(/open-run pointer/);
     expect(workshopJudgmentV1Schema.parse({
       version: 1, runId: "run-storage-test", nodeId: "prepare-report", attemptId: "attempt-storage-test",

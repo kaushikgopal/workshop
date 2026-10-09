@@ -1,24 +1,24 @@
 import { join } from "node:path";
 import type { Context } from "@earendil-works/chord";
 import { z } from "zod";
-import { workflowIdV2 } from "../../definition/schema-v2.js";
-import { activationIdV2Schema, occurrenceIdV2Schema, runIdV2Schema } from "../../run/schema-v2.js";
-import { parseV2Duration } from "../../util/parse-units.js";
+import { workflowIdSchema } from "../../definition/schema.js";
+import { activationIdSchema, occurrenceIdSchema, runIdSchema } from "../../run/schema.js";
+import { parseDuration } from "../../util/parse-units.js";
 import { commitServiceMutationInTransaction, type CommitServiceMutationInTransactionInput } from "./commit-service-mutation.js";
 import type { ConversationId, Harness, Task, TaskId, Tx } from "@earendil-works/pi-durable";
 import { canonicalHash } from "../../definition/hash-canonical-json.js";
 import {
-  activationIndexV2Schema,
+  activationIndexSchema,
   installationDocumentV1Schema,
-  workflowInstallationIndexV2Schema,
-  type ActivationIndexV2,
-  type RunReferenceV2,
-} from "../../installation/schema-v2.js";
+  workflowInstallationIndexSchema,
+  type ActivationIndex,
+  type RunReference,
+} from "../../installation/schema.js";
 import {
   workflowRunDocumentV1Schema,
   workshopEventV1Schema,
-} from "../../run/records-v2.js";
-import { prepareRunAdmissionV2, type AdmissionPreparationFailureV2, type PreparedRunAdmissionV2 } from "../../run/prepare-admission-v2.js";
+} from "../../run/records.js";
+import { prepareRunAdmission, type AdmissionPreparationFailure, type PreparedRunAdmission } from "../../run/prepare-admission.js";
 import {
   WorkshopEventEntry,
   WorkshopInstallationDoc,
@@ -32,7 +32,7 @@ type AdmissionRunIdentity = {
   readonly occurrenceId: string;
 };
 
-export type ScheduleAdmissionCommitV2 = {
+export type ScheduleAdmissionCommit = {
   readonly expectedNextDueAt: string;
   readonly slotAt: string;
   readonly nextDueAt: string | null;
@@ -43,7 +43,7 @@ export type ScheduleAdmissionCommitV2 = {
   readonly admittedCount: number;
 };
 
-export type DurableRunAdmissionV2 = {
+export type DurableRunAdmission = {
   readonly runId: string;
   readonly workflowId: string;
   readonly activationId: string;
@@ -54,18 +54,18 @@ export type DurableRunAdmissionV2 = {
   readonly duplicate: boolean;
 };
 
-const durableRunAdmissionV2Schema = z.strictObject({
-  runId: runIdV2Schema,
-  workflowId: workflowIdV2,
-  activationId: activationIdV2Schema,
-  occurrenceId: occurrenceIdV2Schema,
+const durableRunAdmissionSchema = z.strictObject({
+  runId: runIdSchema,
+  workflowId: workflowIdSchema,
+  activationId: activationIdSchema,
+  occurrenceId: occurrenceIdSchema,
   admissionSequence: z.number().int().positive().safe(),
   conversationId: z.number().int().positive().safe(),
   workflowTaskId: z.number().int().positive().safe(),
   duplicate: z.boolean(),
 });
 
-export type DurableRunAdmissionFailureV2 = {
+export type DurableRunAdmissionFailure = {
   readonly kind:
     | "installation_uninitialized"
     | "workflow_not_registered"
@@ -85,28 +85,28 @@ export type DurableRunAdmissionFailureV2 = {
     | "durable_commit_failed";
   readonly message: string;
   readonly cause?: unknown;
-} | AdmissionPreparationFailureV2;
+} | AdmissionPreparationFailure;
 
-export type DurableRunAdmissionResultV2 =
-  | { readonly ok: true; readonly value: DurableRunAdmissionV2 }
-  | { readonly ok: false; readonly failure: DurableRunAdmissionFailureV2 };
+export type DurableRunAdmissionResult =
+  | { readonly ok: true; readonly value: DurableRunAdmission }
+  | { readonly ok: false; readonly failure: DurableRunAdmissionFailure };
 
 /** Commit run conversation, task, canonical record, admission index, and event as one Durable transaction. */
-export async function admitPreparedRunV2<
+export async function admitPreparedRun<
   I,
   S extends { phase: string },
   R,
   H extends object,
 >(input: {
   readonly harness: Pick<Harness, "commit">;
-  readonly prepared: PreparedRunAdmissionV2;
+  readonly prepared: PreparedRunAdmission;
   readonly workflowRunTask: Task<I, S, R, H>;
   readonly createTaskInput: (identity: AdmissionRunIdentity) => unknown;
   /** Pure schema validation; it also checks that the stored input matches the supplied identity. */
   readonly parseTaskInput: (value: unknown, identity: AdmissionRunIdentity) => I | undefined;
   readonly context: Context;
   readonly serviceMutation?: Omit<CommitServiceMutationInTransactionInput, "apply">;
-  readonly activationProposal?: ActivationIndexV2;
+  readonly activationProposal?: ActivationIndex;
   readonly replaceActiveActivation?: boolean;
   readonly createScheduleWakeupTask?: (
     tx: Tx,
@@ -114,12 +114,12 @@ export async function admitPreparedRunV2<
     workflowId: string,
     activationId: string,
   ) => Promise<TaskId>;
-  readonly scheduleAdmission?: ScheduleAdmissionCommitV2;
+  readonly scheduleAdmission?: ScheduleAdmissionCommit;
   /** Rechecked inside the transaction before scheduled admission becomes durable. */
   readonly admissionAllowed?: () => boolean;
-}): Promise<DurableRunAdmissionResultV2> {
+}): Promise<DurableRunAdmissionResult> {
   const original = input.prepared;
-  const checked = prepareRunAdmissionV2({
+  const checked = prepareRunAdmission({
     sourceText: original.sourceText,
     sourceLabel: original.sourceLabel,
     machineConfig: original.machineConfig,
@@ -137,7 +137,7 @@ export async function admitPreparedRunV2<
   if (!checked.ok) return { ok: false, failure: checked.failure };
   input = { ...input, prepared: checked.value };
   try {
-    const commitAdmission = async (tx: Tx): Promise<DurableRunAdmissionV2> => {
+    const commitAdmission = async (tx: Tx): Promise<DurableRunAdmission> => {
       if (input.admissionAllowed?.() === false) {
         throw abortAdmission({ kind: "admission_deferred", message: "scheduled admission was sealed before commit" });
       }
@@ -154,7 +154,7 @@ export async function admitPreparedRunV2<
       if (existingWorkflow === undefined && input.activationProposal === undefined) {
         throw abortAdmission({ kind: "workflow_not_registered", message: "workflow activation is not registered" });
       }
-      let workflow = existingWorkflow ?? workflowInstallationIndexV2Schema.parse({
+      let workflow = existingWorkflow ?? workflowInstallationIndexSchema.parse({
         definitionHash: input.prepared.canonicalHash,
         admissionHighWater: 0,
         openRunId: null,
@@ -203,7 +203,7 @@ export async function admitPreparedRunV2<
         throw abortAdmission({ kind: "workflow_busy", message: "workflow already has an unresolved run" });
       }
       if (input.replaceActiveActivation === true) {
-        workflow = workflowInstallationIndexV2Schema.parse({
+        workflow = workflowInstallationIndexSchema.parse({
           ...workflow,
           activations: workflow.activations.map((item) => item.state === "active"
             ? { ...item, state: "stopped", nextDueAt: null, admissionError: "schedule policy changed; replaced by explicit start" }
@@ -216,12 +216,12 @@ export async function admitPreparedRunV2<
         if (currentActive !== undefined) {
           activation = currentActive;
         } else if (input.activationProposal !== undefined) {
-          const proposal = activationIndexV2Schema.parse(input.activationProposal);
+          const proposal = activationIndexSchema.parse(input.activationProposal);
           if (proposal.activationId !== input.prepared.activationId || proposal.admittedCount !== 0 || proposal.state !== "active") {
             throw abortAdmission({ kind: "activation_not_active", message: "proposed activation does not match the admission identity" });
           }
           activation = proposal;
-          workflow = workflowInstallationIndexV2Schema.parse({
+          workflow = workflowInstallationIndexSchema.parse({
             ...workflow,
             activations: [...workflow.activations, proposal],
             occurrenceCounters: { ...workflow.occurrenceCounters, [proposal.activationId]: 0 },
@@ -238,7 +238,7 @@ export async function admitPreparedRunV2<
         : { ...input.prepared, activationId: activation.activationId };
       const scheduleEveryMs = prepared.definition.schedule === undefined
         ? null
-        : parseV2Duration(prepared.definition.schedule.every);
+        : parseDuration(prepared.definition.schedule.every);
       const scheduleMaxRuns = prepared.definition.schedule?.max_runs ?? 1;
       if (activation.maxRuns !== scheduleMaxRuns || activation.scheduleEveryMs !== scheduleEveryMs) {
         throw abortAdmission({ kind: "activation_not_active", message: "schedule policy differs from the active activation" });
@@ -288,7 +288,7 @@ export async function admitPreparedRunV2<
       }
       const exhausted = activation.maxRuns !== "unlimited" && occurrenceCount === activation.maxRuns;
       if (exhausted) nextDueAt = null;
-      let nextActivation: ActivationIndexV2 = activationIndexV2Schema.parse({
+      let nextActivation: ActivationIndex = activationIndexSchema.parse({
         ...activation,
         admittedCount: occurrenceCount,
         state: exhausted ? "exhausted" : "active",
@@ -325,7 +325,7 @@ export async function admitPreparedRunV2<
         const schedulerTaskId = await input.createScheduleWakeupTask(
           tx, conversation.id, prepared.workflowId, nextActivation.activationId,
         );
-        nextActivation = activationIndexV2Schema.parse({ ...nextActivation, schedulerTaskId: Number(schedulerTaskId) });
+        nextActivation = activationIndexSchema.parse({ ...nextActivation, schedulerTaskId: Number(schedulerTaskId) });
       }
       const runValue = workflowRunDocumentV1Schema.safeParse({
         state: "ready",
@@ -379,7 +379,7 @@ export async function admitPreparedRunV2<
         status: "queued",
         requestId: prepared.requestId,
       };
-      const nextWorkflow = workflowInstallationIndexV2Schema.safeParse({
+      const nextWorkflow = workflowInstallationIndexSchema.safeParse({
         ...workflow,
         definitionHash: prepared.canonicalHash,
         admissionHighWater: admissionSequence,
@@ -441,7 +441,7 @@ export async function admitPreparedRunV2<
         conversationId: conversation.id,
         workflowTaskId,
         duplicate: false,
-      } satisfies DurableRunAdmissionV2;
+      } satisfies DurableRunAdmission;
     };
     const value = input.serviceMutation === undefined
       ? await input.harness.commit(commitAdmission, input.context)
@@ -456,7 +456,7 @@ export async function admitPreparedRunV2<
         if (result.kind === "idempotency_conflict") {
           throw abortAdmission({ kind: "idempotency_conflict", message: "service request ID was already used with different arguments" });
         }
-        const parsed = durableRunAdmissionV2Schema.safeParse(result.response);
+        const parsed = durableRunAdmissionSchema.safeParse(result.response);
         if (!parsed.success) {
           throw abortAdmission({ kind: "persisted_run_invalid", message: "service receipt contains an invalid run admission", cause: parsed.error });
         }
@@ -474,12 +474,12 @@ export async function admitPreparedRunV2<
 
 async function readExistingAdmission<I>(input: {
   tx: Tx;
-  reference: RunReferenceV2;
-  prepared: PreparedRunAdmissionV2;
+  reference: RunReference;
+  prepared: PreparedRunAdmission;
   taskKind: string;
   parseTaskInput: (value: unknown, identity: AdmissionRunIdentity) => I | undefined;
-}): Promise<DurableRunAdmissionV2> {
-  // SAFETY: runReferenceV2Schema parsed a positive safe integer; Durable ConversationId brands this numeric ID.
+}): Promise<DurableRunAdmission> {
+  // SAFETY: runReferenceSchema parsed a positive safe integer; Durable ConversationId brands this numeric ID.
   const conversationId = input.reference.conversationId as ConversationId;
   const conversation = await input.tx.conversation(conversationId);
   if (conversation === undefined || conversation.owner !== undefined || conversation.parent !== undefined) {
@@ -512,7 +512,7 @@ async function readExistingAdmission<I>(input: {
   if (!sameIdentity || !sameRequest || !samePrepared) {
     throw abortAdmission({ kind: "idempotency_conflict", message: "request or occurrence identity was reused with different prepared inputs" });
   }
-  // SAFETY: runReferenceV2Schema parsed the positive safe integer; Durable TaskId is the same numeric ID with an opaque brand.
+  // SAFETY: runReferenceSchema parsed the positive safe integer; Durable TaskId is the same numeric ID with an opaque brand.
   const taskId = input.reference.workflowTaskId as TaskId;
   const task = await input.tx.task(taskId);
   const taskIdentity = {
@@ -544,11 +544,11 @@ async function readExistingAdmission<I>(input: {
 }
 
 class AdmissionAbort extends Error {
-  constructor(readonly failure: DurableRunAdmissionFailureV2) {
+  constructor(readonly failure: DurableRunAdmissionFailure) {
     super(failure.message);
   }
 }
 
-function abortAdmission(failure: DurableRunAdmissionFailureV2): AdmissionAbort {
+function abortAdmission(failure: DurableRunAdmissionFailure): AdmissionAbort {
   return new AdmissionAbort(failure);
 }

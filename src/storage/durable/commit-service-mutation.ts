@@ -6,7 +6,7 @@ import {
   serviceMutationReceiptV1Schema,
   serviceMutationReceiptsDocumentV1Schema,
   type ServiceMutationReceiptV1,
-} from "../../installation/schema-v2.js";
+} from "../../installation/schema.js";
 import { WorkshopServiceReceiptsDoc } from "./define-workshop-records.js";
 
 const MAX_SERVICE_ONLY_RECEIPTS = 1_000;

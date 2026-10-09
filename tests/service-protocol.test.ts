@@ -21,7 +21,7 @@ import {
   parseServiceResponseLine,
   serviceSuccess,
 } from "../src/service/parse-service-protocol.js";
-import { startWorkshopService } from "../src/service/serve-workshop-service.js";
+import { serveWorkshopService } from "../src/service/serve-workshop-service.js";
 import { sendServiceRequest } from "../src/service/send-service-request.js";
 
 const ReceiptCounterDoc = defineDoc<{ state: "ready"; applied: number }>({
@@ -173,7 +173,7 @@ describe("service protocol v1", () => {
 
   test("waits for an in-flight mutation after the client disconnects before closing Durable storage", async () => {
     const directory = mkdtempSync(join(tmpdir(), "workshop-service-drain-"));
-    let owner: Awaited<ReturnType<typeof startWorkshopService>> | undefined;
+    let owner: Awaited<ReturnType<typeof serveWorkshopService>> | undefined;
     let socket: ReturnType<typeof createConnection> | undefined;
     let releaseHandler: () => void = () => {};
     let markHandlerStarted: () => void = () => {};
@@ -182,7 +182,7 @@ describe("service protocol v1", () => {
     const handlerGate = new Promise<void>((resolve) => { releaseHandler = resolve; });
     const handlerStarted = new Promise<void>((resolve) => { markHandlerStarted = resolve; });
     try {
-      owner = await startWorkshopService({
+      owner = await serveWorkshopService({
         stateDirectory: join(directory, "service"),
         openRuntime: async () => ({
           async handleRequest() {
@@ -208,7 +208,7 @@ describe("service protocol v1", () => {
       await new Promise<void>((resolve) => setTimeout(resolve, 75));
       expect(shutdownFinished).toBe(false);
       expect(runtimeClosed).toBe(false);
-      await expect(startWorkshopService({
+      await expect(serveWorkshopService({
         stateDirectory: join(directory, "service"),
         openRuntime: async () => ({ handleRequest: async () => null, shutdown: async () => {} }),
       })).rejects.toThrow();

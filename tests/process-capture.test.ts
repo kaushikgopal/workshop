@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import { raceDeadline, spawnTracked, type TrackedProcess } from "../src/process/launch-process.js";
-import { captureProcessRecordsV2, recoverProcessCaptureRecordsV2 } from "../src/storage/durable/define-process-execution-task.js";
+import { captureProcessRecords, recoverProcessCaptureRecords } from "../src/storage/durable/define-process-execution-task.js";
 import { retainStreamWindow } from "../src/storage/disk/cap-streams.js";
 
 async function settle(process: TrackedProcess) {
@@ -159,7 +159,7 @@ describe("bounded subprocess capture", () => {
       const finished = await settle(child);
       const input = { stdoutPath, stderrPath, streamCapBytes: 100 };
       let firstHash = true;
-      const monitorCapture = captureProcessRecordsV2(input, finished.captures, {
+      const monitorCapture = captureProcessRecords(input, finished.captures, {
         hashFile: async (path) => {
           if (firstHash) {
             firstHash = false;
@@ -171,7 +171,7 @@ describe("bounded subprocess capture", () => {
       });
       await hashStarted;
       expect(statSync(stdoutPath).size).toBe(100);
-      const abortCaptures = await captureProcessRecordsV2(input, finished.captures, { bestEffort: true });
+      const abortCaptures = await captureProcessRecords(input, finished.captures, { bestEffort: true });
       resumeHash();
       const monitorCaptures = await monitorCapture;
 
@@ -187,7 +187,7 @@ describe("bounded subprocess capture", () => {
       expect(abortCaptures[0]).toMatchObject(expected);
       expect(monitorCaptures[0]).toMatchObject(expected);
 
-      const reopenedCaptures = await recoverProcessCaptureRecordsV2(input);
+      const reopenedCaptures = await recoverProcessCaptureRecords(input);
       expect(reopenedCaptures[0]).toMatchObject(expected);
       expect(readFileSync(stdoutPath, "utf8")).toBe(`HEAD${"x".repeat(92)}TAIL`);
       expect(reopenedCaptures[0]?.sha256).toBe(`sha256:${createHash("sha256").update(readFileSync(stdoutPath)).digest("hex")}`);

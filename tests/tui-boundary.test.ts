@@ -72,9 +72,9 @@ describe("TUI boundary — the folder says what a file is for", () => {
       allImports(readFileSync(file, "utf8")).some(isTuiSpec),
     );
     // The watch command loads the viewer on demand.
-    expect(importers.map(relative)).toEqual(["src/cli/watch-v4.ts"]);
+    expect(importers.map(relative)).toEqual(["src/cli/watch.ts"]);
 
-    const cli = readFileSync(join(REPO_ROOT, "src/cli/watch-v4.ts"), "utf8");
+    const cli = readFileSync(join(REPO_ROOT, "src/cli/watch.ts"), "utf8");
     const { typeOnly, value, dynamic } = importsOf(cli);
     // Nothing the runtime executes may be a TUI module: only the lazily-loaded
     // entry point, plus type-only imports that vanish at compile time.

@@ -10,13 +10,13 @@ import { createModels } from "@earendil-works/pi-ai/models";
 import { createRegistry, defineTask, Harness, type ConversationId } from "@earendil-works/pi-durable";
 import { describe, expect, test } from "bun:test";
 import { z } from "zod";
-import { checkV2DefinitionText } from "../src/definition/check-v2-definition.js";
-import { resolveV2WorkflowSettings } from "../src/definition/resolve-v2-workflow-settings.js";
-import { installationDocumentV1Schema } from "../src/installation/schema-v2.js";
-import { prepareRunAdmissionV2 } from "../src/run/prepare-admission-v2.js";
+import { checkDefinitionText } from "../src/definition/check-definition.js";
+import { resolveWorkflowSettings } from "../src/definition/resolve-workflow-settings.js";
+import { installationDocumentV1Schema } from "../src/installation/schema.js";
+import { prepareRunAdmission } from "../src/run/prepare-admission.js";
 import { WorkshopInstallationDoc, WorkshopRunDoc } from "../src/storage/durable/define-workshop-records.js";
-import { admitPreparedRunV2, type DurableRunAdmissionV2 } from "../src/storage/durable/admit-run.js";
-import { startWorkshopService } from "../src/service/serve-workshop-service.js";
+import { admitPreparedRun, type DurableRunAdmission } from "../src/storage/durable/admit-run.js";
+import { serveWorkshopService } from "../src/service/serve-workshop-service.js";
 import { encodeServiceRequestLine, parseServiceResponseLine } from "../src/service/parse-service-protocol.js";
 import { openDurableStorage } from "../src/storage/durable/open-durable-storage.js";
 
@@ -62,13 +62,13 @@ async function openAdmissionHarness(path: string) {
 }
 
 function prepare(directory: string, overrides: Record<string, unknown> = {}) {
-  const checked = checkV2DefinitionText(sourceText, "release.yaml");
-  const resolvedSettings = resolveV2WorkflowSettings({
+  const checked = checkDefinitionText(sourceText, "release.yaml");
+  const resolvedSettings = resolveWorkflowSettings({
     definition: checked.def,
     machine: machineConfig,
     projectCwd: directory,
   });
-  const result = prepareRunAdmissionV2({
+  const result = prepareRunAdmission({
     sourceText,
     sourceLabel: "release.yaml",
     machineConfig,
@@ -125,7 +125,7 @@ async function initializeInstallation(harness: Awaited<ReturnType<typeof openAdm
 }
 
 function useTestTask(harness: Awaited<ReturnType<typeof openAdmissionHarness>>, prepared: ReturnType<typeof prepare>) {
-  return admitPreparedRunV2({
+  return admitPreparedRun({
     harness,
     prepared,
     workflowRunTask: AdmissionReceiptTask,
@@ -167,8 +167,8 @@ describe("Durable admission transaction seam (test-only task)", () => {
       expect(retried.value).toEqual({ ...firstValue, duplicate: true });
 
       const changedSource = `${sourceText}# a formatting-only source change\n`;
-      const checked = checkV2DefinitionText(changedSource, "release.yaml");
-      const changedSettings = resolveV2WorkflowSettings({
+      const checked = checkDefinitionText(changedSource, "release.yaml");
+      const changedSettings = resolveWorkflowSettings({
         definition: checked.def,
         machine: machineConfig,
         projectCwd: directory,
@@ -255,7 +255,7 @@ describe("Durable admission transaction seam (test-only task)", () => {
     const databasePath = join(directory, "durable.db");
     const requestId = "service-start-retry-001";
     let harness: Awaited<ReturnType<typeof openAdmissionHarness>> | undefined;
-    let owner: Awaited<ReturnType<typeof startWorkshopService>> | undefined;
+    let owner: Awaited<ReturnType<typeof serveWorkshopService>> | undefined;
     let droppedSocket: ReturnType<typeof createConnection> | undefined;
     let releaseFirstResponse: () => void = () => {};
     let markCommitted: () => void = () => {};
@@ -263,13 +263,13 @@ describe("Durable admission transaction seam (test-only task)", () => {
     const firstResponseGate = new Promise<void>((resolve) => { releaseFirstResponse = resolve; });
     const firstCommitted = new Promise<void>((resolve) => { markCommitted = resolve; });
     const firstResponseReady = new Promise<void>((resolve) => { markResponseReady = resolve; });
-    let firstAdmission: DurableRunAdmissionV2 | undefined;
+    let firstAdmission: DurableRunAdmission | undefined;
     let invocations = 0;
     try {
       const initial = prepare(directory, { requestId });
       harness = await openAdmissionHarness(databasePath);
       await initializeInstallation(harness, initial.canonicalHash);
-      owner = await startWorkshopService({
+      owner = await serveWorkshopService({
         stateDirectory: join(directory, "service"),
         openRuntime: async () => ({
           async handleRequest(request) {

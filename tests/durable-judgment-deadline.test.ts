@@ -7,16 +7,16 @@ import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-work
 import { createModels } from "@earendil-works/pi-ai/models";
 import { createRegistry, Harness, type ConversationId, type TaskId } from "@earendil-works/pi-durable";
 import { describe, expect, test } from "bun:test";
-import { checkV2DefinitionText } from "../src/definition/check-v2-definition.js";
-import { resolveV2WorkflowSettings } from "../src/definition/resolve-v2-workflow-settings.js";
-import { installationDocumentV1Schema } from "../src/installation/schema-v2.js";
-import { workflowRunDocumentV1Schema, workshopJudgmentV1Schema } from "../src/run/records-v2.js";
-import { runOutcomeV2Schema } from "../src/run/schema-v2.js";
-import { prepareRunAdmissionV2 } from "../src/run/prepare-admission-v2.js";
-import { admitPreparedRunV2 } from "../src/storage/durable/admit-run.js";
+import { checkDefinitionText } from "../src/definition/check-definition.js";
+import { resolveWorkflowSettings } from "../src/definition/resolve-workflow-settings.js";
+import { installationDocumentV1Schema } from "../src/installation/schema.js";
+import { workflowRunDocumentV1Schema, workshopJudgmentV1Schema } from "../src/run/records.js";
+import { runOutcomeSchema } from "../src/run/schema.js";
+import { prepareRunAdmission } from "../src/run/prepare-admission.js";
+import { admitPreparedRun } from "../src/storage/durable/admit-run.js";
 import { WorkshopInstallationDoc, WorkshopRunDoc } from "../src/storage/durable/define-workshop-records.js";
-import { createWorkflowRunTaskInputV2, defineWorkshopTasksV2, parseWorkflowRunTaskInputV2 } from "../src/storage/durable/define-workshop-tasks.js";
-import { FAILURE_JUDGMENT_DECISION_TOOL_NAME, failureJudgmentTaskInputV2Schema } from "../src/storage/durable/define-failure-judgment-task.js";
+import { createWorkflowRunTaskInput, defineWorkshopTasks, parseWorkflowRunTaskInput } from "../src/storage/durable/define-workshop-tasks.js";
+import { FAILURE_JUDGMENT_DECISION_TOOL_NAME, failureJudgmentTaskInputSchema } from "../src/storage/durable/define-failure-judgment-task.js";
 import { openDurableStorage } from "../src/storage/durable/open-durable-storage.js";
 
 // Commit-time deadline checks for the failure-judge decision tool, exercised through
@@ -55,10 +55,10 @@ function judgedWorkflowSource(workflowId: string): string {
 async function openHarness(databasePath: string, harnessClock: () => number, decisionClock: () => number, models: ReturnType<typeof createModels>) {
   const opened = await openDurableStorage(databasePath);
   if (!opened.ok) throw new Error(`${opened.failure.message}: ${String(opened.failure.cause)}`);
-  const tasks = defineWorkshopTasksV2(undefined, { now: decisionClock });
+  const tasks = defineWorkshopTasks(undefined, { now: decisionClock });
   const registry = createRegistry();
   registry.install({
-    name: "workshop-v4-judgment-deadline-test",
+    name: "workshop-judgment-deadline-test",
     tasks: [tasks.WorkflowRunTask, tasks.NodeAttemptTask, tasks.ProcessExecutionTask, tasks.CapacityGateTask, tasks.FailureJudgmentTask],
   });
   registry.install(tasks.FailureJudgmentExtension);
@@ -68,9 +68,9 @@ async function openHarness(databasePath: string, harnessClock: () => number, dec
 
 function prepare(directory: string, workflowId: string, admittedAt: number) {
   const source = judgedWorkflowSource(workflowId);
-  const checked = checkV2DefinitionText(source, `${workflowId}.yaml`);
-  const resolvedSettings = resolveV2WorkflowSettings({ definition: checked.def, machine: machineConfig, projectCwd: directory });
-  const prepared = prepareRunAdmissionV2({
+  const checked = checkDefinitionText(source, `${workflowId}.yaml`);
+  const resolvedSettings = resolveWorkflowSettings({ definition: checked.def, machine: machineConfig, projectCwd: directory });
+  const prepared = prepareRunAdmission({
     sourceText: source,
     sourceLabel: `${workflowId}.yaml`,
     machineConfig,
@@ -122,12 +122,12 @@ async function admit(opened: OpenedHarness, prepared: ReturnType<typeof prepare>
   await opened.harness.commit(async (tx) => {
     Object.assign(await tx.doc(WorkshopInstallationDoc), installation);
   }, BACKGROUND_CONTEXT);
-  const admission = await admitPreparedRunV2({
+  const admission = await admitPreparedRun({
     harness: opened.harness,
     prepared,
     workflowRunTask: opened.tasks.WorkflowRunTask,
-    createTaskInput: createWorkflowRunTaskInputV2,
-    parseTaskInput: parseWorkflowRunTaskInputV2,
+    createTaskInput: createWorkflowRunTaskInput,
+    parseTaskInput: parseWorkflowRunTaskInput,
     context: BACKGROUND_CONTEXT,
   });
   if (!admission.ok) throw new Error(`${admission.failure.kind}: ${admission.failure.message}`);
@@ -145,7 +145,7 @@ async function readPendingJudgmentDeadline(harness: OpenedHarness["harness"], co
   if (judgment?.status !== "pending") throw new Error("judge answered before its judgment was pending");
   const task = await harness.getTask(judgment.taskId as TaskId, BACKGROUND_CONTEXT);
   if (task === undefined) throw new Error("failure-judgment task is missing");
-  const deadlineAt = failureJudgmentTaskInputV2Schema.parse(task.input).deadlineAt;
+  const deadlineAt = failureJudgmentTaskInputSchema.parse(task.input).deadlineAt;
   if (deadlineAt === null) throw new Error("failure judgment has no persisted absolute deadline");
   return Date.parse(deadlineAt);
 }
@@ -198,9 +198,9 @@ describe("failure-judge decision deadline", () => {
       runConversationId = admission.conversationId as ConversationId;
       await opened.harness.waitForIdle(BACKGROUND_CONTEXT);
 
-      const task = await opened.harness.waitForTask(admission.workflowTaskId as TaskId<ReturnType<typeof runOutcomeV2Schema.parse>>, BACKGROUND_CONTEXT);
+      const task = await opened.harness.waitForTask(admission.workflowTaskId as TaskId<ReturnType<typeof runOutcomeSchema.parse>>, BACKGROUND_CONTEXT);
       if (task.state.status !== "terminal" || task.state.outcome.status !== "completed") throw new Error("late-decision run did not settle");
-      expect(runOutcomeV2Schema.parse(task.state.outcome.result).kind).toBe("blocked");
+      expect(runOutcomeSchema.parse(task.state.outcome.result).kind).toBe("blocked");
       expect(deadline).toBe(admittedAt + JUDGE_TIMEOUT_MS);
       expect(clockAtJudgeRequest).toBeLessThan(deadline!);
 
@@ -308,9 +308,9 @@ describe("failure-judge decision deadline", () => {
       }, BACKGROUND_CONTEXT);
       await opened.harness.waitForIdle(BACKGROUND_CONTEXT);
 
-      const task = await opened.harness.waitForTask(admission.workflowTaskId as TaskId<ReturnType<typeof runOutcomeV2Schema.parse>>, BACKGROUND_CONTEXT);
+      const task = await opened.harness.waitForTask(admission.workflowTaskId as TaskId<ReturnType<typeof runOutcomeSchema.parse>>, BACKGROUND_CONTEXT);
       if (task.state.status !== "terminal" || task.state.outcome.status !== "completed") throw new Error("recovered WorkflowRun did not complete");
-      expect(runOutcomeV2Schema.parse(task.state.outcome.result)).toEqual({ kind: "completed", terminalOutput: "candidate" });
+      expect(runOutcomeSchema.parse(task.state.outcome.result)).toEqual({ kind: "completed", terminalOutput: "candidate" });
       const run = await readRun(opened.harness, runConversationId);
       expect(run.status).toBe("completed");
       expect(run.nodes[0]?.attempts).toHaveLength(2);

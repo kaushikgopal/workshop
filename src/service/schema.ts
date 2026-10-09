@@ -1,7 +1,7 @@
 import { z } from "zod";
-import { nodeIdV2, workflowIdV2 } from "../definition/schema-v2.js";
-import { runIdV2Schema } from "../run/schema-v2.js";
-import { logSectionDtoV2Schema, runSummaryDtoV2Schema } from "../views/schema-v2.js";
+import { nodeIdSchema, workflowIdSchema } from "../definition/schema.js";
+import { runIdSchema } from "../run/schema.js";
+import { logSectionDtoSchema, runSummaryDtoSchema } from "../views/schema.js";
 
 export const serviceStatusV1Schema = z.enum([
   "starting",
@@ -37,7 +37,7 @@ export const serviceRequestIdV1Schema = z.string().min(1).max(128).refine(
 );
 
 const requestBase = { version: z.literal(1) } as const;
-const mutationBase = { ...requestBase, requestId: serviceRequestIdV1Schema, workflowId: workflowIdV2 };
+const mutationBase = { ...requestBase, requestId: serviceRequestIdV1Schema, workflowId: workflowIdSchema };
 
 export const serviceMutationMethodV1Schema = z.enum(["start", "pause", "resume", "stop", "resolve"]);
 
@@ -50,7 +50,7 @@ export const serviceRequestV1Schema = z.discriminatedUnion("method", [
   z.strictObject({
     ...mutationBase,
     method: z.literal("resolve"),
-    runId: runIdV2Schema.optional(),
+    runId: runIdSchema.optional(),
     action: z.enum(["retry", "accept", "fail"]),
     target: z.literal("judgment").optional(),
     reason: z.string().min(1).max(16_384),
@@ -62,50 +62,50 @@ export const serviceRequestV1Schema = z.discriminatedUnion("method", [
   z.strictObject({
     ...requestBase,
     method: z.literal("status"),
-    workflowId: workflowIdV2.optional(),
+    workflowId: workflowIdSchema.optional(),
   }),
   z.strictObject({
     ...requestBase,
     method: z.literal("runs"),
-    workflowId: workflowIdV2,
+    workflowId: workflowIdSchema,
     cursor: z.string().min(1).max(4_096).optional(),
     limit: z.number().int().min(1).max(100).optional(),
   }),
   z.strictObject({
     ...requestBase,
     method: z.literal("logs.page"),
-    workflowId: workflowIdV2,
-    runId: runIdV2Schema.optional(),
+    workflowId: workflowIdSchema,
+    runId: runIdSchema.optional(),
     cursor: z.string().min(1).max(4_096).optional(),
   }),
   z.strictObject({
     ...requestBase,
     method: z.literal("node.describe"),
-    workflowId: workflowIdV2,
-    nodeId: nodeIdV2,
-    runId: runIdV2Schema.optional(),
+    workflowId: workflowIdSchema,
+    nodeId: nodeIdSchema,
+    runId: runIdSchema.optional(),
   }),
   z.strictObject({
     ...requestBase,
     method: z.literal("diagram"),
-    workflowId: workflowIdV2,
-    runId: runIdV2Schema.optional(),
+    workflowId: workflowIdSchema,
+    runId: runIdSchema.optional(),
   }),
   z.strictObject({
     ...requestBase,
     method: z.literal("watch"),
-    workflowId: workflowIdV2.optional(),
+    workflowId: workflowIdSchema.optional(),
   }),
 ]);
 export type ServiceRequestV1 = z.infer<typeof serviceRequestV1Schema>;
 
 export const serviceRunsPageV1Schema = z.strictObject({
   version: z.literal(1),
-  workflowId: workflowIdV2,
+  workflowId: workflowIdSchema,
   total: z.number().int().nonnegative().safe(),
   highWaterMark: z.number().int().nonnegative().safe(),
   nextCursor: z.string().min(1).max(4_096).nullable(),
-  runs: z.array(runSummaryDtoV2Schema).max(100),
+  runs: z.array(runSummaryDtoSchema).max(100),
 }).superRefine((page, context) => {
   if (page.total > page.highWaterMark || page.runs.length > page.total) {
     context.addIssue({ code: "custom", path: ["total"], message: "page total fits within its admission high-water mark" });
@@ -115,11 +115,11 @@ export const serviceRunsPageV1Schema = z.strictObject({
 export const MAX_LOG_CONTENT_CHUNK_BYTES_V1 = 512 * 1024;
 export const serviceLogSectionPageV1Schema = z.strictObject({
   version: z.literal(1),
-  runId: runIdV2Schema,
+  runId: runIdSchema,
   sectionIndex: z.number().int().nonnegative().safe(),
   totalSections: z.number().int().positive().safe(),
   nextCursor: z.string().min(1).max(4_096).nullable(),
-  section: logSectionDtoV2Schema,
+  section: logSectionDtoSchema,
   chunk: z.strictObject({
     offsetBytes: z.number().int().nonnegative().safe(),
     totalBytes: z.number().int().nonnegative().safe(),
@@ -160,8 +160,8 @@ export type ServiceLogSectionPageV1 = z.infer<typeof serviceLogSectionPageV1Sche
 export type ServiceRunsPageV1 = z.infer<typeof serviceRunsPageV1Schema>;
 
 export const serviceStartResultV1Schema = z.strictObject({
-  runId: runIdV2Schema,
-  workflowId: workflowIdV2,
+  runId: runIdSchema,
+  workflowId: workflowIdSchema,
   activationId: z.string().min(1),
   occurrenceId: z.string().min(1),
   admissionSequence: z.number().int().positive().safe(),
@@ -172,8 +172,8 @@ export const serviceStartResultV1Schema = z.strictObject({
 export type ServiceStartResultV1 = z.infer<typeof serviceStartResultV1Schema>;
 
 export const serviceResolveResultV1Schema = z.strictObject({
-  workflowId: workflowIdV2,
-  runId: runIdV2Schema,
+  workflowId: workflowIdSchema,
+  runId: runIdSchema,
   status: z.enum(["queued", "failed"]),
   desiredState: z.enum(["running", "paused", "stopped"]),
   resolutionId: z.string().min(1),

@@ -2,7 +2,7 @@
  * TUI-only: where the viewer gets its data, and the shapes it draws.
  *
  * The viewer must stay disposable: it consumes the same service projections the
- * CLI publishes, adapted by `cli/watch-v4.ts` into the shapes below, so swapping
+ * CLI publishes, adapted by `cli/watch.ts` into the shapes below, so swapping
  * OpenTUI for HTML replaces the binding rather than the data path. Depending on
  * an interface — instead of reaching into SQLite or a run directory — is what
  * keeps that true, and it lets tests drive the binding with a fake source: no

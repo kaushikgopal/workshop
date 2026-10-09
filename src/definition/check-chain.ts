@@ -1,4 +1,4 @@
-import type { WorkflowDefinitionV2 } from "./schema-v2.js";
+import type { WorkflowDefinition } from "./schema.js";
 
 /**
  * Chain topology: the graph invariant the runtime relies on.
@@ -16,7 +16,7 @@ export interface ChainInfo {
   prev: Map<string, string | null>;
 }
 
-export function checkChainV2(def: WorkflowDefinitionV2): ChainInfo {
+export function checkChain(def: WorkflowDefinition): ChainInfo {
   const nodes: Record<string, { next?: string | null }> = def.nodes;
   const ids = Object.keys(nodes);
 

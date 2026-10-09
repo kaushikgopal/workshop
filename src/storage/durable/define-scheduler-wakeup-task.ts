@@ -3,54 +3,54 @@ import type { Context } from "@earendil-works/chord";
 import { defineTask, type ConversationId, type Harness, type Task, type TaskRuntime, type Tx } from "@earendil-works/pi-durable";
 import { z } from "zod";
 import { canonicalHash } from "../../definition/hash-canonical-json.js";
-import { workflowIdV2 } from "../../definition/schema-v2.js";
-import { loadCheckedV2Workflow, type V2Installation } from "../../installation/load-v2-installation.js";
-import { installationDocumentV1Schema } from "../../installation/schema-v2.js";
-import { prepareRunAdmissionV2, type PreparedRunAdmissionV2 } from "../../run/prepare-admission-v2.js";
+import { workflowIdSchema } from "../../definition/schema.js";
+import { loadCheckedWorkflow, type Installation } from "../../installation/load-installation.js";
+import { installationDocumentV1Schema } from "../../installation/schema.js";
+import { prepareRunAdmission, type PreparedRunAdmission } from "../../run/prepare-admission.js";
 import { decideFixedRateSchedule, type FixedRateScheduleDecision } from "../../run/decide-fixed-rate-schedule.js";
-import { activationIdV2Schema, occurrenceIdV2Schema } from "../../run/schema-v2.js";
-import { workshopEventV1Schema } from "../../run/records-v2.js";
-import { utcTimestampV2Schema } from "../../util/schema-v2.js";
-import { parseV2Duration } from "../../util/parse-units.js";
-import { admitPreparedRunV2, type ScheduleAdmissionCommitV2 } from "./admit-run.js";
-import { createWorkflowRunTaskInputV2, parseWorkflowRunTaskInputV2, type WorkflowRunTaskV2 } from "./define-workshop-tasks.js";
+import { activationIdSchema, occurrenceIdSchema } from "../../run/schema.js";
+import { workshopEventV1Schema } from "../../run/records.js";
+import { utcTimestampSchema } from "../../util/schema.js";
+import { parseDuration } from "../../util/parse-units.js";
+import { admitPreparedRun, type ScheduleAdmissionCommit } from "./admit-run.js";
+import { createWorkflowRunTaskInput, parseWorkflowRunTaskInput, type WorkflowRunTaskDefinition } from "./define-workshop-tasks.js";
 import { WorkshopEventEntry, WorkshopInstallationDoc } from "./define-workshop-records.js";
 
-const scheduleWakeupInputV2Schema = z.strictObject({
-  workflowId: workflowIdV2,
-  activationId: activationIdV2Schema,
+const scheduleWakeupInputSchema = z.strictObject({
+  workflowId: workflowIdSchema,
+  activationId: activationIdSchema,
 });
-export type ScheduleWakeupTaskInputV2 = z.infer<typeof scheduleWakeupInputV2Schema>;
+export type ScheduleWakeupTaskInput = z.infer<typeof scheduleWakeupInputSchema>;
 
-const scheduleWakeupCheckpointV2Schema = z.discriminatedUnion("phase", [
+const scheduleWakeupCheckpointSchema = z.discriminatedUnion("phase", [
   z.strictObject({ phase: z.literal("wake") }),
-  z.strictObject({ phase: z.literal("wait"), wakeAt: utcTimestampV2Schema }),
+  z.strictObject({ phase: z.literal("wait"), wakeAt: utcTimestampSchema }),
 ]);
-type ScheduleWakeupCheckpointV2 = z.infer<typeof scheduleWakeupCheckpointV2Schema>;
+type ScheduleWakeupCheckpoint = z.infer<typeof scheduleWakeupCheckpointSchema>;
 
-const scheduleWakeupOutcomeV2Schema = z.strictObject({ kind: z.literal("finished") });
-type ScheduleWakeupOutcomeV2 = z.infer<typeof scheduleWakeupOutcomeV2Schema>;
+const scheduleWakeupOutcomeSchema = z.strictObject({ kind: z.literal("finished") });
+type ScheduleWakeupOutcome = z.infer<typeof scheduleWakeupOutcomeSchema>;
 
-export type ScheduleWakeupTaskV2 = Task<ScheduleWakeupTaskInputV2, ScheduleWakeupCheckpointV2, ScheduleWakeupOutcomeV2, object>;
-type ScheduleWakeupRuntimeV2 = TaskRuntime<ScheduleWakeupTaskInputV2, ScheduleWakeupCheckpointV2, ScheduleWakeupOutcomeV2, object>;
+export type ScheduleWakeupTaskDefinition = Task<ScheduleWakeupTaskInput, ScheduleWakeupCheckpoint, ScheduleWakeupOutcome, object>;
+type ScheduleWakeupRuntime = TaskRuntime<ScheduleWakeupTaskInput, ScheduleWakeupCheckpoint, ScheduleWakeupOutcome, object>;
 
-export function createScheduleWakeupTaskInputV2(input: ScheduleWakeupTaskInputV2): ScheduleWakeupTaskInputV2 {
-  return scheduleWakeupInputV2Schema.parse(input);
+export function createScheduleWakeupTaskInput(input: ScheduleWakeupTaskInput): ScheduleWakeupTaskInput {
+  return scheduleWakeupInputSchema.parse(input);
 }
 
-export function defineScheduleWakeupTaskV2(input: {
-  readonly installation: V2Installation;
-  readonly workflowRunTask: WorkflowRunTaskV2;
-  readonly runtimeManifest: PreparedRunAdmissionV2["runtimeManifest"];
+export function defineScheduleWakeupTask(input: {
+  readonly installation: Installation;
+  readonly workflowRunTask: WorkflowRunTaskDefinition;
+  readonly runtimeManifest: PreparedRunAdmission["runtimeManifest"];
   readonly canAdmit?: () => boolean;
-}): ScheduleWakeupTaskV2 {
-  return defineTask<ScheduleWakeupTaskInputV2, ScheduleWakeupCheckpointV2, ScheduleWakeupOutcomeV2>({
+}): ScheduleWakeupTaskDefinition {
+  return defineTask<ScheduleWakeupTaskInput, ScheduleWakeupCheckpoint, ScheduleWakeupOutcome>({
     name: "workshop.schedule-wakeup",
     version: 1,
     initial: () => ({ phase: "wake" }),
     phases: {
       wake: async (task, runtime, context) => {
-        const taskInput = scheduleWakeupInputV2Schema.parse(task.input);
+        const taskInput = scheduleWakeupInputSchema.parse(task.input);
         if (input.canAdmit?.() === false) {
           await deferWake(runtime, timestamp(runtime.now() + 250), context);
           return;
@@ -96,7 +96,7 @@ export function defineScheduleWakeupTaskV2(input: {
         await admitScheduledOccurrence(input, runtime, taskInput, activation.nextDueAt, decision, context);
       },
       wait: async (task, runtime, context) => {
-        const checkpoint = scheduleWakeupCheckpointV2Schema.parse(task.state.checkpoint);
+        const checkpoint = scheduleWakeupCheckpointSchema.parse(task.state.checkpoint);
         if (checkpoint.phase !== "wait") throw new Error("schedule wakeup wait lacks its persisted deadline");
         const wakeAt = Date.parse(checkpoint.wakeAt);
         if (runtime.now() < wakeAt) await runtime.sleep(wakeAt, context);
@@ -110,9 +110,9 @@ export function defineScheduleWakeupTaskV2(input: {
 }
 
 async function admitScheduledOccurrence(
-  definition: Parameters<typeof defineScheduleWakeupTaskV2>[0],
-  runtime: ScheduleWakeupRuntimeV2,
-  taskInput: ScheduleWakeupTaskInputV2,
+  definition: Parameters<typeof defineScheduleWakeupTask>[0],
+  runtime: ScheduleWakeupRuntime,
+  taskInput: ScheduleWakeupTaskInput,
   expectedNextDueAt: string,
   decision: Extract<FixedRateScheduleDecision, { kind: "admit" }>,
   context: Context,
@@ -121,9 +121,9 @@ async function admitScheduledOccurrence(
     await deferWake(runtime, timestamp(runtime.now() + 250), context);
     return;
   }
-  let checked: ReturnType<typeof loadCheckedV2Workflow>;
+  let checked: ReturnType<typeof loadCheckedWorkflow>;
   try {
-    checked = loadCheckedV2Workflow(definition.installation, taskInput.workflowId);
+    checked = loadCheckedWorkflow(definition.installation, taskInput.workflowId);
   } catch (error) {
     await stopAdmission(runtime, taskInput, safeError(error), context);
     return;
@@ -143,7 +143,7 @@ async function admitScheduledOccurrence(
   let maxRuns: number | "unlimited";
   try {
     if (checked.definition.schedule === undefined) throw new Error("checked workflow no longer has a schedule");
-    everyMs = parseV2Duration(checked.definition.schedule.every);
+    everyMs = parseDuration(checked.definition.schedule.every);
     maxRuns = checked.definition.schedule.max_runs ?? 1;
   } catch (error) {
     await stopAdmission(runtime, taskInput, safeError(error), context);
@@ -164,10 +164,10 @@ async function admitScheduledOccurrence(
     slotAt: decision.slotAt,
   }).slice("sha256:".length, "sha256:".length + 32);
   const runId = `${taskInput.workflowId}-slot-${slotDigest}`;
-  const occurrenceId = occurrenceIdV2Schema.parse(`schedule-${slotDigest}`);
+  const occurrenceId = occurrenceIdSchema.parse(`schedule-${slotDigest}`);
   const requestId = `schedule:${taskInput.workflowId}:${taskInput.activationId}:${slotDigest}`;
   const admittedAt = timestamp(runtime.now());
-  const prepared = prepareRunAdmissionV2({
+  const prepared = prepareRunAdmission({
     sourceText: checked.sourceText,
     sourceLabel: checked.sourcePath,
     machineConfig: definition.installation.machine,
@@ -186,7 +186,7 @@ async function admitScheduledOccurrence(
     await stopAdmission(runtime, taskInput, prepared.failure.message, context);
     return;
   }
-  const scheduleAdmission: ScheduleAdmissionCommitV2 = {
+  const scheduleAdmission: ScheduleAdmissionCommit = {
     expectedNextDueAt,
     slotAt: decision.slotAt,
     nextDueAt: decision.nextDueAt,
@@ -196,12 +196,12 @@ async function admitScheduledOccurrence(
     totalSkippedSlots: decision.totalSkippedSlots,
     admittedCount: decision.admittedCount,
   };
-  const result = await admitPreparedRunV2({
+  const result = await admitPreparedRun({
     harness: taskCommitHarness(runtime, scheduleAdmission),
     prepared: prepared.value,
     workflowRunTask: definition.workflowRunTask,
-    createTaskInput: createWorkflowRunTaskInputV2,
-    parseTaskInput: parseWorkflowRunTaskInputV2,
+    createTaskInput: createWorkflowRunTaskInput,
+    parseTaskInput: parseWorkflowRunTaskInput,
     context,
     scheduleAdmission,
     admissionAllowed: definition.canAdmit,
@@ -246,8 +246,8 @@ async function admitScheduledOccurrence(
 }
 
 async function commitSkippedSlots(
-  runtime: ScheduleWakeupRuntimeV2,
-  taskInput: ScheduleWakeupTaskInputV2,
+  runtime: ScheduleWakeupRuntime,
+  taskInput: ScheduleWakeupTaskInput,
   expectedNextDueAt: string | null,
   context: Context,
 ): Promise<void> {
@@ -304,8 +304,8 @@ async function commitSkippedSlots(
 }
 
 async function stopAdmission(
-  runtime: ScheduleWakeupRuntimeV2,
-  taskInput: ScheduleWakeupTaskInputV2,
+  runtime: ScheduleWakeupRuntime,
+  taskInput: ScheduleWakeupTaskInput,
   reason: string,
   context: Context,
 ): Promise<void> {
@@ -330,26 +330,26 @@ async function stopAdmission(
   }, context);
 }
 
-async function deferWake(runtime: ScheduleWakeupRuntimeV2, wakeAt: string, context: Context): Promise<void> {
+async function deferWake(runtime: ScheduleWakeupRuntime, wakeAt: string, context: Context): Promise<void> {
   await runtime.commit(() => ({ status: "running", checkpoint: { phase: "wait", wakeAt } }), context);
 }
 
-async function finishTask(runtime: ScheduleWakeupRuntimeV2, context: Context): Promise<void> {
+async function finishTask(runtime: ScheduleWakeupRuntime, context: Context): Promise<void> {
   await runtime.commit(() => ({
     status: "terminal",
     outcome: { status: "completed", result: { kind: "finished" } },
   }), context);
 }
 
-async function readInstallation(runtime: ScheduleWakeupRuntimeV2, context: Context) {
+async function readInstallation(runtime: ScheduleWakeupRuntime, context: Context) {
   const parsed = installationDocumentV1Schema.safeParse(await runtime.snapshot(WorkshopInstallationDoc, context));
   if (!parsed.success || parsed.data.state !== "ready") throw new Error("Durable installation document is not initialized");
   return parsed.data;
 }
 
 function taskCommitHarness(
-  runtime: ScheduleWakeupRuntimeV2,
-  schedule: ScheduleAdmissionCommitV2,
+  runtime: ScheduleWakeupRuntime,
+  schedule: ScheduleAdmissionCommit,
  ): Pick<Harness, "commit"> {
   return {
     async commit<T>(change: (tx: Tx) => T | Promise<T>, context: Context): Promise<T> {
@@ -369,7 +369,7 @@ function taskCommitHarness(
 
 function timestamp(ms: number): string {
   if (!Number.isSafeInteger(ms) || !Number.isFinite(new Date(ms).getTime())) throw new Error("scheduler clock returned an invalid timestamp");
-  return utcTimestampV2Schema.parse(new Date(ms).toISOString());
+  return utcTimestampSchema.parse(new Date(ms).toISOString());
 }
 
 function safeError(error: unknown): string {

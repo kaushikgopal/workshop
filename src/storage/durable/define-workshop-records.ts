@@ -1,11 +1,11 @@
 import { defineDoc, defineEntry } from "@earendil-works/pi-durable";
-import type { InstallationDocumentV1, ServiceMutationReceiptsDocumentV1 } from "../../installation/schema-v2.js";
+import type { InstallationDocumentV1, ServiceMutationReceiptsDocumentV1 } from "../../installation/schema.js";
 import type {
   WorkflowRunDocumentV1,
   WorkshopEventV1,
   WorkshopJudgmentV1,
   WorkshopProcessV1,
-} from "../../run/records-v2.js";
+} from "../../run/records.js";
 
 /** Session-scoped installation index; run history lives in run conversations. */
 export const WorkshopInstallationDoc = defineDoc<InstallationDocumentV1>({

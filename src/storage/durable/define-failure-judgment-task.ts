@@ -13,22 +13,22 @@ import {
   type TaskRuntime,
 } from "@earendil-works/pi-durable";
 import { z } from "zod";
-import { blockInfoV2Schema, judgmentDecisionV2Schema, runIdV2Schema, type JudgmentDecisionV2 } from "../../run/schema-v2.js";
+import { blockInfoSchema, judgmentDecisionSchema, runIdSchema, type JudgmentDecision } from "../../run/schema.js";
 import {
-  persistedJudgmentV2Schema,
+  persistedJudgmentSchema,
   workflowRunDocumentV1Schema,
   workshopJudgmentV1Schema,
-  type PersistedJudgmentV2,
+  type PersistedJudgment,
   type WorkflowRunDocumentV1,
-} from "../../run/records-v2.js";
+} from "../../run/records.js";
 import { WorkshopJudgmentEntry, WorkshopRunDoc } from "./define-workshop-records.js";
 
 const FAILURE_JUDGMENT_TASK_NAME = "workshop.failure-judgment";
 const positiveSafeInteger = z.number().int().positive().refine(Number.isSafeInteger);
 const boundedPromptSchema = z.string().max(2 * 1024 * 1024);
 
-export const failureJudgmentTaskInputV2Schema = z.strictObject({
-  runId: runIdV2Schema,
+export const failureJudgmentTaskInputSchema = z.strictObject({
+  runId: runIdSchema,
   runConversationId: positiveSafeInteger,
   workflowTaskId: positiveSafeInteger,
   nodeId: z.string().min(1),
@@ -42,21 +42,21 @@ export const failureJudgmentTaskInputV2Schema = z.strictObject({
   deadlineAt: z.string().datetime().nullable(),
   allowedActions: z.array(z.enum(["retry", "block", "fail"])).nonempty(),
 });
-export type FailureJudgmentTaskInputV2 = z.infer<typeof failureJudgmentTaskInputV2Schema>;
+export type FailureJudgmentTaskInput = z.infer<typeof failureJudgmentTaskInputSchema>;
 
-export const failureJudgmentTaskResultV2Schema = z.discriminatedUnion("kind", [
-  z.strictObject({ kind: z.literal("decided"), decision: judgmentDecisionV2Schema }),
-  z.strictObject({ kind: z.literal("failed"), block: blockInfoV2Schema }),
+export const failureJudgmentTaskResultSchema = z.discriminatedUnion("kind", [
+  z.strictObject({ kind: z.literal("decided"), decision: judgmentDecisionSchema }),
+  z.strictObject({ kind: z.literal("failed"), block: blockInfoSchema }),
 ]);
-export type FailureJudgmentTaskResultV2 = z.infer<typeof failureJudgmentTaskResultV2Schema>;
+export type FailureJudgmentTaskResult = z.infer<typeof failureJudgmentTaskResultSchema>;
 
-const failureJudgmentCheckpointV2Schema = z.discriminatedUnion("phase", [
+const failureJudgmentCheckpointSchema = z.discriminatedUnion("phase", [
   z.strictObject({ phase: z.literal("createConversation") }),
   z.strictObject({ phase: z.literal("submit"), conversationId: positiveSafeInteger }),
   z.strictObject({ phase: z.literal("awaitSubmission"), conversationId: positiveSafeInteger, submissionId: positiveSafeInteger }),
 ]);
-type FailureJudgmentCheckpointV2 = z.infer<typeof failureJudgmentCheckpointV2Schema>;
-type FailureJudgmentRuntime = TaskRuntime<FailureJudgmentTaskInputV2, FailureJudgmentCheckpointV2, FailureJudgmentTaskResultV2, object>;
+type FailureJudgmentCheckpoint = z.infer<typeof failureJudgmentCheckpointSchema>;
+type FailureJudgmentRuntime = TaskRuntime<FailureJudgmentTaskInput, FailureJudgmentCheckpoint, FailureJudgmentTaskResult, object>;
 type ReadyRun = Extract<ReturnType<typeof workflowRunDocumentV1Schema.parse>, { state: "ready" }>;
 
 export const FAILURE_JUDGMENT_DECISION_TOOL_NAME = "record_workshop_failure_decision";
@@ -78,7 +78,7 @@ function defineRecordFailureDecisionTool(now: () => number) {
     parameters: decisionParameters,
     replay: "safe",
     async execute(rawDecision, api, context) {
-      const decision = judgmentDecisionV2Schema.safeParse(rawDecision);
+      const decision = judgmentDecisionSchema.safeParse(rawDecision);
       if (!decision.success) {
         return { isError: true, content: [{ type: "text", text: "Decision does not match the checked failure-decision contract." }] };
       }
@@ -90,7 +90,7 @@ function defineRecordFailureDecisionTool(now: () => number) {
         if (owner === undefined || owner.kind !== FAILURE_JUDGMENT_TASK_NAME) {
           throw new Error("failure-judge conversation is not owned by a failure-judgment task");
         }
-        const taskInput = failureJudgmentTaskInputV2Schema.parse(owner.input);
+        const taskInput = failureJudgmentTaskInputSchema.parse(owner.input);
         if (!taskInput.allowedActions.includes(decision.data.action)) return { rejected: true as const };
         const runDraft = await tx.doc(WorkshopRunDoc, taskInput.runConversationId as ConversationId);
         const run = readyRun(runDraft);
@@ -113,7 +113,7 @@ function defineRecordFailureDecisionTool(now: () => number) {
         const committedAt = now();
         if (taskInput.deadlineAt !== null && committedAt >= Date.parse(taskInput.deadlineAt)) return { late: true as const };
         const decidedAt = timestamp(committedAt);
-        const nextJudgment = persistedJudgmentV2Schema.parse({
+        const nextJudgment = persistedJudgmentSchema.parse({
           ...judgment,
           status: "decided",
           decision: decision.data,
@@ -164,7 +164,7 @@ export function defineFailureJudgmentExtension(now: () => number) {
 const recordFailureDecision = defineRecordFailureDecisionTool(Date.now);
 export const FailureJudgmentExtension = defineExtension({ name: FAILURE_JUDGMENT_EXTENSION_NAME, tools: [recordFailureDecision] });
 
-export const FailureJudgmentTask: Task<FailureJudgmentTaskInputV2, FailureJudgmentCheckpointV2, FailureJudgmentTaskResultV2, object> = defineTask<FailureJudgmentTaskInputV2, FailureJudgmentCheckpointV2, FailureJudgmentTaskResultV2>({
+export const FailureJudgmentTask: Task<FailureJudgmentTaskInput, FailureJudgmentCheckpoint, FailureJudgmentTaskResult, object> = defineTask<FailureJudgmentTaskInput, FailureJudgmentCheckpoint, FailureJudgmentTaskResult>({
   name: FAILURE_JUDGMENT_TASK_NAME,
   version: 1,
   initial: () => ({ phase: "createConversation" }),
@@ -204,7 +204,7 @@ export const FailureJudgmentTask: Task<FailureJudgmentTaskInputV2, FailureJudgme
           instructions: input.prompt,
           cwd: null,
         });
-        const judgment = persistedJudgmentV2Schema.parse({
+        const judgment = persistedJudgmentSchema.parse({
           judgmentId: input.judgmentId,
           conversationId: Number(conversation.id),
           submissionRequestId: input.submissionRequestId,
@@ -327,7 +327,7 @@ export const FailureJudgmentTask: Task<FailureJudgmentTaskInputV2, FailureJudgme
   },
   abort: async (task, runtime, context) => {
     const input = parseInput(task.input);
-    const checkpoint = failureJudgmentCheckpointV2Schema.safeParse(task.state.checkpoint);
+    const checkpoint = failureJudgmentCheckpointSchema.safeParse(task.state.checkpoint);
     if (checkpoint.success && checkpoint.data.phase !== "createConversation") {
       const conversation = await runtime.conversation(checkpoint.data.conversationId as ConversationId, context);
       await conversation?.abort(withoutAbortSignal(context)).catch(() => undefined);
@@ -342,7 +342,7 @@ export const FailureJudgmentTask: Task<FailureJudgmentTaskInputV2, FailureJudgme
       if (judgment?.taskId === Number(runtime.taskId) && judgment.status === "pending"
         && (!checkpoint.success || checkpoint.data.phase === "createConversation"
           || judgment.conversationId === checkpoint.data.conversationId)) {
-        const cancelled = persistedJudgmentV2Schema.parse({
+        const cancelled = persistedJudgmentSchema.parse({
           ...judgment,
           status: "cancelled",
           decision: null,
@@ -368,7 +368,7 @@ export const FailureJudgmentTask: Task<FailureJudgmentTaskInputV2, FailureJudgme
   },
 });
 
-async function submitJudgment(conversation: ConversationHandle, input: FailureJudgmentTaskInputV2, context: Context): Promise<Submission> {
+async function submitJudgment(conversation: ConversationHandle, input: FailureJudgmentTaskInput, context: Context): Promise<Submission> {
   return await conversation.submit({
     type: "input",
     requestId: input.submissionRequestId,
@@ -378,7 +378,7 @@ async function submitJudgment(conversation: ConversationHandle, input: FailureJu
 
 async function waitForSubmission(
   runtime: FailureJudgmentRuntime,
-  input: FailureJudgmentTaskInputV2,
+  input: FailureJudgmentTaskInput,
   conversation: ConversationHandle,
   submission: Submission,
   context: Context,
@@ -395,14 +395,14 @@ async function waitForSubmission(
 
 async function finishFailure(
   runtime: FailureJudgmentRuntime,
-  input: FailureJudgmentTaskInputV2,
+  input: FailureJudgmentTaskInput,
   conversationId: number,
   reason: string,
   kind: "orchestrator_unavailable" | "orchestrator_invalid",
   context: Context,
 ): Promise<void> {
   const blockedAt = timestamp(runtime.now());
-  const block = blockInfoV2Schema.parse({
+  const block = blockInfoSchema.parse({
     blockId: `judgment-${input.judgmentId}`,
     kind,
     reason,
@@ -422,7 +422,7 @@ async function finishFailure(
     if (judgment === undefined || judgment.conversationId !== conversationId || judgment.taskId !== Number(runtime.taskId)) {
       throw new Error("failure-judgment failure differs from its persisted task identity");
     }
-    const failedJudgment = persistedJudgmentV2Schema.parse({
+    const failedJudgment = persistedJudgmentSchema.parse({
       ...judgment,
       status: "failed",
       decision: null,
@@ -446,9 +446,9 @@ async function finishFailure(
 
 async function readJudgment(
   runtime: FailureJudgmentRuntime,
-  input: FailureJudgmentTaskInputV2,
+  input: FailureJudgmentTaskInput,
   context: Context,
-): Promise<PersistedJudgmentV2 | undefined> {
+): Promise<PersistedJudgment | undefined> {
   const value = await runtime.snapshot(WorkshopRunDoc, input.runConversationId as ConversationId, context);
   const run = readyRun(value);
   assertInputRun(input, run);
@@ -461,7 +461,7 @@ function readyRun(value: unknown): ReadyRun {
   return parsed;
 }
 
-function assertInputRun(input: FailureJudgmentTaskInputV2, run: ReadyRun): void {
+function assertInputRun(input: FailureJudgmentTaskInput, run: ReadyRun): void {
   if (run.runId !== input.runId || run.durable.conversationId !== input.runConversationId
     || run.durable.workflowTaskId !== input.workflowTaskId) {
     throw new Error("failure-judgment task input differs from the canonical run identity");
@@ -491,12 +491,12 @@ function replaceAttempt(
   };
 }
 
-function parseInput(value: unknown): FailureJudgmentTaskInputV2 {
-  return failureJudgmentTaskInputV2Schema.parse(value);
+function parseInput(value: unknown): FailureJudgmentTaskInput {
+  return failureJudgmentTaskInputSchema.parse(value);
 }
 
-function parseCheckpoint(value: unknown): FailureJudgmentCheckpointV2 {
-  return failureJudgmentCheckpointV2Schema.parse(value);
+function parseCheckpoint(value: unknown): FailureJudgmentCheckpoint {
+  return failureJudgmentCheckpointSchema.parse(value);
 }
 
 function timestamp(milliseconds: number): string {
@@ -507,12 +507,12 @@ function isPastDeadline(deadlineAt: string | null, now: number): boolean {
   return deadlineAt !== null && now >= Date.parse(deadlineAt);
 }
 
-function sameDecision(left: JudgmentDecisionV2, right: JudgmentDecisionV2): boolean {
+function sameDecision(left: JudgmentDecision, right: JudgmentDecision): boolean {
   return left.action === right.action && left.reason === right.reason;
 }
 
 function judgmentEvidenceFields(
-  input: FailureJudgmentTaskInputV2,
+  input: FailureJudgmentTaskInput,
   conversationId: number,
   taskId: number,
   recordedAt: string,

@@ -1,25 +1,25 @@
 import { join } from "node:path";
 import { atomicWriteFileSync, removeFileSync } from "../disk/write-crash-safe.js";
-import type { PersistedNodeV2, WorkflowRunDocumentV1 } from "../../run/records-v2.js";
-import type { NodeResultV2, NodeAttemptOutcomeV2 } from "../../run/schema-v2.js";
-import { renderV2Worklog } from "./render-v2-worklog.js";
+import type { PersistedNode, WorkflowRunDocumentV1 } from "../../run/records.js";
+import type { NodeResult, NodeAttemptOutcome } from "../../run/schema.js";
+import { renderWorklog } from "./render-worklog.js";
 
-export type RunViewKindV2 = "definition" | "input" | "output" | "worklog";
+export type RunViewKind = "definition" | "input" | "output" | "worklog";
 
-export interface RunViewFailureV2 {
-  view: RunViewKindV2;
+export interface RunViewFailure {
+  view: RunViewKind;
   nodeId: string | null;
   errorCode: string | null;
 }
 
 /** Rebuild every view that follows from the canonical run document. */
-export function materializeRunViewsV2(value: WorkflowRunDocumentV1): RunViewFailureV2[] {
+export function materializeRunViews(value: WorkflowRunDocumentV1): RunViewFailure[] {
   if (value.state !== "ready") throw new Error("cannot materialize views for an uninitialized run");
   const run = value;
-  const failures: RunViewFailureV2[] = [];
+  const failures: RunViewFailure[] = [];
   writeView("definition", null, run.paths.definitionSnapshot, run.sourceText);
   try {
-    writeView("worklog", null, run.paths.worklog, renderV2Worklog(run));
+    writeView("worklog", null, run.paths.worklog, renderWorklog(run));
   } catch (error) {
     failures.push({ view: "worklog", nodeId: null, errorCode: errorCode(error) });
   }
@@ -45,7 +45,7 @@ export function materializeRunViewsV2(value: WorkflowRunDocumentV1): RunViewFail
 
   return failures;
 
-  function writeView(view: RunViewKindV2, nodeId: string | null, path: string, content: string): void {
+  function writeView(view: RunViewKind, nodeId: string | null, path: string, content: string): void {
     try {
       atomicWriteFileSync(path, content);
     } catch (error) {
@@ -53,7 +53,7 @@ export function materializeRunViewsV2(value: WorkflowRunDocumentV1): RunViewFail
     }
   }
 
-  function removeView(view: RunViewKindV2, nodeId: string | null, path: string): void {
+  function removeView(view: RunViewKind, nodeId: string | null, path: string): void {
     try {
       removeFileSync(path);
     } catch (error) {
@@ -62,7 +62,7 @@ export function materializeRunViewsV2(value: WorkflowRunDocumentV1): RunViewFail
   }
 }
 
-function successfulOutput(node: PersistedNodeV2 | undefined): string | null {
+function successfulOutput(node: PersistedNode | undefined): string | null {
   if (node?.status !== "succeeded" || node.successfulAttemptId === null) return null;
   const attempt = node.attempts.at(-1);
   if (attempt?.attemptId !== node.successfulAttemptId) return null;
@@ -70,10 +70,10 @@ function successfulOutput(node: PersistedNodeV2 | undefined): string | null {
   return attempt.result.outcome.candidate.output;
 }
 
-function latestCandidate(result: PersistedNodeV2["attempts"][number]["result"] | undefined): NodeResultV2 | null {
+function latestCandidate(result: PersistedNode["attempts"][number]["result"] | undefined): NodeResult | null {
   if (result === undefined || result.kind === "pending") return null;
   if (result.kind === "candidate_committed" || result.kind === "validation_committed") return result.candidate;
-  const outcome: NodeAttemptOutcomeV2 = result.outcome;
+  const outcome: NodeAttemptOutcome = result.outcome;
   return outcome.kind === "cancelled" ? null : outcome.candidate;
 }
 

@@ -6,8 +6,8 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { locateServiceSocket } from "../src/service/locate-service-socket.js";
 import { probeServiceHealth } from "../src/service/probe-service-health.js";
 
-const FIXTURE = join(process.cwd(), "tests/fixtures/v4/serve-workshop-service.ts");
-const FAILED_OPEN_FIXTURE = join(process.cwd(), "tests/fixtures/v4/hold-v2-service-after-open-failure.ts");
+const FIXTURE = join(process.cwd(), "tests/fixtures/serve-workshop-service.ts");
+const FAILED_OPEN_FIXTURE = join(process.cwd(), "tests/fixtures/hold-service-after-open-failure.ts");
 const children: ReturnType<typeof spawn>[] = [];
 
 afterEach(async () => {

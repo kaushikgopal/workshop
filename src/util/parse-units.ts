@@ -23,32 +23,37 @@ export const DEFAULT_STREAM_CAP_BYTES = 256 * 1024;
 /** A cap is a byte count, or the explicit opt-out. */
 export type StreamCap = number | "unlimited";
 export const BYTE_SIZE_RE = /^([1-9][0-9]*)(kb|mb)?$/;
-/** Parse a `bytes | kb | mb | unlimited` value. Schema validation runs first. */
+/**
+ * Parse a `bytes | kb | mb | unlimited` value, rejecting caps that overflow the
+ * numeric limit representation. Schema validation runs first.
+ */
 export function parseByteSize(value: string): StreamCap {
   if (value === "unlimited") return "unlimited";
   const match = BYTE_SIZE_RE.exec(value);
   if (!match) throw new Error(`not a byte size: "${value}"`);
   const size = Number(match[1]);
   const unit = match[2];
-  if (unit === "kb") return size * 1024;
-  if (unit === "mb") return size * 1024 * 1024;
-  return size;
+  const cap = unit === "kb" ? size * 1024 : unit === "mb" ? size * 1024 * 1024 : size;
+  if (!Number.isSafeInteger(cap)) {
+    throw new Error(`byte size "${value}" exceeds the finite safe-integer byte value`);
+  }
+  return cap;
 }
 
-const V2_DURATION_UNITS_MS: Record<string, number> = {
+const DURATION_UNITS_MS: Record<string, number> = {
   ms: 1,
   ...UNIT_MS,
 };
 
 /** Parse a positive duration with unit ms|s|m|h|d|w. */
-export function parseV2Duration(raw: string): DurationMs {
+export function parseDuration(raw: string): DurationMs {
   const match = /^([1-9][0-9]*)(ms|[smhdw])$/.exec(raw);
   if (!match || !match[1] || !match[2]) {
     throw new Error(
       `invalid duration "${raw}" — expected a positive integer with unit ms|s|m|h|d|w, e.g. "10ms"`,
     );
   }
-  const unit = V2_DURATION_UNITS_MS[match[2]];
+  const unit = DURATION_UNITS_MS[match[2]];
   if (unit === undefined) {
     throw new Error(`invalid duration unit in "${raw}"`);
   }
@@ -57,13 +62,4 @@ export function parseV2Duration(raw: string): DurationMs {
     throw new Error(`duration "${raw}" exceeds the finite safe-integer millisecond range`);
   }
   return durationMs;
-}
-
-/** Reject byte caps that overflow the numeric limit representation. */
-export function parseV2ByteSize(raw: string): StreamCap {
-  const cap = parseByteSize(raw);
-  if (typeof cap === "number" && !Number.isSafeInteger(cap)) {
-    throw new Error(`byte size "${raw}" exceeds the finite safe-integer byte value`);
-  }
-  return cap;
 }

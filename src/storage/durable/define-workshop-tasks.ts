@@ -3,102 +3,102 @@ import type { Context } from "@earendil-works/chord";
 import { defineTask, type ConversationId, type Task, type TaskId, type TaskRuntime, type Tx } from "@earendil-works/pi-durable";
 import { z } from "zod";
 import { canonicalHash } from "../../definition/hash-canonical-json.js";
-import type { ResolvedPreflightSettingsV2 } from "../../definition/schema-resolved-v2.js";
-import { nodeIdV2, workflowIdV2 } from "../../definition/schema-v2.js";
-import { parseV2Model } from "../../definition/parse-v2-model.js";
-import { installationDocumentV1Schema } from "../../installation/schema-v2.js";
-import { executionIdV2Schema, incarnationIdV2Schema } from "../../process/schema-v2.js";
+import type { ResolvedPreflightSettings } from "../../definition/schema-resolved.js";
+import { nodeIdSchema, workflowIdSchema } from "../../definition/schema.js";
+import { parseModel } from "../../definition/parse-model.js";
+import { installationDocumentV1Schema } from "../../installation/schema.js";
+import { executionIdSchema, incarnationIdSchema } from "../../process/schema.js";
 import {
-  attemptIdV2Schema,
-  blockInfoV2Schema,
-  failureInfoV2Schema,
-  judgmentDecisionV2Schema,
-  judgmentIdV2Schema,
-  nodeAttemptOutcomeV2Schema,
-  nodeResultV2Schema,
-  runIdV2Schema,
-  validatorOutcomePassesV2,
-  type BlockInfoV2,
-  type FailureInfoV2,
-  type JudgmentDecisionV2,
-  type NodeAttemptOutcomeV2,
-  type NodeResultV2,
-  type RunOutcomeV2,
-} from "../../run/schema-v2.js";
+  attemptIdSchema,
+  blockInfoSchema,
+  failureInfoSchema,
+  judgmentDecisionSchema,
+  judgmentIdSchema,
+  nodeAttemptOutcomeSchema,
+  nodeResultSchema,
+  runIdSchema,
+  validatorOutcomePasses,
+  type BlockInfo,
+  type FailureInfo,
+  type JudgmentDecision,
+  type NodeAttemptOutcome,
+  type NodeResult,
+  type RunOutcome,
+} from "../../run/schema.js";
 import {
-  persistedJudgmentV2Schema,
-  persistedNodeAttemptV2Schema,
+  persistedJudgmentSchema,
+  persistedNodeAttemptSchema,
   workflowRunDocumentV1Schema,
   workshopEventV1Schema,
   workshopJudgmentV1Schema,
   type WorkflowRunDocumentV1,
-} from "../../run/records-v2.js";
+} from "../../run/records.js";
 import { WorkshopEventEntry, WorkshopInstallationDoc, WorkshopJudgmentEntry, WorkshopRunDoc } from "./define-workshop-records.js";
 import {
   capacityGateOutcomeSchema,
   defineCapacityGateTask,
   type CapacityGateOutcome,
-  type CapacityGateTaskInputV2,
-  type CapacityGateTaskV2,
+  type CapacityGateTaskInput,
+  type CapacityGateTaskDefinition,
 } from "./define-capacity-gate-task.js";
 import {
   defineFailureJudgmentExtension,
   FailureJudgmentTask as FailureJudgmentTaskDefinition,
-  failureJudgmentTaskInputV2Schema,
-  failureJudgmentTaskResultV2Schema,
-  type FailureJudgmentTaskResultV2,
+  failureJudgmentTaskInputSchema,
+  failureJudgmentTaskResultSchema,
+  type FailureJudgmentTaskResult,
 } from "./define-failure-judgment-task.js";
-import { materializeRunViewsV2, type RunViewFailureV2 } from "./materialize-run-views.js";
+import { materializeRunViews, type RunViewFailure } from "./materialize-run-views.js";
 import {
-  defineProcessExecutionTaskV2,
-  buildProcessExecutionEnvironmentV2,
-  processExecutionCapturePathsV2,
-  processExecutionTaskInputV2Schema,
-  processExecutionTaskResultV2Schema,
-  type ProcessExecutionTaskEnvironmentInputV2,
-  type ProcessExecutionTaskInputV2,
-  type ProcessExecutionTaskResultV2,
-  type ProcessExecutionTaskV2,
+  defineProcessExecutionTask,
+  buildProcessExecutionEnvironment,
+  processExecutionCapturePaths,
+  processExecutionTaskInputSchema,
+  processExecutionTaskResultSchema,
+  type ProcessExecutionTaskEnvironmentInput,
+  type ProcessExecutionTaskInput,
+  type ProcessExecutionTaskResult,
+  type ProcessExecutionTaskDefinition,
 } from "./define-process-execution-task.js";
-import { defineNodeAttemptTaskV2, nodeAttemptTaskInputV2Schema, type NodeAttemptTaskV2 } from "./define-node-attempt-task.js";
-import { utcTimestampV2Schema } from "../../util/schema-v2.js";
+import { defineNodeAttemptTask, nodeAttemptTaskInputSchema, type NodeAttemptTaskDefinition } from "./define-node-attempt-task.js";
+import { utcTimestampSchema } from "../../util/schema.js";
 import { DEFAULT_STREAM_CAP_BYTES } from "../../util/parse-units.js";
 
 const positive = z.number().int().positive().refine(Number.isSafeInteger);
 const nonnegative = z.number().int().nonnegative().refine(Number.isSafeInteger);
 
-export const workflowResumeCheckpointV2Schema = z.strictObject({
+export const workflowResumeCheckpointSchema = z.strictObject({
   phase: z.literal("decide"),
   nodeIndex: nonnegative,
-  nodeId: nodeIdV2,
-  attemptId: attemptIdV2Schema,
+  nodeId: nodeIdSchema,
+  attemptId: attemptIdSchema,
 });
-export type WorkflowResumeCheckpointV2 = z.infer<typeof workflowResumeCheckpointV2Schema>;
+export type WorkflowResumeCheckpoint = z.infer<typeof workflowResumeCheckpointSchema>;
 
-export const workflowRunTaskInputV2Schema = z.strictObject({
-  runId: runIdV2Schema,
-  workflowId: workflowIdV2,
+export const workflowRunTaskInputSchema = z.strictObject({
+  runId: runIdSchema,
+  workflowId: workflowIdSchema,
   activationId: z.string().min(1),
   occurrenceId: z.string().min(1),
-  resumeCheckpoint: workflowResumeCheckpointV2Schema.optional(),
+  resumeCheckpoint: workflowResumeCheckpointSchema.optional(),
 });
-export type WorkflowRunTaskInputV2 = z.infer<typeof workflowRunTaskInputV2Schema>;
-export interface WorkflowRunIdentityV2 {
+export type WorkflowRunTaskInput = z.infer<typeof workflowRunTaskInputSchema>;
+export interface WorkflowRunIdentity {
   runId: string;
   workflowId: string;
   activationId: string;
   occurrenceId: string;
 }
 
-export function createWorkflowRunTaskInputV2(
-  identity: WorkflowRunIdentityV2,
-  resumeCheckpoint?: WorkflowResumeCheckpointV2,
-): WorkflowRunTaskInputV2 {
-  return workflowRunTaskInputV2Schema.parse({ ...identity, ...(resumeCheckpoint === undefined ? {} : { resumeCheckpoint }) });
+export function createWorkflowRunTaskInput(
+  identity: WorkflowRunIdentity,
+  resumeCheckpoint?: WorkflowResumeCheckpoint,
+): WorkflowRunTaskInput {
+  return workflowRunTaskInputSchema.parse({ ...identity, ...(resumeCheckpoint === undefined ? {} : { resumeCheckpoint }) });
 }
 
-export function parseWorkflowRunTaskInputV2(value: unknown, identity: WorkflowRunIdentityV2): WorkflowRunTaskInputV2 | undefined {
-  const parsed = workflowRunTaskInputV2Schema.safeParse(value);
+export function parseWorkflowRunTaskInput(value: unknown, identity: WorkflowRunIdentity): WorkflowRunTaskInput | undefined {
+  const parsed = workflowRunTaskInputSchema.safeParse(value);
   return parsed.success
     && parsed.data.runId === identity.runId
     && parsed.data.workflowId === identity.workflowId
@@ -112,37 +112,37 @@ const workflowCheckpointSchema = z.discriminatedUnion("phase", [
   z.strictObject({ phase: z.literal("start") }),
   z.strictObject({ phase: z.literal("awaitCapacity"), taskId: positive }),
   z.strictObject({ phase: z.literal("preflight") }),
-  z.strictObject({ phase: z.literal("awaitPreflight"), taskId: positive, executionId: executionIdV2Schema, incarnationId: incarnationIdV2Schema, incarnationNumber: positive }),
+  z.strictObject({ phase: z.literal("awaitPreflight"), taskId: positive, executionId: executionIdSchema, incarnationId: incarnationIdSchema, incarnationNumber: positive }),
   z.strictObject({ phase: z.literal("admitAttempt"), nodeIndex: nonnegative }),
   z.strictObject({
     phase: z.literal("awaitAttempt"),
     nodeIndex: nonnegative,
-    nodeId: nodeIdV2,
-    attemptId: attemptIdV2Schema,
+    nodeId: nodeIdSchema,
+    attemptId: attemptIdSchema,
     taskId: positive,
   }),
-  z.strictObject({ phase: z.literal("decide"), nodeIndex: nonnegative, nodeId: nodeIdV2, attemptId: attemptIdV2Schema }),
-  z.strictObject({ phase: z.literal("awaitJudgment"), nodeIndex: nonnegative, nodeId: nodeIdV2, attemptId: attemptIdV2Schema, taskId: positive, judgmentId: judgmentIdV2Schema }),
+  z.strictObject({ phase: z.literal("decide"), nodeIndex: nonnegative, nodeId: nodeIdSchema, attemptId: attemptIdSchema }),
+  z.strictObject({ phase: z.literal("awaitJudgment"), nodeIndex: nonnegative, nodeId: nodeIdSchema, attemptId: attemptIdSchema, taskId: positive, judgmentId: judgmentIdSchema }),
 ]);
 const workflowCheckpointV8Schema = z.discriminatedUnion("phase", [
   z.strictObject({ phase: z.literal("start") }),
   z.strictObject({ phase: z.literal("awaitCapacity"), taskId: positive }),
   z.strictObject({ phase: z.literal("preflight") }),
-  z.strictObject({ phase: z.literal("awaitPreflight"), taskId: positive, executionId: executionIdV2Schema, incarnationId: incarnationIdV2Schema, incarnationNumber: positive }),
+  z.strictObject({ phase: z.literal("awaitPreflight"), taskId: positive, executionId: executionIdSchema, incarnationId: incarnationIdSchema, incarnationNumber: positive }),
   z.strictObject({ phase: z.literal("admitAttempt"), nodeIndex: nonnegative }),
-  z.strictObject({ phase: z.literal("awaitAttempt"), nodeIndex: nonnegative, nodeId: nodeIdV2, attemptId: attemptIdV2Schema, taskId: positive }),
+  z.strictObject({ phase: z.literal("awaitAttempt"), nodeIndex: nonnegative, nodeId: nodeIdSchema, attemptId: attemptIdSchema, taskId: positive }),
 ]);
 type WorkflowCheckpoint = z.infer<typeof workflowCheckpointSchema>;
 
 
 type ReadyRun = Extract<WorkflowRunDocumentV1, { state: "ready" }>;
-type PersistedNodeAttempt = z.infer<typeof persistedNodeAttemptV2Schema>;
-type ReplayableProcessResult = Extract<ProcessExecutionTaskResultV2, { kind: "replayable" }>;
-type WorkflowRuntime = TaskRuntime<WorkflowRunTaskInputV2, WorkflowCheckpoint, RunOutcomeV2, object>;
-export type WorkflowRunTaskV2 = Task<WorkflowRunTaskInputV2, WorkflowCheckpoint, RunOutcomeV2, object>;
+type PersistedNodeAttempt = z.infer<typeof persistedNodeAttemptSchema>;
+type ReplayableProcessResult = Extract<ProcessExecutionTaskResult, { kind: "replayable" }>;
+type WorkflowRuntime = TaskRuntime<WorkflowRunTaskInput, WorkflowCheckpoint, RunOutcome, object>;
+export type WorkflowRunTaskDefinition = Task<WorkflowRunTaskInput, WorkflowCheckpoint, RunOutcome, object>;
 
 /** Defines the Durable workflow, node-attempt, process, and judgment lifecycle tasks. */
-export function defineWorkshopTasksV2(
+export function defineWorkshopTasks(
   serviceBootId?: string,
   options: {
     readonly startupLaunchGate?: "open" | "closed";
@@ -151,10 +151,10 @@ export function defineWorkshopTasksV2(
   } = {},
 ): {
   readonly serviceBootId: string;
-  readonly WorkflowRunTask: Task<WorkflowRunTaskInputV2, WorkflowCheckpoint, RunOutcomeV2, object>;
-  readonly NodeAttemptTask: NodeAttemptTaskV2;
-  readonly ProcessExecutionTask: ProcessExecutionTaskV2;
-  readonly CapacityGateTask: CapacityGateTaskV2;
+  readonly WorkflowRunTask: Task<WorkflowRunTaskInput, WorkflowCheckpoint, RunOutcome, object>;
+  readonly NodeAttemptTask: NodeAttemptTaskDefinition;
+  readonly ProcessExecutionTask: ProcessExecutionTaskDefinition;
+  readonly CapacityGateTask: CapacityGateTaskDefinition;
   readonly FailureJudgmentTask: typeof FailureJudgmentTaskDefinition;
   readonly FailureJudgmentExtension: ReturnType<typeof defineFailureJudgmentExtension>;
   readonly stopLaunching: () => void;
@@ -167,9 +167,9 @@ export function defineWorkshopTasksV2(
     stopLaunching,
     canLaunch,
     openStartupLaunchGate,
-  } = defineProcessExecutionTaskV2(serviceBootId, options);
+  } = defineProcessExecutionTask(serviceBootId, options);
 
-  const NodeAttemptTask = defineNodeAttemptTaskV2(ProcessExecutionTask, activeBootId, canLaunch);
+  const NodeAttemptTask = defineNodeAttemptTask(ProcessExecutionTask, activeBootId, canLaunch);
 
   const CapacityGateTask = defineCapacityGateTask(refreshRunViewsBestEffort);
 
@@ -177,12 +177,12 @@ export function defineWorkshopTasksV2(
   const FailureJudgmentTask = FailureJudgmentTaskDefinition;
   const FailureJudgmentExtension = defineFailureJudgmentExtension(options.now ?? Date.now);
 
-  const WorkflowRunTask = defineTask<WorkflowRunTaskInputV2, WorkflowCheckpoint, RunOutcomeV2>({
+  const WorkflowRunTask = defineTask<WorkflowRunTaskInput, WorkflowCheckpoint, RunOutcome>({
     name: "workshop.workflow-run",
     version: 10,
     migrate: (input, checkpoint, fromVersion) => {
-      if (fromVersion === 8) return { input: workflowRunTaskInputV2Schema.parse(input), checkpoint: workflowCheckpointV8Schema.parse(checkpoint) };
-      if (fromVersion === 9) return { input: workflowRunTaskInputV2Schema.parse(input), checkpoint: workflowCheckpointSchema.parse(checkpoint) };
+      if (fromVersion === 8) return { input: workflowRunTaskInputSchema.parse(input), checkpoint: workflowCheckpointV8Schema.parse(checkpoint) };
+      if (fromVersion === 9) return { input: workflowRunTaskInputSchema.parse(input), checkpoint: workflowCheckpointSchema.parse(checkpoint) };
       throw new Error(`unsupported WorkflowRun task version ${fromVersion}`);
     },
     initial: () => ({ phase: "start" }),
@@ -303,7 +303,7 @@ export function defineWorkshopTasksV2(
               || (attempt.result.kind !== "candidate_committed" && attempt.result.kind !== "validation_committed")) {
               throw new Error("resolved current attempt is not ready to resume after capacity acquisition");
             }
-            const childInput = nodeAttemptTaskInputV2Schema.parse({
+            const childInput = nodeAttemptTaskInputSchema.parse({
               runId: current.runId,
               workflowId: current.workflowId,
               activationId: current.activationId,
@@ -376,10 +376,10 @@ export function defineWorkshopTasksV2(
         const cacheKeyHash = run.preflight.cacheKeyHash;
         const site = run.resolvedSettings.preflight;
         if (site === null) throw new Error("pending preflight lacks frozen settings");
-        const executionId = executionIdV2Schema.parse(randomUUID());
-        const incarnationId = incarnationIdV2Schema.parse(randomUUID());
+        const executionId = executionIdSchema.parse(randomUUID());
+        const incarnationId = incarnationIdSchema.parse(randomUUID());
         const launchedAt = timestamp(runtime.now());
-        const processInput = createPreflightProcessInputV2({
+        const processInput = createPreflightProcessInput({
           run,
           taskId: Number(runtime.taskId),
           site,
@@ -444,7 +444,7 @@ export function defineWorkshopTasksV2(
         const input = parseWorkflowInput(task.input);
         const checkpoint = workflowCheckpointSchema.parse(task.state.checkpoint);
         if (checkpoint.phase !== "awaitPreflight") throw new Error("WorkflowRun checkpoint lacks its preflight task identity");
-        const outcome = (await runtime.outcomes([durableTaskId<ProcessExecutionTaskResultV2>(checkpoint.taskId)], context))[0];
+        const outcome = (await runtime.outcomes([durableTaskId<ProcessExecutionTaskResult>(checkpoint.taskId)], context))[0];
         const run = await snapshotRun(runtime, context);
         assertWorkflowIdentity(input, run, runtime.taskId);
         if (outcome === undefined || outcome.status !== "completed") {
@@ -452,7 +452,7 @@ export function defineWorkshopTasksV2(
           await blockRun(task, runtime, input, block, context, { markNode: false, retainCapacity: true, stopped: run.desiredState === "stopped" });
           return;
         }
-        const processResult = processExecutionTaskResultV2Schema.parse(outcome.result);
+        const processResult = processExecutionTaskResultSchema.parse(outcome.result);
         if (processResult.kind === "replayable") {
           await schedulePreflightReplay({ task, runtime, ProcessExecutionTask, activeBootId, input, checkpoint, replay: processResult, context });
           return;
@@ -481,7 +481,7 @@ export function defineWorkshopTasksV2(
         }
         if (processResult.timedOut || processResult.exit.kind !== "code" || processResult.exit.code !== 0) {
           const failedAt = timestamp(runtime.now());
-          const failure = failureInfoV2Schema.parse({
+          const failure = failureInfoSchema.parse({
             kind: processResult.timedOut ? "timeout" : "process_error",
             message: processResult.timedOut ? "configured preflight exceeded its deadline" : `configured preflight exited unsuccessfully (${processResult.exit.kind === "code" ? processResult.exit.code : processResult.exit.signal})`,
             failedAt,
@@ -592,10 +592,10 @@ export function defineWorkshopTasksV2(
         if (nodeId === undefined || node === undefined || (!firstAttempt && !explicitlyRetried)) {
           throw new Error("workflow cursor does not point to a fresh or explicitly retried node");
         }
-        const attemptId = attemptIdV2Schema.parse(randomUUID());
+        const attemptId = attemptIdSchema.parse(randomUUID());
         const attemptNumber = node.attempts.length + 1;
         const at = timestamp(runtime.now());
-        const childInput = nodeAttemptTaskInputV2Schema.parse({
+        const childInput = nodeAttemptTaskInputSchema.parse({
           runId: run.runId,
           workflowId: run.workflowId,
           activationId: run.activationId,
@@ -669,13 +669,13 @@ export function defineWorkshopTasksV2(
         if (checkpoint.phase !== "awaitAttempt") throw new Error("WorkflowRun checkpoint lacks the child task identity");
         let run = await snapshotRun(runtime, context);
         assertWorkflowIdentity(input, run, runtime.taskId);
-        const outcome = (await runtime.outcomes([durableTaskId<NodeAttemptOutcomeV2>(checkpoint.taskId)], context))[0];
+        const outcome = (await runtime.outcomes([durableTaskId<NodeAttemptOutcome>(checkpoint.taskId)], context))[0];
         if (outcome === undefined || outcome.status !== "completed") {
           const block = blockInfo("external_outcome_unknown", "NodeAttempt ended without a checked domain outcome", input.runId, checkpoint.nodeId, checkpoint.attemptId, timestamp(runtime.now()));
           await blockRun(task, runtime, input, block, context, { markNode: true });
           return;
         }
-        const result = nodeAttemptOutcomeV2Schema.parse(outcome.result);
+        const result = nodeAttemptOutcomeSchema.parse(outcome.result);
         if (result.kind === "blocked") {
           await blockRun(task, runtime, input, result.block, context, { markNode: true });
           return;
@@ -730,7 +730,7 @@ export function defineWorkshopTasksV2(
           await blockRun(task, runtime, input, block, context, { markNode: true });
           return;
         }
-        const candidate = nodeResultV2Schema.parse(result.candidate);
+        const candidate = nodeResultSchema.parse(result.candidate);
         const nextIndex = checkpoint.nodeIndex + 1;
         if (nextIndex < run.chain.order.length) {
           await runtime.commit(async (tx) => {
@@ -789,11 +789,11 @@ export function defineWorkshopTasksV2(
           const settings = run.resolvedSettings.nodes[checkpoint.nodeId];
           if (settings === undefined) throw new Error("frozen settings are missing for the failed node");
           const allowedActions = failureJudgmentAllowedActions(attempt, settings);
-          const parsedModel = parseV2Model(orchestrator.model);
-          const judgmentId = judgmentIdV2Schema.parse(randomUUID());
+          const parsedModel = parseModel(orchestrator.model);
+          const judgmentId = judgmentIdSchema.parse(randomUUID());
           const submissionRequestId = `failure-judgment-${judgmentId}`;
           const startedAt = timestamp(runtime.now());
-          const judgmentInput = failureJudgmentTaskInputV2Schema.parse({
+          const judgmentInput = failureJudgmentTaskInputSchema.parse({
             runId: input.runId,
             runConversationId: run.durable.conversationId,
             workflowTaskId: runtime.taskId,
@@ -839,7 +839,7 @@ export function defineWorkshopTasksV2(
         const input = parseWorkflowInput(task.input);
         const checkpoint = workflowCheckpointSchema.parse(task.state.checkpoint);
         if (checkpoint.phase !== "awaitJudgment") throw new Error("WorkflowRun checkpoint lacks its failure-judgment task identity");
-        const outcome = (await runtime.outcomes([durableTaskId<FailureJudgmentTaskResultV2>(checkpoint.taskId)], context))[0];
+        const outcome = (await runtime.outcomes([durableTaskId<FailureJudgmentTaskResult>(checkpoint.taskId)], context))[0];
         let run = await snapshotRun(runtime, context);
         assertWorkflowIdentity(input, run, runtime.taskId);
         while (run.desiredState === "paused" || run.status === "paused") {
@@ -855,7 +855,7 @@ export function defineWorkshopTasksV2(
           await blockRun(task, runtime, input, block, context, { markNode: true, attemptBlockId: checkpoint.attemptId });
           return;
         }
-        const result = failureJudgmentTaskResultV2Schema.parse(outcome.result);
+        const result = failureJudgmentTaskResultSchema.parse(outcome.result);
         if (result.kind === "failed") {
           await blockRun(task, runtime, input, result.block, context, { markNode: true, attemptBlockId: checkpoint.attemptId });
           return;
@@ -910,18 +910,18 @@ export function defineWorkshopTasksV2(
 
 
 
-function createPreflightProcessInputV2(args: {
+function createPreflightProcessInput(args: {
   run: ReadyRun;
   taskId: number;
-  site: ResolvedPreflightSettingsV2;
-  executionId: ProcessExecutionTaskEnvironmentInputV2["executionId"];
-  incarnationId: ProcessExecutionTaskEnvironmentInputV2["incarnationId"];
+  site: ResolvedPreflightSettings;
+  executionId: ProcessExecutionTaskEnvironmentInput["executionId"];
+  incarnationId: ProcessExecutionTaskEnvironmentInput["incarnationId"];
   incarnationNumber?: number;
-  serviceBootId: ProcessExecutionTaskEnvironmentInputV2["serviceBootId"];
+  serviceBootId: ProcessExecutionTaskEnvironmentInput["serviceBootId"];
   launchIntentAt: string;
   deadlineAt: string | null;
-}): ProcessExecutionTaskInputV2 {
-  const base: ProcessExecutionTaskEnvironmentInputV2 = {
+}): ProcessExecutionTaskInput {
+  const base: ProcessExecutionTaskEnvironmentInput = {
     runId: args.run.runId,
     workflowId: args.run.workflowId,
     activationId: args.run.activationId,
@@ -943,21 +943,21 @@ function createPreflightProcessInputV2(args: {
     timeoutMs: args.site.timeoutMs,
     streamCapBytes: DEFAULT_STREAM_CAP_BYTES,
     replay: "safe",
-    stdoutPath: processExecutionCapturePathsV2(args.run.paths.captureDirectory, args.executionId, args.incarnationId).stdoutPath,
-    stderrPath: processExecutionCapturePathsV2(args.run.paths.captureDirectory, args.executionId, args.incarnationId).stderrPath,
+    stdoutPath: processExecutionCapturePaths(args.run.paths.captureDirectory, args.executionId, args.incarnationId).stdoutPath,
+    stderrPath: processExecutionCapturePaths(args.run.paths.captureDirectory, args.executionId, args.incarnationId).stderrPath,
   };
-  return processExecutionTaskInputV2Schema.parse({
+  return processExecutionTaskInputSchema.parse({
     ...base,
-    env: buildProcessExecutionEnvironmentV2(base, args.run, null),
+    env: buildProcessExecutionEnvironment(base, args.run, null),
   });
 }
 
 async function schedulePreflightReplay(args: {
   task: unknown;
   runtime: WorkflowRuntime;
-  ProcessExecutionTask: ProcessExecutionTaskV2;
+  ProcessExecutionTask: ProcessExecutionTaskDefinition;
   activeBootId: string;
-  input: WorkflowRunTaskInputV2;
+  input: WorkflowRunTaskInput;
   checkpoint: Extract<WorkflowCheckpoint, { phase: "awaitPreflight" }>;
   replay: ReplayableProcessResult;
   context: Context;
@@ -987,7 +987,7 @@ async function schedulePreflightReplay(args: {
     await blockRun(task, runtime, input, block, context, { markNode: false, retainCapacity: true, stopped: resumableRun.desiredState === "stopped" });
     return;
   }
-  const replayInput = createPreflightProcessInputV2({
+  const replayInput = createPreflightProcessInput({
     run: resumableRun,
     taskId: Number(runtime.taskId),
     site,
@@ -1041,17 +1041,17 @@ function stoppedAttemptWasChecked(run: ReadyRun): boolean {
 
 async function checkedPreflightStopRetirement(
   runtime: WorkflowRuntime,
-  input: WorkflowRunTaskInputV2,
+  input: WorkflowRunTaskInput,
   run: ReadyRun,
   checkpoint: Extract<WorkflowCheckpoint, { phase: "awaitPreflight" }>,
   context: Context,
  ): Promise<boolean> {
   if (run.preflight.kind !== "pending" || !run.preflight.processExecutionIds.includes(checkpoint.executionId)) return false;
-  const processTask = await runtime.getTask(durableTaskId<ProcessExecutionTaskResultV2>(checkpoint.taskId), context);
+  const processTask = await runtime.getTask(durableTaskId<ProcessExecutionTaskResult>(checkpoint.taskId), context);
   if (processTask === undefined || processTask.kind !== "workshop.process-execution"
     || processTask.owner !== runtime.taskId || processTask.conversationId !== runtime.conversationId
     || processTask.state.status !== "terminal") return false;
-  const parsedInput = processExecutionTaskInputV2Schema.safeParse(processTask.input);
+  const parsedInput = processExecutionTaskInputSchema.safeParse(processTask.input);
   if (!parsedInput.success) return false;
   const processInput = parsedInput.data;
   if (processInput.runId !== input.runId || processInput.workflowId !== input.workflowId
@@ -1063,7 +1063,7 @@ async function checkedPreflightStopRetirement(
   const outcome = processTask.state.outcome;
   if (outcome.status === "aborted") return outcome.reason === "process was aborted before launch intent";
   if (outcome.status !== "completed") return false;
-  const checked = processExecutionTaskResultV2Schema.safeParse(outcome.result);
+  const checked = processExecutionTaskResultSchema.safeParse(outcome.result);
   if (!checked.success) return false;
   if (checked.data.kind === "exited") return true;
   return checked.data.kind === "cancelled"
@@ -1076,11 +1076,11 @@ async function checkedPreflightStopRetirement(
 
 async function checkedWorkflowStopRetirement(
   runtime: WorkflowRuntime,
-  input: WorkflowRunTaskInputV2,
+  input: WorkflowRunTaskInput,
   run: ReadyRun,
   checkpoint: WorkflowCheckpoint,
   context: Context,
- ): Promise<boolean | { kind: "preserve_block"; block: BlockInfoV2 }> {
+ ): Promise<boolean | { kind: "preserve_block"; block: BlockInfo }> {
   if (checkpoint.phase === "awaitPreflight") {
     return await checkedPreflightStopRetirement(runtime, input, run, checkpoint, context);
   }
@@ -1100,16 +1100,16 @@ async function checkedWorkflowStopRetirement(
   }
   if (checkpoint.phase === "awaitAttempt") {
     if (checkpoint.nodeId !== run.currentNodeId || checkpoint.attemptId !== attempt.attemptId) return false;
-    const child = await runtime.getTask(durableTaskId<NodeAttemptOutcomeV2>(checkpoint.taskId), context);
+    const child = await runtime.getTask(durableTaskId<NodeAttemptOutcome>(checkpoint.taskId), context);
     if (child === undefined || child.kind !== "workshop.node-attempt" || child.owner !== runtime.taskId
       || child.conversationId !== runtime.conversationId || child.state.status !== "terminal") return false;
-    const childInput = nodeAttemptTaskInputV2Schema.safeParse(child.input);
+    const childInput = nodeAttemptTaskInputSchema.safeParse(child.input);
     if (!childInput.success || childInput.data.runId !== input.runId || childInput.data.workflowId !== input.workflowId
       || childInput.data.activationId !== input.activationId || childInput.data.occurrenceId !== input.occurrenceId
       || childInput.data.workflowTaskId !== Number(runtime.taskId) || childInput.data.nodeId !== checkpoint.nodeId
       || childInput.data.attemptId !== checkpoint.attemptId || childInput.data.attemptNumber !== attempt.number) return false;
     if (child.state.outcome.status !== "completed") return false;
-    const checked = nodeAttemptOutcomeV2Schema.safeParse(child.state.outcome.result);
+    const checked = nodeAttemptOutcomeSchema.safeParse(child.state.outcome.result);
     return checked.success && checked.data.kind !== "blocked"
       && attempt.result.kind === "settled"
       && canonicalHash(checked.data) === canonicalHash(attempt.result.outcome);
@@ -1117,10 +1117,10 @@ async function checkedWorkflowStopRetirement(
   if (checkpoint.phase !== "awaitJudgment" || checkpoint.nodeId !== run.currentNodeId
     || checkpoint.attemptId !== attempt.attemptId || attempt.status !== "failed"
     || attempt.result.kind !== "settled" || attempt.result.outcome.kind !== "failed") return false;
-  const child = await runtime.getTask(durableTaskId<FailureJudgmentTaskResultV2>(checkpoint.taskId), context);
+  const child = await runtime.getTask(durableTaskId<FailureJudgmentTaskResult>(checkpoint.taskId), context);
   if (child === undefined || child.kind !== "workshop.failure-judgment" || child.owner !== runtime.taskId
     || child.conversationId !== runtime.conversationId || child.state.status !== "terminal") return false;
-  const childInput = failureJudgmentTaskInputV2Schema.safeParse(child.input);
+  const childInput = failureJudgmentTaskInputSchema.safeParse(child.input);
   if (!childInput.success || childInput.data.runId !== input.runId || childInput.data.runConversationId !== run.durable.conversationId
     || childInput.data.workflowTaskId !== Number(runtime.taskId) || childInput.data.nodeId !== checkpoint.nodeId
     || childInput.data.attemptId !== checkpoint.attemptId || childInput.data.judgmentId !== checkpoint.judgmentId) return false;
@@ -1131,7 +1131,7 @@ async function checkedWorkflowStopRetirement(
       && (judgment === undefined || judgment.status !== "pending");
   }
   if (child.state.outcome.status !== "completed") return false;
-  const result = failureJudgmentTaskResultV2Schema.safeParse(child.state.outcome.result);
+  const result = failureJudgmentTaskResultSchema.safeParse(child.state.outcome.result);
   if (!result.success || judgment === undefined) return false;
   if (result.data.kind === "decided") {
     return judgment.status === "decided" && judgment.decision !== null
@@ -1150,8 +1150,8 @@ async function checkedWorkflowStopRetirement(
 async function blockRun(
   _task: unknown,
   runtime: WorkflowRuntime,
-  input: WorkflowRunTaskInputV2,
-  block: BlockInfoV2,
+  input: WorkflowRunTaskInput,
+  block: BlockInfo,
   context: Context,
   options: { markNode: boolean; stopped?: boolean; retainCapacity?: boolean; taskOutcome?: "completed" | "aborted"; attemptBlockId?: string },
 ): Promise<void> {
@@ -1211,12 +1211,12 @@ async function blockRun(
 
 async function applyFailureJudgment(
   runtime: WorkflowRuntime,
-  input: WorkflowRunTaskInputV2,
+  input: WorkflowRunTaskInput,
   checkpoint: Extract<WorkflowCheckpoint, { phase: "awaitJudgment" }>,
-  decision: JudgmentDecisionV2,
+  decision: JudgmentDecision,
   context: Context,
  ): Promise<void> {
-  const checkedDecision = judgmentDecisionV2Schema.parse(decision);
+  const checkedDecision = judgmentDecisionSchema.parse(decision);
   await runtime.commit(async (tx) => {
     const { draft, run } = await runDraft(tx, runtime.conversationId);
     assertWorkflowIdentity(input, run, runtime.taskId);
@@ -1268,7 +1268,7 @@ async function applyFailureJudgment(
         appliedAt,
       )
       : null;
-    const appliedJudgment = persistedJudgmentV2Schema.parse({ ...judgment, applicationReceipt });
+    const appliedJudgment = persistedJudgmentSchema.parse({ ...judgment, applicationReceipt });
     const nodes = run.nodes.map((value, index) => index !== checkpoint.nodeIndex ? value : {
       ...value,
       status: action === "block" ? "blocked" as const : "failed" as const,
@@ -1410,7 +1410,7 @@ function untrustedFailureExcerpt(value: string): string {
 async function cancelRun(
   _task: unknown,
   runtime: WorkflowRuntime,
-  input: WorkflowRunTaskInputV2,
+  input: WorkflowRunTaskInput,
   context: Context,
 ): Promise<void> {
   await runtime.commit(async (tx) => {
@@ -1479,8 +1479,8 @@ async function cancelRun(
 async function failRun(
   _task: unknown,
   runtime: WorkflowRuntime,
-  input: WorkflowRunTaskInputV2,
-  failure: FailureInfoV2,
+  input: WorkflowRunTaskInput,
+  failure: FailureInfo,
   context: Context,
 ): Promise<boolean> {
   let deferred = false;
@@ -1534,9 +1534,9 @@ async function failRun(
 async function completeRun(
   _task: unknown,
   runtime: WorkflowRuntime,
-  input: WorkflowRunTaskInputV2,
+  input: WorkflowRunTaskInput,
   checkpoint: Extract<WorkflowCheckpoint, { phase: "awaitAttempt" }>,
-  candidate: NodeResultV2,
+  candidate: NodeResult,
   context: Context,
 ): Promise<void> {
   await runtime.commit(async (tx) => {
@@ -1623,9 +1623,9 @@ async function appendEvent(tx: Tx, conversationId: ConversationId, value: unknow
 async function refreshRunViewsBestEffort<I, S extends { phase: string }, R, H extends object>(
   runtime: TaskRuntime<I, S, R, H>,
   context: Context,
-): Promise<RunViewFailureV2[]> {
+): Promise<RunViewFailure[]> {
   const run = await snapshotRun(runtime, context);
-  const failures = materializeRunViewsV2(run);
+  const failures = materializeRunViews(run);
   if (failures.length === 0) return failures;
 
   try {
@@ -1699,7 +1699,7 @@ async function snapshotRun<I, S extends { phase: string }, R, H extends object>(
 }
 async function waitForWorkflowResume(
   runtime: WorkflowRuntime,
-  input: WorkflowRunTaskInputV2,
+  input: WorkflowRunTaskInput,
   context: Context,
 ): Promise<ReadyRun> {
   for (;;) {
@@ -1748,8 +1748,8 @@ function assign(draft: object, value: unknown): void {
 }
 
 
-function parseWorkflowInput(value: unknown): WorkflowRunTaskInputV2 {
-  const parsed = workflowRunTaskInputV2Schema.safeParse(value);
+function parseWorkflowInput(value: unknown): WorkflowRunTaskInput {
+  const parsed = workflowRunTaskInputSchema.safeParse(value);
   if (!parsed.success) throw new Error(`WorkflowRun input failed validation: ${parsed.error.message}`);
   return parsed.data;
 }
@@ -1757,7 +1757,7 @@ function parseWorkflowInput(value: unknown): WorkflowRunTaskInputV2 {
 
 
 
-function assertWorkflowIdentity(input: WorkflowRunTaskInputV2, run: ReadyRun, taskId: number): void {
+function assertWorkflowIdentity(input: WorkflowRunTaskInput, run: ReadyRun, taskId: number): void {
   if (input.runId !== run.runId || input.workflowId !== run.workflowId
     || input.activationId !== run.activationId || input.occurrenceId !== run.occurrenceId
     || run.durable.workflowTaskId !== taskId) throw new Error("WorkflowRun identity differs from canonical run");
@@ -1766,21 +1766,21 @@ function assertWorkflowIdentity(input: WorkflowRunTaskInputV2, run: ReadyRun, ta
 
 
 function blockInfo(
-  kind: BlockInfoV2["kind"],
+  kind: BlockInfo["kind"],
   reason: string,
   runId: string,
   nodeId: string | null,
   attemptId: string | null,
   blockedAt: string,
-): BlockInfoV2 {
-  runIdV2Schema.parse(runId);
-  return blockInfoV2Schema.parse({ blockId: randomUUID(), kind, reason, blockedAt, nodeId, attemptId });
+): BlockInfo {
+  runIdSchema.parse(runId);
+  return blockInfoSchema.parse({ blockId: randomUUID(), kind, reason, blockedAt, nodeId, attemptId });
 }
 
 
 function timestamp(ms: number): string {
   if (!Number.isSafeInteger(ms) || !Number.isFinite(new Date(ms).getTime())) throw new Error("task clock returned an invalid timestamp");
-  return utcTimestampV2Schema.parse(new Date(ms).toISOString());
+  return utcTimestampSchema.parse(new Date(ms).toISOString());
 }
 
 function deadline(startedAt: string, timeoutMs: number | null): string | null {

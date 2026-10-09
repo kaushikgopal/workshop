@@ -5,33 +5,33 @@ import type { Context } from "@earendil-works/chord";
 import { defineTask, type ConversationId, type Task, type TaskRuntime, type Tx } from "@earendil-works/pi-durable";
 import { z } from "zod";
 import { canonicalHash } from "../../definition/hash-canonical-json.js";
-import { parseV2Model } from "../../definition/parse-v2-model.js";
-import { nodeIdV2, workflowIdV2 } from "../../definition/schema-v2.js";
+import { parseModel } from "../../definition/parse-model.js";
+import { nodeIdSchema, workflowIdSchema } from "../../definition/schema.js";
 import {
-  executionIdV2Schema,
-  incarnationIdV2Schema,
-  processCaptureV2Schema,
-  processExitV2Schema,
-  processIdentityV2Schema,
-  processIncarnationV2Schema,
-} from "../../process/schema-v2.js";
+  executionIdSchema,
+  incarnationIdSchema,
+  processCaptureSchema,
+  processExitSchema,
+  processIdentitySchema,
+  processIncarnationSchema,
+} from "../../process/schema.js";
 import { processStartId } from "../../process/identify-process.js";
 import { terminateProcessGroup } from "../../process/kill-process-tree.js";
 import { raceDeadline, spawnTracked, type TrackedProcess } from "../../process/launch-process.js";
 import {
-  attemptIdV2Schema,
-  blockInfoV2Schema,
-  runIdV2Schema,
-  type BlockInfoV2,
-} from "../../run/schema-v2.js";
+  attemptIdSchema,
+  blockInfoSchema,
+  runIdSchema,
+  type BlockInfo,
+} from "../../run/schema.js";
 import {
-  persistedNodeAttemptV2Schema,
+  persistedNodeAttemptSchema,
   workflowRunDocumentV1Schema,
   workshopProcessV1Schema,
   type WorkflowRunDocumentV1,
-} from "../../run/records-v2.js";
+} from "../../run/records.js";
 import { WorkshopProcessEntry, WorkshopRunDoc } from "./define-workshop-records.js";
-import { sha256V2Schema, utcTimestampV2Schema } from "../../util/schema-v2.js";
+import { sha256Schema, utcTimestampSchema } from "../../util/schema.js";
 import { DEFAULT_STREAM_CAP_BYTES } from "../../util/parse-units.js";
 import { readVerifiedRetentionWindow, retainStreamWindow } from "../disk/cap-streams.js";
 
@@ -42,22 +42,22 @@ const MAX_SEMANTIC_OUTPUT_BYTES = 1024 * 1024;
 const MAX_PROCESS_INCARNATIONS = 3;
 const MAX_TIMER_MS = 2_147_000_000;
 
-export const processExecutionTaskInputV2Schema = z.strictObject({
-  runId: runIdV2Schema,
-  workflowId: workflowIdV2,
+export const processExecutionTaskInputSchema = z.strictObject({
+  runId: runIdSchema,
+  workflowId: workflowIdSchema,
   activationId: z.string().min(1),
   occurrenceId: z.string().min(1),
   workflowTaskId: positive,
   nodeTaskId: positive,
-  nodeId: nodeIdV2.nullable(),
-  attemptId: attemptIdV2Schema.nullable(),
-  executionId: executionIdV2Schema,
-  incarnationId: incarnationIdV2Schema,
+  nodeId: nodeIdSchema.nullable(),
+  attemptId: attemptIdSchema.nullable(),
+  executionId: executionIdSchema,
+  incarnationId: incarnationIdSchema,
   incarnationNumber: positive,
   serviceBootId: z.string().uuid(),
   role: z.enum(["worker", "validator", "preflight"]),
-  launchIntentAt: utcTimestampV2Schema,
-  deadlineAt: utcTimestampV2Schema.nullable(),
+  launchIntentAt: utcTimestampSchema,
+  deadlineAt: utcTimestampSchema.nullable(),
   shell: absolutePath,
   command: z.string().min(1),
   cwd: absolutePath,
@@ -68,10 +68,10 @@ export const processExecutionTaskInputV2Schema = z.strictObject({
   stderrPath: absolutePath,
   env: z.record(z.string(), z.string()),
 });
-export type ProcessExecutionTaskInputV2 = z.infer<typeof processExecutionTaskInputV2Schema>;
-export type ProcessExecutionTaskEnvironmentInputV2 = Omit<ProcessExecutionTaskInputV2, "env">;
+export type ProcessExecutionTaskInput = z.infer<typeof processExecutionTaskInputSchema>;
+export type ProcessExecutionTaskEnvironmentInput = Omit<ProcessExecutionTaskInput, "env">;
 
-export function processExecutionCapturePathsV2(captureDirectory: string, executionId: string, incarnationId: string) {
+export function processExecutionCapturePaths(captureDirectory: string, executionId: string, incarnationId: string) {
   const prefix = join(captureDirectory, `${executionId}-${incarnationId}`);
   return {
     stdoutPath: `${prefix}.stdout`,
@@ -81,13 +81,13 @@ export function processExecutionCapturePathsV2(captureDirectory: string, executi
   };
 }
 
-export function buildProcessExecutionEnvironmentV2(
-  input: ProcessExecutionTaskEnvironmentInputV2,
+export function buildProcessExecutionEnvironment(
+  input: ProcessExecutionTaskEnvironmentInput,
   runDocument: WorkflowRunDocumentV1,
   attemptNumber: number | null,
 ): Record<string, string> {
   const run = readyRun(runDocument);
-  const paths = processExecutionCapturePathsV2(run.paths.captureDirectory, input.executionId, input.incarnationId);
+  const paths = processExecutionCapturePaths(run.paths.captureDirectory, input.executionId, input.incarnationId);
   if (input.role === "preflight") {
     if (input.nodeId !== null || input.attemptId !== null || attemptNumber !== null || run.resolvedSettings.preflight === null) {
       throw new Error("preflight process identity differs from frozen workflow settings");
@@ -119,7 +119,7 @@ export function buildProcessExecutionEnvironmentV2(
     WORKSHOP_STDERR_FILE: paths.stderrPath,
   };
   if (site.kind === "agent") {
-    const model = parseV2Model(site.model);
+    const model = parseModel(site.model);
     env.WORKSHOP_PROMPT_FILE = paths.promptPath;
     env.WORKSHOP_RESULT_FILE = paths.resultPath;
     env.WORKSHOP_PROVIDER = model.provider;
@@ -131,24 +131,24 @@ export function buildProcessExecutionEnvironmentV2(
   return env;
 }
 
-const processCheckpointV2Schema = z.discriminatedUnion("phase", [
+const processCheckpointSchema = z.discriminatedUnion("phase", [
   z.strictObject({ phase: z.literal("intent") }),
-  z.strictObject({ phase: z.literal("launch"), process: processIncarnationV2Schema }),
-  z.strictObject({ phase: z.literal("monitor"), process: processIncarnationV2Schema }),
+  z.strictObject({ phase: z.literal("launch"), process: processIncarnationSchema }),
+  z.strictObject({ phase: z.literal("monitor"), process: processIncarnationSchema }),
 ]);
-type ProcessCheckpointV2 = z.infer<typeof processCheckpointV2Schema>;
+type ProcessCheckpoint = z.infer<typeof processCheckpointSchema>;
 
-const semanticStdoutV2Schema = z.discriminatedUnion("kind", [
+const semanticStdoutSchema = z.discriminatedUnion("kind", [
   z.strictObject({
     kind: z.literal("captured"),
     text: z.string(),
     byteCount: nonnegative,
-    sha256: sha256V2Schema,
+    sha256: sha256Schema,
   }),
   z.strictObject({
     kind: z.literal("invalid_utf8"),
     byteCount: nonnegative,
-    sha256: sha256V2Schema,
+    sha256: sha256Schema,
   }),
   z.strictObject({ kind: z.literal("too_large"), byteCount: positive }),
   z.strictObject({ kind: z.literal("not_captured") }),
@@ -163,48 +163,48 @@ const semanticStdoutV2Schema = z.discriminatedUnion("kind", [
   }
 });
 
-export const processExecutionTaskResultV2Schema = z.discriminatedUnion("kind", [
+export const processExecutionTaskResultSchema = z.discriminatedUnion("kind", [
   z.strictObject({
     kind: z.literal("exited"),
-    exit: processExitV2Schema,
+    exit: processExitSchema,
     timedOut: z.boolean(),
-    stdoutCaptureHash: sha256V2Schema,
-    stderrCaptureHash: sha256V2Schema,
-    semanticStdout: semanticStdoutV2Schema,
+    stdoutCaptureHash: sha256Schema,
+    stderrCaptureHash: sha256Schema,
+    semanticStdout: semanticStdoutSchema,
   }),
   z.strictObject({
     kind: z.literal("cancelled"),
-    executionId: executionIdV2Schema,
-    incarnationId: incarnationIdV2Schema,
+    executionId: executionIdSchema,
+    incarnationId: incarnationIdSchema,
     incarnationNumber: positive,
-    identity: processIdentityV2Schema,
-    exit: processExitV2Schema,
+    identity: processIdentitySchema,
+    exit: processExitSchema,
     cleanupState: z.literal("confirmed_dead"),
   }),
   z.strictObject({
     kind: z.literal("replayable"),
-    executionId: executionIdV2Schema,
-    incarnationId: incarnationIdV2Schema,
+    executionId: executionIdSchema,
+    incarnationId: incarnationIdSchema,
     incarnationNumber: positive,
-    launchIntentAt: utcTimestampV2Schema,
-    deadlineAt: utcTimestampV2Schema.nullable(),
+    launchIntentAt: utcTimestampSchema,
+    deadlineAt: utcTimestampSchema.nullable(),
   }),
-  z.strictObject({ kind: z.literal("blocked"), block: blockInfoV2Schema }),
+  z.strictObject({ kind: z.literal("blocked"), block: blockInfoSchema }),
 ]);
-export type ProcessExecutionTaskResultV2 = z.infer<typeof processExecutionTaskResultV2Schema>;
+export type ProcessExecutionTaskResult = z.infer<typeof processExecutionTaskResultSchema>;
 
 type ReadyRun = Extract<WorkflowRunDocumentV1, { state: "ready" }>;
-type PersistedNodeAttempt = z.infer<typeof persistedNodeAttemptV2Schema>;
-type ProcessRuntime = TaskRuntime<ProcessExecutionTaskInputV2, ProcessCheckpointV2, ProcessExecutionTaskResultV2, object>;
-export type ProcessExecutionTaskV2 = Task<ProcessExecutionTaskInputV2, ProcessCheckpointV2, ProcessExecutionTaskResultV2, object>;
+type PersistedNodeAttempt = z.infer<typeof persistedNodeAttemptSchema>;
+type ProcessRuntime = TaskRuntime<ProcessExecutionTaskInput, ProcessCheckpoint, ProcessExecutionTaskResult, object>;
+export type ProcessExecutionTaskDefinition = Task<ProcessExecutionTaskInput, ProcessCheckpoint, ProcessExecutionTaskResult, object>;
 
 /** Owns OS-process lifecycle and capture evidence for every Durable execution role. */
-export function defineProcessExecutionTaskV2(
+export function defineProcessExecutionTask(
   serviceBootId: string = randomUUID(),
   options: { readonly startupLaunchGate?: "open" | "closed" } = {},
 ): {
   readonly serviceBootId: string;
-  readonly task: ProcessExecutionTaskV2;
+  readonly task: ProcessExecutionTaskDefinition;
   readonly stopLaunching: () => void;
   readonly canLaunch: () => boolean;
   readonly openStartupLaunchGate: () => void;
@@ -222,7 +222,7 @@ export function defineProcessExecutionTaskV2(
   const launched = new Set<string>();
   const trackedProcesses = new Map<string, TrackedProcess>();
 
-  const task = defineTask<ProcessExecutionTaskInputV2, ProcessCheckpointV2, ProcessExecutionTaskResultV2>({
+  const task = defineTask<ProcessExecutionTaskInput, ProcessCheckpoint, ProcessExecutionTaskResult>({
     name: "workshop.process-execution",
     version: 4,
     initial: () => ({ phase: "intent" }),
@@ -233,7 +233,7 @@ export function defineProcessExecutionTaskV2(
         const run = await snapshotRun(runtime, context);
         assertProcessIdentity(input, run);
         const at = timestamp(runtime.now());
-        const process = processIncarnationV2Schema.parse({
+        const process = processIncarnationSchema.parse({
           executionId: input.executionId,
           incarnationId: input.incarnationId,
           incarnationNumber: input.incarnationNumber,
@@ -276,7 +276,7 @@ export function defineProcessExecutionTaskV2(
       },
       launch: async (task, runtime, context) => {
         const input = parseProcessInput(task.input);
-        const checkpoint = processCheckpointV2Schema.parse(task.state.checkpoint);
+        const checkpoint = processCheckpointSchema.parse(task.state.checkpoint);
         if (checkpoint.phase !== "launch") throw new Error("launch checkpoint lacks process intent");
         const process = checkpoint.process;
         const run = await snapshotRun(runtime, context);
@@ -341,11 +341,11 @@ export function defineProcessExecutionTaskV2(
           return;
         }
         trackedProcesses.set(input.executionId, child);
-        const running = processIncarnationV2Schema.parse({
+        const running = processIncarnationSchema.parse({
           ...process,
           status: "running",
           startedAt: timestamp(runtime.now()),
-          identity: processIdentityV2Schema.parse({
+          identity: processIdentitySchema.parse({
             pid: child.pid,
             pgid: child.pgid,
             startIdentity: child.startId,
@@ -369,7 +369,7 @@ export function defineProcessExecutionTaskV2(
       },
       monitor: async (task, runtime, context) => {
         const input = parseProcessInput(task.input);
-        const checkpoint = processCheckpointV2Schema.parse(task.state.checkpoint);
+        const checkpoint = processCheckpointSchema.parse(task.state.checkpoint);
         if (checkpoint.phase !== "monitor") throw new Error("monitor checkpoint lacks process identity");
         const process = checkpoint.process;
         const identity = process.identity;
@@ -390,7 +390,7 @@ export function defineProcessExecutionTaskV2(
             trackedProcesses.delete(input.executionId);
             return;
           }
-          const captures = await recoverRetainedProcessCaptureRecordsV2(input);
+          const captures = await recoverRetainedProcessCaptureRecords(input);
           await blockProcess(
             task,
             runtime,
@@ -428,13 +428,13 @@ export function defineProcessExecutionTaskV2(
         const stats = child.captures();
         const finishedAt = timestamp(runtime.now());
         const semantic = child.semanticStdout();
-        const captures = await captureProcessRecordsV2(input, stats);
+        const captures = await captureProcessRecords(input, stats);
         const stdoutCapture = captures.find((capture) => capture.stream === "stdout");
         const stderrCapture = captures.find((capture) => capture.stream === "stderr");
         const normalizedExit = exitRecord(exit);
         if (stats.stdout.error !== null || stats.stderr.error !== null
           || stdoutCapture?.sha256 == null || stderrCapture?.sha256 == null || normalizedExit === null) {
-          const blocked = processIncarnationV2Schema.parse({
+          const blocked = processIncarnationSchema.parse({
             ...process,
             status: "blocked",
             finishedAt,
@@ -446,7 +446,7 @@ export function defineProcessExecutionTaskV2(
           trackedProcesses.delete(input.executionId);
           return;
         }
-        const exited = processIncarnationV2Schema.parse({
+        const exited = processIncarnationSchema.parse({
           ...process,
           status: "exited",
           finishedAt,
@@ -454,7 +454,7 @@ export function defineProcessExecutionTaskV2(
           cleanupState: "confirmed_dead",
           captures,
         });
-        let semanticStdout: z.infer<typeof semanticStdoutV2Schema>;
+        let semanticStdout: z.infer<typeof semanticStdoutSchema>;
         if (semantic === null) semanticStdout = { kind: "not_captured" };
         else if (semantic.tooLarge) semanticStdout = { kind: "too_large", byteCount: semantic.totalBytes };
         else {
@@ -470,7 +470,7 @@ export function defineProcessExecutionTaskV2(
             semanticStdout = { kind: "invalid_utf8", byteCount: semantic.totalBytes, sha256: semantic.sha256 };
           }
         }
-        const result = processExecutionTaskResultV2Schema.parse({
+        const result = processExecutionTaskResultSchema.parse({
           kind: "exited",
           exit: normalizedExit,
           timedOut: waited.kind === "timeout",
@@ -490,7 +490,7 @@ export function defineProcessExecutionTaskV2(
     },
     abort: async (task, runtime, context) => {
       const input = parseProcessInput(task.input);
-      const parsed = processCheckpointV2Schema.safeParse(task.state.checkpoint);
+      const parsed = processCheckpointSchema.safeParse(task.state.checkpoint);
       if (!parsed.success) {
         const block = blockInfo("process_death_unconfirmed", "process checkpoint failed validation; cleanup and exit remain unknown", input.runId, input.nodeId, input.attemptId, timestamp(runtime.now()));
         await runtime.commit(() => ({ status: "terminal", outcome: { status: "completed", result: { kind: "blocked", block } } }), context);
@@ -519,18 +519,18 @@ export function defineProcessExecutionTaskV2(
         dead = await terminateProcessGroup(process.identity.pgid);
       }
       let observedExit: ReturnType<typeof exitRecord> = null;
-      let captures: Awaited<ReturnType<typeof captureProcessRecordsV2>> = process.captures;
+      let captures: Awaited<ReturnType<typeof captureProcessRecords>> = process.captures;
       let finishedAt: string | null = null;
       if (dead && identityMatches && child !== undefined && process.identity !== null) {
         const exit = await child.exit;
         await child.streamsClosed;
         const stats = child.captures();
         finishedAt = timestamp(runtime.now());
-        captures = await captureProcessRecordsV2(input, stats, { bestEffort: true });
+        captures = await captureProcessRecords(input, stats, { bestEffort: true });
         observedExit = exitRecord(exit);
         if (operatorStopRequested && observedExit !== null && finishedAt !== null) {
           const completedAt = finishedAt;
-          const retired = processIncarnationV2Schema.parse({
+          const retired = processIncarnationSchema.parse({
             ...process,
             status: "exited",
             finishedAt: completedAt,
@@ -538,7 +538,7 @@ export function defineProcessExecutionTaskV2(
             cleanupState: "confirmed_dead",
             captures,
           });
-          const result = processExecutionTaskResultV2Schema.parse({
+          const result = processExecutionTaskResultSchema.parse({
             kind: "cancelled",
             executionId: input.executionId,
             incarnationId: input.incarnationId,
@@ -551,7 +551,7 @@ export function defineProcessExecutionTaskV2(
             const { draft, run: current } = await runDraft(tx, runtime.conversationId);
             assertProcessIdentity(input, current, { requireReference: true, requireExecuting: false });
             if (current.desiredState !== "stopped" || current.block !== null) {
-              const blockedReceipt = processIncarnationV2Schema.parse({
+              const blockedReceipt = processIncarnationSchema.parse({
                 ...process,
                 status: "blocked",
                 finishedAt: completedAt,
@@ -571,11 +571,11 @@ export function defineProcessExecutionTaskV2(
         }
       } else if (dead && child === undefined && process.identity !== null) {
         finishedAt = timestamp(runtime.now());
-        captures = await recoverProcessCaptureRecordsV2(input);
+        captures = await recoverProcessCaptureRecords(input);
       }
       const block = blockInfo("process_death_unconfirmed", "process was aborted before a checked operator-stop receipt", input.runId, input.nodeId, input.attemptId, timestamp(runtime.now()));
       const confirmedIdentity = process.identity !== null;
-      const blocked = processIncarnationV2Schema.parse({
+      const blocked = processIncarnationSchema.parse({
         ...process,
         status: "blocked",
         ...(finishedAt === null ? {} : { finishedAt }),
@@ -624,16 +624,16 @@ async function waitForStartupLaunchGate(
 async function blockProcess(
   _task: unknown,
   runtime: ProcessRuntime,
-  input: ProcessExecutionTaskInputV2,
-  process: z.infer<typeof processIncarnationV2Schema>,
-  kind: BlockInfoV2["kind"],
+  input: ProcessExecutionTaskInput,
+  process: z.infer<typeof processIncarnationSchema>,
+  kind: BlockInfo["kind"],
   reason: string,
   context: Context,
   cleanup: "confirmed_dead" | "unconfirmed" = "unconfirmed",
   captures = process.captures,
 ): Promise<void> {
   const block = blockInfo(kind, reason, input.runId, input.nodeId, input.attemptId, timestamp(runtime.now()));
-  const blocked = processIncarnationV2Schema.parse({ ...process, status: "blocked", cleanupState: cleanup, captures });
+  const blocked = processIncarnationSchema.parse({ ...process, status: "blocked", cleanupState: cleanup, captures });
   await runtime.commit(async (tx) => {
     await appendProcess(tx, runtime.conversationId, input, Number(runtime.taskId), blocked, timestamp(runtime.now()));
     return { status: "terminal", outcome: { status: "completed", result: { kind: "blocked", block } } };
@@ -642,8 +642,8 @@ async function blockProcess(
 
 async function settleRecoveredProcess(
   runtime: ProcessRuntime,
-  input: ProcessExecutionTaskInputV2,
-  process: z.infer<typeof processIncarnationV2Schema>,
+  input: ProcessExecutionTaskInput,
+  process: z.infer<typeof processIncarnationSchema>,
   context: Context,
 ): Promise<void> {
   if (process.executionId !== input.executionId || process.incarnationId !== input.incarnationId
@@ -653,21 +653,21 @@ async function settleRecoveredProcess(
   }
   const now = runtime.now();
   const recoveredAt = timestamp(now);
-  const captures = await recoverProcessCaptureRecordsV2(input);
-  const blocked = processIncarnationV2Schema.parse({
+  const captures = await recoverProcessCaptureRecords(input);
+  const blocked = processIncarnationSchema.parse({
     ...process,
     status: "blocked",
     finishedAt: recoveredAt,
     cleanupState: "confirmed_dead",
     captures,
   });
-  const nextIncarnationId = incarnationIdV2Schema.parse(randomUUID());
+  const nextIncarnationId = incarnationIdSchema.parse(randomUUID());
   await runtime.commit(async (tx) => {
     const { draft, run } = await runDraft(tx, runtime.conversationId);
     assertProcessIdentity(input, run, { requireReference: true, requireExecuting: false });
     assign(draft, run);
     await appendProcess(tx, runtime.conversationId, input, Number(runtime.taskId), blocked, timestamp(now));
-    const reason = decideProcessReplayV2({
+    const reason = decideProcessReplay({
       replayPolicy: input.replay,
       recordedReplayPolicy: process.replay,
       incarnationNumber: process.incarnationNumber,
@@ -699,7 +699,7 @@ async function settleRecoveredProcess(
   }, context);
 }
 
-export function decideProcessReplayV2(input: {
+export function decideProcessReplay(input: {
   readonly replayPolicy: "safe" | "never";
   readonly recordedReplayPolicy: "safe" | "never";
   readonly incarnationNumber: number;
@@ -719,7 +719,7 @@ export function decideProcessReplayV2(input: {
   return null;
 }
 
-function validProcessDeadline(input: ProcessExecutionTaskInputV2, timeoutMs: number | null): boolean {
+function validProcessDeadline(input: ProcessExecutionTaskInput, timeoutMs: number | null): boolean {
   if (timeoutMs === null) return input.deadlineAt === null;
   if (input.deadlineAt === null) return false;
   const launchTime = Date.parse(input.launchIntentAt);
@@ -731,7 +731,7 @@ function validProcessDeadline(input: ProcessExecutionTaskInputV2, timeoutMs: num
     && (input.incarnationNumber === 1 ? remaining === timeoutMs : remaining <= timeoutMs);
 }
 
-function processCommandHash(input: ProcessExecutionTaskInputV2): string {
+function processCommandHash(input: ProcessExecutionTaskInput): string {
   const {
     WORKSHOP_STDOUT_FILE: _stdoutPath,
     WORKSHOP_STDERR_FILE: _stderrPath,
@@ -773,15 +773,15 @@ function requireAttempt(run: ReadyRun, nodeId: string, attemptId: string): Persi
 }
 
 function assertProcessIdentity(
-  input: ProcessExecutionTaskInputV2,
+  input: ProcessExecutionTaskInput,
   run: ReadyRun,
   options: { requireReference?: boolean; requireExecuting?: boolean } = {},
 ): void {
   const { requireReference = false, requireExecuting = true } = options;
   if (input.role === "preflight") {
     const site = run.resolvedSettings.preflight;
-    const expectedEnv = buildProcessExecutionEnvironmentV2(input, run, null);
-    const paths = processExecutionCapturePathsV2(run.paths.captureDirectory, input.executionId, input.incarnationId);
+    const expectedEnv = buildProcessExecutionEnvironment(input, run, null);
+    const paths = processExecutionCapturePaths(run.paths.captureDirectory, input.executionId, input.incarnationId);
     const validDeadline = site !== null && site !== undefined
       && validProcessDeadline(input, site.timeoutMs);
     const authorized = run.preflight.kind === "pending"
@@ -813,8 +813,8 @@ function assertProcessIdentity(
   const recordedIncarnationIndex = executionIncarnations.findIndex((item) => item.incarnationId === input.incarnationId);
   const hasReference = recordedIncarnationIndex >= 0;
   const expectedIncarnationNumber = hasReference ? recordedIncarnationIndex + 1 : executionIncarnations.length + 1;
-  const expectedEnv = buildProcessExecutionEnvironmentV2(input, run, attempt.number);
-  const paths = processExecutionCapturePathsV2(run.paths.captureDirectory, input.executionId, input.incarnationId);
+  const expectedEnv = buildProcessExecutionEnvironment(input, run, attempt.number);
+  const paths = processExecutionCapturePaths(run.paths.captureDirectory, input.executionId, input.incarnationId);
   const validDeadline = site !== undefined && site !== null
     && validProcessDeadline(input, site.timeoutMs);
   if (input.runId !== run.runId || input.workflowId !== run.workflowId
@@ -835,9 +835,9 @@ function assertProcessIdentity(
 async function appendProcess(
   tx: Tx,
   conversationId: ConversationId,
-  input: ProcessExecutionTaskInputV2,
+  input: ProcessExecutionTaskInput,
   taskId: number,
-  process: z.infer<typeof processIncarnationV2Schema>,
+  process: z.infer<typeof processIncarnationSchema>,
   recordedAt: string,
 ): Promise<void> {
   const checked = workshopProcessV1Schema.safeParse({
@@ -853,8 +853,8 @@ async function appendProcess(
   await tx.appendEntry(WorkshopProcessEntry, conversationId, { data: checked.data });
 }
 
-function parseProcessInput(value: unknown): ProcessExecutionTaskInputV2 {
-  const parsed = processExecutionTaskInputV2Schema.safeParse(value);
+function parseProcessInput(value: unknown): ProcessExecutionTaskInput {
+  const parsed = processExecutionTaskInputSchema.safeParse(value);
   if (!parsed.success) throw new Error(`ProcessExecution input failed validation: ${parsed.error.message}`);
   return parsed.data;
 }
@@ -883,20 +883,20 @@ function assign(draft: object, value: unknown): void {
 }
 
 function blockInfo(
-  kind: BlockInfoV2["kind"],
+  kind: BlockInfo["kind"],
   reason: string,
   runId: string,
   nodeId: string | null,
   attemptId: string | null,
   blockedAt: string,
-): BlockInfoV2 {
-  runIdV2Schema.parse(runId);
-  return blockInfoV2Schema.parse({ blockId: randomUUID(), kind, reason, blockedAt, nodeId, attemptId });
+): BlockInfo {
+  runIdSchema.parse(runId);
+  return blockInfoSchema.parse({ blockId: randomUUID(), kind, reason, blockedAt, nodeId, attemptId });
 }
 
 function timestamp(ms: number): string {
   if (!Number.isSafeInteger(ms) || !Number.isFinite(new Date(ms).getTime())) throw new Error("task clock returned an invalid timestamp");
-  return utcTimestampV2Schema.parse(new Date(ms).toISOString());
+  return utcTimestampSchema.parse(new Date(ms).toISOString());
 }
 
 async function waitForExit(child: TrackedProcess, deadlineAt: string | null) {
@@ -912,8 +912,8 @@ async function waitForExit(child: TrackedProcess, deadlineAt: string | null) {
 }
 
 function exitRecord(exit: { code: number | null; signal: NodeJS.Signals | null }) {
-  if (exit.code !== null && exit.code >= 0) return processExitV2Schema.parse({ kind: "code", code: exit.code });
-  if (exit.signal !== null) return processExitV2Schema.parse({ kind: "signal", signal: exit.signal });
+  if (exit.code !== null && exit.code >= 0) return processExitSchema.parse({ kind: "code", code: exit.code });
+  if (exit.signal !== null) return processExitSchema.parse({ kind: "signal", signal: exit.signal });
   return null;
 }
 
@@ -921,18 +921,18 @@ function sha256(bytes: Uint8Array): string {
   return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
 }
 
-export type ProcessCaptureFilesV2 = Pick<ProcessExecutionTaskInputV2, "stdoutPath" | "stderrPath" | "streamCapBytes">;
+export type ProcessCaptureFiles = Pick<ProcessExecutionTaskInput, "stdoutPath" | "stderrPath" | "streamCapBytes">;
 
-export interface CaptureProcessRecordsOptionsV2 {
+export interface CaptureProcessRecordsOptions {
   readonly bestEffort?: boolean;
   readonly hashFile?: (path: string) => Promise<string>;
 }
 
 /** Persist post-exit stream evidence; monitor and abort may call this concurrently. */
-export async function captureProcessRecordsV2(
-  input: ProcessCaptureFilesV2,
+export async function captureProcessRecords(
+  input: ProcessCaptureFiles,
   stats: ReturnType<TrackedProcess["captures"]>,
-  options: CaptureProcessRecordsOptionsV2 = {},
+  options: CaptureProcessRecordsOptions = {},
 ) {
   const captures = [];
   const hashFile = options.hashFile ?? sha256File;
@@ -958,7 +958,7 @@ export async function captureProcessRecordsV2(
     const totalBytes = retention?.totalBytes ?? Math.max(item.stats.totalBytes, currentBytes);
     const retainedBytes = retention?.retainedBytes ?? Math.min(totalBytes, currentBytes);
     const truncatedBytes = totalBytes - retainedBytes;
-    captures.push(processCaptureV2Schema.parse({
+    captures.push(processCaptureSchema.parse({
       stream: item.stream,
       path: item.path,
       totalBytes,
@@ -977,7 +977,7 @@ export async function captureProcessRecordsV2(
 }
 
 /** Recover readable diagnostics after confirmed death without claiming a checked exit or complete stream. */
-export async function recoverProcessCaptureRecordsV2(input: ProcessCaptureFilesV2) {
+export async function recoverProcessCaptureRecords(input: ProcessCaptureFiles) {
   const captures = [];
   for (const item of [
     { stream: "stdout" as const, path: input.stdoutPath },
@@ -987,7 +987,7 @@ export async function recoverProcessCaptureRecordsV2(input: ProcessCaptureFilesV
     try {
       const retention = retainStreamWindow(item.path, input.streamCapBytes);
       const sha256 = await sha256File(item.path);
-      captures.push(processCaptureV2Schema.parse({
+      captures.push(processCaptureSchema.parse({
         stream: item.stream,
         path: item.path,
         ...retention,
@@ -1002,8 +1002,8 @@ export async function recoverProcessCaptureRecordsV2(input: ProcessCaptureFilesV
 }
 
 /** Recover only captures whose retained file still matches its durable receipt. */
-export async function recoverRetainedProcessCaptureRecordsV2(input: ProcessCaptureFilesV2) {
-  const captures: z.infer<typeof processCaptureV2Schema>[] = [];
+export async function recoverRetainedProcessCaptureRecords(input: ProcessCaptureFiles) {
+  const captures: z.infer<typeof processCaptureSchema>[] = [];
   for (const item of [
     { stream: "stdout" as const, path: input.stdoutPath },
     { stream: "stderr" as const, path: input.stderrPath },
@@ -1011,7 +1011,7 @@ export async function recoverRetainedProcessCaptureRecordsV2(input: ProcessCaptu
     const retained = readVerifiedRetentionWindow(item.path, input.streamCapBytes);
     if (retained === null) continue;
     const { retainedSha256, ...window } = retained;
-    captures.push(processCaptureV2Schema.parse({
+    captures.push(processCaptureSchema.parse({
       stream: item.stream,
       path: item.path,
       ...window,

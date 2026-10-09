@@ -2,35 +2,35 @@ import { randomUUID } from "node:crypto";
 import type { Context } from "@earendil-works/chord";
 import { defineTask, type ConversationId, type Task, type TaskRuntime, type Tx } from "@earendil-works/pi-durable";
 import { z } from "zod";
-import { workflowIdV2 } from "../../definition/schema-v2.js";
-import { installationDocumentV1Schema } from "../../installation/schema-v2.js";
-import { runIdV2Schema } from "../../run/schema-v2.js";
+import { workflowIdSchema } from "../../definition/schema.js";
+import { installationDocumentV1Schema } from "../../installation/schema.js";
+import { runIdSchema } from "../../run/schema.js";
 import {
   workflowRunDocumentV1Schema,
   workshopEventV1Schema,
   type WorkflowRunDocumentV1,
-} from "../../run/records-v2.js";
+} from "../../run/records.js";
 import { WorkshopEventEntry, WorkshopInstallationDoc, WorkshopRunDoc } from "./define-workshop-records.js";
-import { utcTimestampV2Schema } from "../../util/schema-v2.js";
+import { utcTimestampSchema } from "../../util/schema.js";
 
 const positive = z.number().int().positive().refine(Number.isSafeInteger);
 
-export const capacityGateTaskInputV2Schema = z.strictObject({
-  runId: runIdV2Schema,
-  workflowId: workflowIdV2,
+export const capacityGateTaskInputSchema = z.strictObject({
+  runId: runIdSchema,
+  workflowId: workflowIdSchema,
   activationId: z.string().min(1),
   occurrenceId: z.string().min(1),
   workflowTaskId: positive,
 });
-export type CapacityGateTaskInputV2 = z.infer<typeof capacityGateTaskInputV2Schema>;
+export type CapacityGateTaskInput = z.infer<typeof capacityGateTaskInputSchema>;
 
-export function createCapacityGateTaskInputV2(input: CapacityGateTaskInputV2): CapacityGateTaskInputV2 {
-  return capacityGateTaskInputV2Schema.parse(input);
+export function createCapacityGateTaskInput(input: CapacityGateTaskInput): CapacityGateTaskInput {
+  return capacityGateTaskInputSchema.parse(input);
 }
 
 const capacityGateCheckpointSchema = z.discriminatedUnion("phase", [
   z.strictObject({ phase: z.literal("acquire") }),
-  z.strictObject({ phase: z.literal("wait"), wakeAt: utcTimestampV2Schema }),
+  z.strictObject({ phase: z.literal("wait"), wakeAt: utcTimestampSchema }),
 ]);
 export type CapacityGateCheckpoint = z.infer<typeof capacityGateCheckpointSchema>;
 
@@ -40,14 +40,14 @@ export const capacityGateOutcomeSchema = z.discriminatedUnion("kind", [
 ]);
 export type CapacityGateOutcome = z.infer<typeof capacityGateOutcomeSchema>;
 
-export type CapacityGateTaskV2 = Task<CapacityGateTaskInputV2, CapacityGateCheckpoint, CapacityGateOutcome, object>;
-type CapacityGateRuntime = TaskRuntime<CapacityGateTaskInputV2, CapacityGateCheckpoint, CapacityGateOutcome, object>;
+export type CapacityGateTaskDefinition = Task<CapacityGateTaskInput, CapacityGateCheckpoint, CapacityGateOutcome, object>;
+type CapacityGateRuntime = TaskRuntime<CapacityGateTaskInput, CapacityGateCheckpoint, CapacityGateOutcome, object>;
 type ReadyRun = Extract<WorkflowRunDocumentV1, { state: "ready" }>;
 
 export function defineCapacityGateTask(
   refreshViews: (runtime: CapacityGateRuntime, context: Context) => Promise<unknown>,
-): CapacityGateTaskV2 {
-  return defineTask<CapacityGateTaskInputV2, CapacityGateCheckpoint, CapacityGateOutcome>({
+): CapacityGateTaskDefinition {
+  return defineTask<CapacityGateTaskInput, CapacityGateCheckpoint, CapacityGateOutcome>({
     name: "workshop.capacity-gate",
     version: 1,
     initial: () => ({ phase: "acquire" }),
@@ -118,13 +118,13 @@ export function defineCapacityGateTask(
   });
 }
 
-function parseCapacityGateInput(value: unknown): CapacityGateTaskInputV2 {
-  const parsed = capacityGateTaskInputV2Schema.safeParse(value);
+function parseCapacityGateInput(value: unknown): CapacityGateTaskInput {
+  const parsed = capacityGateTaskInputSchema.safeParse(value);
   if (!parsed.success) throw new Error(`CapacityGate input failed validation: ${parsed.error.message}`);
   return parsed.data;
 }
 
-function assertCapacityGateIdentity(input: CapacityGateTaskInputV2, run: ReadyRun, taskId: number): void {
+function assertCapacityGateIdentity(input: CapacityGateTaskInput, run: ReadyRun, taskId: number): void {
   if (input.runId !== run.runId || input.workflowId !== run.workflowId
     || input.activationId !== run.activationId || input.occurrenceId !== run.occurrenceId
     || run.durable.workflowTaskId !== input.workflowTaskId || !Number.isSafeInteger(taskId) || taskId <= 0) {
@@ -156,5 +156,5 @@ function readyRun(value: unknown): ReadyRun {
 
 function timestamp(ms: number): string {
   if (!Number.isSafeInteger(ms) || !Number.isFinite(new Date(ms).getTime())) throw new Error("task clock returned an invalid timestamp");
-  return utcTimestampV2Schema.parse(new Date(ms).toISOString());
+  return utcTimestampSchema.parse(new Date(ms).toISOString());
 }

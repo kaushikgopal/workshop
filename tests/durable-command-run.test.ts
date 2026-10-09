@@ -8,30 +8,30 @@ import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-work
 import { createModels } from "@earendil-works/pi-ai/models";
 import { createRegistry, defineTask, Harness, type ConversationId, type TaskId, type ToolExecutionApi, type ToolRegistration, type Tx } from "@earendil-works/pi-durable";
 import { describe, expect, test } from "bun:test";
-import { checkV2DefinitionText } from "../src/definition/check-v2-definition.js";
-import type { ResolvedExecutionSiteV2 } from "../src/definition/schema-resolved-v2.js";
-import { resolveV2WorkflowSettings } from "../src/definition/resolve-v2-workflow-settings.js";
-import { installationDocumentV1Schema } from "../src/installation/schema-v2.js";
-import { attemptIdV2Schema, nodeResultV2Schema, runOutcomeV2Schema } from "../src/run/schema-v2.js";
-import { executionIdV2Schema, incarnationIdV2Schema } from "../src/process/schema-v2.js";
+import { checkDefinitionText } from "../src/definition/check-definition.js";
+import type { ResolvedExecutionSite } from "../src/definition/schema-resolved.js";
+import { resolveWorkflowSettings } from "../src/definition/resolve-workflow-settings.js";
+import { installationDocumentV1Schema } from "../src/installation/schema.js";
+import { attemptIdSchema, nodeResultSchema, runOutcomeSchema } from "../src/run/schema.js";
+import { executionIdSchema, incarnationIdSchema } from "../src/process/schema.js";
 import { terminateProcessGroup } from "../src/process/kill-process-tree.js";
-import { workflowRunDocumentV1Schema, workshopEventV1Schema, workshopJudgmentV1Schema, workshopProcessV1Schema } from "../src/run/records-v2.js";
-import { prepareRunAdmissionV2 } from "../src/run/prepare-admission-v2.js";
-import { admitPreparedRunV2 } from "../src/storage/durable/admit-run.js";
+import { workflowRunDocumentV1Schema, workshopEventV1Schema, workshopJudgmentV1Schema, workshopProcessV1Schema } from "../src/run/records.js";
+import { prepareRunAdmission } from "../src/run/prepare-admission.js";
+import { admitPreparedRun } from "../src/storage/durable/admit-run.js";
 import { WorkshopInstallationDoc, WorkshopRunDoc } from "../src/storage/durable/define-workshop-records.js";
 import {
-  buildProcessExecutionEnvironmentV2,
-  decideProcessReplayV2,
-  processExecutionCapturePathsV2,
-  processExecutionTaskInputV2Schema,
-  processExecutionTaskResultV2Schema,
-  type ProcessExecutionTaskEnvironmentInputV2,
+  buildProcessExecutionEnvironment,
+  decideProcessReplay,
+  processExecutionCapturePaths,
+  processExecutionTaskInputSchema,
+  processExecutionTaskResultSchema,
+  type ProcessExecutionTaskEnvironmentInput,
 } from "../src/storage/durable/define-process-execution-task.js";
-import { parseWorkerResultBytesV2 } from "../src/attempt/parse-v2-result.js";
-import { createWorkflowRunTaskInputV2, defineWorkshopTasksV2, parseWorkflowRunTaskInputV2 } from "../src/storage/durable/define-workshop-tasks.js";
-import { FAILURE_JUDGMENT_DECISION_TOOL_NAME, FailureJudgmentExtension, failureJudgmentTaskInputV2Schema, failureJudgmentTaskResultV2Schema } from "../src/storage/durable/define-failure-judgment-task.js";
+import { parseWorkerResultBytes } from "../src/attempt/parse-result.js";
+import { createWorkflowRunTaskInput, defineWorkshopTasks, parseWorkflowRunTaskInput } from "../src/storage/durable/define-workshop-tasks.js";
+import { FAILURE_JUDGMENT_DECISION_TOOL_NAME, FailureJudgmentExtension, failureJudgmentTaskInputSchema, failureJudgmentTaskResultSchema } from "../src/storage/durable/define-failure-judgment-task.js";
 import { openDurableStorage } from "../src/storage/durable/open-durable-storage.js";
-import { materializeRunViewsV2 } from "../src/storage/durable/materialize-run-views.js";
+import { materializeRunViews } from "../src/storage/durable/materialize-run-views.js";
 
 const sourceText = [
   "version: 2",
@@ -93,10 +93,10 @@ async function openCommandHarness(
   const opened = await openDurableStorage(databasePath);
   if (!opened.ok) throw new Error(`${opened.failure.message}: ${String(opened.failure.cause)}`);
   const taskOptions = options.startupLaunchGate === undefined ? {} : { startupLaunchGate: options.startupLaunchGate };
-  const tasks = defineWorkshopTasksV2(serviceBootId, taskOptions);
+  const tasks = defineWorkshopTasks(serviceBootId, taskOptions);
   const registry = createRegistry();
   registry.install({
-    name: "workshop-v4-command-runtime",
+    name: "workshop-command-runtime",
     tasks: [tasks.WorkflowRunTask, tasks.NodeAttemptTask, tasks.ProcessExecutionTask, tasks.CapacityGateTask, tasks.FailureJudgmentTask],
   });
   registry.install(tasks.FailureJudgmentExtension);
@@ -113,15 +113,15 @@ function prepare(
   requestId: string,
   runId: string,
   source = sourceText,
-  machine: Parameters<typeof resolveV2WorkflowSettings>[0]["machine"] = machineConfig,
+  machine: Parameters<typeof resolveWorkflowSettings>[0]["machine"] = machineConfig,
 ) {
-  const checked = checkV2DefinitionText(source, "command-chain.yaml");
-  const resolvedSettings = resolveV2WorkflowSettings({
+  const checked = checkDefinitionText(source, "command-chain.yaml");
+  const resolvedSettings = resolveWorkflowSettings({
     definition: checked.def,
     machine,
     projectCwd: directory,
   });
-  const prepared = prepareRunAdmissionV2({
+  const prepared = prepareRunAdmission({
     sourceText: source,
     sourceLabel: "command-chain.yaml",
     machineConfig: machine,
@@ -177,12 +177,12 @@ async function initializeInstallation(harness: CommandHarness["harness"], defini
 }
 
 async function admit(harness: CommandHarness["harness"], tasks: CommandHarness["tasks"], prepared: ReturnType<typeof prepare>) {
-  return admitPreparedRunV2({
+  return admitPreparedRun({
     harness,
     prepared,
     workflowRunTask: tasks.WorkflowRunTask,
-    createTaskInput: createWorkflowRunTaskInputV2,
-    parseTaskInput: parseWorkflowRunTaskInputV2,
+    createTaskInput: createWorkflowRunTaskInput,
+    parseTaskInput: parseWorkflowRunTaskInput,
     context: BACKGROUND_CONTEXT,
   });
 }
@@ -203,11 +203,11 @@ describe("Durable workflow lifecycle", () => {
       expect(admission.value.duplicate).toBe(false);
 
       await opened.harness.waitForIdle(BACKGROUND_CONTEXT);
-      const runTask = await opened.harness.waitForTask(admission.value.workflowTaskId as TaskId<ReturnType<typeof runOutcomeV2Schema.parse>>, BACKGROUND_CONTEXT);
+      const runTask = await opened.harness.waitForTask(admission.value.workflowTaskId as TaskId<ReturnType<typeof runOutcomeSchema.parse>>, BACKGROUND_CONTEXT);
       expect(runTask.state.status).toBe("terminal");
       expect(runTask.state.outcome.status).toBe("completed");
       if (runTask.state.outcome.status !== "completed") throw new Error("WorkflowRun task did not complete");
-      expect(runOutcomeV2Schema.parse(runTask.state.outcome.result)).toEqual({ kind: "completed", terminalOutput: "alpha-beta" });
+      expect(runOutcomeSchema.parse(runTask.state.outcome.result)).toEqual({ kind: "completed", terminalOutput: "alpha-beta" });
       expect((await opened.harness.inspect(BACKGROUND_CONTEXT)).tasks).toEqual([]);
 
       // SAFETY: admission returns the numeric ID created for this ownerless run conversation.
@@ -297,11 +297,11 @@ describe("Durable workflow lifecycle", () => {
       if (!admission.ok) throw new Error(`${admission.failure.kind}: ${admission.failure.message}`);
 
       await opened.harness.waitForIdle(BACKGROUND_CONTEXT);
-      const task = await opened.harness.waitForTask(admission.value.workflowTaskId as TaskId<ReturnType<typeof runOutcomeV2Schema.parse>>, BACKGROUND_CONTEXT);
+      const task = await opened.harness.waitForTask(admission.value.workflowTaskId as TaskId<ReturnType<typeof runOutcomeSchema.parse>>, BACKGROUND_CONTEXT);
       expect(task.state.status).toBe("terminal");
       expect(task.state.outcome.status).toBe("completed");
       if (task.state.outcome.status !== "completed") throw new Error("WorkflowRun task did not settle the timeout");
-      const outcome = runOutcomeV2Schema.parse(task.state.outcome.result);
+      const outcome = runOutcomeSchema.parse(task.state.outcome.result);
       expect(outcome.kind).toBe("failed");
       if (outcome.kind !== "failed") throw new Error("timed-out command was not recorded as a failed run");
       expect(outcome.failure.kind).toBe("timeout");
@@ -365,7 +365,7 @@ describe("Durable workflow lifecycle", () => {
 
       await conversation.abort(BACKGROUND_CONTEXT);
       await idle;
-      const task = await opened.harness.waitForTask(admission.value.workflowTaskId as TaskId<ReturnType<typeof runOutcomeV2Schema.parse>>, BACKGROUND_CONTEXT);
+      const task = await opened.harness.waitForTask(admission.value.workflowTaskId as TaskId<ReturnType<typeof runOutcomeSchema.parse>>, BACKGROUND_CONTEXT);
       expect(task.state.status).toBe("terminal");
       expect(task.state.outcome.status).toBe("aborted");
 
@@ -407,11 +407,11 @@ describe("Durable workflow lifecycle", () => {
       if (!admission.ok) throw new Error(`${admission.failure.kind}: ${admission.failure.message}`);
 
       await opened.harness.waitForIdle(BACKGROUND_CONTEXT);
-      const task = await opened.harness.waitForTask(admission.value.workflowTaskId as TaskId<ReturnType<typeof runOutcomeV2Schema.parse>>, BACKGROUND_CONTEXT);
+      const task = await opened.harness.waitForTask(admission.value.workflowTaskId as TaskId<ReturnType<typeof runOutcomeSchema.parse>>, BACKGROUND_CONTEXT);
       expect(task.state.status).toBe("terminal");
       expect(task.state.outcome.status).toBe("completed");
       if (task.state.outcome.status !== "completed") throw new Error("WorkflowRun must settle expected command failures as domain outcomes");
-      const outcome = runOutcomeV2Schema.parse(task.state.outcome.result);
+      const outcome = runOutcomeSchema.parse(task.state.outcome.result);
       expect(outcome.kind).toBe("failed");
       if (outcome.kind !== "failed") throw new Error("nonzero command did not produce a failed run outcome");
       expect(outcome.failure.kind).toBe("process_error");
@@ -482,7 +482,7 @@ describe("native Durable failure judgment", () => {
       expect(admission.ok).toBe(true);
       if (!admission.ok) throw new Error(`${admission.failure.kind}: ${admission.failure.message}`);
       await opened.harness.waitForIdle(BACKGROUND_CONTEXT);
-      const task = await opened.harness.waitForTask(admission.value.workflowTaskId as TaskId<ReturnType<typeof runOutcomeV2Schema.parse>>, BACKGROUND_CONTEXT);
+      const task = await opened.harness.waitForTask(admission.value.workflowTaskId as TaskId<ReturnType<typeof runOutcomeSchema.parse>>, BACKGROUND_CONTEXT);
       expect(task.state.status).toBe("terminal");
       if (task.state.status !== "terminal" || task.state.outcome.status !== "completed") throw new Error(`judged WorkflowRun did not complete: ${JSON.stringify(task.state)}`);
       const runValue = await opened.harness.snapshot(WorkshopRunDoc, admission.value.conversationId as ConversationId, BACKGROUND_CONTEXT);
@@ -530,9 +530,9 @@ describe("native Durable failure judgment", () => {
       const admission = await admit(opened.harness, opened.tasks, prepared);
       if (!admission.ok) throw new Error(`${admission.failure.kind}: ${admission.failure.message}`);
       await opened.harness.waitForIdle(BACKGROUND_CONTEXT);
-      const task = await opened.harness.waitForTask(admission.value.workflowTaskId as TaskId<ReturnType<typeof runOutcomeV2Schema.parse>>, BACKGROUND_CONTEXT);
+      const task = await opened.harness.waitForTask(admission.value.workflowTaskId as TaskId<ReturnType<typeof runOutcomeSchema.parse>>, BACKGROUND_CONTEXT);
       if (task.state.status !== "terminal" || task.state.outcome.status !== "completed") throw new Error("out-of-policy judgment did not settle");
-      const outcome = runOutcomeV2Schema.parse(task.state.outcome.result);
+      const outcome = runOutcomeSchema.parse(task.state.outcome.result);
       expect(outcome.kind).toBe("blocked");
       const run = workflowRunDocumentV1Schema.parse(await opened.harness.snapshot(WorkshopRunDoc, admission.value.conversationId as ConversationId, BACKGROUND_CONTEXT));
       expect(run.state).toBe("ready");
@@ -653,7 +653,7 @@ describe("native Durable failure judgment", () => {
       const admission = await admit(opened.harness, opened.tasks, prepared);
       if (!admission.ok) throw new Error(`${admission.failure.kind}: ${admission.failure.message}`);
       await opened.harness.waitForIdle(BACKGROUND_CONTEXT);
-      const task = await opened.harness.waitForTask(admission.value.workflowTaskId as TaskId<ReturnType<typeof runOutcomeV2Schema.parse>>, BACKGROUND_CONTEXT);
+      const task = await opened.harness.waitForTask(admission.value.workflowTaskId as TaskId<ReturnType<typeof runOutcomeSchema.parse>>, BACKGROUND_CONTEXT);
       if (task.state.status !== "terminal" || task.state.outcome.status !== "completed") throw new Error("multiple-judgment run did not complete");
       const run = workflowRunDocumentV1Schema.parse(await opened.harness.snapshot(WorkshopRunDoc, admission.value.conversationId as ConversationId, BACKGROUND_CONTEXT));
       expect(run.state).toBe("ready");
@@ -817,9 +817,9 @@ describe("native Durable failure judgment", () => {
       const admission = await admit(opened.harness, opened.tasks, prepared);
       if (!admission.ok) throw new Error(`${admission.failure.kind}: ${admission.failure.message}`);
       await opened.harness.waitForIdle(BACKGROUND_CONTEXT);
-      const task = await opened.harness.waitForTask(admission.value.workflowTaskId as TaskId<ReturnType<typeof runOutcomeV2Schema.parse>>, BACKGROUND_CONTEXT);
+      const task = await opened.harness.waitForTask(admission.value.workflowTaskId as TaskId<ReturnType<typeof runOutcomeSchema.parse>>, BACKGROUND_CONTEXT);
       if (task.state.status !== "terminal" || task.state.outcome.status !== "completed") throw new Error("unavailable judge did not settle");
-      expect(runOutcomeV2Schema.parse(task.state.outcome.result).kind).toBe("blocked");
+      expect(runOutcomeSchema.parse(task.state.outcome.result).kind).toBe("blocked");
       const run = workflowRunDocumentV1Schema.parse(await opened.harness.snapshot(WorkshopRunDoc, admission.value.conversationId as ConversationId, BACKGROUND_CONTEXT));
       expect(run.state).toBe("ready");
       if (run.state !== "ready") throw new Error("unavailable-judge run is missing its canonical document");
@@ -848,7 +848,7 @@ describe("native Durable failure judgment", () => {
       const admission = await admit(opened.harness, opened.tasks, prepared);
       if (!admission.ok) throw new Error(`${admission.failure.kind}: ${admission.failure.message}`);
       await opened.harness.waitForIdle(BACKGROUND_CONTEXT);
-      const task = await opened.harness.waitForTask(admission.value.workflowTaskId as TaskId<ReturnType<typeof runOutcomeV2Schema.parse>>, BACKGROUND_CONTEXT);
+      const task = await opened.harness.waitForTask(admission.value.workflowTaskId as TaskId<ReturnType<typeof runOutcomeSchema.parse>>, BACKGROUND_CONTEXT);
       if (task.state.status !== "terminal" || task.state.outcome.status !== "completed") throw new Error("timed-out judgment did not settle");
       const run = workflowRunDocumentV1Schema.parse(await opened.harness.snapshot(WorkshopRunDoc, admission.value.conversationId as ConversationId, BACKGROUND_CONTEXT));
       expect(run.state).toBe("ready");
@@ -871,7 +871,7 @@ describe("native Durable failure judgment", () => {
       const workflowTaskId = 202;
       const failureTaskId = 303 as TaskId;
       const judgmentConversationId = 404 as ConversationId;
-      const attemptId = attemptIdV2Schema.parse("judgment-commit-deadline-attempt-001");
+      const attemptId = attemptIdSchema.parse("judgment-commit-deadline-attempt-001");
       const judgmentId = "judgment-commit-deadline-001";
       const submissionRequestId = "judgment-commit-deadline-submission-001";
       const startedAt = prepared.admittedAt;
@@ -948,7 +948,7 @@ describe("native Durable failure judgment", () => {
         terminalOutput: null,
       });
       const deadlineMs = Date.now() + 1_000;
-      const input = failureJudgmentTaskInputV2Schema.parse({
+      const input = failureJudgmentTaskInputSchema.parse({
         runId: prepared.runId,
         runConversationId: Number(runConversationId),
         workflowTaskId,
@@ -1110,7 +1110,7 @@ describe("native Durable failure judgment", () => {
       await aborting;
       expect(providerAbortObserved).toBe(true);
       await opened.harness.waitForIdle(BACKGROUND_CONTEXT);
-      const task = await opened.harness.waitForTask(admission.value.workflowTaskId as TaskId<ReturnType<typeof runOutcomeV2Schema.parse>>, BACKGROUND_CONTEXT);
+      const task = await opened.harness.waitForTask(admission.value.workflowTaskId as TaskId<ReturnType<typeof runOutcomeSchema.parse>>, BACKGROUND_CONTEXT);
       if (task.state.status !== "terminal" || task.state.outcome.status !== "completed") throw new Error("stopped WorkflowRun did not settle");
       expect(task.state.outcome.result).toEqual({ kind: "cancelled" });
       const run = workflowRunDocumentV1Schema.parse(await opened.harness.snapshot(WorkshopRunDoc, admission.value.conversationId as ConversationId, BACKGROUND_CONTEXT));
@@ -1200,7 +1200,7 @@ describe("native Durable failure judgment", () => {
         await new Promise<void>((resolve) => setTimeout(resolve, 10));
       }
       if (!childSettled || childOutcome === undefined) throw new Error(`failed judgment task did not settle with a checked block: ${judgment.taskId}`);
-      const failedResult = failureJudgmentTaskResultV2Schema.parse(childOutcome);
+      const failedResult = failureJudgmentTaskResultSchema.parse(childOutcome);
       if (failedResult.kind !== "failed") throw new Error("failed judgment task lacks its exact block result");
       expect(failedJudgmentRun.block).toBeNull();
       expect(failedResult.block).toMatchObject({ nodeId: "verify", attemptId: failedJudgmentRun.currentAttemptId, kind: "orchestrator_invalid" });
@@ -1218,9 +1218,9 @@ describe("native Durable failure judgment", () => {
         Object.assign(installationDraft, installationDocumentV1Schema.parse(installation));
       }, BACKGROUND_CONTEXT);
       await conversation.abort(BACKGROUND_CONTEXT, { background: true });
-      const task = await opened.harness.waitForTask(admission.value.workflowTaskId as TaskId<ReturnType<typeof runOutcomeV2Schema.parse>>, BACKGROUND_CONTEXT);
+      const task = await opened.harness.waitForTask(admission.value.workflowTaskId as TaskId<ReturnType<typeof runOutcomeSchema.parse>>, BACKGROUND_CONTEXT);
       if (task.state.status !== "terminal" || task.state.outcome.status !== "completed") throw new Error("stopped WorkflowRun did not preserve the committed judgment block");
-      expect(runOutcomeV2Schema.parse(task.state.outcome.result)).toMatchObject({ kind: "blocked", block: failedResult.block });
+      expect(runOutcomeSchema.parse(task.state.outcome.result)).toMatchObject({ kind: "blocked", block: failedResult.block });
       const stopped = workflowRunDocumentV1Schema.parse(await opened.harness.snapshot(WorkshopRunDoc, admission.value.conversationId as ConversationId, BACKGROUND_CONTEXT));
       expect(stopped.state).toBe("ready");
       if (stopped.state !== "ready") throw new Error("stopped run document is missing");
@@ -1291,7 +1291,7 @@ describe("native Durable failure judgment", () => {
       if (decision?.status !== "decided" || decision.decidedAt === null) throw new Error("committed failure judgment is missing its decision timestamp");
       const judgmentTask = await opened.harness.getTask(decision.taskId as TaskId, BACKGROUND_CONTEXT);
       if (judgmentTask === undefined) throw new Error("committed failure-judgment task is missing");
-      const judgmentInput = failureJudgmentTaskInputV2Schema.parse(judgmentTask.input);
+      const judgmentInput = failureJudgmentTaskInputSchema.parse(judgmentTask.input);
       if (judgmentInput.deadlineAt === null) throw new Error("failure judgment has no absolute deadline");
       expect(Date.parse(decision.decidedAt)).toBeLessThan(Date.parse(judgmentInput.deadlineAt));
       expect(decision.applicationReceipt).toBeNull();
@@ -1317,9 +1317,9 @@ describe("native Durable failure judgment", () => {
         Object.assign(runDraft, workflowRunDocumentV1Schema.parse({ ...currentRun, status: "running", desiredState: "running" }));
       }, BACKGROUND_CONTEXT);
       await opened.harness.waitForIdle(BACKGROUND_CONTEXT);
-      const task = await opened.harness.waitForTask(admission.value.workflowTaskId as TaskId<ReturnType<typeof runOutcomeV2Schema.parse>>, BACKGROUND_CONTEXT);
+      const task = await opened.harness.waitForTask(admission.value.workflowTaskId as TaskId<ReturnType<typeof runOutcomeSchema.parse>>, BACKGROUND_CONTEXT);
       if (task.state.status !== "terminal" || task.state.outcome.status !== "completed") throw new Error("recovered WorkflowRun did not complete");
-      expect(runOutcomeV2Schema.parse(task.state.outcome.result)).toEqual({ kind: "completed", terminalOutput: "candidate" });
+      expect(runOutcomeSchema.parse(task.state.outcome.result)).toEqual({ kind: "completed", terminalOutput: "candidate" });
       const run = workflowRunDocumentV1Schema.parse(await opened.harness.snapshot(WorkshopRunDoc, admission.value.conversationId as ConversationId, BACKGROUND_CONTEXT));
       expect(run.state).toBe("ready");
       if (run.state !== "ready") throw new Error("recovered run is missing its canonical document");
@@ -1337,7 +1337,7 @@ describe("native Durable failure judgment", () => {
     const databasePath = join(directory, "durable.db");
     let v8Harness: Awaited<ReturnType<typeof Harness.open>> | undefined;
     let opened: CommandHarness | undefined;
-    const v8WorkflowTask = defineTask<ReturnType<typeof createWorkflowRunTaskInputV2>, { phase: "start" }, ReturnType<typeof runOutcomeV2Schema.parse>>({
+    const v8WorkflowTask = defineTask<ReturnType<typeof createWorkflowRunTaskInput>, { phase: "start" }, ReturnType<typeof runOutcomeSchema.parse>>({
       name: "workshop.workflow-run",
       version: 8,
       initial: () => ({ phase: "start" }),
@@ -1359,12 +1359,12 @@ describe("native Durable failure judgment", () => {
       registry.install({ name: "workshop-v8-migration-fixture", tasks: [v8WorkflowTask] });
       v8Harness = await Harness.open(storage.storage, { models: createModels(), registry }, BACKGROUND_CONTEXT);
       await initializeInstallation(v8Harness, prepared.canonicalHash);
-      const admission = await admitPreparedRunV2({
+      const admission = await admitPreparedRun({
         harness: v8Harness,
         prepared: v8Prepared,
         workflowRunTask: v8WorkflowTask as never,
-        createTaskInput: createWorkflowRunTaskInputV2,
-        parseTaskInput: parseWorkflowRunTaskInputV2,
+        createTaskInput: createWorkflowRunTaskInput,
+        parseTaskInput: parseWorkflowRunTaskInput,
         context: BACKGROUND_CONTEXT,
       });
       if (!admission.ok) throw new Error(`${admission.failure.kind}: ${admission.failure.message}`);
@@ -1373,7 +1373,7 @@ describe("native Durable failure judgment", () => {
 
       opened = await openCommandHarness(databasePath);
       await opened.harness.waitForIdle(BACKGROUND_CONTEXT);
-      const task = await opened.harness.waitForTask(admission.value.workflowTaskId as TaskId<ReturnType<typeof runOutcomeV2Schema.parse>>, BACKGROUND_CONTEXT);
+      const task = await opened.harness.waitForTask(admission.value.workflowTaskId as TaskId<ReturnType<typeof runOutcomeSchema.parse>>, BACKGROUND_CONTEXT);
       if (task.state.status !== "terminal" || task.state.outcome.status !== "completed") throw new Error("migrated WorkflowRun did not complete");
       const run = workflowRunDocumentV1Schema.parse(await opened.harness.snapshot(WorkshopRunDoc, admission.value.conversationId as ConversationId, BACKGROUND_CONTEXT));
       expect(run.state).toBe("ready");
@@ -1398,7 +1398,7 @@ describe("canonical worker output views", () => {
     const previousOutputPath = join(prepared.paths.inputDirectory, "second.previous.txt");
     const outputPath = join(prepared.paths.outputDirectory, "second.output.txt");
     try {
-      const candidate = nodeResultV2Schema.parse({
+      const candidate = nodeResultSchema.parse({
         version: 1,
         source: "command",
         output: "alpha",
@@ -1412,7 +1412,7 @@ describe("canonical worker output views", () => {
       const firstFinishedAt = iso(Date.parse(admittedAt) + 2);
       const secondStartedAt = iso(Date.parse(admittedAt) + 3);
       const firstAttemptId = "canonical-output-first-attempt";
-      const secondAttemptId = attemptIdV2Schema.parse("canonical-output-second-attempt");
+      const secondAttemptId = attemptIdSchema.parse("canonical-output-second-attempt");
       const firstAttempt = {
         attemptId: firstAttemptId,
         number: 1,
@@ -1561,7 +1561,7 @@ describe("canonical worker output views", () => {
         throw new Error("reopened successor lacks canonical output");
       }
       expect(storedResult.outcome.candidate.output).toBe("alpha-beta");
-      expect(materializeRunViewsV2(afterTamper)).toEqual([]);
+      expect(materializeRunViews(afterTamper)).toEqual([]);
       expect(readFileSync(definitionPath, "utf8")).toBe(sourceText);
       expect(readFileSync(previousOutputPath, "utf8")).toBe("alpha");
       expect(readFileSync(outputPath, "utf8")).toBe("alpha-beta");
@@ -1608,12 +1608,12 @@ describe("run view write failures", () => {
 
       await opened.harness.waitForIdle(BACKGROUND_CONTEXT);
       const task = await opened.harness.waitForTask(
-        admission.value.workflowTaskId as TaskId<ReturnType<typeof runOutcomeV2Schema.parse>>,
+        admission.value.workflowTaskId as TaskId<ReturnType<typeof runOutcomeSchema.parse>>,
         BACKGROUND_CONTEXT,
       );
       expect(task.state.outcome.status).toBe("completed");
       if (task.state.outcome.status !== "completed") throw new Error("view failure changed the workflow task outcome");
-      const outcome = runOutcomeV2Schema.parse(task.state.outcome.result);
+      const outcome = runOutcomeSchema.parse(task.state.outcome.result);
       expect(outcome).toEqual({ kind: "completed", terminalOutput: "alpha-beta" });
 
       const conversationId = admission.value.conversationId as ConversationId;
@@ -1635,7 +1635,7 @@ describe("run view write failures", () => {
       expect(projectionFailures.some((event) => event.view === "output" && event.nodeId === "first")).toBe(true);
 
       rmSync(blockedOutput, { recursive: true, force: true });
-      expect(materializeRunViewsV2(stored)).toEqual([]);
+      expect(materializeRunViews(stored)).toEqual([]);
       expect(readFileSync(blockedOutput, "utf8")).toBe("alpha");
       expect(readFileSync(join(prepared.paths.inputDirectory, "second.previous.txt"), "utf8")).toBe("alpha");
       expect(readFileSync(join(prepared.paths.outputDirectory, "second.output.txt"), "utf8")).toBe("alpha-beta");
@@ -1685,12 +1685,12 @@ describe("required execution view failures", () => {
 
       await opened.harness.waitForIdle(BACKGROUND_CONTEXT);
       const task = await opened.harness.waitForTask(
-        admission.value.workflowTaskId as TaskId<ReturnType<typeof runOutcomeV2Schema.parse>>,
+        admission.value.workflowTaskId as TaskId<ReturnType<typeof runOutcomeSchema.parse>>,
         BACKGROUND_CONTEXT,
       );
       expect(task.state.outcome.status).toBe("completed");
       if (task.state.outcome.status !== "completed") throw new Error("input-view failure did not settle as a domain block");
-      const outcome = runOutcomeV2Schema.parse(task.state.outcome.result);
+      const outcome = runOutcomeSchema.parse(task.state.outcome.result);
       expect(outcome.kind).toBe("blocked");
       if (outcome.kind !== "blocked") throw new Error("successor launched with an invalid input view");
       expect(outcome.block.kind).toBe("integrity_failed");
@@ -1721,7 +1721,7 @@ describe("required execution view failures", () => {
       expect(projectionFailures.some((event) => event.view === "input" && event.nodeId === "second")).toBe(true);
 
       rmSync(inputPath, { recursive: true, force: true });
-      expect(materializeRunViewsV2(stored)).toEqual([]);
+      expect(materializeRunViews(stored)).toEqual([]);
       expect(readFileSync(inputPath, "utf8")).toBe("alpha");
       expect(readFileSync(workerMarker, "utf8")).toBe("w");
       expect(existsSync(successorMarker)).toBe(false);
@@ -1768,12 +1768,12 @@ describe("required execution view failures", () => {
 
       await opened.harness.waitForIdle(BACKGROUND_CONTEXT);
       const task = await opened.harness.waitForTask(
-        admission.value.workflowTaskId as TaskId<ReturnType<typeof runOutcomeV2Schema.parse>>,
+        admission.value.workflowTaskId as TaskId<ReturnType<typeof runOutcomeSchema.parse>>,
         BACKGROUND_CONTEXT,
       );
       expect(task.state.outcome.status).toBe("completed");
       if (task.state.outcome.status !== "completed") throw new Error("validator view failure did not settle as a domain block");
-      const outcome = runOutcomeV2Schema.parse(task.state.outcome.result);
+      const outcome = runOutcomeSchema.parse(task.state.outcome.result);
       expect(outcome.kind).toBe("blocked");
       if (outcome.kind !== "blocked") throw new Error("validator launched with a stale candidate output view");
       expect(outcome.block.kind).toBe("integrity_failed");
@@ -1817,7 +1817,7 @@ describe("required execution view failures", () => {
       if (reopened.state !== "ready") throw new Error("validator-view failure run did not survive reopen");
       expect(reopened.status).toBe("blocked");
       expect(reopened.nodes[0]?.attempts).toHaveLength(1);
-      expect(materializeRunViewsV2(reopened)).toEqual([]);
+      expect(materializeRunViews(reopened)).toEqual([]);
       expect(readFileSync(blockedOutput, "utf8")).toBe("candidate");
       expect(readFileSync(workerMarker, "utf8")).toBe("w");
       expect(existsSync(validatorMarker)).toBe(false);
@@ -1855,7 +1855,7 @@ async function verifyDurableRestartAfterProcessLaunch(mode: "worker" | "validato
   let runnerStderr = "";
   try {
     runner = spawn(process.execPath, [
-      join(process.cwd(), "tests/fixtures/v4/launch-durable-crash-harness.ts"),
+      join(process.cwd(), "tests/fixtures/launch-durable-crash-harness.ts"),
       mode,
       directory,
       databasePath,
@@ -1895,12 +1895,12 @@ async function verifyDurableRestartAfterProcessLaunch(mode: "worker" | "validato
     opened = await openCommandHarness(databasePath);
     await opened.harness.waitForIdle(BACKGROUND_CONTEXT);
     const runTask = await opened.harness.waitForTask(
-      admission.workflowTaskId as TaskId<ReturnType<typeof runOutcomeV2Schema.parse>>,
+      admission.workflowTaskId as TaskId<ReturnType<typeof runOutcomeSchema.parse>>,
       BACKGROUND_CONTEXT,
     );
     expect(runTask.state.outcome.status).toBe("completed");
     if (runTask.state.outcome.status !== "completed") throw new Error("recovered WorkflowRun did not settle");
-    const runOutcome = runOutcomeV2Schema.parse(runTask.state.outcome.result);
+    const runOutcome = runOutcomeSchema.parse(runTask.state.outcome.result);
     if (replayedProcess) {
       expect(runOutcome.kind).toBe("completed");
       if (runOutcome.kind !== "completed") throw new Error("safe process replay did not complete the run");
@@ -2092,7 +2092,7 @@ describe("Durable process launch startup gate", () => {
       const inspection = await opened.harness.inspect(BACKGROUND_CONTEXT);
       const task = inspection.tasks.find((entry) => entry.record.kind === opened.tasks.ProcessExecutionTask.definition.name);
       if (task?.record.state.status === "running") {
-        const input = processExecutionTaskInputV2Schema.parse(task.record.input);
+        const input = processExecutionTaskInputSchema.parse(task.record.input);
         return { task, input };
       }
       await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
@@ -2233,13 +2233,13 @@ describe("Durable headless validation chain", () => {
       if (!admission.ok) throw new Error(`${admission.failure.kind}: ${admission.failure.message}`);
       await opened.harness.waitForIdle(BACKGROUND_CONTEXT);
       const task = await opened.harness.waitForTask(
-        admission.value.workflowTaskId as TaskId<ReturnType<typeof runOutcomeV2Schema.parse>>,
+        admission.value.workflowTaskId as TaskId<ReturnType<typeof runOutcomeSchema.parse>>,
         BACKGROUND_CONTEXT,
       );
       expect(task.state.status).toBe("terminal");
       expect(task.state.outcome.status).toBe("completed");
       if (task.state.outcome.status !== "completed") throw new Error("headless chain did not settle");
-      expect(runOutcomeV2Schema.parse(task.state.outcome.result)).toEqual({
+      expect(runOutcomeSchema.parse(task.state.outcome.result)).toEqual({
         kind: "completed",
         terminalOutput: "validated candidate-next",
       });
@@ -2271,8 +2271,8 @@ describe("Durable headless validation chain", () => {
       const validatorRef = firstAttempt.processIncarnations.find((ref) => ref.executionId === firstAttempt.validatorExecutionId);
       if (firstAttempt.workerExecutionId === null || firstAttempt.validatorExecutionId === null
         || workerRef === undefined || validatorRef === undefined) throw new Error("agent process identities were not committed");
-      const workerPaths = processExecutionCapturePathsV2(stored.paths.captureDirectory, firstAttempt.workerExecutionId, workerRef.incarnationId);
-      const validatorPaths = processExecutionCapturePathsV2(stored.paths.captureDirectory, firstAttempt.validatorExecutionId, validatorRef.incarnationId);
+      const workerPaths = processExecutionCapturePaths(stored.paths.captureDirectory, firstAttempt.workerExecutionId, workerRef.incarnationId);
+      const validatorPaths = processExecutionCapturePaths(stored.paths.captureDirectory, firstAttempt.validatorExecutionId, validatorRef.incarnationId);
       expect(readFileSync(workerPaths.promptPath, "utf8")).toContain("produce a checked candidate");
       expect(readFileSync(validatorPaths.promptPath, "utf8")).toContain("immutable evidence");
       expect(workerPaths.resultPath).not.toBe(validatorPaths.resultPath);
@@ -2343,12 +2343,12 @@ describe("Durable headless validation chain", () => {
         if (!admission.ok) throw new Error(`${admission.failure.kind}: ${admission.failure.message}`);
         await opened.harness.waitForIdle(BACKGROUND_CONTEXT);
         const task = await opened.harness.waitForTask(
-          admission.value.workflowTaskId as TaskId<ReturnType<typeof runOutcomeV2Schema.parse>>,
+          admission.value.workflowTaskId as TaskId<ReturnType<typeof runOutcomeSchema.parse>>,
           BACKGROUND_CONTEXT,
         );
         expect(task.state.status).toBe("terminal");
         if (task.state.outcome.status !== "completed") throw new Error("validator failure did not settle as a domain result");
-        const outcome = runOutcomeV2Schema.parse(task.state.outcome.result);
+        const outcome = runOutcomeSchema.parse(task.state.outcome.result);
         expect(outcome.kind).toBe("failed");
         if (outcome.kind !== "failed") throw new Error("validator failure did not fail the workflow");
         expect(outcome.failure.kind).toBe(mode === "rejected" ? "validator_rejection" : "result_invalid");
@@ -2418,12 +2418,12 @@ describe("Durable headless validation chain", () => {
       if (!admission.ok) throw new Error(`${admission.failure.kind}: ${admission.failure.message}`);
       await opened.harness.waitForIdle(BACKGROUND_CONTEXT);
       const task = await opened.harness.waitForTask(
-        admission.value.workflowTaskId as TaskId<ReturnType<typeof runOutcomeV2Schema.parse>>,
+        admission.value.workflowTaskId as TaskId<ReturnType<typeof runOutcomeSchema.parse>>,
         BACKGROUND_CONTEXT,
       );
       expect(task.state.status).toBe("terminal");
       if (task.state.outcome.status !== "completed") throw new Error("ill-formed worker output did not settle as a domain failure");
-      const outcome = runOutcomeV2Schema.parse(task.state.outcome.result);
+      const outcome = runOutcomeSchema.parse(task.state.outcome.result);
       expect(outcome.kind).toBe("failed");
       if (outcome.kind !== "failed") throw new Error("ill-formed worker output was accepted");
       expect(outcome.failure.kind).toBe("result_invalid");
@@ -2489,12 +2489,12 @@ describe("Durable headless validation chain", () => {
       if (!admission.ok) throw new Error(admission.failure.kind + ": " + admission.failure.message);
       await opened.harness.waitForIdle(BACKGROUND_CONTEXT);
       const task = await opened.harness.waitForTask(
-        admission.value.workflowTaskId as TaskId<ReturnType<typeof runOutcomeV2Schema.parse>>,
+        admission.value.workflowTaskId as TaskId<ReturnType<typeof runOutcomeSchema.parse>>,
         BACKGROUND_CONTEXT,
       );
       expect(task.state.outcome.status).toBe("completed");
       if (task.state.outcome.status !== "completed") throw new Error("validator timeout did not settle");
-      const outcome = runOutcomeV2Schema.parse(task.state.outcome.result);
+      const outcome = runOutcomeSchema.parse(task.state.outcome.result);
       expect(outcome.kind).toBe("failed");
       if (outcome.kind !== "failed") throw new Error("validator timeout did not fail the workflow");
       expect(outcome.failure.kind).toBe("timeout");
@@ -2564,12 +2564,12 @@ describe("Durable command validator chain", () => {
         if (!admission.ok) throw new Error(admission.failure.kind + ": " + admission.failure.message);
         await opened.harness.waitForIdle(BACKGROUND_CONTEXT);
         const task = await opened.harness.waitForTask(
-          admission.value.workflowTaskId as TaskId<ReturnType<typeof runOutcomeV2Schema.parse>>,
+          admission.value.workflowTaskId as TaskId<ReturnType<typeof runOutcomeSchema.parse>>,
           BACKGROUND_CONTEXT,
         );
         expect(task.state.outcome.status).toBe("completed");
         if (task.state.outcome.status !== "completed") throw new Error("command validator chain did not settle");
-        const outcome = runOutcomeV2Schema.parse(task.state.outcome.result);
+        const outcome = runOutcomeSchema.parse(task.state.outcome.result);
         const stored = workflowRunDocumentV1Schema.parse(
           await opened.harness.snapshot(WorkshopRunDoc, admission.value.conversationId as ConversationId, BACKGROUND_CONTEXT),
         );
@@ -2648,7 +2648,7 @@ const agentProcessMachineConfig = {
       expect(validatorTask.state.status).toBe("terminal");
       expect(validatorTask.state.outcome.status).toBe("completed");
       if (validatorTask.state.outcome.status !== "completed") throw new Error("paused validator did not return checked process evidence");
-      expect(processExecutionTaskResultV2Schema.parse(validatorTask.state.outcome.result).kind).toBe("exited");
+      expect(processExecutionTaskResultSchema.parse(validatorTask.state.outcome.result).kind).toBe("exited");
 
       const conversation = await opened.harness.conversation(seeded.conversationId, BACKGROUND_CONTEXT);
       if (conversation === undefined) throw new Error("paused validator conversation is missing");
@@ -2687,7 +2687,7 @@ describe("safe process replay policy", () => {
       hasExitReceipt: false,
       now: 10_000,
     };
-    const decide = (overrides: Partial<Parameters<typeof decideProcessReplayV2>[0]> = {}) => decideProcessReplayV2({ ...base, ...overrides });
+    const decide = (overrides: Partial<Parameters<typeof decideProcessReplay>[0]> = {}) => decideProcessReplay({ ...base, ...overrides });
 
     expect(decide()).toBeNull();
     expect(decide({ incarnationNumber: 2 })).toBeNull();
@@ -2760,7 +2760,7 @@ describe("Durable process execution adapter", () => {
         expect(task.state.status).toBe("terminal");
         expect(task.state.outcome.status).toBe("completed");
         if (task.state.outcome.status !== "completed") throw new Error("agent process lacked a checked outcome");
-        return processExecutionTaskResultV2Schema.parse(task.state.outcome.result);
+        return processExecutionTaskResultSchema.parse(task.state.outcome.result);
       });
       expect(results).toHaveLength(2);
       expect(results.every((result) => result.kind === "exited" && !result.timedOut
@@ -2768,7 +2768,7 @@ describe("Durable process execution adapter", () => {
         && result.semanticStdout.kind === "not_captured")).toBe(true);
       const resultPath = seeded.inputs[0]?.env.WORKSHOP_RESULT_FILE;
       if (resultPath === undefined) throw new Error("agent process input lacks its result path");
-      const checkedResult = parseWorkerResultBytesV2(readFileSync(resultPath));
+      const checkedResult = parseWorkerResultBytes(readFileSync(resultPath));
       expect(checkedResult.ok).toBe(true);
       if (!checkedResult.ok) throw new Error(`agent result failed validation: ${checkedResult.failure.message}`);
       expect(checkedResult.value.output).toBe("agent-result");
@@ -2808,13 +2808,13 @@ describe("Durable process execution adapter", () => {
 
       await opened.harness.waitForIdle(BACKGROUND_CONTEXT);
       const task = await opened.harness.waitForTask(
-        admission.value.workflowTaskId as TaskId<ReturnType<typeof runOutcomeV2Schema.parse>>,
+        admission.value.workflowTaskId as TaskId<ReturnType<typeof runOutcomeSchema.parse>>,
         BACKGROUND_CONTEXT,
       );
       expect(task.state.status).toBe("terminal");
       expect(task.state.outcome.status).toBe("completed");
       if (task.state.outcome.status !== "completed") throw new Error("unsafe deadline did not settle as a domain outcome");
-      const outcome = runOutcomeV2Schema.parse(task.state.outcome.result);
+      const outcome = runOutcomeSchema.parse(task.state.outcome.result);
       expect(outcome.kind).toBe("failed");
       if (outcome.kind !== "failed") throw new Error("unsafe deadline did not fail the run");
       expect(outcome.failure.kind).toBe("runtime_fault");
@@ -2836,8 +2836,8 @@ async function seedAgentProcessTasks(
   options: { readonly pauseBeforeValidator?: boolean } = {},
 ): Promise<{
   conversationId: ConversationId;
-  inputs: ReturnType<typeof processExecutionTaskInputV2Schema.parse>[];
-  taskIds: TaskId<ReturnType<typeof processExecutionTaskResultV2Schema.parse>>[];
+  inputs: ReturnType<typeof processExecutionTaskInputSchema.parse>[];
+  taskIds: TaskId<ReturnType<typeof processExecutionTaskResultSchema.parse>>[];
 }> {
   const nodeId = prepared.chain.order[0];
   if (nodeId === undefined) throw new Error("prepared chain has no node");
@@ -2846,16 +2846,16 @@ async function seedAgentProcessTasks(
   if (settings === undefined || settings.run.kind !== "agent" || validatorSite?.kind !== "agent") {
     throw new Error("test fixture must resolve an agent worker and agent validator");
   }
-  const attemptId = attemptIdV2Schema.parse("process-adapter-attempt-001");
-  const workerExecutionId = executionIdV2Schema.parse("process-adapter-worker-001");
-  const validatorExecutionId = executionIdV2Schema.parse("process-adapter-validator-001");
+  const attemptId = attemptIdSchema.parse("process-adapter-attempt-001");
+  const workerExecutionId = executionIdSchema.parse("process-adapter-worker-001");
+  const validatorExecutionId = executionIdSchema.parse("process-adapter-validator-001");
   const startedAt = prepared.admittedAt;
-  const workerIncarnationId = incarnationIdV2Schema.parse("process-adapter-worker-incarnation-001");
-  const validatorIncarnationId = incarnationIdV2Schema.parse("process-adapter-validator-incarnation-001");
-  const inputs: ReturnType<typeof processExecutionTaskInputV2Schema.parse>[] = [];
-  const taskIds: TaskId<ReturnType<typeof processExecutionTaskResultV2Schema.parse>>[] = [];
+  const workerIncarnationId = incarnationIdSchema.parse("process-adapter-worker-incarnation-001");
+  const validatorIncarnationId = incarnationIdSchema.parse("process-adapter-validator-incarnation-001");
+  const inputs: ReturnType<typeof processExecutionTaskInputSchema.parse>[] = [];
+  const taskIds: TaskId<ReturnType<typeof processExecutionTaskResultSchema.parse>>[] = [];
   let conversationId: ConversationId | undefined;
-  let workerTaskId: TaskId<ReturnType<typeof processExecutionTaskResultV2Schema.parse>> | undefined;
+  let workerTaskId: TaskId<ReturnType<typeof processExecutionTaskResultSchema.parse>> | undefined;
 
   await harness.commit(async (tx) => {
     const conversation = await tx.createConversation({ ownership: { kind: "ownerless" } });
@@ -2936,7 +2936,7 @@ async function seedAgentProcessTasks(
   if (conversationId === undefined || workerTaskId === undefined) throw new Error("process fixture worker was not created");
   await harness.waitForTask(workerTaskId, BACKGROUND_CONTEXT);
 
-  const candidate = nodeResultV2Schema.parse({
+  const candidate = nodeResultSchema.parse({
     version: 1,
     source: "agent",
     output: "seeded candidate",
@@ -2945,7 +2945,7 @@ async function seedAgentProcessTasks(
     sourceBytesHash: hash("seeded candidate"),
     exit: { kind: "code", code: 0 },
   });
-  let validatorTaskId: TaskId<ReturnType<typeof processExecutionTaskResultV2Schema.parse>> | undefined;
+  let validatorTaskId: TaskId<ReturnType<typeof processExecutionTaskResultSchema.parse>> | undefined;
   await harness.commit(async (tx) => {
     const draft = await tx.doc(WorkshopRunDoc, conversationId!);
     const current = workflowRunDocumentV1Schema.parse(draft);
@@ -2997,21 +2997,21 @@ function readyRun(value: ReturnType<typeof workflowRunDocumentV1Schema.parse>): 
 function createAdapterAgentProcessInput(args: {
   run: ReadyWorkflowRun;
   nodeId: ReadyWorkflowRun["nodes"][number]["nodeId"];
-  attemptId: ReturnType<typeof attemptIdV2Schema.parse>;
+  attemptId: ReturnType<typeof attemptIdSchema.parse>;
   nodeTaskId: number;
   role: "worker" | "validator";
-  executionId: ReturnType<typeof executionIdV2Schema.parse>;
-  incarnationId: ReturnType<typeof incarnationIdV2Schema.parse>;
+  executionId: ReturnType<typeof executionIdSchema.parse>;
+  incarnationId: ReturnType<typeof incarnationIdSchema.parse>;
   serviceBootId: string;
   launchIntentAt: string;
-  site: ResolvedExecutionSiteV2;
-}): ReturnType<typeof processExecutionTaskInputV2Schema.parse> {
+  site: ResolvedExecutionSite;
+}): ReturnType<typeof processExecutionTaskInputSchema.parse> {
   if (args.site.kind !== "agent") throw new Error("adapter test expects an agent execution site");
   const deadlineAt = args.site.timeoutMs === null
     ? null
     : iso(Date.parse(args.launchIntentAt) + args.site.timeoutMs);
-  const paths = processExecutionCapturePathsV2(args.run.paths.captureDirectory, args.executionId, args.incarnationId);
-  const base: ProcessExecutionTaskEnvironmentInputV2 = {
+  const paths = processExecutionCapturePaths(args.run.paths.captureDirectory, args.executionId, args.incarnationId);
+  const base: ProcessExecutionTaskEnvironmentInput = {
     runId: args.run.runId,
     workflowId: args.run.workflowId,
     activationId: args.run.activationId,
@@ -3036,8 +3036,8 @@ function createAdapterAgentProcessInput(args: {
     stdoutPath: paths.stdoutPath,
     stderrPath: paths.stderrPath,
   };
-  return processExecutionTaskInputV2Schema.parse({
+  return processExecutionTaskInputSchema.parse({
     ...base,
-    env: buildProcessExecutionEnvironmentV2(base, args.run, 1),
+    env: buildProcessExecutionEnvironment(base, args.run, 1),
   });
 }
