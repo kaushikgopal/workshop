@@ -1,11 +1,10 @@
-import { existsSync, lstatSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { canonicalHash } from "../definition/hash-canonical-json.js";
 import { checkV2DefinitionText } from "../definition/check-v2-definition.js";
 import { resolveV2WorkflowSettings } from "../definition/resolve-v2-workflow-settings.js";
 import { machineConfigSchemaV2, workflowIdV2, type MachineConfigV2 } from "../definition/schema-v2.js";
 import { parseStrictYaml } from "../definition/parse-yaml.js";
-import { renderV3MigrationGuidance } from "../definition/render-v3-migration-guidance.js";
 
 export interface V2Installation {
   readonly root: string;
@@ -29,7 +28,7 @@ export interface CheckedV2Workflow {
   readonly resolvedSettings: ReturnType<typeof resolveV2WorkflowSettings>;
 }
 
-/** Locate v4 installation paths without parsing or creating v3 state. */
+/** Locate the nearest installation without creating any state. */
 export function findV2Installation(from: string = process.cwd()): V2Installation {
   let directory = resolve(from);
   for (;;) {
@@ -49,14 +48,14 @@ export function loadV2Installation(root: string): V2Installation {
   const workshopDirectory = join(absoluteRoot, ".workshop");
   const stat = lstatSync(workshopDirectory);
   if (!stat.isDirectory() || stat.isSymbolicLink()) {
-    throw new Error(`v4 installation path must be a real .workshop directory: ${workshopDirectory}`);
+    throw new Error(`installation path must be a real .workshop directory: ${workshopDirectory}`);
   }
 
   const configDirectory = join(workshopDirectory, "config");
   const workflowsDirectory = join(configDirectory, "workflows");
   const stateDirectory = join(workshopDirectory, "state");
   const configPath = join(configDirectory, "workshop.yaml");
-  const machine = loadV2MachineConfig(configPath, stateDirectory, workflowsDirectory);
+  const machine = loadV2MachineConfig(configPath);
   const projectCwd = machine.project_dir === undefined ? absoluteRoot : resolve(configDirectory, machine.project_dir);
 
   return {
@@ -73,57 +72,20 @@ export function loadV2Installation(root: string): V2Installation {
 }
 
 /**
- * A v3 installation has either a machine config without `version: 2`, or no
- * config beside v3's SQLite state or version 1 workflows. Refuse all three
- * before any v4 code can create service files in that state directory; a
- * fresh installation without v3 files may still rely on v2 defaults.
+ * A missing machine config means built-in defaults. A present one must declare
+ * `version: 2`, so an unversioned file fails with a schema error that names the
+ * fix instead of a list of unrecognized keys.
  */
-function loadV2MachineConfig(configPath: string, stateDirectory: string, workflowsDirectory: string): MachineConfigV2 {
-  if (!existsSync(configPath)) {
-    const legacyDatabase = join(stateDirectory, "workshop.db");
-    if (existsSync(legacyDatabase)) {
-      throw new Error(renderV3MigrationGuidance(
-        `this installation has v3 state (${legacyDatabase}) and no version 2 machine config at ${configPath}; v4 will not start beside it implicitly.`,
-      ));
-    }
-    const legacyWorkflow = findVersion1Workflow(workflowsDirectory);
-    if (legacyWorkflow !== null) {
-      throw new Error(renderV3MigrationGuidance(
-        `this installation has a version 1 workflow (${legacyWorkflow}) and no version 2 machine config at ${configPath}; v4 will not start beside it implicitly.`,
-      ));
-    }
-    return machineConfigSchemaV2.parse({ version: 2 });
-  }
+function loadV2MachineConfig(configPath: string): MachineConfigV2 {
+  if (!existsSync(configPath)) return machineConfigSchemaV2.parse({ version: 2 });
   const raw = parseStrictYaml(readFileSync(configPath, "utf8"), configPath);
-  const version = declaredVersion(raw);
-  if (version === undefined || version === 1) {
-    throw new Error(renderV3MigrationGuidance(
-      `${configPath} is a v3 machine config (it does not declare \`version: 2\`), which the default v4 engine cannot read.`,
-    ));
+  const version = typeof raw === "object" && raw !== null && !Array.isArray(raw) && "version" in raw ? raw.version : undefined;
+  if (version !== 2) {
+    throw new Error(version === undefined
+      ? `${configPath}: machine config does not declare a version; add version: 2`
+      : `${configPath}: unsupported machine config version ${JSON.stringify(version)}; expected version: 2`);
   }
   return machineConfigSchemaV2.parse(raw);
-}
-
-function findVersion1Workflow(workflowsDirectory: string): string | null {
-  let names: string[];
-  try {
-    names = readdirSync(workflowsDirectory).filter((name) => name.endsWith(".yaml")).sort();
-  } catch {
-    return null;
-  }
-  for (const name of names) {
-    const path = join(workflowsDirectory, name);
-    try {
-      if (declaredVersion(parseStrictYaml(readFileSync(path, "utf8"), path)) === 1) return path;
-    } catch {
-      // Unreadable or malformed files surface through the normal workflow check.
-    }
-  }
-  return null;
-}
-
-function declaredVersion(value: unknown): unknown {
-  return typeof value === "object" && value !== null && !Array.isArray(value) && "version" in value ? value.version : undefined;
 }
 
 /** Read, check, and resolve one v2 workflow; this function has no execution or storage effects. */

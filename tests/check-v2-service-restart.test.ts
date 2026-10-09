@@ -65,14 +65,14 @@ describe("v4 public service restart", () => {
     ].join("\n"), "utf8");
 
     try {
-      const validated = runCli(root, ["--engine", "v4", "validate", "hemingway"]);
+      const validated = runCli(root, ["validate", "hemingway"]);
       expect(validated.status).toBe(0);
-      const started = runCli(root, ["--engine", "v4", "start", "hemingway", "--detach"]);
+      const started = runCli(root, ["start", "hemingway", "--detach"]);
       expect(started.status).toBe(0);
       const runId = runIdV2Schema.parse(started.stdout.match(/Started run (\S+)/)?.[1]);
       await waitForLaunch(launches);
 
-      const activeResult = runCli(root, ["--engine", "v4", "status", "hemingway", "--json"]);
+      const activeResult = runCli(root, ["status", "hemingway", "--json"]);
       expect(activeResult.status).toBe(0);
       const active = statusDtoV2Schema.parse(JSON.parse(activeResult.stdout));
       expect(active.workflows[0]?.unresolvedRun?.runId).toBe(runId);
@@ -82,7 +82,7 @@ describe("v4 public service restart", () => {
       const completed = await waitForRun(root, "hemingway", runId);
       expect(completed.status).toBe("completed");
       expect(completed.terminalOutput).toBe(sentence);
-      const logsBeforeRestartResult = runCli(root, ["--engine", "v4", "logs", "hemingway", "--run", runId, "--json"]);
+      const logsBeforeRestartResult = runCli(root, ["logs", "hemingway", "--run", runId, "--json"]);
       expect(logsBeforeRestartResult.status).toBe(0);
       const logsBeforeRestart = logsDtoV2Schema.parse(JSON.parse(logsBeforeRestartResult.stdout));
       expect(logsBeforeRestart.runId).toBe(runId);
@@ -95,16 +95,16 @@ describe("v4 public service restart", () => {
       const firstBootId = active.service.bootId;
       await stopV4Service(root);
 
-      const afterRestart = runCli(root, ["--engine", "v4", "runs", "hemingway", "--json"]);
+      const afterRestart = runCli(root, ["runs", "hemingway", "--json"]);
       expect(afterRestart.status).toBe(0);
       const history = runsDtoV2Schema.parse(JSON.parse(afterRestart.stdout));
       expect(history.runs.some((run) => run.runId === runId && run.status === "completed")).toBe(true);
-      const restartedStatusResult = runCli(root, ["--engine", "v4", "status", "hemingway", "--json"]);
+      const restartedStatusResult = runCli(root, ["status", "hemingway", "--json"]);
       expect(restartedStatusResult.status).toBe(0);
       const restartedStatus = statusDtoV2Schema.parse(JSON.parse(restartedStatusResult.stdout));
       expect(restartedStatus.installationId).toBe(installationId);
       expect(restartedStatus.service.bootId).not.toBe(firstBootId);
-      const logsAfterRestartResult = runCli(root, ["--engine", "v4", "logs", "hemingway", "--run", runId, "--json"]);
+      const logsAfterRestartResult = runCli(root, ["logs", "hemingway", "--run", runId, "--json"]);
       expect(logsAfterRestartResult.status).toBe(0);
       const logsAfterRestart = logsDtoV2Schema.parse(JSON.parse(logsAfterRestartResult.stdout));
       expect(logsAfterRestart.runId).toBe(runId);
@@ -154,13 +154,13 @@ describe("v4 public service restart", () => {
     ].join("\n"), "utf8");
 
     try {
-      const validated = runCli(root, ["--engine", "v4", "validate", "harness-parity"]);
+      const validated = runCli(root, ["validate", "harness-parity"]);
       expect(validated.status).toBe(0);
-      const started = runCli(root, ["--engine", "v4", "start", "harness-parity"]);
+      const started = runCli(root, ["start", "harness-parity"]);
       expect(started.status).toBe(0);
       const runId = runIdV2Schema.parse(started.stdout.match(/Started run (\S+)/)?.[1]);
 
-      const historyResult = runCli(root, ["--engine", "v4", "runs", "harness-parity", "--json"]);
+      const historyResult = runCli(root, ["runs", "harness-parity", "--json"]);
       expect(historyResult.status).toBe(0);
       const history = runsDtoV2Schema.parse(JSON.parse(historyResult.stdout));
       const completed = history.runs.find((run) => run.runId === runId);
@@ -230,7 +230,7 @@ describe("v4 public service restart", () => {
     writeFileSync(workflowPath, workflow("printf first-result"), "utf8");
 
     try {
-      const firstStart = runCli(root, ["--engine", "v4", "start", "preflight-chain", "--detach"]);
+      const firstStart = runCli(root, ["start", "preflight-chain", "--detach"]);
       expect(firstStart.status).toBe(0);
       const firstRunId = runIdV2Schema.parse(firstStart.stdout.match(/Started run (\S+)/)?.[1]);
       const failed = await waitForRunStatus(root, "preflight-chain", firstRunId, "blocked");
@@ -238,20 +238,20 @@ describe("v4 public service restart", () => {
       expect(readFileSync(preflightLaunches, "utf8")).toBe("run");
       expect(existsSync(workerLaunches)).toBe(false);
 
-      const failedLogsResult = runCli(root, ["--engine", "v4", "logs", "preflight-chain", "--run", firstRunId, "--json"]);
+      const failedLogsResult = runCli(root, ["logs", "preflight-chain", "--run", firstRunId, "--json"]);
       expect(failedLogsResult.status).toBe(0);
       const failedLogs = logsDtoV2Schema.parse(JSON.parse(failedLogsResult.stdout));
       expect(failedLogs.sections.some((section) => section.kind === "capture" && section.label.includes("preflight") && section.content !== null && section.content.includes("preflight-check"))).toBe(true);
 
       writeFileSync(gatePath, "ready", "utf8");
-      const resume = runCli(root, ["--engine", "v4", "resume", "preflight-chain"]);
+      const resume = runCli(root, ["resume", "preflight-chain"]);
       expect(resume.status).toBe(0);
       const repaired = await waitForRunStatus(root, "preflight-chain", firstRunId, "completed");
       expect(repaired.terminalOutput).toBe("first-result");
       expect(readFileSync(preflightLaunches, "utf8")).toBe("runrun");
       expect(readFileSync(workerLaunches, "utf8")).toBe("worker");
 
-      const cachedStart = runCli(root, ["--engine", "v4", "start", "preflight-chain", "--detach"]);
+      const cachedStart = runCli(root, ["start", "preflight-chain", "--detach"]);
       expect(cachedStart.status).toBe(0);
       const cachedRunId = runIdV2Schema.parse(cachedStart.stdout.match(/Started run (\S+)/)?.[1]);
       expect((await waitForRunStatus(root, "preflight-chain", cachedRunId, "completed")).terminalOutput).toBe("first-result");
@@ -259,7 +259,7 @@ describe("v4 public service restart", () => {
       expect(readFileSync(workerLaunches, "utf8")).toBe("workerworker");
 
       writeFileSync(workflowPath, workflow("printf changed-definition"), "utf8");
-      const changedStart = runCli(root, ["--engine", "v4", "start", "preflight-chain", "--detach"]);
+      const changedStart = runCli(root, ["start", "preflight-chain", "--detach"]);
       expect(changedStart.status).toBe(0);
       const changedRunId = runIdV2Schema.parse(changedStart.stdout.match(/Started run (\S+)/)?.[1]);
       expect((await waitForRunStatus(root, "preflight-chain", changedRunId, "completed")).terminalOutput).toBe("changed-definition");
@@ -296,7 +296,7 @@ describe("v4 public service restart", () => {
       "",
     ].join("\n"), "utf8");
     try {
-      const started = runCli(root, ["--engine", "v4", "start", "preflight-stop", "--detach"]);
+      const started = runCli(root, ["start", "preflight-stop", "--detach"]);
       expect(started.status).toBe(0);
       const runId = runIdV2Schema.parse(started.stdout.match(/Started run (\S+)/)?.[1]);
       await waitForFile(preflightGroupPath);
@@ -305,7 +305,7 @@ describe("v4 public service restart", () => {
       const childId = Number(readFileSync(preflightChildPath, "utf8").trim());
       expect(isProcessGroupAlive(groupId)).toBe(true);
       expect(Number.isSafeInteger(childId) && childId > 0).toBe(true);
-      const stopping = spawnCli(root, ["--engine", "v4", "stop", "preflight-stop"]);
+      const stopping = spawnCli(root, ["stop", "preflight-stop"]);
       const stopped = await stopping.completion;
       expect(stopped.status).toBe(0);
       expect(stopped.stdout).toContain("cancelled (stopped)");
@@ -339,7 +339,7 @@ describe("v4 public service restart", () => {
     ].join("\n"), "utf8");
 
     try {
-      const client = spawnCli(root, ["--engine", "v4", "start", "disconnect"]);
+      const client = spawnCli(root, ["start", "disconnect"]);
       await waitForFile(workerStarted);
       expect(client.child.kill("SIGKILL")).toBe(true);
       const disconnected = await client.completion;
@@ -398,18 +398,18 @@ describe("v4 public service restart", () => {
 
 
     try {
-      const started = runCli(root, ["--engine", "v4", "start", "pause-chain", "--detach"]);
+      const started = runCli(root, ["start", "pause-chain", "--detach"]);
       expect(started.status).toBe(0);
       const runId = runIdV2Schema.parse(started.stdout.match(/Started run (\S+)/)?.[1]);
       await waitForFile(workerStarted);
 
-      const pause = runCli(root, ["--engine", "v4", "pause", "pause-chain"]);
+      const pause = runCli(root, ["pause", "pause-chain"]);
       expect(pause.status).toBe(0);
       expect(pause.stdout).toContain("running (paused)");
-      const repeatedPause = runCli(root, ["--engine", "v4", "pause", "pause-chain"]);
+      const repeatedPause = runCli(root, ["pause", "pause-chain"]);
       expect(repeatedPause.status).toBe(0);
 
-      const otherWhileFinishing = runCli(root, ["--engine", "v4", "start", "other", "--detach"]);
+      const otherWhileFinishing = runCli(root, ["start", "other", "--detach"]);
       expect(otherWhileFinishing.status).not.toBe(0);
       expect(otherWhileFinishing.stdout + otherWhileFinishing.stderr).not.toBe("");
       expect(existsSync(otherStarted)).toBe(false);
@@ -425,42 +425,42 @@ describe("v4 public service restart", () => {
       const oldService = JSON.parse(readFileSync(metadataPath, "utf8")) as { pid: number; bootId: string };
       process.kill(oldService.pid, "SIGKILL");
       await waitForPidGone(oldService.pid);
-      const reopenedStatus = runCli(root, ["--engine", "v4", "status", "pause-chain", "--json"]);
+      const reopenedStatus = runCli(root, ["status", "pause-chain", "--json"]);
       expect(reopenedStatus.status).toBe(0);
       expect(statusDtoV2Schema.parse(JSON.parse(reopenedStatus.stdout)).service.bootId).not.toBe(oldService.bootId);
       expect((await waitForRunStatus(root, "pause-chain", runId, "paused")).status).toBe("paused");
 
-      const pausedStatus = runCli(root, ["--engine", "v4", "status", "pause-chain", "--json"]);
+      const pausedStatus = runCli(root, ["status", "pause-chain", "--json"]);
       expect(pausedStatus.status).toBe(0);
       expect(statusDtoV2Schema.parse(JSON.parse(pausedStatus.stdout)).workflows[0]?.unresolvedRun?.status).toBe("paused");
 
-      const duplicateStart = runCli(root, ["--engine", "v4", "start", "pause-chain", "--detach"]);
+      const duplicateStart = runCli(root, ["start", "pause-chain", "--detach"]);
       expect(duplicateStart.status).toBe(0);
       expect(duplicateStart.stdout.match(/(?:Started|Using existing) run (\S+)/)?.[1]).toBe(runId);
 
-      const otherStart = runCli(root, ["--engine", "v4", "start", "other", "--detach"]);
+      const otherStart = runCli(root, ["start", "other", "--detach"]);
       expect(otherStart.status).toBe(0);
       const otherRunId = runIdV2Schema.parse(otherStart.stdout.match(/Started run (\S+)/)?.[1]);
       await waitForFile(otherStarted);
-      const resumeWhileAtCapacity = runCli(root, ["--engine", "v4", "resume", "pause-chain"]);
+      const resumeWhileAtCapacity = runCli(root, ["resume", "pause-chain"]);
       expect(resumeWhileAtCapacity.status).toBe(0);
       const capacityWait = await waitForRunStatus(root, "pause-chain", runId, "queued");
       expect(capacityWait.waitingForCapacity).toBe(true);
-      const waitingStatus = runCli(root, ["--engine", "v4", "status", "pause-chain", "--json"]);
+      const waitingStatus = runCli(root, ["status", "pause-chain", "--json"]);
       expect(statusDtoV2Schema.parse(JSON.parse(waitingStatus.stdout)).workflows[0]?.unresolvedRun?.waitingForCapacity).toBe(true);
 
-      expect(runCli(root, ["--engine", "v4", "pause", "pause-chain"]).status).toBe(0);
+      expect(runCli(root, ["pause", "pause-chain"]).status).toBe(0);
       const pausedCapacityWait = await waitForRunStatus(root, "pause-chain", runId, "queued");
       expect(pausedCapacityWait.desiredState).toBe("paused");
       expect(pausedCapacityWait.waitingForCapacity).toBe(true);
       expect((await waitForRun(root, "other", otherRunId)).status).toBe("completed");
       expect(existsSync(successorStarted)).toBe(false);
-      expect(runCli(root, ["--engine", "v4", "resume", "pause-chain"]).status).toBe(0);
+      expect(runCli(root, ["resume", "pause-chain"]).status).toBe(0);
       expect((await waitForRunStatus(root, "pause-chain", runId, "running")).waitingForCapacity).toBe(false);
-      const repeatedResume = runCli(root, ["--engine", "v4", "resume", "pause-chain"]);
+      const repeatedResume = runCli(root, ["resume", "pause-chain"]);
       expect(repeatedResume.status).toBe(0);
       await waitForFile(successorStarted);
-      const pauseFinalNode = runCli(root, ["--engine", "v4", "pause", "pause-chain"]);
+      const pauseFinalNode = runCli(root, ["pause", "pause-chain"]);
       expect(pauseFinalNode.status).toBe(0);
       const completed = await waitForRun(root, "pause-chain", runId);
       expect(completed.status).toBe("completed");
@@ -513,13 +513,13 @@ describe("v4 public service restart", () => {
     ].join("\n"), "utf8");
 
     try {
-      const started = runCli(root, ["--engine", "v4", "start", "safe-replay", "--detach"]);
+      const started = runCli(root, ["start", "safe-replay", "--detach"]);
       expect(started.status).toBe(0);
       const runId = runIdV2Schema.parse(started.stdout.match(/Started run (\S+)/)?.[1]);
       await waitForFile(validatorPgidPath);
       const oldPgid = Number(readFileSync(validatorPgidPath, "utf8").trim());
       if (!Number.isSafeInteger(oldPgid) || oldPgid <= 0) throw new Error("validator fixture did not record its process group");
-      const beforePause = runCli(root, ["--engine", "v4", "node", "describe", "safe-replay", "work", "--run", runId, "--json"]);
+      const beforePause = runCli(root, ["node", "describe", "safe-replay", "work", "--run", runId, "--json"]);
       expect(beforePause.status).toBe(0);
       const originalNode = nodeDescriptionDtoV2Schema.parse(JSON.parse(beforePause.stdout)).node;
       expect(originalNode.attempts).toHaveLength(1);
@@ -528,13 +528,13 @@ describe("v4 public service restart", () => {
       expect(originalAttempt.candidate).not.toBeNull();
       expect(originalAttempt.processes.filter((entry) => entry.role === "validator")).toHaveLength(1);
 
-      const pause = runCli(root, ["--engine", "v4", "pause", "safe-replay"]);
+      const pause = runCli(root, ["pause", "safe-replay"]);
       expect(pause.status).toBe(0);
       const oldService = JSON.parse(readFileSync(join(root, ".workshop", "state", "service.json"), "utf8")) as { pid: number; bootId: string };
       process.kill(oldService.pid, "SIGKILL");
       await waitForPidGone(oldService.pid);
 
-      const reopened = runCli(root, ["--engine", "v4", "status", "safe-replay", "--json"]);
+      const reopened = runCli(root, ["status", "safe-replay", "--json"]);
       expect(reopened.status).toBe(0);
       expect(statusDtoV2Schema.parse(JSON.parse(reopened.stdout)).service.bootId).not.toBe(oldService.bootId);
       const paused = await waitForRunStatus(root, "safe-replay", runId, "paused");
@@ -544,18 +544,18 @@ describe("v4 public service restart", () => {
       expect(readFileSync(workerLaunches, "utf8")).toBe("w");
       expect(readFileSync(validatorLaunches, "utf8")).toBe("v");
 
-      const pausedNodeResult = runCli(root, ["--engine", "v4", "node", "describe", "safe-replay", "work", "--run", runId, "--json"]);
+      const pausedNodeResult = runCli(root, ["node", "describe", "safe-replay", "work", "--run", runId, "--json"]);
       expect(pausedNodeResult.status).toBe(0);
       const pausedAttempt = nodeDescriptionDtoV2Schema.parse(JSON.parse(pausedNodeResult.stdout)).node.attempts[0];
       if (pausedAttempt === undefined) throw new Error("paused safe replay attempt is missing");
       expect(pausedAttempt.candidate).toEqual(originalAttempt.candidate);
       expect(pausedAttempt.processes.filter((entry) => entry.role === "validator").map((entry) => entry.cleanupState)).toEqual(["confirmed_dead"]);
 
-      const holderStart = runCli(root, ["--engine", "v4", "start", "holder", "--detach"]);
+      const holderStart = runCli(root, ["start", "holder", "--detach"]);
       expect(holderStart.status).toBe(0);
       const holderRunId = runIdV2Schema.parse(holderStart.stdout.match(/Started run (\S+)/)?.[1]);
       await waitForFile(holderStarted);
-      const resumed = runCli(root, ["--engine", "v4", "resume", "safe-replay"]);
+      const resumed = runCli(root, ["resume", "safe-replay"]);
       expect(resumed.status).toBe(0);
       const waiting = await waitForRunStatus(root, "safe-replay", runId, "queued");
       expect(waiting.waitingForCapacity).toBe(true);
@@ -571,7 +571,7 @@ describe("v4 public service restart", () => {
       expect(readFileSync(workerLaunches, "utf8")).toBe("w");
       expect(readFileSync(validatorLaunches, "utf8")).toBe("vv");
 
-      const finalNodeResult = runCli(root, ["--engine", "v4", "node", "describe", "safe-replay", "work", "--run", runId, "--json"]);
+      const finalNodeResult = runCli(root, ["node", "describe", "safe-replay", "work", "--run", runId, "--json"]);
       expect(finalNodeResult.status).toBe(0);
       const finalNode = nodeDescriptionDtoV2Schema.parse(JSON.parse(finalNodeResult.stdout)).node;
       expect(finalNode.attempts).toHaveLength(1);
@@ -587,7 +587,7 @@ describe("v4 public service restart", () => {
       expect(validators[0]?.exit).toBeNull();
       expect(validators[0]?.cleanupState).toBe("confirmed_dead");
       expect(validators[1]?.status).toBe("exited");
-      const historyResult = runCli(root, ["--engine", "v4", "runs", "safe-replay", "--json"]);
+      const historyResult = runCli(root, ["runs", "safe-replay", "--json"]);
       expect(historyResult.status).toBe(0);
       expect(runsDtoV2Schema.parse(JSON.parse(historyResult.stdout)).runs.map((entry) => entry.runId)).toEqual([runId]);
     } finally {
@@ -604,10 +604,10 @@ describe("v4 public service restart", () => {
     try {
       const retryStarted = join(retryRoot, "retry-started.txt");
       const retry = await startBlockedCommandRun(retryRoot, "retryable", `printf w >> '${retryMarker}'; if [ ! -f '${join(retryRoot, "attempt-")}-$WORKSHOP_RUN_ID' ]; then touch '${join(retryRoot, "attempt-")}-$WORKSHOP_RUN_ID'; sleep 60; else touch '${retryStarted}'; sleep 3; printf retry-success; fi`);
-      const resume = runCli(retryRoot, ["--engine", "v4", "resume", "retryable"]);
+      const resume = runCli(retryRoot, ["resume", "retryable"]);
       expect(resume.status).not.toBe(0);
       expect(resume.stderr).toContain("resolve the current block");
-      const missingOverrides = runCli(retryRoot, ["--engine", "v4", "resolve", "retryable", "--action", "retry", "--reason", "retry after checking the external effect", "--allow-repeat"]);
+      const missingOverrides = runCli(retryRoot, ["resolve", "retryable", "--action", "retry", "--reason", "retry after checking the external effect", "--allow-repeat"]);
       expect(missingOverrides.status).not.toBe(0);
       expect(missingOverrides.stderr).toContain("--extra-attempt required");
       expect(missingOverrides.stdout).toContain(`Resolving run ${retry.runId}`);
@@ -627,12 +627,12 @@ describe("v4 public service restart", () => {
       expect(retryRun.status).toBe("completed");
       expect(retryRun.terminalOutput).toBe("retry-success");
       expect(readFileSync(retryMarker, "utf8")).toBe("ww");
-      const retryNodeResult = runCli(retryRoot, ["--engine", "v4", "node", "describe", "retryable", "work", "--run", retry.runId, "--json"]);
+      const retryNodeResult = runCli(retryRoot, ["node", "describe", "retryable", "work", "--run", retry.runId, "--json"]);
       expect(retryNodeResult.status).toBe(0);
       const retryNode = nodeDescriptionDtoV2Schema.parse(JSON.parse(retryNodeResult.stdout)).node;
       expect(retryNode.attempts.map((attempt) => attempt.number)).toEqual([1, 2]);
       expect(retryNode.attempts.map((attempt) => attempt.status)).toEqual(["interrupted", "succeeded"]);
-      const retryLogs = runCli(retryRoot, ["--engine", "v4", "logs", "retryable", "--run", retry.runId, "--json"]);
+      const retryLogs = runCli(retryRoot, ["logs", "retryable", "--run", retry.runId, "--json"]);
       expect(retryLogs.status).toBe(0);
       expect(logsDtoV2Schema.parse(JSON.parse(retryLogs.stdout)).sections.some((section) => section.kind === "worklog" && section.content.includes("retry after checking the external effect"))).toBe(true);
     } finally {
@@ -649,7 +649,7 @@ describe("v4 public service restart", () => {
       const resultFile = join(acceptRoot, "accepted-result.json");
       const unpairedSurrogate = String.fromCharCode(0xd800);
       writeFileSync(resultFile, JSON.stringify({ version: 1, output: unpairedSurrogate, summary: "checked by the operator", artifacts: [] }), "utf8");
-      const malformedAcceptance = runCli(acceptRoot, ["--engine", "v4", "resolve", "acceptable", "--action", "accept", "--reason", "the recorded worker effect was checked", "--result-file", resultFile, "--acknowledge-effects"]);
+      const malformedAcceptance = runCli(acceptRoot, ["resolve", "acceptable", "--action", "accept", "--reason", "the recorded worker effect was checked", "--result-file", resultFile, "--acknowledge-effects"]);
       expect(malformedAcceptance.status).not.toBe(0);
       expect(malformedAcceptance.stderr).toContain("accept_result_invalid");
       const stillBlocked = await waitForRunStatus(acceptRoot, "acceptable", blocked.runId, "blocked");
@@ -657,14 +657,14 @@ describe("v4 public service restart", () => {
       expect(stillBlocked.terminalOutput).toBeNull();
       expect(readFileSync(acceptMarker, "utf8")).toBe("w");
       expect(existsSync(acceptedValidatorStarted)).toBe(false);
-      const blockedNode = runCli(acceptRoot, ["--engine", "v4", "node", "describe", "acceptable", "work", "--run", blocked.runId, "--json"]);
+      const blockedNode = runCli(acceptRoot, ["node", "describe", "acceptable", "work", "--run", blocked.runId, "--json"]);
       expect(blockedNode.status).toBe(0);
       const blockedDescription = nodeDescriptionDtoV2Schema.parse(JSON.parse(blockedNode.stdout));
       expect(blockedDescription.node.successfulOutput).toBeNull();
       expect(blockedDescription.node.attempts[0]?.candidate).toBeNull();
 
       writeFileSync(resultFile, JSON.stringify({ version: 1, output: "operator-accepted", summary: "checked by the operator", artifacts: [] }), "utf8");
-      const missingAcknowledgement = runCli(acceptRoot, ["--engine", "v4", "resolve", "acceptable", "--action", "accept", "--reason", "the recorded worker effect was checked", "--result-file", resultFile]);
+      const missingAcknowledgement = runCli(acceptRoot, ["resolve", "acceptable", "--action", "accept", "--reason", "the recorded worker effect was checked", "--result-file", resultFile]);
       expect(missingAcknowledgement.status).not.toBe(0);
       const acceptService = JSON.parse(readFileSync(join(acceptRoot, ".workshop", "state", "service.json"), "utf8")) as { socketPath: string };
       const acceptRequest = { version: 1 as const, requestId: randomUUID(), method: "resolve" as const, workflowId: "acceptable", action: "accept" as const, reason: "the recorded worker effect was checked", resultFile, acknowledgeEffects: true };
@@ -683,7 +683,7 @@ describe("v4 public service restart", () => {
       expect(acceptedRun.terminalOutput).toBe("operator-accepted");
       expect(readFileSync(acceptMarker, "utf8")).toBe("w");
       expect(readFileSync(acceptedValidatorMarker, "utf8")).toBe("v");
-      const acceptedNodeResult = runCli(acceptRoot, ["--engine", "v4", "node", "describe", "acceptable", "work", "--run", blocked.runId, "--json"]);
+      const acceptedNodeResult = runCli(acceptRoot, ["node", "describe", "acceptable", "work", "--run", blocked.runId, "--json"]);
       expect(acceptedNodeResult.status).toBe(0);
       const acceptedAttempt = nodeDescriptionDtoV2Schema.parse(JSON.parse(acceptedNodeResult.stdout)).node.attempts[0];
       expect(acceptedAttempt?.candidate?.kind).toBe("candidate");
@@ -711,14 +711,14 @@ describe("v4 public service restart", () => {
       );
       const resultFile = join(validatorRoot, "accepted-verdict.json");
       writeFileSync(resultFile, JSON.stringify({ version: 1, passed: true, reason: "the committed candidate passed operator review" }), "utf8");
-      const accepted = runCli(validatorRoot, ["--engine", "v4", "resolve", "acceptable-validator", "--action", "accept", "--reason", "the validator process group is confirmed dead", "--result-file", resultFile, "--acknowledge-effects"]);
+      const accepted = runCli(validatorRoot, ["resolve", "acceptable-validator", "--action", "accept", "--reason", "the validator process group is confirmed dead", "--result-file", resultFile, "--acknowledge-effects"]);
       expect(accepted.status).toBe(0);
       const acceptedRun = await waitForRun(validatorRoot, "acceptable-validator", blocked.runId);
       expect(acceptedRun.status).toBe("completed");
       expect(acceptedRun.terminalOutput).toBe("candidate");
       expect(readFileSync(workerMarker, "utf8")).toBe("w");
       expect(readFileSync(validatorMarker, "utf8")).toBe("v");
-      const nodeResult = runCli(validatorRoot, ["--engine", "v4", "node", "describe", "acceptable-validator", "work", "--run", blocked.runId, "--json"]);
+      const nodeResult = runCli(validatorRoot, ["node", "describe", "acceptable-validator", "work", "--run", blocked.runId, "--json"]);
       expect(nodeResult.status).toBe(0);
       const acceptedAttempt = nodeDescriptionDtoV2Schema.parse(JSON.parse(nodeResult.stdout)).node.attempts[0];
       expect(acceptedAttempt?.verdict?.kind).toBe("verdict");
@@ -749,18 +749,18 @@ describe("v4 public service restart", () => {
       const duplicateResult = serviceResolveResultV1Schema.parse(duplicateResolution.result);
       expect(duplicateResult).toEqual(firstResult);
       expect(firstResult.status).toBe("failed");
-      const history = runCli(failRoot, ["--engine", "v4", "runs", "fail-run", "--json"]);
+      const history = runCli(failRoot, ["runs", "fail-run", "--json"]);
       expect(history.status).toBe(0);
       const failedRun = runsDtoV2Schema.parse(JSON.parse(history.stdout)).runs.find((entry) => entry.runId === blocked.runId);
       expect(failedRun?.status).toBe("failed");
       expect(failedRun?.failure?.kind).toBe("operator");
       if (failedRun?.failure?.kind !== "operator") throw new Error("operator failure was not retained");
       expect(failedRun.failure.reason).toBe("the external effect cannot be safely repeated");
-      const failureLogs = runCli(failRoot, ["--engine", "v4", "logs", "fail-run", "--run", blocked.runId, "--json"]);
+      const failureLogs = runCli(failRoot, ["logs", "fail-run", "--run", blocked.runId, "--json"]);
       expect(failureLogs.status).toBe(0);
       const failureSections = logsDtoV2Schema.parse(JSON.parse(failureLogs.stdout)).sections;
       expect(failureSections.map((section) => section.content).join("\n")).toContain("the external effect cannot be safely repeated");
-      const failureNodeResult = runCli(failRoot, ["--engine", "v4", "node", "describe", "fail-run", "work", "--run", blocked.runId, "--json"]);
+      const failureNodeResult = runCli(failRoot, ["node", "describe", "fail-run", "work", "--run", blocked.runId, "--json"]);
       expect(failureNodeResult.status).toBe(0);
       expect(nodeDescriptionDtoV2Schema.parse(JSON.parse(failureNodeResult.stdout)).runFailure?.kind).toBe("operator");
     } finally {
@@ -809,20 +809,20 @@ describe("v4 public service restart", () => {
     ].join("\n"), "utf8");
 
     try {
-      const waiterStart = runCli(root, ["--engine", "v4", "start", "waiter", "--detach"]);
+      const waiterStart = runCli(root, ["start", "waiter", "--detach"]);
       expect(waiterStart.status).toBe(0);
       const waiterRunId = runIdV2Schema.parse(waiterStart.stdout.match(/Started run (\S+)/)?.[1]);
       await waitForFile(waiterStarted);
       expect(readFileSync(waiterStarted, "utf8").trim().split("\n")).toHaveLength(1);
-      expect(runCli(root, ["--engine", "v4", "pause", "waiter"]).status).toBe(0);
+      expect(runCli(root, ["pause", "waiter"]).status).toBe(0);
       expect((await waitForRunStatus(root, "waiter", waiterRunId, "paused")).currentNodeId).toBe("second");
 
-      const holderStart = runCli(root, ["--engine", "v4", "start", "holder", "--detach"]);
+      const holderStart = runCli(root, ["start", "holder", "--detach"]);
       expect(holderStart.status).toBe(0);
       await waitForFile(holderStarted);
-      expect(runCli(root, ["--engine", "v4", "resume", "waiter"]).status).toBe(0);
+      expect(runCli(root, ["resume", "waiter"]).status).toBe(0);
       expect((await waitForRunStatus(root, "waiter", waiterRunId, "queued")).waitingForCapacity).toBe(true);
-      expect(runCli(root, ["--engine", "v4", "pause", "waiter"]).status).toBe(0);
+      expect(runCli(root, ["pause", "waiter"]).status).toBe(0);
       const pausedWaiting = await waitForRunStatus(root, "waiter", waiterRunId, "queued");
       expect(pausedWaiting.desiredState).toBe("paused");
       expect(pausedWaiting.waitingForCapacity).toBe(true);
@@ -836,21 +836,21 @@ describe("v4 public service restart", () => {
       await waitForPidGone(oldService.pid);
       await waitForProcessGroupGone(Number(readFileSync(holderPgid, "utf8")));
 
-      const reopened = runCli(root, ["--engine", "v4", "status", "waiter", "--json"]);
+      const reopened = runCli(root, ["status", "waiter", "--json"]);
       expect(reopened.status).toBe(0);
       const reopenedDto = statusDtoV2Schema.parse(JSON.parse(reopened.stdout));
       expect(reopenedDto.service.bootId).not.toBe(oldService.bootId);
       expect(reopenedDto.workflows[0]?.unresolvedRun?.runId).toBe(waiterRunId);
       expect(reopenedDto.workflows[0]?.unresolvedRun?.status).toBe("queued");
       expect(reopenedDto.workflows[0]?.unresolvedRun?.desiredState).toBe("paused");
-      const reopenedRuns = runCli(root, ["--engine", "v4", "runs", "waiter", "--json"]);
+      const reopenedRuns = runCli(root, ["runs", "waiter", "--json"]);
       expect(reopenedRuns.status).toBe(0);
       expect(runsDtoV2Schema.parse(JSON.parse(reopenedRuns.stdout)).runs.map((run) => run.runId)).toEqual([waiterRunId]);
       expect(readFileSync(waiterStarted, "utf8").trim().split("\n")).toHaveLength(1);
       expect(reopenedDto.workflows[0]?.unresolvedRun?.waitingForCapacity).toBe(true);
-      const stoppedWaiting = runCli(root, ["--engine", "v4", "stop", "waiter"]);
+      const stoppedWaiting = runCli(root, ["stop", "waiter"]);
       if (stoppedWaiting.status !== 0) throw new Error(`${stoppedWaiting.stdout} ${stoppedWaiting.stderr}`);
-      const stoppedRuns = runCli(root, ["--engine", "v4", "runs", "waiter", "--json"]);
+      const stoppedRuns = runCli(root, ["runs", "waiter", "--json"]);
       expect(runsDtoV2Schema.parse(JSON.parse(stoppedRuns.stdout)).runs.find((entry) => entry.runId === waiterRunId)?.status).toBe("cancelled");
       expect(existsSync(successorStarted)).toBe(false);
     } finally {
@@ -879,11 +879,11 @@ describe("v4 public service restart", () => {
     ].join("\n"), "utf8");
 
     try {
-      const started = runCli(root, ["--engine", "v4", "start", "paused-failure", "--detach"]);
+      const started = runCli(root, ["start", "paused-failure", "--detach"]);
       expect(started.status).toBe(0);
       const runId = runIdV2Schema.parse(started.stdout.match(/Started run (\S+)/)?.[1]);
       await waitForFile(workerStarted);
-      const pause = runCli(root, ["--engine", "v4", "pause", "paused-failure"]);
+      const pause = runCli(root, ["pause", "paused-failure"]);
       expect(pause.status).toBe(0);
 
       const failedAttempt = await waitForAttemptStatus(root, "paused-failure", runId, "fail", "failed");
@@ -891,7 +891,7 @@ describe("v4 public service restart", () => {
       const stillPaused = await waitForRunStatus(root, "paused-failure", runId, "paused");
       expect(stillPaused.status).toBe("paused");
 
-      const resume = runCli(root, ["--engine", "v4", "resume", "paused-failure"]);
+      const resume = runCli(root, ["resume", "paused-failure"]);
       expect(resume.status).toBe(0);
       const failed = await waitForRunStatus(root, "paused-failure", runId, "failed");
       expect(failed.status).toBe("failed");
@@ -953,26 +953,26 @@ describe("v4 public service restart", () => {
     ].join("\n"), "utf8");
 
     try {
-      const safeStart = runCli(root, ["--engine", "v4", "start", "safe-stop", "--detach"]);
+      const safeStart = runCli(root, ["start", "safe-stop", "--detach"]);
       expect(safeStart.status).toBe(0);
       const safeRunId = runIdV2Schema.parse(safeStart.stdout.match(/Started run (\S+)/)?.[1]);
       await waitForFile(safeWorkerStarted);
-      const pause = runCli(root, ["--engine", "v4", "pause", "safe-stop"]);
+      const pause = runCli(root, ["pause", "safe-stop"]);
       expect(pause.status).toBe(0);
       await waitForNodeStatus(root, "safe-stop", safeRunId, "first", "succeeded");
       const pausedRun = await waitForRunStatus(root, "safe-stop", safeRunId, "paused");
       expect(pausedRun.currentNodeId).toBe("second");
 
-      const safeStop = runCli(root, ["--engine", "v4", "stop", "safe-stop"]);
+      const safeStop = runCli(root, ["stop", "safe-stop"]);
       expect(safeStop.status).toBe(0);
       expect(safeStop.stdout).toContain("cancelled (stopped)");
       const safeCancelled = await waitForRunStatus(root, "safe-stop", safeRunId, "cancelled");
       expect(safeCancelled.status).toBe("cancelled");
       expect(existsSync(safeSuccessorStarted)).toBe(false);
-      const safeStatus = runCli(root, ["--engine", "v4", "status", "safe-stop", "--json"]);
+      const safeStatus = runCli(root, ["status", "safe-stop", "--json"]);
       expect(statusDtoV2Schema.parse(JSON.parse(safeStatus.stdout)).workflows[0]?.activation?.state).toBe("stopped");
 
-      const activeStart = runCli(root, ["--engine", "v4", "start", "active-stop", "--detach"]);
+      const activeStart = runCli(root, ["start", "active-stop", "--detach"]);
       expect(activeStart.status).toBe(0);
       const activeRunId = runIdV2Schema.parse(activeStart.stdout.match(/Started run (\S+)/)?.[1]);
       await waitForFile(activePidPath);
@@ -980,15 +980,15 @@ describe("v4 public service restart", () => {
       expect(Number.isSafeInteger(processGroupId)).toBe(true);
       if (!Number.isSafeInteger(processGroupId) || processGroupId <= 0) throw new Error("active stop fixture did not record a process-group ID");
 
-      const activeStop = spawnCli(root, ["--engine", "v4", "stop", "active-stop"]);
+      const activeStop = spawnCli(root, ["stop", "active-stop"]);
       await waitForFile(activeTermPath);
       expect(isProcessGroupAlive(processGroupId)).toBe(true);
-      const concurrentStart = runCli(root, ["--engine", "v4", "start", "after-stop", "--detach"]);
+      const concurrentStart = runCli(root, ["start", "after-stop", "--detach"]);
       expect(concurrentStart.status).not.toBe(0);
       expect(concurrentStart.stdout + concurrentStart.stderr).not.toBe("");
       expect(existsSync(afterStopStarted)).toBe(false);
 
-      const pauseDuringStop = runCli(root, ["--engine", "v4", "pause", "active-stop"]);
+      const pauseDuringStop = runCli(root, ["pause", "active-stop"]);
       expect(pauseDuringStop.status).not.toBe(0);
       expect(pauseDuringStop.stderr).toContain("run_stopped");
       const stopped = await activeStop.completion;
@@ -997,7 +997,7 @@ describe("v4 public service restart", () => {
       await waitForProcessGroupGone(processGroupId);
       const activeCancelled = await waitForRunStatus(root, "active-stop", activeRunId, "cancelled");
       expect(activeCancelled.status).toBe("cancelled");
-      const activeDescription = runCli(root, ["--engine", "v4", "node", "describe", "active-stop", "wait", "--run", activeRunId, "--json"]);
+      const activeDescription = runCli(root, ["node", "describe", "active-stop", "wait", "--run", activeRunId, "--json"]);
       expect(activeDescription.status).toBe(0);
       const activeAttempt = nodeDescriptionDtoV2Schema.parse(JSON.parse(activeDescription.stdout)).node.attempts[0];
       expect(activeAttempt?.status).toBe("cancelled");
@@ -1005,7 +1005,7 @@ describe("v4 public service restart", () => {
         { status: "exited", exit: { kind: "signal" }, cleanupState: "confirmed_dead" },
       ]);
 
-      const afterCleanup = runCli(root, ["--engine", "v4", "start", "after-stop", "--detach"]);
+      const afterCleanup = runCli(root, ["start", "after-stop", "--detach"]);
       expect(afterCleanup.status).toBe(0);
       await waitForFile(afterStopStarted);
     } finally {
@@ -1040,7 +1040,7 @@ describe("v4 public service restart", () => {
     ].join("\n"), "utf8");
 
     try {
-      const started = runCli(root, ["--engine", "v4", "start", "validator-stop", "--detach"]);
+      const started = runCli(root, ["start", "validator-stop", "--detach"]);
       expect(started.status).toBe(0);
       const runId = runIdV2Schema.parse(started.stdout.match(/Started run (\S+)/)?.[1]);
       await waitForFile(validatorGroupPath);
@@ -1052,14 +1052,14 @@ describe("v4 public service restart", () => {
       expect(isProcessGroupAlive(validatorGroupId)).toBe(true);
       process.kill(validatorChildId, 0);
 
-      const stopping = spawnCli(root, ["--engine", "v4", "stop", "validator-stop"]);
+      const stopping = spawnCli(root, ["stop", "validator-stop"]);
       const stopped = await stopping.completion;
       expect(stopped.status).toBe(0);
       expect(stopped.stdout).toContain("cancelled (stopped)");
       await waitForProcessGroupGone(validatorGroupId);
       const run = await waitForRunStatus(root, "validator-stop", runId, "cancelled");
       expect(run.status).toBe("cancelled");
-      const description = runCli(root, ["--engine", "v4", "node", "describe", "validator-stop", "validate", "--run", runId, "--json"]);
+      const description = runCli(root, ["node", "describe", "validator-stop", "validate", "--run", runId, "--json"]);
       expect(description.status).toBe(0);
       const node = nodeDescriptionDtoV2Schema.parse(JSON.parse(description.stdout)).node;
       const attempt = node.attempts[0];
@@ -1095,7 +1095,7 @@ describe("v4 public service restart", () => {
     ].join("\n"), "utf8");
 
     try {
-      const started = runCli(root, ["--engine", "v4", "start", "long-process", "--detach"]);
+      const started = runCli(root, ["start", "long-process", "--detach"]);
       expect(started.status).toBe(0);
       const runId = runIdV2Schema.parse(started.stdout.match(/Started run (\S+)/)?.[1]);
       await waitForFile(pidPath);
@@ -1108,17 +1108,17 @@ describe("v4 public service restart", () => {
       process.kill(oldService.pid, "SIGKILL");
       await waitForPidGone(oldService.pid);
 
-      const historyResult = runCli(root, ["--engine", "v4", "runs", "long-process", "--json"]);
+      const historyResult = runCli(root, ["runs", "long-process", "--json"]);
       expect(historyResult.status).toBe(0);
       const history = runsDtoV2Schema.parse(JSON.parse(historyResult.stdout));
       const interrupted = history.runs.find((run) => run.runId === runId);
       expect(interrupted).toBeDefined();
       expect(interrupted?.status).not.toBe("completed");
-      const statusResult = runCli(root, ["--engine", "v4", "status", "long-process", "--json"]);
+      const statusResult = runCli(root, ["status", "long-process", "--json"]);
       expect(statusResult.status).toBe(0);
       const status = statusDtoV2Schema.parse(JSON.parse(statusResult.stdout));
       expect(status.service.bootId).not.toBe(oldService.bootId);
-      const logsResult = runCli(root, ["--engine", "v4", "logs", "long-process", "--run", runId, "--json"]);
+      const logsResult = runCli(root, ["logs", "long-process", "--run", runId, "--json"]);
       expect(logsResult.status).toBe(0);
       expect(logsDtoV2Schema.parse(JSON.parse(logsResult.stdout)).runId).toBe(runId);
       expect(readFileSync(pidPath, "utf8").trim()).toBe(workerPidText);
@@ -1179,7 +1179,7 @@ describe("v4 public service restart", () => {
     ].join("\n"), "utf8");
 
     try {
-      const started = runCli(root, ["--engine", "v4", "start", "capture-recovery", "--detach"]);
+      const started = runCli(root, ["start", "capture-recovery", "--detach"]);
       expect(started.status).toBe(0);
       const runId = runIdV2Schema.parse(started.stdout.match(/Started run (\S+)/)?.[1]);
       const oldService = JSON.parse(readFileSync(join(state, "service.json"), "utf8")) as { pid: number; bootId: string };
@@ -1195,7 +1195,7 @@ describe("v4 public service restart", () => {
 
       process.kill(oldService.pid, "SIGKILL");
       await waitForPidGone(oldService.pid);
-      const restartResult = runCli(root, ["--engine", "v4", "runs", "capture-recovery", "--json"], 60_000);
+      const restartResult = runCli(root, ["runs", "capture-recovery", "--json"], 60_000);
       expect(restartResult.status).toBe(0);
       const recoveredService = JSON.parse(readFileSync(join(state, "service.json"), "utf8")) as { status: string; bootId: string; socketPath: string };
       expect(recoveredService.status).toBe("ready");
@@ -1230,7 +1230,7 @@ describe("v4 public service restart", () => {
         },
       });
 
-      const cliLogs = await runCliPrefix(root, ["--engine", "v4", "logs", "capture-recovery", "--run", runId], 60_000);
+      const cliLogs = await runCliPrefix(root, ["logs", "capture-recovery", "--run", runId], 60_000);
       expect(cliLogs.status).toBe(0);
       expect(cliLogs.stdout).toContain(
         `${totalBytes} bytes total; ${capBytes} retained (22369622 head + 11184810 tail), ${totalBytes - capBytes} omitted; incomplete`,
@@ -1282,7 +1282,7 @@ describe("v4 public service restart", () => {
     ].join("\n"), "utf8");
 
     try {
-      const started = runCli(root, ["--engine", "v4", "start", "long-process", "--detach"]);
+      const started = runCli(root, ["start", "long-process", "--detach"]);
       expect(started.status).toBe(0);
       const oldRunId = runIdV2Schema.parse(started.stdout.match(/Started run (\S+)/)?.[1]);
       await waitForFile(oldPidPath);
@@ -1294,7 +1294,7 @@ describe("v4 public service restart", () => {
       await waitForPidGone(oldService.pid);
       const queuedRunId = await admitQueuedRunOffline(root, "queued-clean");
 
-      const command = spawnCli(root, ["--engine", "v4", "runs", "queued-clean", "--json"]);
+      const command = spawnCli(root, ["runs", "queued-clean", "--json"]);
       await waitForFile(termPath);
       expect(isProcessGroupAlive(oldWorkerPid)).toBe(true);
       expect(existsSync(queuedStartPath)).toBe(false);
@@ -1307,10 +1307,10 @@ describe("v4 public service restart", () => {
       expect(queuedRun.status).toBe("completed");
       expect(queuedRun.runId).toBe(queuedRunId);
       expect(readFileSync(queuedStartPath, "utf8")).toBe("started\n");
-      const statusResult = runCli(root, ["--engine", "v4", "status", "long-process", "--json"]);
+      const statusResult = runCli(root, ["status", "long-process", "--json"]);
       expect(statusResult.status).toBe(0);
       expect(statusDtoV2Schema.parse(JSON.parse(statusResult.stdout)).service.bootId).not.toBe(oldService.bootId);
-      const oldRunHistory = runCli(root, ["--engine", "v4", "runs", "long-process", "--json"]);
+      const oldRunHistory = runCli(root, ["runs", "long-process", "--json"]);
       expect(runsDtoV2Schema.parse(JSON.parse(oldRunHistory.stdout)).runs.some((run) => run.runId === oldRunId)).toBe(true);
     } finally {
       await stopV4Service(root);
@@ -1328,7 +1328,7 @@ describe("v4 public service restart", () => {
     writeFileSync(workflowPath, frozenWorkflow("sleep 3; printf frozen-first", 'cat "$WORKSHOP_PREVIOUS_OUTPUT_FILE"'), "utf8");
 
     try {
-      const started = runCli(root, ["--engine", "v4", "start", "frozen-chain", "--detach"]);
+      const started = runCli(root, ["start", "frozen-chain", "--detach"]);
       expect(started.status).toBe(0);
       const runId = runIdV2Schema.parse(started.stdout.match(/Started run (\S+)/)?.[1]);
       writeFileSync(workflowPath, frozenWorkflow("sleep 0.1; printf edited-first", "printf edited-second"), "utf8");
@@ -1336,18 +1336,18 @@ describe("v4 public service restart", () => {
       const completed = await waitForRun(root, "frozen-chain", runId);
       expect(completed.status).toBe("completed");
       expect(completed.terminalOutput).toBe("frozen-first");
-      const runsResult = runCli(root, ["--engine", "v4", "runs", "frozen-chain", "--json"]);
+      const runsResult = runCli(root, ["runs", "frozen-chain", "--json"]);
       expect(runsResult.status).toBe(0);
       const runs = runsDtoV2Schema.parse(JSON.parse(runsResult.stdout));
       const listed = runs.runs.find((run) => run.runId === runId);
       expect(listed?.definitionHash).toBe(completed.definitionHash);
       expect(listed?.status).toBe("completed");
 
-      const logsResult = runCli(root, ["--engine", "v4", "logs", "frozen-chain", "--run", runId, "--json"]);
+      const logsResult = runCli(root, ["logs", "frozen-chain", "--run", runId, "--json"]);
       expect(logsResult.status).toBe(0);
       expect(logsDtoV2Schema.parse(JSON.parse(logsResult.stdout)).runId).toBe(runId);
 
-      const firstNodeResult = runCli(root, ["--engine", "v4", "node", "describe", "frozen-chain", "first", "--run", runId, "--json"]);
+      const firstNodeResult = runCli(root, ["node", "describe", "frozen-chain", "first", "--run", runId, "--json"]);
       expect(firstNodeResult.status).toBe(0);
       const firstNode = nodeDescriptionDtoV2Schema.parse(JSON.parse(firstNodeResult.stdout));
       expect(firstNode.runId).toBe(runId);
@@ -1358,7 +1358,7 @@ describe("v4 public service restart", () => {
       expect(firstNode.node.successfulOutput).toBe("frozen-first");
       expect(firstNode.node.attempts).toHaveLength(1);
 
-      const secondNodeResult = runCli(root, ["--engine", "v4", "node", "describe", "frozen-chain", "second", "--run", runId, "--json"]);
+      const secondNodeResult = runCli(root, ["node", "describe", "frozen-chain", "second", "--run", runId, "--json"]);
       expect(secondNodeResult.status).toBe(0);
       const secondNode = nodeDescriptionDtoV2Schema.parse(JSON.parse(secondNodeResult.stdout));
       expect(secondNode.runId).toBe(runId);
@@ -1375,12 +1375,12 @@ describe("v4 public service restart", () => {
         "    next: null",
         "",
       ].join("\n"), "utf8");
-      const replacementStart = runCli(root, ["--engine", "v4", "start", "frozen-chain", "--detach"]);
+      const replacementStart = runCli(root, ["start", "frozen-chain", "--detach"]);
       expect(replacementStart.status).toBe(0);
       const replacementRunId = runIdV2Schema.parse(replacementStart.stdout.match(/Started run (\S+)/)?.[1]);
       expect((await waitForRun(root, "frozen-chain", replacementRunId)).status).toBe("completed");
 
-      const historicalDiagram = runCli(root, ["--engine", "v4", "diagram", "frozen-chain", "--run", runId, "--mermaid"]);
+      const historicalDiagram = runCli(root, ["diagram", "frozen-chain", "--run", runId, "--mermaid"]);
       expect(historicalDiagram.status).toBe(0);
       expect(historicalDiagram.stdout).toContain('first["first [succeeded]"]');
       expect(historicalDiagram.stdout).toContain('second["second [succeeded]"]');
@@ -1390,7 +1390,7 @@ describe("v4 public service restart", () => {
       const historicalView = await viewerSource.snapshot("frozen-chain", runId);
       expect(historicalView.runs.runs.find((run) => run.id === runId)?.nodes.map((node) => node.id)).toEqual(["first", "second"]);
       expect(historicalView.runs.runs.find((run) => run.id === runId)?.nodes.map((node) => node.status)).toEqual(["completed", "completed"]);
-      const latestDiagram = runCli(root, ["--engine", "v4", "diagram", "frozen-chain", "--mermaid"]);
+      const latestDiagram = runCli(root, ["diagram", "frozen-chain", "--mermaid"]);
       expect(latestDiagram.status).toBe(0);
       expect(latestDiagram.stdout).toContain('replacement["replacement [succeeded]"]');
       expect(latestDiagram.stdout).not.toContain('first["first');
@@ -1421,7 +1421,7 @@ describe("v4 public service restart", () => {
     ].join("\n"), "utf8");
 
     try {
-      const started = runCli(root, ["--engine", "v4", "start", "scheduled", "--detach"]);
+      const started = runCli(root, ["start", "scheduled", "--detach"]);
       expect(started.status).toBe(0);
       const firstRunId = runIdV2Schema.parse(started.stdout.match(/Started run (\S+)/)?.[1]);
       const firstRun = await waitForRun(root, "scheduled", firstRunId);
@@ -1443,7 +1443,7 @@ describe("v4 public service restart", () => {
       const deadline = Date.now() + 8_000;
       let history = runsDtoV2Schema.parse({ version: 2, workflowId: "scheduled", total: 0, truncated: false, runs: [] });
       while (Date.now() < deadline && (history.runs.length < 2 || !history.runs.every((run) => run.status === "completed"))) {
-        const result = runCli(root, ["--engine", "v4", "runs", "scheduled", "--json", "--all"]);
+        const result = runCli(root, ["runs", "scheduled", "--json", "--all"]);
         if (result.status !== 0) throw new Error(result.stderr);
         history = runsDtoV2Schema.parse(JSON.parse(result.stdout));
         if (history.runs.length < 2 || !history.runs.every((run) => run.status === "completed")) {
@@ -1455,7 +1455,7 @@ describe("v4 public service restart", () => {
       expect(history.runs.some((run) => run.runId === firstRunId)).toBe(true);
       expect(readFileSync(launches, "utf8")).toBe("tickfuture");
 
-      const statusResult = runCli(root, ["--engine", "v4", "status", "scheduled", "--json"]);
+      const statusResult = runCli(root, ["status", "scheduled", "--json"]);
       expect(statusResult.status).toBe(0);
       const status = statusDtoV2Schema.parse(JSON.parse(statusResult.stdout));
       const activation = status.workflows[0]?.activation;
@@ -1469,18 +1469,18 @@ describe("v4 public service restart", () => {
       expect(elapsedFromActivation).toBeGreaterThanOrEqual(750);
       expect(elapsedFromActivation).toBeLessThan(4_000);
       const exhaustedActivationId = activation.activationId;
-      const reactivated = runCli(root, ["--engine", "v4", "start", "scheduled", "--detach"]);
+      const reactivated = runCli(root, ["start", "scheduled", "--detach"]);
       expect(reactivated.status).toBe(0);
       const thirdRunId = runIdV2Schema.parse(reactivated.stdout.match(/Started run (\S+)/)?.[1]);
       expect((await waitForRun(root, "scheduled", thirdRunId)).status).toBe("completed");
       expect(readFileSync(launches, "utf8")).toBe("tickfuturefuture");
-      const afterReactivation = runCli(root, ["--engine", "v4", "status", "scheduled", "--json"]);
+      const afterReactivation = runCli(root, ["status", "scheduled", "--json"]);
       expect(afterReactivation.status).toBe(0);
       const newActivation = statusDtoV2Schema.parse(JSON.parse(afterReactivation.stdout)).workflows[0]?.activation;
       expect(newActivation).toMatchObject({ state: "active", admittedCount: 1, maxRuns: 2 });
       if (newActivation === null || newActivation === undefined) throw new Error("reactivated activation is missing");
       expect(newActivation.activationId).not.toBe(exhaustedActivationId);
-      const allRuns = runCli(root, ["--engine", "v4", "runs", "scheduled", "--json", "--all"]);
+      const allRuns = runCli(root, ["runs", "scheduled", "--json", "--all"]);
       expect(allRuns.status).toBe(0);
       const retainedRuns = runsDtoV2Schema.parse(JSON.parse(allRuns.stdout)).runs;
       expect(retainedRuns).toHaveLength(3);
@@ -1514,7 +1514,7 @@ describe("v4 public service restart", () => {
     ].join("\n"), "utf8");
 
     try {
-      const started = runCli(root, ["--engine", "v4", "start", "scheduled", "--detach"]);
+      const started = runCli(root, ["start", "scheduled", "--detach"]);
       expect(started.status).toBe(0);
       const firstRunId = runIdV2Schema.parse(started.stdout.match(/Started run (\S+)/)?.[1]);
       expect((await waitForRun(root, "scheduled", firstRunId)).status).toBe("completed");
@@ -1523,7 +1523,7 @@ describe("v4 public service restart", () => {
       const deadline = Date.now() + 5_000;
       let status: ReturnType<typeof statusDtoV2Schema.parse> | undefined;
       while (Date.now() < deadline) {
-        const result = runCli(root, ["--engine", "v4", "status", "scheduled", "--json"]);
+        const result = runCli(root, ["status", "scheduled", "--json"]);
         if (result.status !== 0) throw new Error(result.stderr);
         status = statusDtoV2Schema.parse(JSON.parse(result.stdout));
         if (status.workflows[0]?.activation?.state === "stopped") break;
@@ -1533,7 +1533,7 @@ describe("v4 public service restart", () => {
       expect(workflow?.activation).toMatchObject({ state: "stopped", admittedCount: 1, maxRuns: 5, nextDueAt: null });
       expect(workflow?.configurationError).not.toBeNull();
       expect(readFileSync(launches, "utf8")).toBe("tick");
-      const runsResult = runCli(root, ["--engine", "v4", "runs", "scheduled", "--json", "--all"]);
+      const runsResult = runCli(root, ["runs", "scheduled", "--json", "--all"]);
       expect(runsResult.status).toBe(0);
       expect(runsDtoV2Schema.parse(JSON.parse(runsResult.stdout)).runs).toHaveLength(1);
     } finally {
@@ -1563,7 +1563,7 @@ describe("v4 public service restart", () => {
     ].join("\n"), "utf8");
 
     try {
-      const started = runCli(root, ["--engine", "v4", "start", "scheduled", "--detach"]);
+      const started = runCli(root, ["start", "scheduled", "--detach"]);
       expect(started.status).toBe(0);
       const firstRunId = runIdV2Schema.parse(started.stdout.match(/Started run (\S+)/)?.[1]);
       expect((await waitForRun(root, "scheduled", firstRunId)).status).toBe("completed");
@@ -1571,7 +1571,7 @@ describe("v4 public service restart", () => {
       const deadline = Date.now() + 8_000;
       let history = runsDtoV2Schema.parse({ version: 2, workflowId: "scheduled", total: 0, truncated: false, runs: [] });
       while (Date.now() < deadline && (history.runs.length < 2 || !history.runs.every((run) => run.status === "completed"))) {
-        const result = runCli(root, ["--engine", "v4", "runs", "scheduled", "--json", "--all"]);
+        const result = runCli(root, ["runs", "scheduled", "--json", "--all"]);
         if (result.status !== 0) throw new Error(result.stderr);
         history = runsDtoV2Schema.parse(JSON.parse(result.stdout));
         if (history.runs.length < 2 || !history.runs.every((run) => run.status === "completed")) {
@@ -1581,7 +1581,7 @@ describe("v4 public service restart", () => {
       expect(history.runs).toHaveLength(2);
       expect(history.runs.every((run) => run.status === "completed")).toBe(true);
       expect(readFileSync(launches, "utf8")).toBe("ticktick");
-      const statusResult = runCli(root, ["--engine", "v4", "status", "scheduled", "--json"]);
+      const statusResult = runCli(root, ["status", "scheduled", "--json"]);
       expect(statusResult.status).toBe(0);
       const activation = statusDtoV2Schema.parse(JSON.parse(statusResult.stdout)).workflows[0]?.activation;
       expect(activation).toMatchObject({ state: "exhausted", admittedCount: 2, skippedSlots: 2 });
@@ -1625,17 +1625,17 @@ describe("v4 public service restart", () => {
     ].join("\n"), "utf8");
 
     try {
-      const holderStart = runCli(root, ["--engine", "v4", "start", "holder", "--detach"]);
+      const holderStart = runCli(root, ["start", "holder", "--detach"]);
       expect(holderStart.status).toBe(0);
       const holderRunId = runIdV2Schema.parse(holderStart.stdout.match(/Started run (\S+)/)?.[1]);
       await waitForFile(holderStarted);
 
-      const rejectedStart = runCli(root, ["--engine", "v4", "start", "scheduled", "--detach"]);
+      const rejectedStart = runCli(root, ["start", "scheduled", "--detach"]);
       expect(rejectedStart.status).not.toBe(0);
-      const statusResult = runCli(root, ["--engine", "v4", "status", "scheduled", "--json"]);
+      const statusResult = runCli(root, ["status", "scheduled", "--json"]);
       expect(statusResult.status).toBe(0);
       expect(statusDtoV2Schema.parse(JSON.parse(statusResult.stdout)).workflows[0]?.activation).toBeNull();
-      const historyResult = runCli(root, ["--engine", "v4", "runs", "scheduled", "--json"]);
+      const historyResult = runCli(root, ["runs", "scheduled", "--json"]);
       expect(historyResult.status).toBe(0);
       expect(runsDtoV2Schema.parse(JSON.parse(historyResult.stdout)).runs).toHaveLength(0);
       expect((await waitForRun(root, "holder", holderRunId)).status).toBe("completed");
@@ -1666,11 +1666,11 @@ describe("v4 public service restart", () => {
     ].join("\n"), "utf8");
 
     try {
-      const started = runCli(root, ["--engine", "v4", "start", "scheduled", "--detach"]);
+      const started = runCli(root, ["start", "scheduled", "--detach"]);
       expect(started.status).toBe(0);
       const firstRunId = runIdV2Schema.parse(started.stdout.match(/Started run (\S+)/)?.[1]);
       expect((await waitForRun(root, "scheduled", firstRunId)).status).toBe("completed");
-      const firstStatus = runCli(root, ["--engine", "v4", "status", "scheduled", "--json"]);
+      const firstStatus = runCli(root, ["status", "scheduled", "--json"]);
       expect(firstStatus.status).toBe(0);
       const firstActivation = statusDtoV2Schema.parse(JSON.parse(firstStatus.stdout)).workflows[0]?.activation;
       if (firstActivation === null || firstActivation === undefined) throw new Error("scheduled activation is missing");
@@ -1678,14 +1678,14 @@ describe("v4 public service restart", () => {
 
       await stopV4Service(root);
       await new Promise((resolveDelay) => setTimeout(resolveDelay, 2_200));
-      const restartedStatus = runCli(root, ["--engine", "v4", "status", "scheduled", "--json"]);
+      const restartedStatus = runCli(root, ["status", "scheduled", "--json"]);
       expect(restartedStatus.status).toBe(0);
       expect(statusDtoV2Schema.parse(JSON.parse(restartedStatus.stdout)).service.bootId).not.toBe(firstBootId);
 
       const deadline = Date.now() + 8_000;
       let history = runsDtoV2Schema.parse({ version: 2, workflowId: "scheduled", total: 0, truncated: false, runs: [] });
       while (Date.now() < deadline && history.runs.length < 2) {
-        const result = runCli(root, ["--engine", "v4", "runs", "scheduled", "--json", "--all"]);
+        const result = runCli(root, ["runs", "scheduled", "--json", "--all"]);
         if (result.status !== 0) throw new Error(result.stderr);
         history = runsDtoV2Schema.parse(JSON.parse(result.stdout));
         if (history.runs.length < 2) await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
@@ -1694,7 +1694,7 @@ describe("v4 public service restart", () => {
       expect(history.runs.some((run) => run.runId === firstRunId)).toBe(true);
       expect(readFileSync(launches, "utf8")).toBe("ticktick");
 
-      const finalStatus = runCli(root, ["--engine", "v4", "status", "scheduled", "--json"]);
+      const finalStatus = runCli(root, ["status", "scheduled", "--json"]);
       expect(finalStatus.status).toBe(0);
       const activation = statusDtoV2Schema.parse(JSON.parse(finalStatus.stdout)).workflows[0]?.activation;
       expect(activation).toMatchObject({ state: "exhausted", admittedCount: 2, skippedSlots: 1, maxRuns: 2 });
@@ -1728,34 +1728,34 @@ describe("v4 public service restart", () => {
     ].join("\n"), "utf8");
 
     try {
-      const firstStart = runCli(root, ["--engine", "v4", "start", "scheduled", "--detach"]);
+      const firstStart = runCli(root, ["start", "scheduled", "--detach"]);
       expect(firstStart.status).toBe(0);
       const firstRunId = runIdV2Schema.parse(firstStart.stdout.match(/Started run (\S+)/)?.[1]);
       expect((await waitForRun(root, "scheduled", firstRunId)).status).toBe("completed");
-      const beforePause = runCli(root, ["--engine", "v4", "status", "scheduled", "--json"]);
+      const beforePause = runCli(root, ["status", "scheduled", "--json"]);
       expect(beforePause.status).toBe(0);
       const initialActivation = statusDtoV2Schema.parse(JSON.parse(beforePause.stdout)).workflows[0]?.activation;
       if (initialActivation === null || initialActivation === undefined) throw new Error("scheduled activation is missing");
 
-      const paused = runCli(root, ["--engine", "v4", "pause", "scheduled"]);
+      const paused = runCli(root, ["pause", "scheduled"]);
       expect(paused.status).toBe(0);
-      const pausedStatus = runCli(root, ["--engine", "v4", "status", "scheduled", "--json"]);
+      const pausedStatus = runCli(root, ["status", "scheduled", "--json"]);
       expect(pausedStatus.status).toBe(0);
       expect(statusDtoV2Schema.parse(JSON.parse(pausedStatus.stdout)).workflows[0]?.activation)
         .toMatchObject({ activationId: initialActivation.activationId, state: "paused", admittedCount: 1 });
 
       await new Promise((resolveDelay) => setTimeout(resolveDelay, 2_300));
-      const pausedHistory = runCli(root, ["--engine", "v4", "runs", "scheduled", "--json", "--all"]);
+      const pausedHistory = runCli(root, ["runs", "scheduled", "--json", "--all"]);
       expect(pausedHistory.status).toBe(0);
       expect(runsDtoV2Schema.parse(JSON.parse(pausedHistory.stdout)).runs).toHaveLength(1);
       expect(readFileSync(launches, "utf8")).toBe("tick");
 
-      const resumed = runCli(root, ["--engine", "v4", "resume", "scheduled"]);
+      const resumed = runCli(root, ["resume", "scheduled"]);
       expect(resumed.status).toBe(0);
       const deadline = Date.now() + 8_000;
       let history = runsDtoV2Schema.parse({ version: 2, workflowId: "scheduled", total: 0, truncated: false, runs: [] });
       while (Date.now() < deadline && (history.runs.length < 2 || !history.runs.every((run) => run.status === "completed"))) {
-        const result = runCli(root, ["--engine", "v4", "runs", "scheduled", "--json", "--all"]);
+        const result = runCli(root, ["runs", "scheduled", "--json", "--all"]);
         if (result.status !== 0) throw new Error(result.stderr);
         history = runsDtoV2Schema.parse(JSON.parse(result.stdout));
         if (history.runs.length < 2 || !history.runs.every((run) => run.status === "completed")) {
@@ -1763,28 +1763,28 @@ describe("v4 public service restart", () => {
         }
       }
       expect(history.runs).toHaveLength(2);
-      const afterResume = runCli(root, ["--engine", "v4", "status", "scheduled", "--json"]);
+      const afterResume = runCli(root, ["status", "scheduled", "--json"]);
       expect(afterResume.status).toBe(0);
       expect(statusDtoV2Schema.parse(JSON.parse(afterResume.stdout)).workflows[0]?.activation)
         .toMatchObject({ activationId: initialActivation.activationId, state: "active", admittedCount: 2 });
       expect(readFileSync(launches, "utf8")).toBe("ticktick");
 
-      const stopped = runCli(root, ["--engine", "v4", "stop", "scheduled"]);
+      const stopped = runCli(root, ["stop", "scheduled"]);
       expect(stopped.status).toBe(0);
-      const stoppedStatus = runCli(root, ["--engine", "v4", "status", "scheduled", "--json"]);
+      const stoppedStatus = runCli(root, ["status", "scheduled", "--json"]);
       expect(stoppedStatus.status).toBe(0);
       expect(statusDtoV2Schema.parse(JSON.parse(stoppedStatus.stdout)).workflows[0]?.activation)
         .toMatchObject({ activationId: initialActivation.activationId, state: "stopped", nextDueAt: null });
 
       await new Promise((resolveDelay) => setTimeout(resolveDelay, 2_100));
-      const afterStop = runCli(root, ["--engine", "v4", "runs", "scheduled", "--json", "--all"]);
+      const afterStop = runCli(root, ["runs", "scheduled", "--json", "--all"]);
       expect(afterStop.status).toBe(0);
       expect(runsDtoV2Schema.parse(JSON.parse(afterStop.stdout)).runs).toHaveLength(2);
-      const reactivated = runCli(root, ["--engine", "v4", "start", "scheduled", "--detach"]);
+      const reactivated = runCli(root, ["start", "scheduled", "--detach"]);
       expect(reactivated.status).toBe(0);
       const thirdRunId = runIdV2Schema.parse(reactivated.stdout.match(/Started run (\S+)/)?.[1]);
       expect((await waitForRun(root, "scheduled", thirdRunId)).status).toBe("completed");
-      const finalStatus = runCli(root, ["--engine", "v4", "status", "scheduled", "--json"]);
+      const finalStatus = runCli(root, ["status", "scheduled", "--json"]);
       expect(finalStatus.status).toBe(0);
       const newActivation = statusDtoV2Schema.parse(JSON.parse(finalStatus.stdout)).workflows[0]?.activation;
       expect(newActivation).toMatchObject({ state: "active", admittedCount: 1 });
@@ -1830,18 +1830,18 @@ describe("v4 public service restart", () => {
     ].join("\n"), "utf8");
 
     try {
-      const firstStart = runCli(root, ["--engine", "v4", "start", "scheduled", "--detach"]);
+      const firstStart = runCli(root, ["start", "scheduled", "--detach"]);
       expect(firstStart.status).toBe(0);
       const firstRunId = runIdV2Schema.parse(firstStart.stdout.match(/Started run (\S+)/)?.[1]);
       expect((await waitForRun(root, "scheduled", firstRunId)).status).toBe("completed");
-      const beforeHolder = runCli(root, ["--engine", "v4", "status", "scheduled", "--json"]);
+      const beforeHolder = runCli(root, ["status", "scheduled", "--json"]);
       expect(beforeHolder.status).toBe(0);
       const activation = statusDtoV2Schema.parse(JSON.parse(beforeHolder.stdout)).workflows[0]?.activation;
       if (activation === null || activation === undefined || activation.nextDueAt === null) {
         throw new Error("scheduled activation deadline is missing");
       }
 
-      const holderStart = runCli(root, ["--engine", "v4", "start", "holder", "--detach"]);
+      const holderStart = runCli(root, ["start", "holder", "--detach"]);
       expect(holderStart.status).toBe(0);
       const holderRunId = runIdV2Schema.parse(holderStart.stdout.match(/Started run (\S+)/)?.[1]);
       await waitForFile(holderPidPath);
@@ -1851,10 +1851,10 @@ describe("v4 public service restart", () => {
 
       const delayUntilDue = Date.parse(activation.nextDueAt) + 500 - Date.now();
       if (delayUntilDue > 0) await new Promise((resolveDelay) => setTimeout(resolveDelay, delayUntilDue));
-      const capacityRejectedHistory = runCli(root, ["--engine", "v4", "runs", "scheduled", "--json", "--all"]);
+      const capacityRejectedHistory = runCli(root, ["runs", "scheduled", "--json", "--all"]);
       expect(capacityRejectedHistory.status).toBe(0);
       expect(runsDtoV2Schema.parse(JSON.parse(capacityRejectedHistory.stdout)).runs).toHaveLength(1);
-      const capacityRejectedStatus = runCli(root, ["--engine", "v4", "status", "scheduled", "--json"]);
+      const capacityRejectedStatus = runCli(root, ["status", "scheduled", "--json"]);
       expect(capacityRejectedStatus.status).toBe(0);
       expect(statusDtoV2Schema.parse(JSON.parse(capacityRejectedStatus.stdout)).workflows[0]?.activation)
         .toMatchObject({ activationId: activation.activationId, state: "active", admittedCount: 1, nextDueAt: activation.nextDueAt });
@@ -1864,7 +1864,7 @@ describe("v4 public service restart", () => {
       const oldService = JSON.parse(readFileSync(serviceMetadataPath, "utf8")) as { pid: number; bootId: string };
       process.kill(oldService.pid, "SIGKILL");
       await waitForPidGone(oldService.pid);
-      const reopened = runCli(root, ["--engine", "v4", "status", "scheduled", "--json"]);
+      const reopened = runCli(root, ["status", "scheduled", "--json"]);
       expect(reopened.status).toBe(0);
       const reopenedDto = statusDtoV2Schema.parse(JSON.parse(reopened.stdout));
       expect(reopenedDto.service.bootId).not.toBe(oldService.bootId);
@@ -1873,7 +1873,7 @@ describe("v4 public service restart", () => {
       const deadline = Date.now() + 12_000;
       let history = runsDtoV2Schema.parse({ version: 2, workflowId: "scheduled", total: 0, truncated: false, runs: [] });
       while (Date.now() < deadline && (history.runs.length < 2 || !history.runs.every((run) => run.status === "completed"))) {
-        const result = runCli(root, ["--engine", "v4", "runs", "scheduled", "--json", "--all"]);
+        const result = runCli(root, ["runs", "scheduled", "--json", "--all"]);
         if (result.status !== 0) throw new Error(result.stderr);
         history = runsDtoV2Schema.parse(JSON.parse(result.stdout));
         if (history.runs.length < 2 || !history.runs.every((run) => run.status === "completed")) {
@@ -1885,17 +1885,17 @@ describe("v4 public service restart", () => {
       expect(new Set(history.runs.map((run) => run.occurrenceId)).size).toBe(2);
       expect(readFileSync(scheduledLaunches, "utf8")).toBe("ticktick");
       expect(readFileSync(holderLaunches, "utf8")).toBe("launch\n");
-      const holderHistoryResult = runCli(root, ["--engine", "v4", "runs", "holder", "--json", "--all"]);
+      const holderHistoryResult = runCli(root, ["runs", "holder", "--json", "--all"]);
       expect(holderHistoryResult.status).toBe(0);
       const interruptedHolder = runsDtoV2Schema.parse(JSON.parse(holderHistoryResult.stdout)).runs.find((run) => run.runId === holderRunId);
       expect(interruptedHolder).toBeDefined();
       expect(interruptedHolder?.status).not.toBe("completed");
 
-      const afterRestart = runCli(root, ["--engine", "v4", "status", "scheduled", "--json"]);
+      const afterRestart = runCli(root, ["status", "scheduled", "--json"]);
       expect(afterRestart.status).toBe(0);
       expect(statusDtoV2Schema.parse(JSON.parse(afterRestart.stdout)).workflows[0]?.activation)
         .toMatchObject({ activationId: activation.activationId, state: "exhausted", admittedCount: 2, maxRuns: 2 });
-      const noDuplicate = runCli(root, ["--engine", "v4", "runs", "scheduled", "--json", "--all"]);
+      const noDuplicate = runCli(root, ["runs", "scheduled", "--json", "--all"]);
       expect(noDuplicate.status).toBe(0);
       expect(runsDtoV2Schema.parse(JSON.parse(noDuplicate.stdout)).runs).toHaveLength(2);
     } finally {
@@ -2046,14 +2046,14 @@ async function startBlockedCommandRun(
     "    next: null",
     "",
   ].join("\n"), "utf8");
-  const started = runCli(root, ["--engine", "v4", "start", workflowId, "--detach"]);
+  const started = runCli(root, ["start", workflowId, "--detach"]);
   if (started.status !== 0) throw new Error(started.stderr);
   const runId = runIdV2Schema.parse(started.stdout.match(/Started run (\S+)/)?.[1]);
   await waitForFile(launchMarker);
   const service = JSON.parse(readFileSync(join(root, ".workshop", "state", "service.json"), "utf8")) as { pid: number };
   process.kill(service.pid, "SIGKILL");
   await waitForPidGone(service.pid);
-  const reopened = runCli(root, ["--engine", "v4", "status", workflowId, "--json"]);
+  const reopened = runCli(root, ["status", workflowId, "--json"]);
   if (reopened.status !== 0) throw new Error(reopened.stderr);
   await waitForRunStatus(root, workflowId, runId, "blocked");
   return { runId };
@@ -2121,7 +2121,7 @@ async function waitForLaunch(path: string): Promise<void> {
 async function waitForRun(root: string, workflowId: string, runId: string) {
   const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {
-    const result = runCli(root, ["--engine", "v4", "runs", workflowId, "--json"]);
+    const result = runCli(root, ["runs", workflowId, "--json"]);
     if (result.status !== 0) throw new Error(result.stderr);
     const projection = runsDtoV2Schema.parse(JSON.parse(result.stdout));
     const run = projection.runs.find((entry) => entry.runId === runId);
@@ -2134,7 +2134,7 @@ async function waitForRun(root: string, workflowId: string, runId: string) {
 async function waitForRunStatus(root: string, workflowId: string, runId: string, expectedStatus: string) {
   const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {
-    const result = runCli(root, ["--engine", "v4", "runs", workflowId, "--json"]);
+    const result = runCli(root, ["runs", workflowId, "--json"]);
     if (result.status !== 0) throw new Error(result.stderr);
     const projection = runsDtoV2Schema.parse(JSON.parse(result.stdout));
     const run = projection.runs.find((entry) => entry.runId === runId);
@@ -2153,7 +2153,7 @@ async function waitForNodeStatus(
 ) {
   const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {
-    const result = runCli(root, ["--engine", "v4", "node", "describe", workflowId, nodeId, "--run", runId, "--json"]);
+    const result = runCli(root, ["node", "describe", workflowId, nodeId, "--run", runId, "--json"]);
     if (result.status !== 0) throw new Error(result.stderr);
     const description = nodeDescriptionDtoV2Schema.parse(JSON.parse(result.stdout));
     if (description.node.status === expectedStatus) return description;
@@ -2171,7 +2171,7 @@ async function waitForAttemptStatus(
 ) {
   const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {
-    const result = runCli(root, ["--engine", "v4", "node", "describe", workflowId, nodeId, "--run", runId, "--json"]);
+    const result = runCli(root, ["node", "describe", workflowId, nodeId, "--run", runId, "--json"]);
     if (result.status !== 0) throw new Error(result.stderr);
     const description = nodeDescriptionDtoV2Schema.parse(JSON.parse(result.stdout));
     if (description.node.attempts.at(-1)?.status === expectedStatus) return description;

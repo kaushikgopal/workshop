@@ -1,4 +1,3 @@
-import type { WorkflowDefinition } from "./schema.js";
 import type { WorkflowDefinitionV2 } from "./schema-v2.js";
 
 /**
@@ -17,15 +16,8 @@ export interface ChainInfo {
   prev: Map<string, string | null>;
 }
 
-export function validateChain(def: WorkflowDefinition): ChainInfo {
-  return checkChainNodes(def.nodes);
-}
-
 export function checkChainV2(def: WorkflowDefinitionV2): ChainInfo {
-  return checkChainNodes(def.nodes);
-}
-
-function checkChainNodes(nodes: Record<string, { next?: string | null }>): ChainInfo {
+  const nodes: Record<string, { next?: string | null }> = def.nodes;
   const ids = Object.keys(nodes);
 
   const referenced = new Set<string>();

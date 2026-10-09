@@ -1,18 +1,16 @@
 import { loadCheckedV2Workflow, findV2Installation } from "../installation/load-v2-installation.js";
 import { errorText } from "./errors.js";
 
-const HELP = `workshop — local agent workflows on a Durable-backed service (v4)
+const HELP = `workshop — local agent workflows on a durable background service
 
-Usage: workshop [--engine v3|v4] <command> [args]
-v4 is the default engine and reads version 2 YAML. A leading --engine v3 runs
-the legacy engine against existing version 1 YAML and v3 state; see
-\`workshop --engine v3 help\`. Workshop never migrates v3 files or state.
+Usage: workshop <command> [args]
+Workflows and the machine config are version 2 YAML under .workshop/config/.
 
 Commands:
   validate <workflow>
-      Check v2 YAML and resolved settings without starting the service.
+      Check workflow YAML and resolved settings without starting the service.
   start <workflow> [--detach]
-      Admit a Durable run; wait for its result unless detached.
+      Admit a run; wait for its result unless detached.
   pause <workflow>
       Pause new work and let the active node finish.
   resume <workflow>
@@ -36,10 +34,10 @@ Commands:
   service start | serve | status [--json] | stop
       Start the detached service owner (idempotent), serve it in the
       foreground, read its health and identity, or shut it down gracefully.
-      The service runs schedules; it replaces v3's \`orchestrate\` daemon.
+      The service runs schedules.
 `;
 
-/** Keep every v4 route isolated from the v3 runtime; unknown commands fail closed. */
+/** Route one command line; help and validate stay offline, and unknown commands fail closed. */
 export async function dispatchV4Command(args: readonly string[]): Promise<void> {
   const [command, ...rest] = args;
   if (command === undefined || command === "help" || command === "--help" || command === "-h") {
@@ -53,7 +51,7 @@ export async function dispatchV4Command(args: readonly string[]): Promise<void> 
     try {
       const installation = findV2Installation();
       const workflow = loadCheckedV2Workflow(installation, rest[0]!);
-      process.stdout.write(`valid v4 workflow ${JSON.stringify(workflow.workflowId)} (${workflow.chain.order.length} nodes)\n`);
+      process.stdout.write(`valid workflow ${JSON.stringify(workflow.workflowId)} (${workflow.chain.order.length} nodes)\n`);
     } catch (error) {
       console.error(`error: ${errorText(error)}`);
       process.exitCode = 64;

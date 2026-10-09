@@ -1,7 +1,6 @@
 import { DefinitionError, parseStrictYaml } from "./parse-yaml.js";
 import { checkChainV2, type ChainInfo } from "./check-chain.js";
 import { workflowSchemaV2, type WorkflowDefinitionV2 } from "./schema-v2.js";
-import { renderV3MigrationGuidance } from "./render-v3-migration-guidance.js";
 
 export interface DefinitionBundleV2 {
   def: WorkflowDefinitionV2;
@@ -11,10 +10,10 @@ export interface DefinitionBundleV2 {
 /** Parse v2 workflow text, apply its strict schema, then check its chain. */
 export function checkV2DefinitionText(text: string, label: string): DefinitionBundleV2 {
   const value = parseStrictYaml(text, label);
-  if (isRecord(value) && value.version === 1) {
-    throw new DefinitionError(renderV3MigrationGuidance(
-      `${label}: workflow version 1 is not supported by the v4 runtime; update the workflow to version: 2 before using it with v4.`,
-    ));
+  if (isRecord(value) && value.version !== 2) {
+    throw new DefinitionError(value.version === undefined
+      ? `${label}: workflow does not declare a version; add version: 2`
+      : `${label}: unsupported workflow version ${JSON.stringify(value.version)}; expected version: 2`);
   }
 
   const def = workflowSchemaV2.parse(value);

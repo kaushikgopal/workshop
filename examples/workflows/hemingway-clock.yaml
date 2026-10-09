@@ -46,7 +46,7 @@ nodes:
   node-publish-quote:
     run:
       command: |
-        directory=".workshop/state/v4/quotes"
+        directory=".workshop/state/quotes"
         mkdir -p "$directory"
         target="$directory/$WORKSHOP_RUN_ID.md"
         if [ -f "$target" ]; then

@@ -1,8 +1,6 @@
 import { readServiceWorklog, sendServiceRequest } from "../service/send-service-request.js";
 import { serviceRunsPageV1Schema } from "../service/schema.js";
-import type { ViewerSource } from "../tui/data-source.js";
-import type { ActivationDto, NodeStatusDto, StatusDto } from "../views/build-status-json.js";
-import { DEFAULT_RUNS_LIMIT, type RunsFeed, type RunsFeedEntry } from "../views/build-runs-json.js";
+import type { ActivationDto, NodeStatusDto, RunsFeed, RunsFeedEntry, StatusDto, ViewerSource } from "../tui/data-source.js";
 import {
   diagramDtoV2Schema,
   nodeDescriptionDtoV2Schema,
@@ -10,6 +8,9 @@ import {
   type RunSummaryDtoV2,
   type StatusDtoV2,
 } from "../views/schema-v2.js";
+
+/** How many occurrences the viewer's feed carries; `total` still counts every run. */
+const VIEWER_RUNS_LIMIT = 50;
 
 export async function openV4Watch(socketPath: string, workflowId: string | null): Promise<void> {
   const source = createV4ViewerSource(socketPath);
@@ -194,7 +195,7 @@ function adaptRuns(
     version: 1,
     workflowId,
     total,
-    runs: runs.slice(0, DEFAULT_RUNS_LIMIT).map((run) => adaptRun(run, run.runId === selectedRunId ? selectedNodes : [])),
+    runs: runs.slice(0, VIEWER_RUNS_LIMIT).map((run) => adaptRun(run, run.runId === selectedRunId ? selectedNodes : [])),
   };
 }
 

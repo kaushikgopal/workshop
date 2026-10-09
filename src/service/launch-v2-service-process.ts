@@ -32,13 +32,13 @@ export async function launchV2ServiceProcess(input: LaunchV2ServiceInput): Promi
 
   const deadline = Date.now() + (input.timeoutMs ?? DEFAULT_START_TIMEOUT_MS);
   while (Date.now() < deadline) {
-    if (spawnError !== undefined) throw new ServiceConnectionError("could not start the v4 service", { cause: spawnError });
-    if (child.exitCode !== null) throw new ServiceConnectionError(`v4 service exited during startup with code ${child.exitCode}`);
+    if (spawnError !== undefined) throw new ServiceConnectionError("could not start the service", { cause: spawnError });
+    if (child.exitCode !== null) throw new ServiceConnectionError(`service exited during startup with code ${child.exitCode}`);
     const probe = await probeServiceHealth(input.stateDirectory, 500);
     if (probe.kind === "ready") return { _tag: "started", metadata: probe.metadata };
     await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
   }
   const finalProbe = await probeServiceHealth(input.stateDirectory, 500);
   if (finalProbe.kind === "ready") return { _tag: "started", metadata: finalProbe.metadata };
-  throw new ServiceConnectionError(`v4 service did not become ready: ${finalProbe.reason}`);
+  throw new ServiceConnectionError(`service did not become ready: ${finalProbe.reason}`);
 }

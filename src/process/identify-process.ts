@@ -11,9 +11,6 @@ export function processStartId(pid: number): string | null {
   const out = r.stdout.trim();
   return out === "" ? null : out;
 }
-export function isProcessAlive(pid: number): boolean {
-  return processStartId(pid) !== null;
-}
 /**
  * Claim identities must carry a start id, so an unreadable `ps` row is an
  * error rather than a null that would weaken the identity check.

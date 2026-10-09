@@ -36,7 +36,7 @@ async function startCommand(installation: V2Installation): Promise<void> {
     const launched = await launchV2ServiceProcess({
       root: installation.root,
       stateDirectory: installation.stateDirectory,
-      serveArguments: [CLI_PATH, "--engine", "v4", "service", "serve"],
+      serveArguments: [CLI_PATH, "service", "serve"],
     });
     const verb = launched._tag === "started" ? "started" : "already running";
     process.stdout.write(`service ${verb} (${describeIdentity(launched.metadata)})\n`);

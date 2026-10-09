@@ -123,7 +123,7 @@ async function openV2ServiceRuntime(
           case "diagram":
             return await projectV2ServiceRead(activeHarness, installation, metadata, request);
           default:
-            throw new Error(`v4 service method ${request.method} is not available yet`);
+            throw new Error(`service method ${request.method} is not available yet`);
         }
       },
       async shutdown(deadlineMs) {

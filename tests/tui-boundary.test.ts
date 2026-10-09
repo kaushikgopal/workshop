@@ -71,10 +71,10 @@ describe("TUI boundary — the folder says what a file is for", () => {
     const importers = rest.filter((file) =>
       allImports(readFileSync(file, "utf8")).some(isTuiSpec),
     );
-    // Both engine-specific watch entry points load the viewer on demand.
-    expect(importers.map(relative)).toEqual(["src/cli/watch.ts", "src/cli/watch-v4.ts"]);
+    // The watch command loads the viewer on demand.
+    expect(importers.map(relative)).toEqual(["src/cli/watch-v4.ts"]);
 
-    const cli = readFileSync(join(REPO_ROOT, "src/cli/watch.ts"), "utf8");
+    const cli = readFileSync(join(REPO_ROOT, "src/cli/watch-v4.ts"), "utf8");
     const { typeOnly, value, dynamic } = importsOf(cli);
     // Nothing the runtime executes may be a TUI module: only the lazily-loaded
     // entry point, plus type-only imports that vanish at compile time.
@@ -84,26 +84,17 @@ describe("TUI boundary — the folder says what a file is for", () => {
     // A static value import would pull OpenTUI into every invocation, including
     // `validate` and `status`.
     expect(cli).toContain('await import("../tui/mount-viewer.js")');
-
-    const v4Cli = readFileSync(join(REPO_ROOT, "src/cli/watch-v4.ts"), "utf8");
-    const v4Imports = importsOf(v4Cli);
-    expect(v4Imports.value.filter(isTuiSpec)).toEqual([]);
-    expect(v4Imports.dynamic.filter(isTuiSpec)).toEqual(["../tui/mount-viewer.js"]);
-    expect(v4Imports.typeOnly.filter(isTuiSpec)).toEqual(["../tui/data-source.js"]);
-    expect(v4Cli).toContain('await import("../tui/mount-viewer.js")');
   });
 
   test("the viewer never reaches past the CLI contract, transitively", () => {
     // The spec's rule: the viewer consumes projections, so it must not touch the
     // store, the database, run evidence, or the filesystem.
     //
-    // Checking only direct specifiers let a real violation hide: the panes
-    // imported a formatting helper from the status tree renderer, which imports
-    // the store, the recovery module, and `node:fs` — so loading the viewer
-    // loaded SQLite. Type-only imports are erased and load nothing, so only value
-    // imports are followed.
+    // Checking only direct specifiers would let a violation hide behind a
+    // helper that itself imports storage or `node:fs`. Type-only imports are
+    // erased and load nothing, so only value imports are followed.
     const forbiddenSpec = /^node:(fs|child_process|sqlite)$/;
-    const forbiddenPath = /\/src\/(storage|worklog|run|daemon|attempt|process)\//;
+    const forbiddenPath = /\/src\/(storage|run|service|attempt|process)\//;
 
     /** Resolve a relative specifier to a source file, or null when external. */
     const resolve = (from: string, spec: string): string | null => {

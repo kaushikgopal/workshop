@@ -1,4 +1,4 @@
-# Test fixture copied to .workshop/config/workshop.yaml by v4 tests.
+# Test fixture copied to .workshop/config/workshop.yaml by tests.
 version: 2
 project_dir: ../..
 shell: /bin/bash

@@ -12,7 +12,7 @@ import { REPO_ROOT } from "./helpers.js";
 
 const cliPath = join(REPO_ROOT, "src/cli/main.ts");
 
-describe("v4 public inspection parity", () => {
+describe("public inspection parity", () => {
   test("status text, validator streams, node text, and a failed selected chain follow canonical state", async () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-v4-parity-gaps-"));
     const config = join(root, ".workshop", "config");
@@ -56,12 +56,12 @@ describe("v4 public inspection parity", () => {
     ].join("\n"), "utf8");
 
     try {
-      const started = runCli(root, ["--engine", "v4", "start", "chain", "--detach"]);
+      const started = runCli(root, ["start", "chain", "--detach"]);
       expect(started.status).toBe(0);
       const runId = runIdV2Schema.parse(started.stdout.match(/Started run (\S+)/)?.[1]);
       await waitForFile(firstStarted);
 
-      const statusJson = runCli(root, ["--engine", "v4", "status", "--json"]);
+      const statusJson = runCli(root, ["status", "--json"]);
       expect(statusJson.status).toBe(0);
       const status = statusDtoV2Schema.parse(JSON.parse(statusJson.stdout));
       const chainStatus = status.workflows.find((workflow) => workflow.workflowId === "chain");
@@ -69,21 +69,21 @@ describe("v4 public inspection parity", () => {
       expect(chainStatus?.unresolvedRun?.status).toBe("running");
       expect(chainStatus?.activation).toMatchObject({ state: "exhausted", admittedCount: 1, maxRuns: 1 });
       expect(status.workflows.find((workflow) => workflow.workflowId === "idle")?.unresolvedRun).toBeNull();
-      const statusText = runCli(root, ["--engine", "v4", "status"]);
+      const statusText = runCli(root, ["status"]);
       expect(statusText.status).toBe(0);
       expect(statusText.stdout).toContain(`chain: exhausted (1/1); running ${runId}`);
       expect(statusText.stdout).toContain("idle: inactive; no unresolved run");
-      const filteredText = runCli(root, ["--engine", "v4", "status", "chain"]);
+      const filteredText = runCli(root, ["status", "chain"]);
       expect(filteredText.stdout.trim()).toBe(`chain: exhausted (1/1); running ${runId}`);
 
       writeFileSync(releaseFirst, "go", "utf8");
       const failed = await waitForRunStatus(root, "chain", runId, "failed");
       expect(failed.currentNodeId).toBe("second");
       expect(existsSync(thirdStarted)).toBe(false);
-      const settledText = runCli(root, ["--engine", "v4", "status", "chain"]);
+      const settledText = runCli(root, ["status", "chain"]);
       expect(settledText.stdout.trim()).toBe("chain: exhausted (1/1); no unresolved run");
 
-      const logsJson = runCli(root, ["--engine", "v4", "logs", "chain", "--run", runId, "--json"]);
+      const logsJson = runCli(root, ["logs", "chain", "--run", runId, "--json"]);
       expect(logsJson.status).toBe(0);
       const logs = logsDtoV2Schema.parse(JSON.parse(logsJson.stdout));
       // Stderr may begin with noise from the caller's BASH_ENV, so stderr checks match the suffix.
@@ -94,38 +94,38 @@ describe("v4 public inspection parity", () => {
       expect(captures.get("first validator stderr")).toEndWith("validator-err");
       expect(captures.get("second worker stderr")).toEndWith("second-err");
       expect([...captures.keys()].some((label) => label.startsWith("third "))).toBe(false);
-      const logsText = runCli(root, ["--engine", "v4", "logs", "chain", "--run", runId]);
+      const logsText = runCli(root, ["logs", "chain", "--run", runId]);
       expect(logsText.status).toBe(0);
       for (const text of ["first validator stdout", "validator-out", "first validator stderr", "validator-err", "second-err"]) {
         expect(logsText.stdout).toContain(text);
       }
 
-      const failedNodeJson = runCli(root, ["--engine", "v4", "node", "describe", "chain", "second", "--run", runId, "--json"]);
+      const failedNodeJson = runCli(root, ["node", "describe", "chain", "second", "--run", runId, "--json"]);
       expect(failedNodeJson.status).toBe(0);
       const failedNode = nodeDescriptionDtoV2Schema.parse(JSON.parse(failedNodeJson.stdout));
       expect(failedNode.runStatus).toBe("failed");
       expect(failedNode.node.status).toBe("failed");
       expect(failedNode.node.successfulOutput).toBeNull();
       expect(failedNode.node.resolvedSettings.run).toMatchObject({ kind: "command", command: "printf second-err >&2; exit 7" });
-      const failedNodeText = runCli(root, ["--engine", "v4", "node", "describe", "chain", "second", "--run", runId]);
+      const failedNodeText = runCli(root, ["node", "describe", "chain", "second", "--run", runId]);
       expect(failedNodeText.status).toBe(0);
       expect(failedNodeText.stdout).toContain(`chain/second  failed  ${runId}`);
-      const firstNodeText = runCli(root, ["--engine", "v4", "node", "describe", "chain", "first", "--run", runId]);
+      const firstNodeText = runCli(root, ["node", "describe", "chain", "first", "--run", runId]);
       expect(firstNodeText.stdout).toContain(`chain/first  succeeded  ${runId}`);
       expect(firstNodeText.stdout).toContain("first-output");
       const pendingNode = nodeDescriptionDtoV2Schema.parse(JSON.parse(
-        runCli(root, ["--engine", "v4", "node", "describe", "chain", "third", "--run", runId, "--json"]).stdout,
+        runCli(root, ["node", "describe", "chain", "third", "--run", runId, "--json"]).stdout,
       ));
       expect(pendingNode.node.status).toBe("pending");
       expect(pendingNode.node.attempts).toHaveLength(0);
 
-      const diagram = runCli(root, ["--engine", "v4", "diagram", "chain", "--run", runId]);
+      const diagram = runCli(root, ["diagram", "chain", "--run", runId]);
       expect(diagram.status).toBe(0);
       expect(diagram.stdout).toContain("first (succeeded)");
       expect(diagram.stdout).toContain("second (failed)");
       expect(diagram.stdout).not.toContain("third (succeeded)");
       expect(diagram.stdout).not.toContain("third (failed)");
-      const mermaid = runCli(root, ["--engine", "v4", "diagram", "chain", "--run", runId, "--mermaid"]);
+      const mermaid = runCli(root, ["diagram", "chain", "--run", runId, "--mermaid"]);
       expect(mermaid.status).toBe(0);
       expect(mermaid.stdout).toContain('first["first [succeeded]"]');
       expect(mermaid.stdout).toContain('second["second [failed]"]');
@@ -137,7 +137,7 @@ describe("v4 public inspection parity", () => {
   }, 30_000);
 });
 
-describe("v4 retention limits", () => {
+describe("retention limits", () => {
   test("resolves stream caps from node override, workflow default, machine default, then the built-in limit", () => {
     const definition = (defaults: string) => checkV2DefinitionText([
       "version: 2",
@@ -173,35 +173,27 @@ describe("v4 retention limits", () => {
   });
 });
 
-describe("v4 import boundaries", () => {
+describe("import boundaries", () => {
   const sourceRoot = join(REPO_ROOT, "src");
-  const productFiles = sourceFiles(sourceRoot).filter((file) => !repoPath(file).startsWith("src/proof/"));
+  const productFiles = sourceFiles(sourceRoot);
 
-  test("no product module imports the A0 proof", () => {
-    const importers = productFiles.filter((file) => relativeImports(file, { includeTypes: true }).some((target) => repoPath(target).startsWith("src/proof/")));
-    expect(importers.map(repoPath)).toEqual([]);
+  test("every source file is reachable from the CLI or the service process", () => {
+    // Type-only imports count: a file that only declares a contract is still in use.
+    const reachable = importClosure(["src/cli/main.ts", "src/service/serve-v2-service-process.ts"], { includeTypes: true });
+    expect(productFiles.map(repoPath).filter((path) => !reachable.includes(path))).toEqual([]);
   });
 
-  test("the v4 runtime graph never loads v3 lifecycle storage, recovery, daemon, or proof modules", () => {
-    const reachable = runtimeClosure([
-      "src/cli/dispatch-v4-command.ts",
-      "src/service/serve-v2-service-process.ts",
-      "src/cli/watch-v4.ts",
-    ]);
-    expect(reachable).toContain("src/storage/durable/define-workshop-tasks.ts");
-    const forbidden = reachable.filter((path) =>
-      path.startsWith("src/storage/db/")
-      || path.startsWith("src/daemon/")
-      || path.startsWith("src/proof/")
-      || [
-        "src/run/recover-after-crash.ts",
-        "src/run/start-run.ts",
-        "src/run/create-run.ts",
-        "src/run/advance-chain.ts",
-        "src/run/orchestrate-failure.ts",
-        "src/load-installation.ts",
-      ].includes(path));
-    expect(forbidden).toEqual([]);
+  test("help and validate load neither the service client nor the viewer", () => {
+    const loaded = importClosure(["src/cli/main.ts"], { includeTypes: false, includeDynamic: false });
+    expect(loaded).toContain("src/installation/load-v2-installation.ts");
+    expect(loaded.filter((path) => path.startsWith("src/tui/") || path.startsWith("src/service/"))).toEqual([]);
+  });
+
+  test("the CLI is a socket client and never loads Durable storage", () => {
+    // `service serve` turns the CLI process into the service, so the walk stops there.
+    const loaded = importClosure(["src/cli/main.ts"], { includeTypes: false, stopAt: ["src/service/serve-v2-service-process.ts"] });
+    expect(loaded).toContain("src/cli/watch-v4.ts");
+    expect(loaded.filter((path) => path.startsWith("src/storage/durable/"))).toEqual([]);
   });
 
   test("product code does not hardcode the Hemingway workflow or node ids", () => {
@@ -210,22 +202,26 @@ describe("v4 import boundaries", () => {
     expect(offenders.map(repoPath)).toEqual([]);
   });
 
-  function runtimeClosure(entries: readonly string[]): string[] {
+  function importClosure(
+    entries: readonly string[],
+    options: { includeTypes: boolean; includeDynamic?: boolean; stopAt?: readonly string[] },
+  ): string[] {
     const seen = new Set<string>();
     const pending = entries.map((entry) => join(REPO_ROOT, entry));
     while (pending.length > 0) {
       const file = pending.pop()!;
-      if (seen.has(file)) continue;
+      if (seen.has(file) || options.stopAt?.includes(repoPath(file))) continue;
       seen.add(file);
-      pending.push(...relativeImports(file, { includeTypes: false }));
+      pending.push(...relativeImports(file, options));
     }
     return [...seen].map(repoPath).sort();
   }
 
-  function relativeImports(file: string, options: { includeTypes: boolean }): string[] {
+  function relativeImports(file: string, options: { includeTypes: boolean; includeDynamic?: boolean }): string[] {
     let source = withoutComments(readFileSync(file, "utf8"));
     // Type-only imports vanish at compile time, so they cannot load a module at runtime.
     if (!options.includeTypes) source = source.replace(/^(?:import|export)\s+type\s[^;]*?from\s+"[^"]+";?/gm, "");
+    if (options.includeDynamic === false) source = source.replace(/import\(\s*"[^"]+"\s*\)/g, "");
     const targets: string[] = [];
     for (const match of source.matchAll(/(?:from|import)\s*\(?\s*"(\.{1,2}\/[^"]+)"/g)) {
       const target = resolve(dirname(file), match[1]!).replace(/\.js$/, ".ts");
@@ -269,7 +265,7 @@ async function waitForFile(path: string): Promise<void> {
 async function waitForRunStatus(root: string, workflowId: string, runId: string, expectedStatus: string) {
   const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {
-    const result = runCli(root, ["--engine", "v4", "runs", workflowId, "--json"]);
+    const result = runCli(root, ["runs", workflowId, "--json"]);
     if (result.status !== 0) throw new Error(result.stderr);
     const run = runsDtoV2Schema.parse(JSON.parse(result.stdout)).runs.find((entry) => entry.runId === runId);
     if (run?.status === expectedStatus) return run;

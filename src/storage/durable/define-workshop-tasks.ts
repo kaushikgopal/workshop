@@ -200,8 +200,8 @@ export function defineWorkshopTasksV2(
         const schedulerCompatible = taskVersions.scheduleWakeup === undefined || taskVersions.scheduleWakeup === 1;
         const currentWorkflowVersion = taskVersions.workflowRun === 10 && taskVersions.failureJudgment === 1;
         const previousWorkflowVersion = taskVersions.workflowRun === 9 && taskVersions.failureJudgment === 1;
-        const legacyWorkflowVersion = taskVersions.workflowRun === 8 && taskVersions.failureJudgment === undefined;
-        const compatible = schedulerCompatible && (currentWorkflowVersion || previousWorkflowVersion || legacyWorkflowVersion)
+        const oldestWorkflowVersion = taskVersions.workflowRun === 8 && taskVersions.failureJudgment === undefined;
+        const compatible = schedulerCompatible && (currentWorkflowVersion || previousWorkflowVersion || oldestWorkflowVersion)
           && taskVersions.nodeAttempt === 4
           && taskVersions.processExecution === 4
           && taskVersions.capacityGate === 1;

@@ -1,61 +1,56 @@
-import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
+import { processStartIdOrThrow } from "../src/process/identify-process.js";
 import { runIdV2Schema } from "../src/run/schema-v2.js";
+import { locateServiceSocket } from "../src/service/locate-service-socket.js";
 import { logsDtoV2Schema, runsDtoV2Schema, statusDtoV2Schema } from "../src/views/schema-v2.js";
 import { createV4ViewerSource } from "../src/cli/watch-v4.js";
 import { REPO_ROOT } from "./helpers.js";
 
 const cliPath = join(REPO_ROOT, "src/cli/main.ts");
 
-describe("CLI engine selector", () => {
-  test("defaults help to v4, keeps v3 help behind --engine v3, and stays offline", () => {
-    const directory = mkdtempSync(join(tmpdir(), "workshop-engine-selector-"));
+const V2_WORKFLOW = [
+  "version: 2",
+  "id: clock",
+  "nodes:",
+  "  tick:",
+  "    run:",
+  "      command: printf fixture-output",
+  "    next: null",
+  "",
+].join("\n");
+
+describe("CLI commands", () => {
+  test("help is offline and describes one runtime", () => {
+    const directory = mkdtempSync(join(tmpdir(), "workshop-cli-help-"));
     try {
-      for (const args of [[], ["help"], ["--help"], ["--engine", "v4", "help"]]) {
+      for (const args of [[], ["help"], ["--help"], ["-h"]]) {
         const help = runCli(directory, args);
         expect(help.status).toBe(0);
-        expect(help.stdout).toContain("v4 is the default engine");
-        expect(help.stdout).toContain("--engine v3");
+        expect(help.stdout).toContain("Usage: workshop <command> [args]");
         expect(help.stdout).toContain("watch [<workflow>]");
         expect(help.stdout).toContain("service start | serve | status [--json] | stop");
-        expect(help.stdout).not.toContain("experimental");
+        expect(help.stdout).not.toMatch(/\bv[34]\b|experimental|engine|orchestrate|legacy/i);
       }
-
-      const legacy = runCli(directory, ["--engine", "v3", "help"]);
-      expect(legacy.status).toBe(0);
-      expect(legacy.stdout).toContain("workshop v3 — legacy SQLite runner");
-      expect(legacy.stdout).toContain("workshop --engine v3 orchestrate");
       expect(existsSync(join(directory, ".workshop"))).toBe(false);
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
   });
 
-  test("rejects unsupported, misplaced, and repeated selectors without falling back", () => {
-    const directory = mkdtempSync(join(tmpdir(), "workshop-engine-selector-invalid-"));
+  test("rejects unknown commands, including the removed --engine selector", () => {
+    const directory = mkdtempSync(join(tmpdir(), "workshop-cli-unknown-"));
     try {
-      const invalidArguments = [
-        ["--engine"],
-        ["--engine", "v5", "help"],
-        ["--engine=v4", "help"],
-        ["help", "--engine", "v4"],
-        ["status", "--engine", "v3"],
-        ["--engine", "v4", "--engine", "v4", "help"],
-        ["--engine", "v3", "--engine", "v3", "help"],
-      ];
-      for (const args of invalidArguments) {
+      for (const args of [["unknown-command"], ["--engine", "v4", "help"], ["--engine=v4", "status"], ["runtime", "worklog"], ["orchestrate"]]) {
         const result = runCli(directory, args);
         expect(result.status).toBe(64);
-        expect(result.stderr).toContain("error:");
+        expect(result.stderr).toContain(`unknown command: ${args[0]}`);
         expect(result.stdout).toBe("");
       }
-
-      const unknown = runCli(directory, ["unknown-command"]);
-      expect(unknown.status).toBe(64);
-      expect(unknown.stderr).toContain("unknown command: unknown-command");
       const invalidWatch = runCli(directory, ["watch", "--json"]);
       expect(invalidWatch.status).toBe(64);
       expect(invalidWatch.stderr).toContain("usage: workshop watch");
@@ -65,35 +60,139 @@ describe("CLI engine selector", () => {
     }
   });
 
-  test("validates v2 YAML and resolved settings without creating service state", () => {
-    const directory = mkdtempSync(join(tmpdir(), "workshop-v4-validate-"));
-    const configDirectory = join(directory, ".workshop", "config");
-    const workflowsDirectory = join(configDirectory, "workflows");
-    const stateDirectory = join(directory, ".workshop", "state");
-    mkdirSync(workflowsDirectory, { recursive: true });
-    writeFileSync(join(configDirectory, "workshop.yaml"), "version: 2\nshell: /bin/bash\n", "utf8");
-    writeFileSync(join(workflowsDirectory, "clock.yaml"), [
-      "version: 2",
-      "id: clock",
-      "nodes:",
-      "  tick:",
-      "    run:",
-      "      command: printf-tick",
-      "    next: null",
-      "",
-    ].join("\n"), "utf8");
+  test("validates the shipped example without creating state", () => {
+    const root = makeRoot({ machine: null, workflows: {} });
     try {
-      const result = runCli(directory, ["--engine", "v4", "validate", "clock"]);
+      copyFileSync(join(REPO_ROOT, "examples", "workshop.yaml"), join(root, ".workshop", "config", "workshop.yaml"));
+      copyFileSync(
+        join(REPO_ROOT, "examples", "workflows", "hemingway-clock.yaml"),
+        join(root, ".workshop", "config", "workflows", "hemingway-clock.yaml"),
+      );
+
+      const result = runCli(root, ["validate", "hemingway-clock"]);
+      expect(result.stderr).toBe("");
       expect(result.status).toBe(0);
-      expect(result.stdout).toContain('valid v4 workflow "clock" (1 nodes)');
-      expect(existsSync(stateDirectory)).toBe(false);
+      expect(result.stdout).toBe('valid workflow "hemingway-clock" (3 nodes)\n');
+      expect(existsSync(join(root, ".workshop", "state"))).toBe(false);
     } finally {
-      rmSync(directory, { recursive: true, force: true });
+      rmSync(root, { recursive: true, force: true });
     }
   });
 
-  test("routes public v4 commands through one temporary YAML installation and canonical run", async () => {
-    const directory = mkdtempSync(join(tmpdir(), "workshop-v4-public-cli-"));
+  test("a version 1 workflow or machine config fails with a plain schema error", () => {
+    const v1Workflow = V2_WORKFLOW.replace("version: 2", "version: 1");
+    const oldWorkflow = makeRoot({ machine: "version: 2\nshell: /bin/bash\n", workflows: { clock: v1Workflow } });
+    const oldMachine = makeRoot({ machine: "version: 1\nshell: /bin/bash\n", workflows: { clock: V2_WORKFLOW } });
+    const unversionedMachine = makeRoot({ machine: "shell: /bin/bash\n", workflows: { clock: V2_WORKFLOW } });
+    try {
+      const workflow = runCli(oldWorkflow, ["validate", "clock"]);
+      expect(workflow.status).toBe(64);
+      expect(workflow.stderr).toContain("unsupported workflow version 1; expected version: 2");
+
+      const machine = runCli(oldMachine, ["validate", "clock"]);
+      expect(machine.status).toBe(64);
+      expect(machine.stderr).toContain("unsupported machine config version 1; expected version: 2");
+
+      const unversioned = runCli(unversionedMachine, ["status"]);
+      expect(unversioned.status).not.toBe(0);
+      expect(unversioned.stderr).toContain("machine config does not declare a version; add version: 2");
+
+      for (const root of [oldWorkflow, oldMachine, unversionedMachine]) {
+        expect(existsSync(join(root, ".workshop", "state"))).toBe(false);
+      }
+    } finally {
+      for (const root of [oldWorkflow, oldMachine, unversionedMachine]) rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("service start, status, and stop manage one owner idempotently", async () => {
+    const root = makeRoot({ machine: "version: 2\nshell: /bin/bash\n", workflows: { clock: V2_WORKFLOW } });
+    const metadataPath = join(root, ".workshop", "state", "service.json");
+    try {
+      const absent = runCli(root, ["service", "status", "--json"]);
+      expect(absent.status).toBe(3);
+      expect(JSON.parse(absent.stdout)).toMatchObject({ version: 1, state: "not_running" });
+      const absentStop = runCli(root, ["service", "stop"]);
+      expect(absentStop.status).toBe(0);
+      expect(absentStop.stdout).toContain("service is not running");
+
+      const started = runCli(root, ["service", "start"]);
+      expect(started.stderr).toBe("");
+      expect(started.status).toBe(0);
+      expect(started.stdout).toMatch(/^service started \(pid \d+, boot [0-9a-f-]{36}\)\n$/);
+      const metadata = JSON.parse(readFileSync(metadataPath, "utf8")) as { pid: number; bootId: string };
+
+      const again = runCli(root, ["service", "start"]);
+      expect(again.status).toBe(0);
+      expect(again.stdout).toBe(`service already running (pid ${metadata.pid}, boot ${metadata.bootId})\n`);
+
+      const status = runCli(root, ["service", "status", "--json"]);
+      expect(status.status).toBe(0);
+      expect(JSON.parse(status.stdout)).toMatchObject({ version: 1, state: "ready", pid: metadata.pid, bootId: metadata.bootId });
+      const human = runCli(root, ["service", "status"]);
+      expect(human.status).toBe(0);
+      expect(human.stdout).toContain(`service ready (pid ${metadata.pid}, boot ${metadata.bootId})`);
+
+      const run = runCli(root, ["start", "clock"]);
+      expect(run.status).toBe(0);
+      expect(run.stdout).toContain("completed clock-");
+
+      const stopped = runCli(root, ["service", "stop"]);
+      expect(stopped.stderr).toBe("");
+      expect(stopped.status).toBe(0);
+      expect(stopped.stdout).toBe(`service stopped (pid ${metadata.pid}, boot ${metadata.bootId})\n`);
+      expect(isAlive(metadata.pid)).toBe(false);
+      expect(JSON.parse(readFileSync(metadataPath, "utf8"))).toMatchObject({ status: "stopped", bootId: metadata.bootId });
+
+      const stoppedAgain = runCli(root, ["service", "stop"]);
+      expect(stoppedAgain.status).toBe(0);
+      expect(stoppedAgain.stdout).toContain("service is not running");
+      expect(runCli(root, ["service", "status"]).status).toBe(3);
+      expect(runCli(root, ["service", "bogus"]).status).toBe(64);
+    } finally {
+      killRecordedService(metadataPath);
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("service stop never signals a PID it cannot verify as the healthy owner", async () => {
+    const root = makeRoot({ machine: "version: 2\nshell: /bin/bash\n", workflows: {} });
+    const stateDirectory = join(root, ".workshop", "state");
+    mkdirSync(stateDirectory, { recursive: true });
+    const bystander = spawn("sleep", ["30"], { stdio: "ignore" });
+    try {
+      const pid = await pidOf(bystander);
+      const writeMetadata = (startIdentity: string, status: string): void => {
+        writeFileSync(join(stateDirectory, "service.json"), JSON.stringify({
+          version: 1,
+          status,
+          pid,
+          startIdentity,
+          bootId: randomUUID(),
+          startedAt: new Date().toISOString(),
+          socketPath: locateServiceSocket(stateDirectory).socketPath,
+        }), "utf8");
+      };
+
+      writeMetadata(processStartIdOrThrow(pid), "ready");
+      const unhealthy = runCli(root, ["service", "stop"]);
+      expect(unhealthy.status).toBe(3);
+      expect(unhealthy.stderr).toContain(`service pid ${pid} is still alive but not healthy`);
+      expect(isAlive(pid)).toBe(true);
+
+      writeMetadata("not the bystander's start identity", "ready");
+      const stale = runCli(root, ["service", "stop"]);
+      expect(stale.status).toBe(0);
+      expect(stale.stdout).toContain("service is not running");
+      expect(isAlive(pid)).toBe(true);
+    } finally {
+      bystander.kill("SIGKILL");
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("routes public commands through one temporary YAML installation and canonical run", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "workshop-public-cli-"));
     const configDirectory = join(directory, ".workshop", "config");
     const workflowsDirectory = join(configDirectory, "workflows");
     mkdirSync(workflowsDirectory, { recursive: true });
@@ -160,24 +259,24 @@ describe("CLI engine selector", () => {
     ].join("\n"), "utf8");
 
     try {
-      const started = runCli(directory, ["--engine", "v4", "start", "clock", "--detach"]);
+      const started = runCli(directory, ["start", "clock", "--detach"]);
       expect(started.status).toBe(0);
       const runId = runIdV2Schema.parse(started.stdout.match(/Started run (\S+)/)?.[1]);
 
-      const statusResult = runCli(directory, ["--engine", "v4", "status", "clock", "--json"]);
+      const statusResult = runCli(directory, ["status", "clock", "--json"]);
       expect(statusResult.status).toBe(0);
       const status = statusDtoV2Schema.parse(JSON.parse(statusResult.stdout));
       expect(status.installationId).toMatch(/^[0-9a-f-]{36}$/);
       expect(status.workflows[0]?.workflowId).toBe("clock");
       expect(status.workflows[0]?.unresolvedRun?.runId).toBe(runId);
-      const followedLogs = runCli(directory, ["--engine", "v4", "logs", "clock", "--run", runId, "--follow"], 15_000);
+      const followedLogs = runCli(directory, ["logs", "clock", "--run", runId, "--follow"], 15_000);
       expect(followedLogs.status).toBe(0);
       expect(followedLogs.stdout).toContain("fixture-output");
 
       let runs = runsDtoV2Schema.parse({ version: 2, workflowId: "clock", total: 0, truncated: false, runs: [] });
       const deadline = Date.now() + 10_000;
       while (Date.now() < deadline) {
-        const result = runCli(directory, ["--engine", "v4", "runs", "clock", "--json"]);
+        const result = runCli(directory, ["runs", "clock", "--json"]);
         expect(result.status).toBe(0);
         runs = runsDtoV2Schema.parse(JSON.parse(result.stdout));
         if (runs.runs[0]?.status === "completed") break;
@@ -186,34 +285,34 @@ describe("CLI engine selector", () => {
       expect(runs.runs[0]?.status).toBe("completed");
       expect(runs.runs[0]?.runId).toBe(runId);
 
-      const logsResult = runCli(directory, ["--engine", "v4", "logs", "clock", "--run", runId!, "--json"]);
+      const logsResult = runCli(directory, ["logs", "clock", "--run", runId!, "--json"]);
       expect(logsResult.status).toBe(0);
       const logs = logsDtoV2Schema.parse(JSON.parse(logsResult.stdout));
       expect(logs.runId).toBe(runId);
       expect(logs.sections.some((section) => section.kind === "capture" && section.content === "fixture-output")).toBe(true);
-      const humanRuns = runCli(directory, ["--engine", "v4", "runs", "clock"]);
+      const humanRuns = runCli(directory, ["runs", "clock"]);
       expect(humanRuns.status).toBe(0);
       expect(humanRuns.stdout).toMatch(/\d{2}:\d{2}:\d{2}/);
       expect(humanRuns.stdout).not.toMatch(/\d{4}-\d{2}-\d{2}T/);
 
-      const secondStart = runCli(directory, ["--engine", "v4", "start", "clock"], 15_000);
+      const secondStart = runCli(directory, ["start", "clock"], 15_000);
       expect(secondStart.status).toBe(0);
       const secondRunId = runIdV2Schema.parse(secondStart.stdout.match(/Started run (\S+)/)?.[1]);
-      const allLogsText = runCli(directory, ["--engine", "v4", "logs", "clock", "--all"]);
+      const allLogsText = runCli(directory, ["logs", "clock", "--all"]);
       expect(allLogsText.status).toBe(0);
       const firstHeader = allLogsText.stdout.indexOf(`━━ run ${runId} — completed ━━`);
       const secondHeader = allLogsText.stdout.indexOf(`━━ run ${secondRunId} — completed ━━`);
       expect(firstHeader).toBeGreaterThanOrEqual(0);
       expect(secondHeader).toBeGreaterThan(firstHeader);
-      const allLogsJsonResult = runCli(directory, ["--engine", "v4", "logs", "clock", "--all", "--json"]);
+      const allLogsJsonResult = runCli(directory, ["logs", "clock", "--all", "--json"]);
       expect(allLogsJsonResult.status).toBe(0);
       const allLogsJson = JSON.parse(allLogsJsonResult.stdout) as { version: number; workflowId: string; runs: { runId: string }[] };
       expect(allLogsJson).toMatchObject({ version: 2, workflowId: "clock" });
       expect(allLogsJson.runs.map((run) => run.runId)).toEqual([runId, secondRunId]);
-      const selectedDiagram = runCli(directory, ["--engine", "v4", "diagram", "clock", "--run", runId]);
+      const selectedDiagram = runCli(directory, ["diagram", "clock", "--run", runId]);
       expect(selectedDiagram.status).toBe(0);
       expect(selectedDiagram.stdout).toContain("tick (succeeded)");
-      const mermaidDiagram = runCli(directory, ["--engine", "v4", "diagram", "clock", "--run", runId, "--mermaid"]);
+      const mermaidDiagram = runCli(directory, ["diagram", "clock", "--run", runId, "--mermaid"]);
       expect(mermaidDiagram.status).toBe(0);
       expect(mermaidDiagram.stdout).toContain("flowchart LR");
       expect(mermaidDiagram.stdout).toContain('tick["tick [succeeded]"]');
@@ -235,20 +334,20 @@ describe("CLI engine selector", () => {
       const pickerSnapshot = await viewerSource.snapshot(null);
       expect(pickerSnapshot.status.workflows.map((workflow) => workflow.id)).toContain("clock");
 
-      const laterStatusResult = runCli(directory, ["--engine", "v4", "status", "clock", "--json"]);
+      const laterStatusResult = runCli(directory, ["status", "clock", "--json"]);
       expect(laterStatusResult.status).toBe(0);
       const laterStatus = statusDtoV2Schema.parse(JSON.parse(laterStatusResult.stdout));
       expect(laterStatus.installationId).toBe(status.installationId);
       expect(laterStatus.service.bootId).toBe(status.service.bootId);
 
-      const bigStart = runCli(directory, ["--engine", "v4", "start", "big"]);
+      const bigStart = runCli(directory, ["start", "big"]);
       if (bigStart.status !== 0) throw new Error(bigStart.stderr);
       const bigRunId = runIdV2Schema.parse(bigStart.stdout.match(/Started run (\S+)/)?.[1]);
       expect(bigStart.stdout).toContain(`completed ${bigRunId}`);
       const bigDeadline = Date.now() + 10_000;
       let bigRuns = runsDtoV2Schema.parse({ version: 2, workflowId: "big", total: 0, truncated: false, runs: [] });
       while (Date.now() < bigDeadline) {
-        const result = runCli(directory, ["--engine", "v4", "runs", "big", "--json"]);
+        const result = runCli(directory, ["runs", "big", "--json"]);
         expect(result.status).toBe(0);
         bigRuns = runsDtoV2Schema.parse(JSON.parse(result.stdout));
         if (bigRuns.runs[0]?.status === "completed") break;
@@ -257,7 +356,7 @@ describe("CLI engine selector", () => {
       expect(bigRuns.runs[0]?.runId).toBe(bigRunId);
       expect(bigRuns.runs[0]?.status).toBe("completed");
       expect(bigRuns.runs[0]?.terminalOutput?.length).toBe(700_000);
-      const bigLogsResult = runCli(directory, ["--engine", "v4", "logs", "big", "--run", bigRunId, "--json"]);
+      const bigLogsResult = runCli(directory, ["logs", "big", "--run", bigRunId, "--json"]);
       expect(bigLogsResult.status).toBe(0);
       const bigLogs = logsDtoV2Schema.parse(JSON.parse(bigLogsResult.stdout));
       expect(bigLogs.runId).toBe(bigRunId);
@@ -274,13 +373,13 @@ describe("CLI engine selector", () => {
       expect(truncatedCapture.content?.length).toBe(1024);
       expect(truncatedCapture.content?.startsWith("HEAD")).toBe(true);
       expect(truncatedCapture.content?.endsWith("TAIL")).toBe(true);
-      const bigLogsText = runCli(directory, ["--engine", "v4", "logs", "big", "--run", bigRunId]);
+      const bigLogsText = runCli(directory, ["logs", "big", "--run", bigRunId]);
       expect(bigLogsText.status).toBe(0);
       expect(bigLogsText.stdout).toMatch(/700000 bytes total; 1024 retained \(683 head \+ 341 tail\), 698976 omitted/);
-      const unlimitedStart = runCli(directory, ["--engine", "v4", "start", "unlimited"]);
+      const unlimitedStart = runCli(directory, ["start", "unlimited"]);
       expect(unlimitedStart.status).toBe(0);
       const unlimitedRunId = runIdV2Schema.parse(unlimitedStart.stdout.match(/Started run (\S+)/)?.[1]);
-      const unlimitedLogsResult = runCli(directory, ["--engine", "v4", "logs", "unlimited", "--run", unlimitedRunId, "--json"]);
+      const unlimitedLogsResult = runCli(directory, ["logs", "unlimited", "--run", unlimitedRunId, "--json"]);
       expect(unlimitedLogsResult.status).toBe(0);
       const unlimitedLogs = logsDtoV2Schema.parse(JSON.parse(unlimitedLogsResult.stdout));
       const unlimitedCapture = unlimitedLogs.sections.find((section) => section.kind === "capture" && section.capture.stream === "stdout");
@@ -295,28 +394,28 @@ describe("CLI engine selector", () => {
         complete: true,
       });
       for (let index = 0; index < 8; index += 1) {
-        const extra = runCli(directory, ["--engine", "v4", "start", "big"]);
+        const extra = runCli(directory, ["start", "big"]);
         expect(extra.status).toBe(0);
         expect(extra.stdout).toContain("completed big-");
       }
-      const boundedRunsResult = runCli(directory, ["--engine", "v4", "runs", "big", "--json"]);
+      const boundedRunsResult = runCli(directory, ["runs", "big", "--json"]);
       expect(boundedRunsResult.status).toBe(0);
       const boundedRuns = runsDtoV2Schema.parse(JSON.parse(boundedRunsResult.stdout));
       expect(boundedRuns.total).toBe(9);
       expect(boundedRuns.runs.length).toBeLessThan(boundedRuns.total);
       expect(boundedRuns.truncated).toBe(true);
-      const allRunsResult = runCli(directory, ["--engine", "v4", "runs", "big", "--json", "--all"]);
+      const allRunsResult = runCli(directory, ["runs", "big", "--json", "--all"]);
       expect(allRunsResult.status).toBe(0);
       const allRuns = runsDtoV2Schema.parse(JSON.parse(allRunsResult.stdout));
       expect(allRuns.total).toBe(9);
       expect(allRuns.runs).toHaveLength(9);
       expect(allRuns.truncated).toBe(false);
 
-      const oversizeStart = runCli(directory, ["--engine", "v4", "start", "oversize"]);
+      const oversizeStart = runCli(directory, ["start", "oversize"]);
       if (oversizeStart.status !== 0) throw new Error(oversizeStart.stderr);
       const oversizeRunId = runIdV2Schema.parse(oversizeStart.stdout.match(/Started run (\S+)/)?.[1]);
       expect(oversizeStart.stdout).toContain(`completed ${oversizeRunId}`);
-      const oversizeLogsResult = runCli(directory, ["--engine", "v4", "logs", "oversize", "--run", oversizeRunId, "--json"], 30_000);
+      const oversizeLogsResult = runCli(directory, ["logs", "oversize", "--run", oversizeRunId, "--json"], 30_000);
       expect(oversizeLogsResult.status).toBe(0);
       const oversizeLogs = logsDtoV2Schema.parse(JSON.parse(oversizeLogsResult.stdout));
       expect(Buffer.byteLength(oversizeLogsResult.stdout, "utf8")).toBeGreaterThan(16 * 1024 * 1024);
@@ -324,22 +423,49 @@ describe("CLI engine selector", () => {
       const completeStdoutSections = oversizeLogs.sections.filter((section) => section.kind === "capture" && section.content?.length === 700_000);
       expect(completeStdoutSections).toHaveLength(4);
     } finally {
-      await stopV4Service(directory);
+      await stopService(directory);
       rmSync(directory, { recursive: true, force: true });
     }
   }, 30_000);
 });
 
-function runCli(cwd: string, args: readonly string[], timeout = 10_000) {
-  const result = spawnSync("bun", [cliPath, ...args], { cwd, encoding: "utf8", timeout, maxBuffer: 20 * 1024 * 1024 });
-  return {
-    status: result.status ?? -1,
-    stdout: result.stdout ?? "",
-    stderr: result.stderr ?? "",
-  };
+function makeRoot(input: { machine: string | null; workflows: Record<string, string> }): string {
+  const root = mkdtempSync(join(tmpdir(), "workshop-cli-"));
+  const config = join(root, ".workshop", "config");
+  mkdirSync(join(config, "workflows"), { recursive: true });
+  if (input.machine !== null) writeFileSync(join(config, "workshop.yaml"), input.machine, "utf8");
+  for (const [id, text] of Object.entries(input.workflows)) writeFileSync(join(config, "workflows", `${id}.yaml`), text, "utf8");
+  return root;
 }
 
-async function stopV4Service(root: string): Promise<void> {
+function runCli(cwd: string, args: readonly string[], timeout = 20_000) {
+  const result = spawnSync("bun", [cliPath, ...args], { cwd, encoding: "utf8", timeout, maxBuffer: 20 * 1024 * 1024 });
+  return { status: result.status ?? -1, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
+}
+
+function isAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function pidOf(child: ChildProcess): Promise<number> {
+  if (child.pid === undefined) await new Promise((resolveSpawn) => child.once("spawn", resolveSpawn));
+  return child.pid!;
+}
+
+function killRecordedService(metadataPath: string): void {
+  if (!existsSync(metadataPath)) return;
+  const metadata = JSON.parse(readFileSync(metadataPath, "utf8")) as { pid?: unknown; status?: unknown };
+  if (typeof metadata.pid === "number" && metadata.status !== "stopped") {
+    try { process.kill(metadata.pid, "SIGKILL"); } catch { /* already exited */ }
+  }
+}
+
+async function stopService(root: string): Promise<void> {
   const metadataPath = join(root, ".workshop", "state", "service.json");
   if (!existsSync(metadataPath)) return;
   const metadata = JSON.parse(readFileSync(metadataPath, "utf8")) as { pid?: unknown; status?: unknown };

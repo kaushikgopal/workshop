@@ -2,9 +2,7 @@ import { describe, test, expect } from "bun:test";
 import { createTestRenderer } from "@opentui/core/testing";
 import { createViewerRefresh, makeShutdown, mountViewer, reduceKey, type ViewerRefreshSelection, type ViewerState } from "../src/tui/mount-viewer.js";
 import { buildViewerModel, pickerModel } from "../src/tui/build-panes.js";
-import type { ViewerSource } from "../src/tui/data-source.js";
-import type { StatusDto } from "../src/views/build-status-json.js";
-import { buildRunsFeed, type RunsFeed } from "../src/views/build-runs-json.js";
+import type { RunsFeed, RunsFeedEntry, StatusDto, ViewerSource } from "../src/tui/data-source.js";
 
 /**
  * The binding, asserted against a real render.
@@ -232,16 +230,15 @@ describe("viewer keys — pure state transitions", () => {
 });
 
 describe("viewer frame — picker and a scrolled feed", () => {
-  const run = (over: { run_id: string; seq: number; status?: string }) => ({
-    run_id: over.run_id,
-    workflow_id: "wf",
-    seq: over.seq,
+  const run = (over: { id: string; status?: string }): RunsFeedEntry => ({
+    id: over.id,
     status: over.status ?? "completed",
-    desired_state: "running",
-    started_at: "2026-09-24T11:00:00.000Z",
-    finished_at: "2026-09-24T11:01:00.000Z",
-    block_kind: null,
-  }) as never;
+    desiredState: "running",
+    startedAt: "2026-09-24T11:00:00.000Z",
+    finishedAt: "2026-09-24T11:01:00.000Z",
+    blocker: null,
+    nodes: [],
+  });
 
   test("no workflow given: the picker lists what is configured", async () => {
     const { renderer, renderOnce, captureCharFrame } = await createTestRenderer({ width: 100, height: 22 });
@@ -266,9 +263,9 @@ describe("viewer frame — picker and a scrolled feed", () => {
 
   test("with more runs than rows, the feed scrolls to keep the selection visible", async () => {
     const many = Array.from({ length: 20 }, (_, i) =>
-      run({ run_id: `wfy-${String(i + 1).padStart(3, "0")}`, seq: i + 1, status: i % 2 === 0 ? "failed" : "completed" }),
-    );
-    const long = buildRunsFeed({ workflowId: "wf", runs: many, nodes: () => [] });
+      run({ id: `wfy-${String(i + 1).padStart(3, "0")}`, status: i % 2 === 0 ? "failed" : "completed" }),
+    ).reverse();
+    const long: RunsFeed = { version: 1, workflowId: "wf", total: many.length, runs: many };
     const { renderer, renderOnce, captureCharFrame } = await createTestRenderer({ width: 100, height: 24 });
     mountViewer(renderer, { rows: 4, runsRows: 5 }).paint(
       buildViewerModel({ workflowId: "wf", dto, feed: long, logText: null, selectedRunId: "wfy-007", now: NOW, runsHeight: 5 }),

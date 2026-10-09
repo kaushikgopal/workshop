@@ -1335,18 +1335,18 @@ describe("native Durable failure judgment", () => {
   test("migrates a persisted WorkflowRun v8 start checkpoint", async () => {
     const directory = mkdtempSync(join(tmpdir(), "workshop-workflow-migration-v8-"));
     const databasePath = join(directory, "durable.db");
-    let legacyHarness: Awaited<ReturnType<typeof Harness.open>> | undefined;
+    let v8Harness: Awaited<ReturnType<typeof Harness.open>> | undefined;
     let opened: CommandHarness | undefined;
-    const legacyWorkflowTask = defineTask<ReturnType<typeof createWorkflowRunTaskInputV2>, { phase: "start" }, ReturnType<typeof runOutcomeV2Schema.parse>>({
+    const v8WorkflowTask = defineTask<ReturnType<typeof createWorkflowRunTaskInputV2>, { phase: "start" }, ReturnType<typeof runOutcomeV2Schema.parse>>({
       name: "workshop.workflow-run",
       version: 8,
       initial: () => ({ phase: "start" }),
-      phases: { start: async () => { throw new Error("legacy task must remain unstarted before migration"); } },
+      phases: { start: async () => { throw new Error("v8 task must remain unstarted before migration"); } },
       abort: async () => {},
     });
     try {
       const prepared = prepare(directory, "workflow-v8-request-001", "command-chain-workflow-v8-run-001");
-      const legacyPrepared = {
+      const v8Prepared = {
         ...prepared,
         runtimeManifest: {
           ...prepared.runtimeManifest,
@@ -1356,20 +1356,20 @@ describe("native Durable failure judgment", () => {
       const storage = await openDurableStorage(databasePath);
       if (!storage.ok) throw new Error(`${storage.failure.message}: ${String(storage.failure.cause)}`);
       const registry = createRegistry();
-      registry.install({ name: "workshop-v8-migration-fixture", tasks: [legacyWorkflowTask] });
-      legacyHarness = await Harness.open(storage.storage, { models: createModels(), registry }, BACKGROUND_CONTEXT);
-      await initializeInstallation(legacyHarness, prepared.canonicalHash);
+      registry.install({ name: "workshop-v8-migration-fixture", tasks: [v8WorkflowTask] });
+      v8Harness = await Harness.open(storage.storage, { models: createModels(), registry }, BACKGROUND_CONTEXT);
+      await initializeInstallation(v8Harness, prepared.canonicalHash);
       const admission = await admitPreparedRunV2({
-        harness: legacyHarness,
-        prepared: legacyPrepared,
-        workflowRunTask: legacyWorkflowTask as never,
+        harness: v8Harness,
+        prepared: v8Prepared,
+        workflowRunTask: v8WorkflowTask as never,
         createTaskInput: createWorkflowRunTaskInputV2,
         parseTaskInput: parseWorkflowRunTaskInputV2,
         context: BACKGROUND_CONTEXT,
       });
       if (!admission.ok) throw new Error(`${admission.failure.kind}: ${admission.failure.message}`);
-      await legacyHarness.close(BACKGROUND_CONTEXT);
-      legacyHarness = undefined;
+      await v8Harness.close(BACKGROUND_CONTEXT);
+      v8Harness = undefined;
 
       opened = await openCommandHarness(databasePath);
       await opened.harness.waitForIdle(BACKGROUND_CONTEXT);
@@ -1381,7 +1381,7 @@ describe("native Durable failure judgment", () => {
       expect(run.status).toBe("completed");
       expect(run.runtimeManifest.taskVersions).toEqual({ workflowRun: 8, nodeAttempt: 4, processExecution: 4, capacityGate: 1 });
     } finally {
-      if (legacyHarness !== undefined) await legacyHarness.close(BACKGROUND_CONTEXT);
+      if (v8Harness !== undefined) await v8Harness.close(BACKGROUND_CONTEXT);
       if (opened !== undefined) await opened.harness.close(BACKGROUND_CONTEXT);
       rmSync(directory, { recursive: true, force: true });
     }

@@ -9,8 +9,7 @@ import {
   type StyledText,
 } from "@opentui/core";
 import { buildViewerModel, pickerModel, type ViewerModel } from "./build-panes.js";
-import type { ViewerSource } from "./data-source.js";
-import type { StatusDto } from "../views/build-status-json.js";
+import type { StatusDto, ViewerSource } from "./data-source.js";
 
 /**
  * TUI-only: the terminal binding. Nothing in the runtime imports this — the

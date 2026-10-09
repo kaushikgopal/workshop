@@ -28,10 +28,10 @@ describe("v4 recurring Hemingway acceptance", () => {
   test("admits six distinct runs on one activation and publishes each after independent validation", async () => {
     const fixture = createFixture({ id: workflowId, schedule: true, generatorSleepMs: 120, validatorSleepMs: 120 });
     try {
-      const validation = runCli(fixture.root, ["--engine", "v4", "validate", workflowId]);
+      const validation = runCli(fixture.root, ["validate", workflowId]);
       expect(validation.status).toBe(0);
 
-      const started = runCli(fixture.root, ["--engine", "v4", "start", workflowId, "--detach"], 30_000);
+      const started = runCli(fixture.root, ["start", workflowId, "--detach"], 30_000);
       expect(started.status).toBe(0);
       expect(started.stdout).toContain("Started run ");
       const firstRunId = runIdV2Schema.parse(started.stdout.match(/Started run (\S+)/)?.[1]);
@@ -40,7 +40,7 @@ describe("v4 recurring Hemingway acceptance", () => {
       expect(history.runs.every((run) => run.status === "completed")).toBe(true);
       expect(history.runs.some((run) => run.runId === firstRunId)).toBe(true);
 
-      const statusResult = runCli(fixture.root, ["--engine", "v4", "status", workflowId, "--json"]);
+      const statusResult = runCli(fixture.root, ["status", workflowId, "--json"]);
       expect(statusResult.status).toBe(0);
       const status = statusDtoV2Schema.parse(JSON.parse(statusResult.stdout));
       const workflow = status.workflows.find((entry) => entry.workflowId === workflowId);
@@ -107,7 +107,7 @@ describe("v4 recurring Hemingway acceptance", () => {
       expect(activeRuns.size).toBe(0);
       expect(maxActiveRuns).toBe(1);
 
-      const cliLogs = runCli(fixture.root, ["--engine", "v4", "logs", workflowId, "--all", "--json"]);
+      const cliLogs = runCli(fixture.root, ["logs", workflowId, "--all", "--json"]);
       expect(cliLogs.status).toBe(0);
       const logHistory = JSON.parse(cliLogs.stdout) as { runs: { runId: string }[] };
       expect(logHistory.runs.map((run) => run.runId).sort()).toEqual([...runIds].sort());
@@ -180,7 +180,7 @@ function createFixture(options: {
   const configDirectory = join(root, ".workshop", "config");
   const workflowDirectory = join(configDirectory, "workflows");
   const stateDirectory = join(root, ".workshop", "state");
-  const archiveDirectory = join(root, ".workshop", "state", "v4", "quotes");
+  const archiveDirectory = join(root, ".workshop", "state", "quotes");
   const activityLog = join(stateDirectory, "mock-activity.jsonl");
   mkdirSync(workflowDirectory, { recursive: true });
   mkdirSync(stateDirectory, { recursive: true });
@@ -279,7 +279,7 @@ function shellDoubleQuote(value: string): string {
 }
 
 async function startSingleRun(root: string, id: string): Promise<string> {
-  const started = runCli(root, ["--engine", "v4", "start", id, "--detach"], 30_000);
+  const started = runCli(root, ["start", id, "--detach"], 30_000);
   if (started.status !== 0) throw new Error(started.stderr);
   return runIdV2Schema.parse(started.stdout.match(/Started run (\S+)/)?.[1]);
 }
@@ -288,7 +288,7 @@ async function waitForCompletedRuns(root: string, id: string, count: number) {
   const deadline = Date.now() + 45_000;
   let history = runsDtoV2Schema.parse({ version: 2, workflowId: id, total: 0, truncated: false, runs: [] });
   while (Date.now() < deadline) {
-    const result = runCli(root, ["--engine", "v4", "runs", id, "--json", "--all"]);
+    const result = runCli(root, ["runs", id, "--json", "--all"]);
     if (result.status !== 0) throw new Error(result.stderr);
     history = runsDtoV2Schema.parse(JSON.parse(result.stdout));
     const failed = history.runs.find((run) => run.status === "blocked" || run.status === "failed");
@@ -302,7 +302,7 @@ async function waitForCompletedRuns(root: string, id: string, count: number) {
 async function waitForRunStatus(root: string, id: string, runId: string, expected: string) {
   const deadline = Date.now() + 20_000;
   while (Date.now() < deadline) {
-    const result = runCli(root, ["--engine", "v4", "runs", id, "--json"]);
+    const result = runCli(root, ["runs", id, "--json"]);
     if (result.status !== 0) throw new Error(result.stderr);
     const history = runsDtoV2Schema.parse(JSON.parse(result.stdout));
     const run = history.runs.find((entry) => entry.runId === runId);

@@ -22,10 +22,3 @@ export function errorText(e: unknown): string {
   }
   return e instanceof Error ? e.message : String(e);
 }
-
-/** The first positional argument, or a usage failure naming what was missing. */
-export function requireArg(args: string[], name: string): string {
-  const value = args[0];
-  if (!value) die(`missing <${name}> argument`);
-  return value;
-}

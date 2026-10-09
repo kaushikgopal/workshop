@@ -1,6 +1,5 @@
 import { glyph, localClock } from "../views/format-for-terminal.js";
-import type { StatusDto, NodeStatusDto, AttemptStatusDto } from "../views/build-status-json.js";
-import type { RunsFeed, RunsFeedEntry } from "../views/build-runs-json.js";
+import type { AttemptStatusDto, NodeStatusDto, RunsFeed, RunsFeedEntry, StatusDto } from "./data-source.js";
 
 /**
  * TUI-only: the viewer's panes as plain data.

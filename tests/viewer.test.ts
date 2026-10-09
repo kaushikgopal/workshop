@@ -1,12 +1,10 @@
 import { describe, test, expect } from "bun:test";
-import { buildRunsFeed, DEFAULT_RUNS_LIMIT, RUNS_DTO_VERSION } from "../src/views/build-runs-json.js";
 import { buildViewerModel, failureLabel, nodeLines, pickerModel, windowRuns } from "../src/tui/build-panes.js";
-import type { StatusDto, NodeStatusDto } from "../src/views/build-status-json.js";
-import type { RunRow } from "../src/storage/db/store.js";
+import type { NodeStatusDto, RunsFeed, RunsFeedEntry, StatusDto } from "../src/tui/data-source.js";
 import { glyph } from "../src/views/format-for-terminal.js";
 
 /**
- * The viewer contract: the runs feed's shape, and the panes built from it.
+ * The viewer contract: the panes built from the status and runs-feed shapes.
  *
  * The panes are pure functions over the CLI's own surfaces, so the layout can
  * be asserted byte for byte here — no TTY, no terminal library, and nothing
@@ -14,16 +12,18 @@ import { glyph } from "../src/views/format-for-terminal.js";
  */
 const NOW = new Date("2026-09-24T12:00:00.000Z");
 
-const run = (over: Partial<RunRow> & { run_id: string; seq: number }): RunRow =>
-  ({
-    workflow_id: "wf",
-    status: "completed",
-    desired_state: "running",
-    started_at: "2026-09-24T10:00:00.000Z",
-    finished_at: "2026-09-24T10:01:00.000Z",
-    block_kind: null,
-    ...over,
-  }) as RunRow;
+const run = (over: Partial<RunsFeedEntry> & { id: string }): RunsFeedEntry => ({
+  status: "completed",
+  desiredState: "running",
+  startedAt: "2026-09-24T10:00:00.000Z",
+  finishedAt: "2026-09-24T10:01:00.000Z",
+  blocker: null,
+  nodes: [],
+  ...over,
+});
+
+/** A feed holds its runs newest first, as the watch adapter delivers them. */
+const feedOf = (runs: RunsFeedEntry[]): RunsFeed => ({ version: 1, workflowId: "wf", total: runs.length, runs });
 
 const attempt = (over: Partial<NodeStatusDto["attempts"][number]> & { number: number }) => ({
   status: "completed",
@@ -48,64 +48,6 @@ const CHAIN: NodeStatusDto[] = [
   },
 ];
 
-describe("runs feed — the occurrences projection", () => {
-  test("marks a paused occurrence distinctly from pending work", () => {
-    expect(glyph("paused")).toBe("‖");
-  });
-  test("reverses runtime chronology so the newest occurrence leads", () => {
-    const feed = buildRunsFeed({
-      workflowId: "wf",
-      runs: [run({ run_id: "wf-001", seq: 1 }), run({ run_id: "wf-002", seq: 2 }), run({ run_id: "wf-003", seq: 3 })],
-      nodes: () => [],
-    });
-    expect(feed.runs.map((r) => r.id)).toEqual(["wf-003", "wf-002", "wf-001"]);
-    expect(feed.total).toBe(3);
-    expect(feed.version).toBe(RUNS_DTO_VERSION);
-  });
-
-  test("caps the shape but never the count, so a viewer can say what it hid", () => {
-    const many = Array.from({ length: DEFAULT_RUNS_LIMIT + 7 }, (_, i) =>
-      run({ run_id: `wf-${String(i + 1).padStart(3, "0")}`, seq: i + 1 }),
-    );
-    const capped = buildRunsFeed({ workflowId: "wf", runs: many, nodes: () => [] });
-    expect(capped.total).toBe(DEFAULT_RUNS_LIMIT + 7);
-    expect(capped.runs.length).toBe(DEFAULT_RUNS_LIMIT);
-    expect(capped.runs[0]!.id).toBe(`wf-${String(DEFAULT_RUNS_LIMIT + 7).padStart(3, "0")}`);
-
-    const all = buildRunsFeed({ workflowId: "wf", runs: many, all: true, nodes: () => [] });
-    expect(all.runs.length).toBe(DEFAULT_RUNS_LIMIT + 7);
-  });
-
-  test("carries nullable fields explicitly rather than omitting them", () => {
-    const feed = buildRunsFeed({
-      workflowId: "wf",
-      runs: [run({ run_id: "wf-001", seq: 1, finished_at: null, block_kind: "orchestrator_unresolved" })],
-      nodes: () => [],
-    });
-    expect(feed.runs[0]).toEqual({
-      id: "wf-001",
-      status: "completed",
-      desiredState: "running",
-      startedAt: "2026-09-24T10:00:00.000Z",
-      finishedAt: null,
-      blocker: "orchestrator_unresolved",
-      nodes: [],
-    });
-  });
-
-  test("each occurrence carries its own chain, so a finished run stays inspectable", () => {
-    // The status DTO only holds the unresolved run; without chains in the feed a
-    // viewer could say nothing about the failure you actually opened it for.
-    const feed = buildRunsFeed({
-      workflowId: "wf",
-      runs: [run({ run_id: "wf-001", seq: 1 }), run({ run_id: "wf-002", seq: 2, status: "failed" })],
-      nodes: (runId) => (runId === "wf-002" ? CHAIN : []),
-    });
-    expect(feed.runs[0]!.nodes).toEqual(CHAIN);
-    expect(feed.runs[1]!.nodes).toEqual([]);
-  });
-});
-
 const dto = (over: Partial<StatusDto["workflows"][number]> = {}): StatusDto => ({
   version: 1,
   workflows: [
@@ -128,26 +70,22 @@ const dto = (over: Partial<StatusDto["workflows"][number]> = {}): StatusDto => (
 });
 
 /** Two occurrences; the newest is the live one whose chain is CHAIN. */
-const feed = buildRunsFeed({
-  workflowId: "wf",
-  runs: [run({ run_id: "wf-001", seq: 1 }), run({ run_id: "wf-002", seq: 2, status: "running", finished_at: null })],
-  nodes: (runId) => (runId === "wf-002" ? CHAIN : []),
-});
+const feed = feedOf([run({ id: "wf-002", status: "running", finishedAt: null, nodes: CHAIN }), run({ id: "wf-001" })]);
 
 const model = (over: Partial<Parameters<typeof buildViewerModel>[0]> = {}) =>
   buildViewerModel({ workflowId: "wf", dto: dto(), feed, logText: null, now: NOW, ...over });
 
 describe("viewer panes — pure layout over the CLI surfaces", () => {
+  test("a paused occurrence has its own glyph, distinct from pending work", () => {
+    expect(glyph("paused")).toBe("‖");
+  });
+
   test("the header names the workflow, its activation, and the run on screen", () => {
     expect(model().header).toBe("wf  active 2/6  002 running");
   });
 
   test("a run-level blocker is surfaced in the header", () => {
-    const blocked = buildRunsFeed({
-      workflowId: "wf",
-      runs: [run({ run_id: "wf-009", seq: 9, status: "blocked", finished_at: null, block_kind: "orchestrator_unresolved" })],
-      nodes: () => [],
-    });
+    const blocked = feedOf([run({ id: "wf-009", status: "blocked", finishedAt: null, blocker: "orchestrator_unresolved" })]);
     expect(model({ feed: blocked }).header).toBe("wf  active 2/6  009 blocked · orchestrator_unresolved");
   });
 
@@ -164,15 +102,10 @@ describe("viewer panes — pure layout over the CLI surfaces", () => {
 
   test("a terminal run still renders its chain, which is the point of inspecting it", () => {
     // Same code path as the live run: the feed carries chains for finished runs.
-    const failed = buildRunsFeed({
-      workflowId: "wf",
-      // Passed in seq order, the runtime's own chronology, as the store does.
-      runs: [
-        run({ run_id: "wf-001", seq: 1, status: "failed", block_kind: "orchestrator_unresolved" }),
-        run({ run_id: "wf-002", seq: 2, status: "running", finished_at: null }),
-      ],
-      nodes: (runId) => (runId === "wf-001" ? CHAIN : []),
-    });
+    const failed = feedOf([
+      run({ id: "wf-002", status: "running", finishedAt: null }),
+      run({ id: "wf-001", status: "failed", blocker: "orchestrator_unresolved", nodes: CHAIN }),
+    ]);
     const m = model({ feed: failed, selectedRunId: "wf-001" });
     expect(m.nodes.title).toBe("chain · 001 · failed");
     expect(m.nodes.lines[0]).toContain("node-a");
@@ -181,9 +114,9 @@ describe("viewer panes — pure layout over the CLI surfaces", () => {
 
   test("the runs viewport keeps the selection on screen and says what it is showing", () => {
     const many = Array.from({ length: 30 }, (_, i) =>
-      run({ run_id: `wf-${String(i + 1).padStart(3, "0")}`, seq: i + 1, status: i % 3 === 0 ? "failed" : "completed" }),
+      run({ id: `wf-${String(i + 1).padStart(3, "0")}`, status: i % 3 === 0 ? "failed" : "completed" }),
     );
-    const long = buildRunsFeed({ workflowId: "wf", runs: many, nodes: () => [] });
+    const long = feedOf(many.reverse());
     // Newest first: wf-030 is at index 0. Select the 20th row down.
     const m = model({ feed: long, selectedRunId: "wf-011", runsHeight: 6 });
     expect(m.runs.lines.length).toBe(6);
@@ -229,7 +162,7 @@ describe("viewer panes — pure layout over the CLI surfaces", () => {
   });
 
   test("a workflow with no runs says so rather than showing an empty chain", () => {
-    const m = model({ feed: buildRunsFeed({ workflowId: "wf", runs: [], nodes: () => [] }) });
+    const m = model({ feed: feedOf([]) });
     expect(m.nodes.lines).toEqual(["(no runs yet)"]);
     expect(m.runs.lines).toEqual(["(no runs yet)"]);
   });

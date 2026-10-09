@@ -7,7 +7,7 @@ export interface ParsedModelV2 extends Omit<ParsedModel, "thinking"> {
   thinking: ThinkingLevelV2;
 }
 
-/** Parse the v2 model contract without changing the v1 parser used by the default CLI. */
+/** Parse a model string and check its thinking level against the workflow contract. */
 export function parseV2Model(full: string): ParsedModelV2 {
   if (/\s/.test(full)) {
     throw new Error("model strings cannot contain whitespace");

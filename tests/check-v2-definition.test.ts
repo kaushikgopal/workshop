@@ -12,8 +12,7 @@ import {
   type WorkflowDefinitionV2,
 } from "../src/definition/schema-v2.js";
 import { parseStrictYaml } from "../src/definition/parse-yaml.js";
-import { workflowSchema } from "../src/definition/schema.js";
-import { parseDuration, parseV2ByteSize, parseV2Duration } from "../src/util/parse-units.js";
+import { parseV2ByteSize, parseV2Duration } from "../src/util/parse-units.js";
 
 function baseDefinition(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
@@ -49,7 +48,7 @@ describe("v2 workflow and machine schemas", () => {
     expect(machineConfigSchemaV2.parse({ version: 2 })).toEqual({ version: 2 });
   });
 
-  test("loads the copyable v4 workflow and fixture machine in a temporary installation", () => {
+  test("loads the copyable workflow and fixture machine in a temporary installation", () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-v4-fixture-"));
     try {
       const configDir = join(root, ".workshop", "config");
@@ -106,7 +105,7 @@ describe("v2 workflow and machine schemas", () => {
         command: z.string().min(1),
       }),
     });
-    const templates = templateSchema.parse(parseStrictYaml(yaml, "README.md v4 harness templates"));
+    const templates = templateSchema.parse(parseStrictYaml(yaml, "README.md harness templates"));
     expect(templates.pi.model_env).toEqual(["WORKSHOP_MODEL_WITH_THINKING"]);
     expect(templates.opencode.model_env).toEqual(["WORKSHOP_MODEL", "WORKSHOP_THINKING"]);
     expect(templates["claude-code"].model_env).toEqual(["WORKSHOP_MODEL_ID", "WORKSHOP_THINKING"]);
@@ -128,21 +127,15 @@ describe("v2 workflow and machine schemas", () => {
 
     const checked = workflowSchemaV2.parse({ version: 2, id: "harness-templates", nodes });
     expect(Object.keys(checked.nodes)).toEqual(["node-pi", "node-opencode", "node-claude-code"]);
-    expect(readme.slice(start)).toContain("have **not** been checked against installed Pi, OpenCode, or Claude Code binaries");
+    expect(readme.slice(start)).toContain("Claude Code flags have not been checked against installed binaries");
   });
 
-  test("rejects unsupported workflow version 1 with conversion guidance", () => {
-    const error = () => checkV2DefinitionText(
-      "version: 1\nid: old\ndescription: old workflow\nnodes:\n  node-a:\n    run: { command: echo hi }\n    next: null\n",
-      "legacy.yaml",
-    );
-    expect(error).toThrow(/version 1 is not supported by the v4 runtime.*version: 2/);
-    expect(workflowSchema.parse({
-      version: 1,
-      id: "old",
-      description: "legacy remains valid on the v3 route",
-      nodes: { "node-a": { run: { command: "echo hi" }, next: null } },
-    }).version).toBe(1);
+  test("rejects a workflow version other than 2, or none, with a plain schema error", () => {
+    const nodes = "nodes:\n  node-a:\n    run: { command: echo hi }\n    next: null\n";
+    expect(() => checkV2DefinitionText(`version: 1\nid: old\n${nodes}`, "old.yaml"))
+      .toThrow("old.yaml: unsupported workflow version 1; expected version: 2");
+    expect(() => checkV2DefinitionText(`id: old\n${nodes}`, "unversioned.yaml"))
+      .toThrow("unversioned.yaml: workflow does not declare a version; add version: 2");
   });
 
   test("rejects unknown keys at every schema depth and prohibits instructions in defaults", () => {
@@ -268,11 +261,10 @@ describe("v2 workflow and machine schemas", () => {
     expect(() => parseV2Model("provider/model:low extra")).toThrow(/whitespace/);
   });
 
-  test("millisecond duration parsing is v2-only and rejects malformed or overflowing values", () => {
+  test("duration parsing accepts milliseconds and rejects malformed or overflowing values", () => {
     expect(parseV2Duration("1ms")).toBe(1);
     expect(parseV2Duration("2s")).toBe(2_000);
     expect(parseV2Duration("3w")).toBe(3 * 604_800_000);
-    expect(() => parseDuration("1ms")).toThrow();
     for (const value of ["0ms", "01ms", "1us", "1s ", `${"9".repeat(400)}w`]) {
       expect(() => parseV2Duration(value)).toThrow();
     }

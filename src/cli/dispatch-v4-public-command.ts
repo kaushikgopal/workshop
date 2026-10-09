@@ -159,7 +159,7 @@ async function resolveCommand(args: readonly string[]): Promise<void> {
       acknowledgeEffects = true;
       continue;
     }
-    if (argument.startsWith("-")) return usage(`unsupported v4 resolve option: ${argument}`);
+    if (argument.startsWith("-")) return usage(`unsupported resolve option: ${argument}`);
     positional.push(argument);
   }
   if (positional.length !== 1 || action === undefined || reason === undefined || reason.trim() === "") {
@@ -304,7 +304,7 @@ async function logsCommand(args: readonly string[]): Promise<void> {
       if (runId === undefined) return usage("--run requires a run ID");
       continue;
     }
-    if (argument.startsWith("-")) return usage(`unsupported v4 logs option: ${argument}`);
+    if (argument.startsWith("-")) return usage(`unsupported logs option: ${argument}`);
     positional.push(argument);
   }
   const usageText = "usage: workshop logs <workflow> [--run <run-id>] [--follow | --all] [--json]";
@@ -485,7 +485,7 @@ async function diagramCommand(args: readonly string[]): Promise<void> {
       if (runId === undefined) return usage("--run requires a run ID");
       continue;
     }
-    if (argument.startsWith("-")) return usage(`unsupported v4 diagram option: ${argument}`);
+    if (argument.startsWith("-")) return usage(`unsupported diagram option: ${argument}`);
     positional.push(argument);
   }
   if (positional.length !== 1) {
@@ -607,7 +607,7 @@ async function nodeDescribeCommand(args: readonly string[]): Promise<void> {
       if (runId === undefined) return usage("--run requires a run ID");
       continue;
     }
-    if (argument.startsWith("-")) return usage(`unsupported v4 node describe option: ${argument}`);
+    if (argument.startsWith("-")) return usage(`unsupported node describe option: ${argument}`);
     positional.push(argument);
   }
   if (positional.length !== 2) return usage("usage: workshop node describe <workflow> <node> [--run <run-id>] [--json]");
@@ -659,7 +659,7 @@ async function ensureService(installation: V2Installation): Promise<string> {
   const launched = await launchV2ServiceProcess({
     root: installation.root,
     stateDirectory: installation.stateDirectory,
-    serveArguments: [CLI_PATH, "--engine", "v4", "service", "serve"],
+    serveArguments: [CLI_PATH, "service", "serve"],
     timeoutMs: SERVICE_START_TIMEOUT_MS,
   });
   return launched.metadata.socketPath;
