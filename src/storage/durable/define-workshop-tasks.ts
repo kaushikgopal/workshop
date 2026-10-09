@@ -42,7 +42,7 @@ import {
   type CapacityGateTaskV2,
 } from "./define-capacity-gate-task.js";
 import {
-  FailureJudgmentExtension,
+  defineFailureJudgmentExtension,
   FailureJudgmentTask as FailureJudgmentTaskDefinition,
   failureJudgmentTaskInputV2Schema,
   failureJudgmentTaskResultV2Schema,
@@ -144,7 +144,11 @@ export type WorkflowRunTaskV2 = Task<WorkflowRunTaskInputV2, WorkflowCheckpoint,
 /** Defines the Durable workflow, node-attempt, process, and judgment lifecycle tasks. */
 export function defineWorkshopTasksV2(
   serviceBootId?: string,
-  options: { readonly startupLaunchGate?: "open" | "closed" } = {},
+  options: {
+    readonly startupLaunchGate?: "open" | "closed";
+    /** Must be the Harness clock; the judge decision tool checks its absolute deadline with it. */
+    readonly now?: () => number;
+  } = {},
 ): {
   readonly serviceBootId: string;
   readonly WorkflowRunTask: Task<WorkflowRunTaskInputV2, WorkflowCheckpoint, RunOutcomeV2, object>;
@@ -152,7 +156,7 @@ export function defineWorkshopTasksV2(
   readonly ProcessExecutionTask: ProcessExecutionTaskV2;
   readonly CapacityGateTask: CapacityGateTaskV2;
   readonly FailureJudgmentTask: typeof FailureJudgmentTaskDefinition;
-  readonly FailureJudgmentExtension: typeof FailureJudgmentExtension;
+  readonly FailureJudgmentExtension: ReturnType<typeof defineFailureJudgmentExtension>;
   readonly stopLaunching: () => void;
   readonly canLaunch: () => boolean;
   readonly openStartupLaunchGate: () => void;
@@ -171,6 +175,7 @@ export function defineWorkshopTasksV2(
 
 
   const FailureJudgmentTask = FailureJudgmentTaskDefinition;
+  const FailureJudgmentExtension = defineFailureJudgmentExtension(options.now ?? Date.now);
 
   const WorkflowRunTask = defineTask<WorkflowRunTaskInputV2, WorkflowCheckpoint, RunOutcomeV2>({
     name: "workshop.workflow-run",

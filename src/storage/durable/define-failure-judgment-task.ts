@@ -60,97 +60,109 @@ type FailureJudgmentRuntime = TaskRuntime<FailureJudgmentTaskInputV2, FailureJud
 type ReadyRun = Extract<ReturnType<typeof workflowRunDocumentV1Schema.parse>, { state: "ready" }>;
 
 export const FAILURE_JUDGMENT_DECISION_TOOL_NAME = "record_workshop_failure_decision";
+const FAILURE_JUDGMENT_EXTENSION_NAME = "workshop-failure-judgment";
 
 const decisionParameters = Type.Object({
   action: Type.Union([Type.Literal("retry"), Type.Literal("block"), Type.Literal("fail")]),
   reason: Type.String({ minLength: 1, maxLength: 16_384 }),
 }, { additionalProperties: false });
 
-const recordFailureDecision = defineTool({
-  name: FAILURE_JUDGMENT_DECISION_TOOL_NAME,
-  description: "Record one checked retry, block, or fail decision for this judgment.",
-  parameters: decisionParameters,
-  replay: "safe",
-  async execute(rawDecision, api, context) {
-    const decision = judgmentDecisionV2Schema.safeParse(rawDecision);
-    if (!decision.success) {
-      return { isError: true, content: [{ type: "text", text: "Decision does not match the checked failure-decision contract." }] };
-    }
-    const recorded = await api.commit(async (tx) => {
-      const conversation = await tx.conversation(api.conversationId);
-      const ownerTaskId = conversation?.owner?.taskId;
-      if (ownerTaskId === undefined) throw new Error("failure-judge conversation has no owning task");
-      const owner = await tx.task(ownerTaskId);
-      if (owner === undefined || owner.kind !== FAILURE_JUDGMENT_TASK_NAME) {
-        throw new Error("failure-judge conversation is not owned by a failure-judgment task");
+/**
+ * Durable's tool API does not expose the Harness clock, so the decision tool takes it explicitly.
+ * The commit-time deadline check must use the same clock the judgment task and Harness use.
+ */
+function defineRecordFailureDecisionTool(now: () => number) {
+  return defineTool({
+    name: FAILURE_JUDGMENT_DECISION_TOOL_NAME,
+    description: "Record one checked retry, block, or fail decision for this judgment.",
+    parameters: decisionParameters,
+    replay: "safe",
+    async execute(rawDecision, api, context) {
+      const decision = judgmentDecisionV2Schema.safeParse(rawDecision);
+      if (!decision.success) {
+        return { isError: true, content: [{ type: "text", text: "Decision does not match the checked failure-decision contract." }] };
       }
-      const taskInput = failureJudgmentTaskInputV2Schema.parse(owner.input);
-      if (!taskInput.allowedActions.includes(decision.data.action)) return { rejected: true as const };
-      const runDraft = await tx.doc(WorkshopRunDoc, taskInput.runConversationId as ConversationId);
-      const run = readyRun(runDraft);
-      assertInputRun(taskInput, run);
-      const located = locateAttempt(run, taskInput.nodeId, taskInput.attemptId);
-      const judgment = located.attempt.judgments.find((entry) => entry.judgmentId === taskInput.judgmentId);
-      if (judgment === undefined
-        || judgment.taskId !== Number(ownerTaskId)
-        || judgment.conversationId !== Number(api.conversationId)
-        || judgment.submissionRequestId !== taskInput.submissionRequestId) {
-        throw new Error("decision does not match the persisted judgment identity");
-      }
-      if (judgment.status === "decided") {
-        if (judgment.decision === null || !sameDecision(judgment.decision, decision.data)) {
-          throw new Error("conflicting duplicate failure-judgment decision");
+      const recorded = await api.commit(async (tx) => {
+        const conversation = await tx.conversation(api.conversationId);
+        const ownerTaskId = conversation?.owner?.taskId;
+        if (ownerTaskId === undefined) throw new Error("failure-judge conversation has no owning task");
+        const owner = await tx.task(ownerTaskId);
+        if (owner === undefined || owner.kind !== FAILURE_JUDGMENT_TASK_NAME) {
+          throw new Error("failure-judge conversation is not owned by a failure-judgment task");
         }
-        return { decision: judgment.decision, rejected: false as const };
+        const taskInput = failureJudgmentTaskInputV2Schema.parse(owner.input);
+        if (!taskInput.allowedActions.includes(decision.data.action)) return { rejected: true as const };
+        const runDraft = await tx.doc(WorkshopRunDoc, taskInput.runConversationId as ConversationId);
+        const run = readyRun(runDraft);
+        assertInputRun(taskInput, run);
+        const located = locateAttempt(run, taskInput.nodeId, taskInput.attemptId);
+        const judgment = located.attempt.judgments.find((entry) => entry.judgmentId === taskInput.judgmentId);
+        if (judgment === undefined
+          || judgment.taskId !== Number(ownerTaskId)
+          || judgment.conversationId !== Number(api.conversationId)
+          || judgment.submissionRequestId !== taskInput.submissionRequestId) {
+          throw new Error("decision does not match the persisted judgment identity");
+        }
+        if (judgment.status === "decided") {
+          if (judgment.decision === null || !sameDecision(judgment.decision, decision.data)) {
+            throw new Error("conflicting duplicate failure-judgment decision");
+          }
+          return { decision: judgment.decision, rejected: false as const };
+        }
+        if (judgment.status !== "pending") throw new Error("failure judgment is no longer accepting a decision");
+        const committedAt = now();
+        if (taskInput.deadlineAt !== null && committedAt >= Date.parse(taskInput.deadlineAt)) return { late: true as const };
+        const decidedAt = timestamp(committedAt);
+        const nextJudgment = persistedJudgmentV2Schema.parse({
+          ...judgment,
+          status: "decided",
+          decision: decision.data,
+          finishedAt: decidedAt,
+          decidedAt,
+        });
+        Object.assign(runDraft, workflowRunDocumentV1Schema.parse(replaceAttempt(run, taskInput.nodeId, taskInput.attemptId, (attempt) => ({
+          ...attempt,
+          judgments: attempt.judgments.map((value) => value.judgmentId === taskInput.judgmentId ? nextJudgment : value),
+        }))));
+        const evidence = workshopJudgmentV1Schema.parse({
+          ...judgmentEvidenceFields(taskInput, Number(api.conversationId), Number(ownerTaskId), decidedAt),
+          phase: "decision_recorded",
+          decision: decision.data,
+          decidedAt,
+        });
+        await tx.appendEntry(WorkshopJudgmentEntry, taskInput.runConversationId as ConversationId, { data: evidence });
+        return { decision: decision.data, rejected: false as const };
+      }, context);
+      if ("late" in recorded) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: "The failure-judge deadline elapsed; the decision was not recorded." }],
+          control: { terminate: true },
+        };
       }
-      if (judgment.status !== "pending") throw new Error("failure judgment is no longer accepting a decision");
-      if (taskInput.deadlineAt !== null && Date.now() >= Date.parse(taskInput.deadlineAt)) return { late: true as const };
-      const decidedAt = new Date().toISOString();
-      const nextJudgment = persistedJudgmentV2Schema.parse({
-        ...judgment,
-        status: "decided",
-        decision: decision.data,
-        finishedAt: decidedAt,
-        decidedAt,
-      });
-      Object.assign(runDraft, workflowRunDocumentV1Schema.parse(replaceAttempt(run, taskInput.nodeId, taskInput.attemptId, (attempt) => ({
-        ...attempt,
-        judgments: attempt.judgments.map((value) => value.judgmentId === taskInput.judgmentId ? nextJudgment : value),
-      }))));
-      const evidence = workshopJudgmentV1Schema.parse({
-        ...judgmentEvidenceFields(taskInput, Number(api.conversationId), Number(ownerTaskId), decidedAt),
-        phase: "decision_recorded",
-        decision: decision.data,
-        decidedAt,
-      });
-      await tx.appendEntry(WorkshopJudgmentEntry, taskInput.runConversationId as ConversationId, { data: evidence });
-      return { decision: decision.data, rejected: false as const };
-    }, context);
-    if ("late" in recorded) {
+      if (recorded.rejected) {
+        return {
+          content: [{ type: "text", text: "That action is not allowed by the frozen retry policy; the judgment will be blocked." }],
+          control: { terminate: true },
+        };
+      }
       return {
-        isError: true,
-        content: [{ type: "text", text: "The failure-judge deadline elapsed; the decision was not recorded." }],
+        content: [{ type: "text", text: "The checked decision has been recorded." }],
+        details: { decision: recorded.decision },
         control: { terminate: true },
       };
-    }
-    if (recorded.rejected) {
-      return {
-        content: [{ type: "text", text: "That action is not allowed by the frozen retry policy; the judgment will be blocked." }],
-        control: { terminate: true },
-      };
-    }
-    return {
-      content: [{ type: "text", text: "The checked decision has been recorded." }],
-      details: { decision: recorded.decision },
-      control: { terminate: true },
-    };
-  },
-});
+    },
+  });
+}
 
-export const FailureJudgmentExtension = defineExtension({
-  name: "workshop-failure-judgment",
-  tools: [recordFailureDecision],
-});
+/** Builds the decision-tool extension against the Harness clock it will be installed beside. */
+export function defineFailureJudgmentExtension(now: () => number) {
+  return defineExtension({ name: FAILURE_JUDGMENT_EXTENSION_NAME, tools: [defineRecordFailureDecisionTool(now)] });
+}
+
+// configure() persists only extension/tool names; the Registry-installed extension supplies the executor.
+const recordFailureDecision = defineRecordFailureDecisionTool(Date.now);
+export const FailureJudgmentExtension = defineExtension({ name: FAILURE_JUDGMENT_EXTENSION_NAME, tools: [recordFailureDecision] });
 
 export const FailureJudgmentTask: Task<FailureJudgmentTaskInputV2, FailureJudgmentCheckpointV2, FailureJudgmentTaskResultV2, object> = defineTask<FailureJudgmentTaskInputV2, FailureJudgmentCheckpointV2, FailureJudgmentTaskResultV2>({
   name: FAILURE_JUDGMENT_TASK_NAME,
