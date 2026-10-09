@@ -1,4 +1,4 @@
-import { closeSync, fsyncSync, linkSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, fsyncSync, linkSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { WorklogIntegrityError } from "../../worklog/detect-tampering.js";
 
@@ -40,6 +40,17 @@ export function atomicWriteFileSync(path: string, content: string): string {
   renameSync(tmp, path);
   fsyncDirectory(dirname(path));
   return content;
+}
+
+/** Remove a derived file and flush its containing directory. */
+export function removeFileSync(path: string): void {
+  try {
+    unlinkSync(path);
+  } catch (error) {
+    if (error !== null && typeof error === "object" && "code" in error && error.code === "ENOENT") return;
+    throw error;
+  }
+  fsyncDirectory(dirname(path));
 }
 
 /** Flush an externally written file without changing its bytes or inode. */

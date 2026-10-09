@@ -1,0 +1,1033 @@
+import { createHash, randomUUID } from "node:crypto";
+import { createReadStream, existsSync, mkdirSync, statSync } from "node:fs";
+import { dirname, isAbsolute, join } from "node:path";
+import type { Context } from "@earendil-works/chord";
+import { defineTask, type ConversationId, type Task, type TaskRuntime, type Tx } from "@earendil-works/pi-durable";
+import { z } from "zod";
+import { canonicalHash } from "../../definition/hash-canonical-json.js";
+import { parseV2Model } from "../../definition/parse-v2-model.js";
+import { nodeIdV2, workflowIdV2 } from "../../definition/schema-v2.js";
+import {
+  executionIdV2Schema,
+  incarnationIdV2Schema,
+  processCaptureV2Schema,
+  processExitV2Schema,
+  processIdentityV2Schema,
+  processIncarnationV2Schema,
+} from "../../process/schema-v2.js";
+import { processStartId } from "../../process/identify-process.js";
+import { terminateProcessGroup } from "../../process/kill-process-tree.js";
+import { raceDeadline, spawnTracked, type TrackedProcess } from "../../process/launch-process.js";
+import {
+  attemptIdV2Schema,
+  blockInfoV2Schema,
+  runIdV2Schema,
+  type BlockInfoV2,
+} from "../../run/schema-v2.js";
+import {
+  persistedNodeAttemptV2Schema,
+  workflowRunDocumentV1Schema,
+  workshopProcessV1Schema,
+  type WorkflowRunDocumentV1,
+} from "../../run/records-v2.js";
+import { WorkshopProcessEntry, WorkshopRunDoc } from "./define-workshop-records.js";
+import { sha256V2Schema, utcTimestampV2Schema } from "../../util/schema-v2.js";
+import { DEFAULT_STREAM_CAP_BYTES } from "../../util/parse-units.js";
+import { readVerifiedRetentionWindow, retainStreamWindow } from "../disk/cap-streams.js";
+
+const positive = z.number().int().positive().refine(Number.isSafeInteger);
+const nonnegative = z.number().int().nonnegative().refine(Number.isSafeInteger);
+const absolutePath = z.string().min(1).refine((value) => isAbsolute(value) && !value.includes("\u0000"));
+const MAX_SEMANTIC_OUTPUT_BYTES = 1024 * 1024;
+const MAX_PROCESS_INCARNATIONS = 3;
+const MAX_TIMER_MS = 2_147_000_000;
+
+export const processExecutionTaskInputV2Schema = z.strictObject({
+  runId: runIdV2Schema,
+  workflowId: workflowIdV2,
+  activationId: z.string().min(1),
+  occurrenceId: z.string().min(1),
+  workflowTaskId: positive,
+  nodeTaskId: positive,
+  nodeId: nodeIdV2.nullable(),
+  attemptId: attemptIdV2Schema.nullable(),
+  executionId: executionIdV2Schema,
+  incarnationId: incarnationIdV2Schema,
+  incarnationNumber: positive,
+  serviceBootId: z.string().uuid(),
+  role: z.enum(["worker", "validator", "preflight"]),
+  launchIntentAt: utcTimestampV2Schema,
+  deadlineAt: utcTimestampV2Schema.nullable(),
+  shell: absolutePath,
+  command: z.string().min(1),
+  cwd: absolutePath,
+  timeoutMs: positive.nullable(),
+  streamCapBytes: z.union([positive, z.literal("unlimited")]),
+  replay: z.enum(["never", "safe"]),
+  stdoutPath: absolutePath,
+  stderrPath: absolutePath,
+  env: z.record(z.string(), z.string()),
+});
+export type ProcessExecutionTaskInputV2 = z.infer<typeof processExecutionTaskInputV2Schema>;
+export type ProcessExecutionTaskEnvironmentInputV2 = Omit<ProcessExecutionTaskInputV2, "env">;
+
+export function processExecutionCapturePathsV2(captureDirectory: string, executionId: string, incarnationId: string) {
+  const prefix = join(captureDirectory, `${executionId}-${incarnationId}`);
+  return {
+    stdoutPath: `${prefix}.stdout`,
+    stderrPath: `${prefix}.stderr`,
+    promptPath: `${prefix}.prompt.md`,
+    resultPath: `${prefix}.result.json`,
+  };
+}
+
+export function buildProcessExecutionEnvironmentV2(
+  input: ProcessExecutionTaskEnvironmentInputV2,
+  runDocument: WorkflowRunDocumentV1,
+  attemptNumber: number | null,
+): Record<string, string> {
+  const run = readyRun(runDocument);
+  const paths = processExecutionCapturePathsV2(run.paths.captureDirectory, input.executionId, input.incarnationId);
+  if (input.role === "preflight") {
+    if (input.nodeId !== null || input.attemptId !== null || attemptNumber !== null || run.resolvedSettings.preflight === null) {
+      throw new Error("preflight process identity differs from frozen workflow settings");
+    }
+    return {
+      WORKSHOP_RUN_ID: run.runId,
+      WORKSHOP_WORKFLOW_ID: run.workflowId,
+      WORKSHOP_EXECUTION_ID: input.executionId,
+      WORKSHOP_STDOUT_FILE: paths.stdoutPath,
+      WORKSHOP_STDERR_FILE: paths.stderrPath,
+    };
+  }
+  if (input.nodeId === null || input.attemptId === null || attemptNumber === null) {
+    throw new Error("node process identity is missing its node or attempt");
+  }
+  const nodeSettings = run.resolvedSettings.nodes[input.nodeId];
+  const site = input.role === "worker" ? nodeSettings?.run : nodeSettings?.validator;
+  if (site === undefined || site === null) throw new Error("process role has no resolved execution site");
+  const env: Record<string, string> = {
+    WORKSHOP_RUN_ID: run.runId,
+    WORKSHOP_WORKFLOW_ID: run.workflowId,
+    WORKSHOP_NODE_ID: input.nodeId,
+    WORKSHOP_ATTEMPT: String(attemptNumber),
+    WORKSHOP_EXECUTION_ID: input.executionId,
+    WORKSHOP_NODE_OUTPUT_FILE: join(run.paths.outputDirectory, `${input.nodeId}.output.txt`),
+    WORKSHOP_PREVIOUS_OUTPUT_FILE: join(run.paths.inputDirectory, `${input.nodeId}.previous.txt`),
+    WORKSHOP_WORKLOG_FILE: run.paths.worklog,
+    WORKSHOP_STDOUT_FILE: paths.stdoutPath,
+    WORKSHOP_STDERR_FILE: paths.stderrPath,
+  };
+  if (site.kind === "agent") {
+    const model = parseV2Model(site.model);
+    env.WORKSHOP_PROMPT_FILE = paths.promptPath;
+    env.WORKSHOP_RESULT_FILE = paths.resultPath;
+    env.WORKSHOP_PROVIDER = model.provider;
+    env.WORKSHOP_MODEL_ID = model.modelId;
+    env.WORKSHOP_MODEL = `${model.provider}/${model.modelId}`;
+    env.WORKSHOP_THINKING = model.thinking;
+    env.WORKSHOP_MODEL_WITH_THINKING = model.full;
+  }
+  return env;
+}
+
+const processCheckpointV2Schema = z.discriminatedUnion("phase", [
+  z.strictObject({ phase: z.literal("intent") }),
+  z.strictObject({ phase: z.literal("launch"), process: processIncarnationV2Schema }),
+  z.strictObject({ phase: z.literal("monitor"), process: processIncarnationV2Schema }),
+]);
+type ProcessCheckpointV2 = z.infer<typeof processCheckpointV2Schema>;
+
+const semanticStdoutV2Schema = z.discriminatedUnion("kind", [
+  z.strictObject({
+    kind: z.literal("captured"),
+    text: z.string(),
+    byteCount: nonnegative,
+    sha256: sha256V2Schema,
+  }),
+  z.strictObject({
+    kind: z.literal("invalid_utf8"),
+    byteCount: nonnegative,
+    sha256: sha256V2Schema,
+  }),
+  z.strictObject({ kind: z.literal("too_large"), byteCount: positive }),
+  z.strictObject({ kind: z.literal("not_captured") }),
+]).superRefine((capture, context) => {
+  if (capture.kind === "captured") {
+    if (Buffer.byteLength(capture.text, "utf8") !== capture.byteCount) {
+      context.addIssue({ code: "custom", path: ["byteCount"], message: "semantic stdout byte count matches its text" });
+    }
+    if (sha256(Buffer.from(capture.text, "utf8")) !== capture.sha256) {
+      context.addIssue({ code: "custom", path: ["sha256"], message: "semantic stdout digest matches its text" });
+    }
+  }
+});
+
+export const processExecutionTaskResultV2Schema = z.discriminatedUnion("kind", [
+  z.strictObject({
+    kind: z.literal("exited"),
+    exit: processExitV2Schema,
+    timedOut: z.boolean(),
+    stdoutCaptureHash: sha256V2Schema,
+    stderrCaptureHash: sha256V2Schema,
+    semanticStdout: semanticStdoutV2Schema,
+  }),
+  z.strictObject({
+    kind: z.literal("cancelled"),
+    executionId: executionIdV2Schema,
+    incarnationId: incarnationIdV2Schema,
+    incarnationNumber: positive,
+    identity: processIdentityV2Schema,
+    exit: processExitV2Schema,
+    cleanupState: z.literal("confirmed_dead"),
+  }),
+  z.strictObject({
+    kind: z.literal("replayable"),
+    executionId: executionIdV2Schema,
+    incarnationId: incarnationIdV2Schema,
+    incarnationNumber: positive,
+    launchIntentAt: utcTimestampV2Schema,
+    deadlineAt: utcTimestampV2Schema.nullable(),
+  }),
+  z.strictObject({ kind: z.literal("blocked"), block: blockInfoV2Schema }),
+]);
+export type ProcessExecutionTaskResultV2 = z.infer<typeof processExecutionTaskResultV2Schema>;
+
+type ReadyRun = Extract<WorkflowRunDocumentV1, { state: "ready" }>;
+type PersistedNodeAttempt = z.infer<typeof persistedNodeAttemptV2Schema>;
+type ProcessRuntime = TaskRuntime<ProcessExecutionTaskInputV2, ProcessCheckpointV2, ProcessExecutionTaskResultV2, object>;
+export type ProcessExecutionTaskV2 = Task<ProcessExecutionTaskInputV2, ProcessCheckpointV2, ProcessExecutionTaskResultV2, object>;
+
+/** Owns OS-process lifecycle and capture evidence for every Durable execution role. */
+export function defineProcessExecutionTaskV2(
+  serviceBootId: string = randomUUID(),
+  options: { readonly startupLaunchGate?: "open" | "closed" } = {},
+): {
+  readonly serviceBootId: string;
+  readonly task: ProcessExecutionTaskV2;
+  readonly stopLaunching: () => void;
+  readonly canLaunch: () => boolean;
+  readonly openStartupLaunchGate: () => void;
+} {
+  let acceptingLaunches = true;
+  let releaseStartupLaunchGate: (() => void) | undefined;
+  const startupLaunchGate = options.startupLaunchGate === "closed"
+    ? new Promise<void>((resolve) => { releaseStartupLaunchGate = resolve; })
+    : Promise.resolve();
+  const openStartupLaunchGate = () => {
+    const release = releaseStartupLaunchGate;
+    releaseStartupLaunchGate = undefined;
+    release?.();
+  };
+  const launched = new Set<string>();
+  const trackedProcesses = new Map<string, TrackedProcess>();
+
+  const task = defineTask<ProcessExecutionTaskInputV2, ProcessCheckpointV2, ProcessExecutionTaskResultV2>({
+    name: "workshop.process-execution",
+    version: 4,
+    initial: () => ({ phase: "intent" }),
+    phases: {
+      intent: async (task, runtime, context) => {
+        await waitForStartupLaunchGate(startupLaunchGate, runtime.signal);
+        const input = parseProcessInput(task.input);
+        const run = await snapshotRun(runtime, context);
+        assertProcessIdentity(input, run);
+        const at = timestamp(runtime.now());
+        const process = processIncarnationV2Schema.parse({
+          executionId: input.executionId,
+          incarnationId: input.incarnationId,
+          incarnationNumber: input.incarnationNumber,
+          role: input.role,
+          status: "launching",
+          replay: input.replay,
+          commandHash: processCommandHash(input),
+          launchIntentAt: input.launchIntentAt,
+          launchServiceBootId: serviceBootId,
+          startedAt: null,
+          finishedAt: null,
+          deadlineAt: input.deadlineAt,
+          identity: null,
+          exit: null,
+          cleanupState: "pending",
+          captures: [],
+        });
+        await runtime.commit(async (tx) => {
+          const { draft, run: current } = await runDraft(tx, runtime.conversationId);
+          assertProcessIdentity(input, current);
+          if (input.role === "preflight") {
+            assign(draft, current);
+          } else {
+            if (input.nodeId === null || input.attemptId === null) throw new Error("node process identity is incomplete");
+            const attempt = requireAttempt(current, input.nodeId, input.attemptId);
+            const incarnations = attempt.processIncarnations.filter((item) => item.executionId === input.executionId);
+            if (incarnations.some((item) => item.incarnationId === input.incarnationId)
+              || incarnations.length + 1 !== input.incarnationNumber) {
+              throw new Error("process incarnation does not extend the canonical execution history");
+            }
+            const next = replaceRunAttempt(current, input.nodeId, input.attemptId, (value) => ({
+              ...value,
+              processIncarnations: [...value.processIncarnations, { executionId: input.executionId, incarnationId: input.incarnationId }],
+            }));
+            assign(draft, next);
+          }
+          await appendProcess(tx, runtime.conversationId, input, Number(runtime.taskId), process, at);
+          return { status: "running", checkpoint: { phase: "launch", process } };
+        }, context);
+      },
+      launch: async (task, runtime, context) => {
+        const input = parseProcessInput(task.input);
+        const checkpoint = processCheckpointV2Schema.parse(task.state.checkpoint);
+        if (checkpoint.phase !== "launch") throw new Error("launch checkpoint lacks process intent");
+        const process = checkpoint.process;
+        const run = await snapshotRun(runtime, context);
+        assertProcessIdentity(input, run, { requireReference: true, requireExecuting: false });
+        const authorized = input.role === "preflight"
+          ? run.preflight.kind === "pending" && run.preflight.processExecutionIds.includes(input.executionId)
+          : input.nodeId !== null && input.attemptId !== null
+            && (() => {
+              const attempt = requireAttempt(run, input.nodeId, input.attemptId);
+              return input.role === "worker"
+                ? attempt.status === "executing" && attempt.result.kind === "pending"
+                : attempt.status === "validating" && attempt.result.kind === "candidate_committed";
+            })();
+        const runIsActive = run.status === "running" && run.desiredState === "running";
+        const pausedValidatorMayFinish = input.role === "validator"
+          && run.desiredState === "paused"
+          && (run.status === "running" || run.status === "paused");
+        const pausedPreflightMayFinish = input.role === "preflight"
+          && run.desiredState === "paused"
+          && (run.status === "running" || run.status === "paused");
+        if ((!runIsActive && !pausedValidatorMayFinish && !pausedPreflightMayFinish) || !authorized) {
+          await blockProcess(task, runtime, input, process, "external_outcome_unknown", "run state no longer authorizes process launch", context);
+          return;
+        }
+        if (!acceptingLaunches) {
+          await blockProcess(task, runtime, input, process, "external_outcome_unknown", "service shutdown prevented process launch", context);
+          return;
+        }
+        const launchServiceBootId = process.launchServiceBootId ?? input.serviceBootId;
+        const key = `${launchServiceBootId}:${input.executionId}:${input.incarnationId}`;
+        if (launchServiceBootId !== serviceBootId || launched.has(key)) {
+          await blockProcess(task, runtime, input, process, "external_outcome_unknown", "persisted launch intent cannot authorize a second process launch", context);
+          return;
+        }
+        launched.add(key);
+        const until = process.deadlineAt === null ? null : Date.parse(process.deadlineAt);
+        if (until !== null && (!Number.isSafeInteger(until) || until <= Date.now())) {
+          await blockProcess(task, runtime, input, process, "external_outcome_unknown", "process deadline elapsed before a launch could be authorized", context);
+          return;
+        }
+        mkdirSync(dirname(input.stdoutPath), { recursive: true });
+        const siteSettings = input.nodeId === null ? undefined : run.resolvedSettings.nodes[input.nodeId];
+        const site = input.role === "preflight" ? run.resolvedSettings.preflight
+          : input.role === "worker" ? siteSettings?.run : siteSettings?.validator;
+        const semanticStdoutLimitBytes = input.role === "worker" && input.nodeId !== null
+          && run.resolvedSettings.nodes[input.nodeId]?.run.kind === "command"
+          ? MAX_SEMANTIC_OUTPUT_BYTES
+          : undefined;
+        let child: TrackedProcess;
+        try {
+          child = spawnTracked({
+            shell: input.shell,
+            command: input.command,
+            cwd: input.cwd,
+            env: input.env,
+            stdoutFile: input.stdoutPath,
+            stderrFile: input.stderrPath,
+            ...(semanticStdoutLimitBytes === undefined ? {} : { semanticStdoutLimitBytes }),
+          });
+        } catch {
+          await blockProcess(task, runtime, input, process, "external_outcome_unknown", "process launch did not produce a durable identity", context);
+          return;
+        }
+        trackedProcesses.set(input.executionId, child);
+        const running = processIncarnationV2Schema.parse({
+          ...process,
+          status: "running",
+          startedAt: timestamp(runtime.now()),
+          identity: processIdentityV2Schema.parse({
+            pid: child.pid,
+            pgid: child.pgid,
+            startIdentity: child.startId,
+            serviceBootId,
+          }),
+        });
+        try {
+          await runtime.commit(async (tx) => {
+            const { draft, run: current } = await runDraft(tx, runtime.conversationId);
+            assertProcessIdentity(input, current, { requireReference: true });
+            assign(draft, current);
+            await appendProcess(tx, runtime.conversationId, input, Number(runtime.taskId), running, timestamp(runtime.now()));
+            return { status: "running", checkpoint: { phase: "monitor", process: running } };
+          }, context);
+        } catch (error) {
+          const dead = await child.kill();
+          if (dead) await child.streamsClosed;
+          trackedProcesses.delete(input.executionId);
+          throw error;
+        }
+      },
+      monitor: async (task, runtime, context) => {
+        const input = parseProcessInput(task.input);
+        const checkpoint = processCheckpointV2Schema.parse(task.state.checkpoint);
+        if (checkpoint.phase !== "monitor") throw new Error("monitor checkpoint lacks process identity");
+        const process = checkpoint.process;
+        const identity = process.identity;
+        if (identity === null) throw new Error("running process checkpoint has no identity");
+        const run = await snapshotRun(runtime, context);
+        assertProcessIdentity(input, run, { requireReference: true, requireExecuting: false });
+        const child = trackedProcesses.get(input.executionId);
+        const launchServiceBootId = process.launchServiceBootId ?? input.serviceBootId;
+        if (identity.serviceBootId !== launchServiceBootId) {
+          await blockProcess(task, runtime, input, process, "process_death_unconfirmed", "process identity does not match its launch intent", context);
+          return;
+        }
+        if (launchServiceBootId !== serviceBootId || child === undefined) {
+          const sameProcess = processStartId(identity.pid) === identity.startIdentity;
+          const dead = sameProcess ? await terminateProcessGroup(identity.pgid) : false;
+          if (dead) {
+            await settleRecoveredProcess(runtime, input, process, context);
+            trackedProcesses.delete(input.executionId);
+            return;
+          }
+          const captures = await recoverRetainedProcessCaptureRecordsV2(input);
+          await blockProcess(
+            task,
+            runtime,
+            input,
+            process,
+            "process_death_unconfirmed",
+            "recorded process identity could not be reconciled safely",
+            context,
+            "unconfirmed",
+            captures,
+          );
+          return;
+        }
+        const onAbort = () => { void child.kill(); };
+        runtime.signal.addEventListener("abort", onAbort, { once: true });
+        let waited: Awaited<ReturnType<typeof waitForExit>>;
+        try {
+          if (runtime.signal.aborted) await child.kill();
+          waited = await waitForExit(child, process.deadlineAt);
+        } finally {
+          runtime.signal.removeEventListener("abort", onAbort);
+        }
+        if (runtime.signal.aborted) {
+          await child.kill();
+          return;
+        }
+        const dead = await child.kill();
+        const exit = await child.exit;
+        if (!dead) {
+          await blockProcess(task, runtime, input, process, "process_death_unconfirmed", "process group death could not be confirmed", context);
+          trackedProcesses.delete(input.executionId);
+          return;
+        }
+        await child.streamsClosed;
+        const stats = child.captures();
+        const finishedAt = timestamp(runtime.now());
+        const semantic = child.semanticStdout();
+        const captures = await captureProcessRecordsV2(input, stats);
+        const stdoutCapture = captures.find((capture) => capture.stream === "stdout");
+        const stderrCapture = captures.find((capture) => capture.stream === "stderr");
+        const normalizedExit = exitRecord(exit);
+        if (stats.stdout.error !== null || stats.stderr.error !== null
+          || stdoutCapture?.sha256 == null || stderrCapture?.sha256 == null || normalizedExit === null) {
+          const blocked = processIncarnationV2Schema.parse({
+            ...process,
+            status: "blocked",
+            finishedAt,
+            exit: normalizedExit,
+            cleanupState: "confirmed_dead",
+            captures,
+          });
+          await blockProcess(task, runtime, input, blocked, "integrity_failed", "process exit or stream evidence failed validation", context, "confirmed_dead");
+          trackedProcesses.delete(input.executionId);
+          return;
+        }
+        const exited = processIncarnationV2Schema.parse({
+          ...process,
+          status: "exited",
+          finishedAt,
+          exit: normalizedExit,
+          cleanupState: "confirmed_dead",
+          captures,
+        });
+        let semanticStdout: z.infer<typeof semanticStdoutV2Schema>;
+        if (semantic === null) semanticStdout = { kind: "not_captured" };
+        else if (semantic.tooLarge) semanticStdout = { kind: "too_large", byteCount: semantic.totalBytes };
+        else {
+          if (semantic.sha256 === null) throw new Error("complete semantic stdout lacks its digest");
+          try {
+            semanticStdout = {
+              kind: "captured",
+              text: new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(semantic.bytes),
+              byteCount: semantic.totalBytes,
+              sha256: semantic.sha256,
+            };
+          } catch {
+            semanticStdout = { kind: "invalid_utf8", byteCount: semantic.totalBytes, sha256: semantic.sha256 };
+          }
+        }
+        const result = processExecutionTaskResultV2Schema.parse({
+          kind: "exited",
+          exit: normalizedExit,
+          timedOut: waited.kind === "timeout",
+          stdoutCaptureHash: stdoutCapture.sha256,
+          stderrCaptureHash: stderrCapture.sha256,
+          semanticStdout,
+        });
+        await runtime.commit(async (tx) => {
+          const { draft, run: current } = await runDraft(tx, runtime.conversationId);
+          assertProcessIdentity(input, current, { requireReference: true, requireExecuting: false });
+          assign(draft, current);
+          await appendProcess(tx, runtime.conversationId, input, Number(runtime.taskId), exited, finishedAt);
+          return { status: "terminal", outcome: { status: "completed", result } };
+        }, context);
+        trackedProcesses.delete(input.executionId);
+      },
+    },
+    abort: async (task, runtime, context) => {
+      const input = parseProcessInput(task.input);
+      const parsed = processCheckpointV2Schema.safeParse(task.state.checkpoint);
+      if (!parsed.success) {
+        const block = blockInfo("process_death_unconfirmed", "process checkpoint failed validation; cleanup and exit remain unknown", input.runId, input.nodeId, input.attemptId, timestamp(runtime.now()));
+        await runtime.commit(() => ({ status: "terminal", outcome: { status: "completed", result: { kind: "blocked", block } } }), context);
+        return;
+      }
+      if (parsed.data.phase === "intent") {
+        await runtime.commit(() => ({ status: "terminal", outcome: { status: "aborted", reason: "process was aborted before launch intent" } }), context);
+        return;
+      }
+      const process = parsed.data.process;
+      const run = await snapshotRun(runtime, context);
+      assertProcessIdentity(input, run, { requireReference: true, requireExecuting: false });
+      const operatorStopRequested = run.desiredState === "stopped" && run.block === null;
+      const child = trackedProcesses.get(input.executionId);
+      const expectedBootId = process.launchServiceBootId ?? input.serviceBootId;
+      const identityMatches = child !== undefined && process.identity !== null
+        && child.pid === process.identity.pid && child.pgid === process.identity.pgid
+        && child.startId === process.identity.startIdentity
+        && process.identity.serviceBootId === expectedBootId;
+      let dead = false;
+      if (identityMatches && child !== undefined) dead = await child.kill();
+      else if (child !== undefined && process.identity === null) dead = await child.kill();
+      else if (child === undefined && process.identity !== null
+        && process.identity.serviceBootId === expectedBootId
+        && processStartId(process.identity.pid) === process.identity.startIdentity) {
+        dead = await terminateProcessGroup(process.identity.pgid);
+      }
+      let observedExit: ReturnType<typeof exitRecord> = null;
+      let captures: Awaited<ReturnType<typeof captureProcessRecordsV2>> = process.captures;
+      let finishedAt: string | null = null;
+      if (dead && identityMatches && child !== undefined && process.identity !== null) {
+        const exit = await child.exit;
+        await child.streamsClosed;
+        const stats = child.captures();
+        finishedAt = timestamp(runtime.now());
+        captures = await captureProcessRecordsV2(input, stats, { bestEffort: true });
+        observedExit = exitRecord(exit);
+        if (operatorStopRequested && observedExit !== null && finishedAt !== null) {
+          const completedAt = finishedAt;
+          const retired = processIncarnationV2Schema.parse({
+            ...process,
+            status: "exited",
+            finishedAt: completedAt,
+            exit: observedExit,
+            cleanupState: "confirmed_dead",
+            captures,
+          });
+          const result = processExecutionTaskResultV2Schema.parse({
+            kind: "cancelled",
+            executionId: input.executionId,
+            incarnationId: input.incarnationId,
+            incarnationNumber: input.incarnationNumber,
+            identity: process.identity,
+            exit: observedExit,
+            cleanupState: "confirmed_dead",
+          });
+          await runtime.commit(async (tx) => {
+            const { draft, run: current } = await runDraft(tx, runtime.conversationId);
+            assertProcessIdentity(input, current, { requireReference: true, requireExecuting: false });
+            if (current.desiredState !== "stopped" || current.block !== null) {
+              const blockedReceipt = processIncarnationV2Schema.parse({
+                ...process,
+                status: "blocked",
+                finishedAt: completedAt,
+                exit: observedExit,
+                cleanupState: "confirmed_dead",
+                captures,
+              });
+              await appendProcess(tx, runtime.conversationId, input, Number(runtime.taskId), blockedReceipt, timestamp(runtime.now()));
+              return { status: "terminal", outcome: { status: "aborted", reason: "operator stop was no longer eligible at retirement commit" } };
+            }
+            assign(draft, current);
+            await appendProcess(tx, runtime.conversationId, input, Number(runtime.taskId), retired, completedAt);
+            return { status: "terminal", outcome: { status: "completed", result } };
+          }, context);
+          trackedProcesses.delete(input.executionId);
+          return;
+        }
+      } else if (dead && child === undefined && process.identity !== null) {
+        finishedAt = timestamp(runtime.now());
+        captures = await recoverProcessCaptureRecordsV2(input);
+      }
+      const block = blockInfo("process_death_unconfirmed", "process was aborted before a checked operator-stop receipt", input.runId, input.nodeId, input.attemptId, timestamp(runtime.now()));
+      const confirmedIdentity = process.identity !== null;
+      const blocked = processIncarnationV2Schema.parse({
+        ...process,
+        status: "blocked",
+        ...(finishedAt === null ? {} : { finishedAt }),
+        exit: observedExit,
+        cleanupState: dead && confirmedIdentity ? "confirmed_dead" : "unconfirmed",
+        captures,
+      });
+      await runtime.commit(async (tx) => {
+        const { draft, run: current } = await runDraft(tx, runtime.conversationId);
+        assertProcessIdentity(input, current, { requireReference: true, requireExecuting: false });
+        assign(draft, current);
+        await appendProcess(tx, runtime.conversationId, input, Number(runtime.taskId), blocked, timestamp(runtime.now()));
+        return { status: "terminal", outcome: { status: "aborted", reason: dead ? "process stopped without a checked operator-stop receipt" : block.reason } };
+      }, context);
+      trackedProcesses.delete(input.executionId);
+    },
+  });
+
+  return {
+    serviceBootId,
+    task,
+    stopLaunching: () => { acceptingLaunches = false; },
+    canLaunch: () => acceptingLaunches,
+    openStartupLaunchGate,
+  };
+}
+
+async function waitForStartupLaunchGate(
+  gate: Promise<void>,
+  signal: AbortSignal,
+): Promise<void> {
+  if (signal.aborted) throw signal.reason ?? new Error("process launch wait was aborted");
+  await new Promise<void>((resolve, reject) => {
+    const onAbort = () => {
+      signal.removeEventListener("abort", onAbort);
+      reject(signal.reason ?? new Error("process launch wait was aborted"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    void gate.then(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, reject);
+  });
+}
+
+async function blockProcess(
+  _task: unknown,
+  runtime: ProcessRuntime,
+  input: ProcessExecutionTaskInputV2,
+  process: z.infer<typeof processIncarnationV2Schema>,
+  kind: BlockInfoV2["kind"],
+  reason: string,
+  context: Context,
+  cleanup: "confirmed_dead" | "unconfirmed" = "unconfirmed",
+  captures = process.captures,
+): Promise<void> {
+  const block = blockInfo(kind, reason, input.runId, input.nodeId, input.attemptId, timestamp(runtime.now()));
+  const blocked = processIncarnationV2Schema.parse({ ...process, status: "blocked", cleanupState: cleanup, captures });
+  await runtime.commit(async (tx) => {
+    await appendProcess(tx, runtime.conversationId, input, Number(runtime.taskId), blocked, timestamp(runtime.now()));
+    return { status: "terminal", outcome: { status: "completed", result: { kind: "blocked", block } } };
+  }, context);
+}
+
+async function settleRecoveredProcess(
+  runtime: ProcessRuntime,
+  input: ProcessExecutionTaskInputV2,
+  process: z.infer<typeof processIncarnationV2Schema>,
+  context: Context,
+): Promise<void> {
+  if (process.executionId !== input.executionId || process.incarnationId !== input.incarnationId
+    || process.incarnationNumber !== input.incarnationNumber || process.replay !== input.replay
+    || process.launchIntentAt !== input.launchIntentAt || process.deadlineAt !== input.deadlineAt) {
+    throw new Error("recovered process identity differs from its durable task input");
+  }
+  const now = runtime.now();
+  const recoveredAt = timestamp(now);
+  const captures = await recoverProcessCaptureRecordsV2(input);
+  const blocked = processIncarnationV2Schema.parse({
+    ...process,
+    status: "blocked",
+    finishedAt: recoveredAt,
+    cleanupState: "confirmed_dead",
+    captures,
+  });
+  const nextIncarnationId = incarnationIdV2Schema.parse(randomUUID());
+  await runtime.commit(async (tx) => {
+    const { draft, run } = await runDraft(tx, runtime.conversationId);
+    assertProcessIdentity(input, run, { requireReference: true, requireExecuting: false });
+    assign(draft, run);
+    await appendProcess(tx, runtime.conversationId, input, Number(runtime.taskId), blocked, timestamp(now));
+    const reason = decideProcessReplayV2({
+      replayPolicy: input.replay,
+      recordedReplayPolicy: process.replay,
+      incarnationNumber: process.incarnationNumber,
+      runStatus: run.status,
+      desiredState: run.desiredState,
+      deadlineAt: input.deadlineAt,
+      confirmedDead: true,
+      hasExitReceipt: process.exit !== null,
+      now,
+    });
+    if (reason !== null) {
+      const block = blockInfo("external_outcome_unknown", reason, input.runId, input.nodeId, input.attemptId, timestamp(now));
+      return { status: "terminal", outcome: { status: "completed", result: { kind: "blocked", block } } };
+    }
+    return {
+      status: "terminal",
+      outcome: {
+        status: "completed",
+        result: {
+          kind: "replayable",
+          executionId: input.executionId,
+          incarnationId: nextIncarnationId,
+          incarnationNumber: process.incarnationNumber + 1,
+          launchIntentAt: recoveredAt,
+          deadlineAt: input.deadlineAt,
+        },
+      },
+    };
+  }, context);
+}
+
+export function decideProcessReplayV2(input: {
+  readonly replayPolicy: "safe" | "never";
+  readonly recordedReplayPolicy: "safe" | "never";
+  readonly incarnationNumber: number;
+  readonly runStatus: "queued" | "running" | "paused" | "blocked" | "failed" | "completed" | "cancelled";
+  readonly desiredState: "running" | "paused" | "stopped";
+  readonly deadlineAt: string | null;
+  readonly confirmedDead: boolean;
+  readonly hasExitReceipt: boolean;
+  readonly now: number;
+}): string | null {
+  if (!input.confirmedDead || input.hasExitReceipt) return "same-attempt replay requires confirmed death without a checked exit receipt";
+  if (input.replayPolicy !== "safe" || input.recordedReplayPolicy !== "safe") return "process replay policy forbids automatic repetition";
+  if (input.incarnationNumber >= MAX_PROCESS_INCARNATIONS) return "safe process replay limit was exhausted";
+  if (input.desiredState === "stopped") return "run was stopped while the process outcome remained unknown";
+  if (input.runStatus !== "running" && input.runStatus !== "paused") return "run state no longer authorizes safe process replay";
+  if (input.deadlineAt !== null && Date.parse(input.deadlineAt) <= input.now) return "absolute process deadline elapsed before safe replay";
+  return null;
+}
+
+function validProcessDeadline(input: ProcessExecutionTaskInputV2, timeoutMs: number | null): boolean {
+  if (timeoutMs === null) return input.deadlineAt === null;
+  if (input.deadlineAt === null) return false;
+  const launchTime = Date.parse(input.launchIntentAt);
+  const deadlineTime = Date.parse(input.deadlineAt);
+  const remaining = deadlineTime - launchTime;
+  return Number.isSafeInteger(launchTime) && Number.isSafeInteger(deadlineTime)
+    && Number.isFinite(new Date(deadlineTime).getTime())
+    && remaining >= 0
+    && (input.incarnationNumber === 1 ? remaining === timeoutMs : remaining <= timeoutMs);
+}
+
+function processCommandHash(input: ProcessExecutionTaskInputV2): string {
+  const {
+    WORKSHOP_STDOUT_FILE: _stdoutPath,
+    WORKSHOP_STDERR_FILE: _stderrPath,
+    WORKSHOP_PROMPT_FILE: _promptPath,
+    WORKSHOP_RESULT_FILE: _resultPath,
+    ...stableEnvironment
+  } = input.env;
+  return canonicalHash({
+    role: input.role,
+    command: input.command,
+    shell: input.shell,
+    cwd: input.cwd,
+    env: stableEnvironment,
+  });
+}
+
+
+function replaceRunAttempt(
+  run: ReadyRun,
+  nodeId: string,
+  attemptId: string,
+  update: (attempt: PersistedNodeAttempt) => PersistedNodeAttempt,
+): ReadyRun {
+  const parsed = workflowRunDocumentV1Schema.parse({
+    ...run,
+    nodes: run.nodes.map((node) => node.nodeId !== nodeId ? node : {
+      ...node,
+      attempts: node.attempts.map((attempt) => attempt.attemptId === attemptId ? update(attempt) : attempt),
+    }),
+  });
+  if (parsed.state !== "ready") throw new Error("canonical run document is uninitialized");
+  return parsed;
+}
+
+function requireAttempt(run: ReadyRun, nodeId: string, attemptId: string): PersistedNodeAttempt {
+  const attempt = run.nodes.find((node) => node.nodeId === nodeId)?.attempts.find((value) => value.attemptId === attemptId);
+  if (attempt === undefined) throw new Error("canonical attempt is missing");
+  return attempt;
+}
+
+function assertProcessIdentity(
+  input: ProcessExecutionTaskInputV2,
+  run: ReadyRun,
+  options: { requireReference?: boolean; requireExecuting?: boolean } = {},
+): void {
+  const { requireReference = false, requireExecuting = true } = options;
+  if (input.role === "preflight") {
+    const site = run.resolvedSettings.preflight;
+    const expectedEnv = buildProcessExecutionEnvironmentV2(input, run, null);
+    const paths = processExecutionCapturePathsV2(run.paths.captureDirectory, input.executionId, input.incarnationId);
+    const validDeadline = site !== null && site !== undefined
+      && validProcessDeadline(input, site.timeoutMs);
+    const authorized = run.preflight.kind === "pending"
+      && run.preflight.processExecutionIds.includes(input.executionId);
+    if (input.runId !== run.runId || input.workflowId !== run.workflowId
+      || input.activationId !== run.activationId || input.occurrenceId !== run.occurrenceId
+      || input.workflowTaskId !== run.durable.workflowTaskId || input.nodeTaskId !== run.durable.workflowTaskId
+      || input.nodeId !== null || input.attemptId !== null || site === null
+      || (requireExecuting && !authorized) || (requireReference && !authorized)
+      || site.command !== input.command || site.shell !== input.shell || site.cwd !== input.cwd
+      || site.timeoutMs !== input.timeoutMs || input.streamCapBytes !== DEFAULT_STREAM_CAP_BYTES
+      || input.replay !== "safe" || !validDeadline
+      || input.stdoutPath !== paths.stdoutPath || input.stderrPath !== paths.stderrPath
+      || canonicalHash(input.env) !== canonicalHash(expectedEnv)) {
+      throw new Error("Preflight ProcessExecution input differs from frozen settings or run identity");
+    }
+    return;
+  }
+  if (input.nodeId === null || input.attemptId === null) throw new Error("node process identity is incomplete");
+  const attempt = requireAttempt(run, input.nodeId, input.attemptId);
+  const nodeSettings = run.resolvedSettings.nodes[input.nodeId];
+  const site = input.role === "worker" ? nodeSettings?.run : nodeSettings?.validator;
+  const command = site?.kind === "command" ? site.command : site?.kind === "agent" ? site.harnessCommand : null;
+  const executionId = input.role === "worker" ? attempt.workerExecutionId : attempt.validatorExecutionId;
+  const authorizedAttempt = input.role === "worker"
+    ? attempt.status === "executing" && attempt.result.kind === "pending"
+    : attempt.status === "validating" && attempt.result.kind === "candidate_committed";
+  const executionIncarnations = attempt.processIncarnations.filter((item) => item.executionId === input.executionId);
+  const recordedIncarnationIndex = executionIncarnations.findIndex((item) => item.incarnationId === input.incarnationId);
+  const hasReference = recordedIncarnationIndex >= 0;
+  const expectedIncarnationNumber = hasReference ? recordedIncarnationIndex + 1 : executionIncarnations.length + 1;
+  const expectedEnv = buildProcessExecutionEnvironmentV2(input, run, attempt.number);
+  const paths = processExecutionCapturePathsV2(run.paths.captureDirectory, input.executionId, input.incarnationId);
+  const validDeadline = site !== undefined && site !== null
+    && validProcessDeadline(input, site.timeoutMs);
+  if (input.runId !== run.runId || input.workflowId !== run.workflowId
+    || input.activationId !== run.activationId || input.occurrenceId !== run.occurrenceId
+    || input.workflowTaskId !== run.durable.workflowTaskId || input.nodeTaskId !== attempt.taskId
+    || executionId !== input.executionId || input.incarnationNumber !== expectedIncarnationNumber
+    || (requireExecuting && !authorizedAttempt) || (requireReference && !hasReference)
+    || site === undefined || site === null || command !== input.command
+    || site.shell !== input.shell || site.cwd !== input.cwd || site.timeoutMs !== input.timeoutMs
+    || site.streamCapBytes !== input.streamCapBytes || site.replay !== input.replay || !validDeadline
+    || input.stdoutPath !== paths.stdoutPath
+    || input.stderrPath !== paths.stderrPath
+    || canonicalHash(input.env) !== canonicalHash(expectedEnv)) {
+    throw new Error("ProcessExecution input differs from frozen settings or attempt identity");
+  }
+}
+
+async function appendProcess(
+  tx: Tx,
+  conversationId: ConversationId,
+  input: ProcessExecutionTaskInputV2,
+  taskId: number,
+  process: z.infer<typeof processIncarnationV2Schema>,
+  recordedAt: string,
+): Promise<void> {
+  const checked = workshopProcessV1Schema.safeParse({
+    version: 1,
+    runId: input.runId,
+    nodeId: input.nodeId,
+    attemptId: input.attemptId,
+    taskId,
+    recordedAt,
+    process,
+  });
+  if (!checked.success) throw new Error(`process evidence failed validation: ${checked.error.message}`);
+  await tx.appendEntry(WorkshopProcessEntry, conversationId, { data: checked.data });
+}
+
+function parseProcessInput(value: unknown): ProcessExecutionTaskInputV2 {
+  const parsed = processExecutionTaskInputV2Schema.safeParse(value);
+  if (!parsed.success) throw new Error(`ProcessExecution input failed validation: ${parsed.error.message}`);
+  return parsed.data;
+}
+
+function readyRun(value: unknown): ReadyRun {
+  const parsed = workflowRunDocumentV1Schema.safeParse(value);
+  if (!parsed.success) throw new Error(`canonical run document failed validation: ${parsed.error.message}`);
+  if (parsed.data.state !== "ready") throw new Error("canonical run document is uninitialized");
+  return parsed.data;
+}
+
+async function snapshotRun<I, S extends { phase: string }, R, H extends object>(
+  runtime: TaskRuntime<I, S, R, H>,
+  context: Context,
+): Promise<ReadyRun> {
+  return readyRun(await runtime.snapshot(WorkshopRunDoc, runtime.conversationId, context));
+}
+
+async function runDraft(tx: Tx, conversationId: ConversationId) {
+  const draft = await tx.doc(WorkshopRunDoc, conversationId);
+  return { draft, run: readyRun(draft) };
+}
+
+function assign(draft: object, value: unknown): void {
+  Object.assign(draft, readyRun(value));
+}
+
+function blockInfo(
+  kind: BlockInfoV2["kind"],
+  reason: string,
+  runId: string,
+  nodeId: string | null,
+  attemptId: string | null,
+  blockedAt: string,
+): BlockInfoV2 {
+  runIdV2Schema.parse(runId);
+  return blockInfoV2Schema.parse({ blockId: randomUUID(), kind, reason, blockedAt, nodeId, attemptId });
+}
+
+function timestamp(ms: number): string {
+  if (!Number.isSafeInteger(ms) || !Number.isFinite(new Date(ms).getTime())) throw new Error("task clock returned an invalid timestamp");
+  return utcTimestampV2Schema.parse(new Date(ms).toISOString());
+}
+
+async function waitForExit(child: TrackedProcess, deadlineAt: string | null) {
+  if (deadlineAt === null) return raceDeadline(child, null);
+  const at = Date.parse(deadlineAt);
+  if (!Number.isSafeInteger(at)) throw new Error("stored process deadline is invalid");
+  while (true) {
+    const left = at - Date.now();
+    if (left <= 0) return { kind: "timeout" as const };
+    const result = await raceDeadline(child, Math.min(left, MAX_TIMER_MS));
+    if (result.kind === "exit") return result;
+  }
+}
+
+function exitRecord(exit: { code: number | null; signal: NodeJS.Signals | null }) {
+  if (exit.code !== null && exit.code >= 0) return processExitV2Schema.parse({ kind: "code", code: exit.code });
+  if (exit.signal !== null) return processExitV2Schema.parse({ kind: "signal", signal: exit.signal });
+  return null;
+}
+
+function sha256(bytes: Uint8Array): string {
+  return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+}
+
+export type ProcessCaptureFilesV2 = Pick<ProcessExecutionTaskInputV2, "stdoutPath" | "stderrPath" | "streamCapBytes">;
+
+export interface CaptureProcessRecordsOptionsV2 {
+  readonly bestEffort?: boolean;
+  readonly hashFile?: (path: string) => Promise<string>;
+}
+
+/** Persist post-exit stream evidence; monitor and abort may call this concurrently. */
+export async function captureProcessRecordsV2(
+  input: ProcessCaptureFilesV2,
+  stats: ReturnType<TrackedProcess["captures"]>,
+  options: CaptureProcessRecordsOptionsV2 = {},
+) {
+  const captures = [];
+  const hashFile = options.hashFile ?? sha256File;
+  for (const item of [
+    { stream: "stdout" as const, path: input.stdoutPath, stats: stats.stdout },
+    { stream: "stderr" as const, path: input.stderrPath, stats: stats.stderr },
+  ]) {
+    let retention: ReturnType<typeof retainStreamWindow> | undefined;
+    let retentionFailed = false;
+    let sha256: string | null = null;
+    if (item.stats.error === null) {
+      try { retention = retainStreamWindow(item.path, input.streamCapBytes); }
+      catch (error) {
+        if (!options.bestEffort) throw error;
+        retentionFailed = true;
+      }
+      if (!retentionFailed) {
+        try { sha256 = await hashFile(item.path); }
+        catch (error) { if (!options.bestEffort) throw error; }
+      }
+    }
+    const currentBytes = captureFileSize(item.path);
+    const totalBytes = retention?.totalBytes ?? Math.max(item.stats.totalBytes, currentBytes);
+    const retainedBytes = retention?.retainedBytes ?? Math.min(totalBytes, currentBytes);
+    const truncatedBytes = totalBytes - retainedBytes;
+    captures.push(processCaptureV2Schema.parse({
+      stream: item.stream,
+      path: item.path,
+      totalBytes,
+      retainedBytes,
+      truncatedBytes,
+      ...(retention === undefined ? {} : {
+        keptHeadBytes: retention.keptHeadBytes,
+        keptTailBytes: retention.keptTailBytes,
+      }),
+      sha256,
+      complete: item.stats.error === null && !retentionFailed && retention !== undefined
+        && truncatedBytes === 0 && sha256 !== null,
+    }));
+  }
+  return captures;
+}
+
+/** Recover readable diagnostics after confirmed death without claiming a checked exit or complete stream. */
+export async function recoverProcessCaptureRecordsV2(input: ProcessCaptureFilesV2) {
+  const captures = [];
+  for (const item of [
+    { stream: "stdout" as const, path: input.stdoutPath },
+    { stream: "stderr" as const, path: input.stderrPath },
+  ]) {
+    if (!existsSync(item.path)) continue;
+    try {
+      const retention = retainStreamWindow(item.path, input.streamCapBytes);
+      const sha256 = await sha256File(item.path);
+      captures.push(processCaptureV2Schema.parse({
+        stream: item.stream,
+        path: item.path,
+        ...retention,
+        sha256,
+        complete: false,
+      }));
+    } catch {
+      // Keep the process blocked, but omit bytes whose retention receipt cannot be reconciled.
+    }
+  }
+  return captures;
+}
+
+/** Recover only captures whose retained file still matches its durable receipt. */
+export async function recoverRetainedProcessCaptureRecordsV2(input: ProcessCaptureFilesV2) {
+  const captures: z.infer<typeof processCaptureV2Schema>[] = [];
+  for (const item of [
+    { stream: "stdout" as const, path: input.stdoutPath },
+    { stream: "stderr" as const, path: input.stderrPath },
+  ]) {
+    const retained = readVerifiedRetentionWindow(item.path, input.streamCapBytes);
+    if (retained === null) continue;
+    const { retainedSha256, ...window } = retained;
+    captures.push(processCaptureV2Schema.parse({
+      stream: item.stream,
+      path: item.path,
+      ...window,
+      sha256: retainedSha256,
+      complete: false,
+    }));
+  }
+  return captures;
+}
+
+function captureFileSize(path: string): number {
+  try { return statSync(path).size; } catch { return 0; }
+}
+
+async function sha256File(path: string): Promise<string> {
+  const hash = createHash("sha256");
+  for await (const chunk of createReadStream(path)) hash.update(chunk);
+  return `sha256:${hash.digest("hex")}`;
+}

@@ -1,4 +1,5 @@
-import type { WorkflowDefinition, NodeDefinition } from "./schema.js";
+import type { WorkflowDefinition } from "./schema.js";
+import type { WorkflowDefinitionV2 } from "./schema-v2.js";
 
 /**
  * Chain topology: the graph invariant the runtime relies on.
@@ -17,7 +18,14 @@ export interface ChainInfo {
 }
 
 export function validateChain(def: WorkflowDefinition): ChainInfo {
-  const nodes = def.nodes;
+  return checkChainNodes(def.nodes);
+}
+
+export function checkChainV2(def: WorkflowDefinitionV2): ChainInfo {
+  return checkChainNodes(def.nodes);
+}
+
+function checkChainNodes(nodes: Record<string, { next?: string | null }>): ChainInfo {
   const ids = Object.keys(nodes);
 
   const referenced = new Set<string>();
@@ -46,7 +54,7 @@ export function validateChain(def: WorkflowDefinition): ChainInfo {
     if (seen.has(cursor)) throw new Error(`chain has a cycle at node "${cursor}"`);
     seen.add(cursor);
     order.push(cursor);
-    const node: NodeDefinition = nodes[cursor]!;
+    const node: { next?: string | null } = nodes[cursor]!;
     if (node.next === undefined || node.next === null) break;
     cursor = node.next;
   }

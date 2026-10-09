@@ -201,17 +201,32 @@ file does; `CONTRIBUTING.md` lists the verbs.
 
 ```text
 src/
-├─ cli/                  one file per command group; main.ts is the entrypoint
+├─ cli/                  command groups; main.ts dispatches the selected engine
+│  ├─ dispatch-v4-command.ts isolated temporary v4 route
+│  ├─ dispatch-v4-public-command.ts public socket-only v4 client
+│  └─ watch-v4.ts          service-backed v4 viewer adapter
 ├─ load-installation.ts  find .workshop/ and read machine defaults
-├─ definition/           YAML → checked WorkflowDefinition
+├─ definition/           v1 definitions plus v2 contracts
 │  ├─ parse-yaml.ts            strict YAML: no duplicate keys or anchors
-│  ├─ schema.ts                the Zod schema
-│  ├─ check-chain.ts           nodes form one linear chain
-│  ├─ load-definition.ts       the three steps above, from a file or snapshot
-│  ├─ resolve-node-settings.ts node → workflow → machine settings
-│  ├─ parse-model.ts           provider/model:thinking
-│  └─ hash-canonical-json.ts   the definition hash
+│  ├─ schema.ts                v1 Zod workflow and machine schemas
+│  ├─ check-chain.ts           shared v1/v2 linear-chain policy
+│  ├─ load-definition.ts       v1 file/snapshot loader
+│  ├─ resolve-node-settings.ts v1 node → workflow → machine settings
+│  ├─ parse-model.ts           v1 provider/model:thinking parser
+│  ├─ hash-canonical-json.ts   canonical definition and exact source hashes
+│  ├─ schema-v2.ts             v2 workflow and machine schemas
+│  ├─ schema-resolved-v2.ts    frozen node and internal-judge settings
+│  ├─ check-v2-definition.ts   strict v2 text/schema/topology check
+│  ├─ parse-v2-model.ts        supported v2 thinking-level parser
+│  ├─ resolve-v2-agent-settings.ts v2 site → workflow → machine resolution
+│  └─ resolve-v2-workflow-settings.ts v2 workflow → machine resolution
+├─ installation/         session-scoped installation index and service receipts
+│  └─ schema-v2.ts             run references, activations, reservations, preflight cache, receipts
 ├─ run/                  one run, start to finish
+│  ├─ schema-v2.ts             v2 outcomes, judgment decisions, failure/block states
+│  ├─ records-v2.ts            canonical run document and immutable evidence contracts
+│  ├─ prepare-admission-v2.ts  check frozen definition, settings, and paths
+│  ├─ decide-fixed-rate-schedule.ts fixed-rate slots, deadlines, and skip decisions
 │  ├─ create-run.ts            reserve a run, freeze its definition
 │  ├─ check-environment.ts     preflight, cached per definition hash
 │  ├─ start-run.ts             create, preflight, first attempt
@@ -219,29 +234,66 @@ src/
 │  ├─ orchestrate-failure.ts   an agent decides: retry, block, or fail
 │  └─ recover-after-crash.ts   reconcile work orphaned by a crash
 ├─ attempt/              one node, once
-│  ├─ execute-attempt.ts       claim → spawn → check → judge → merge → complete
-│  ├─ build-attempt-env.ts     the WORKSHOP_* variables
-│  ├─ render-agent-prompt.ts   node instructions plus the packet contract
-│  └─ judge-output.ts          the node's validator
+│  ├─ parse-v2-result.ts          strict worker-result and validator-verdict envelopes
+│  ├─ render-v2-agent-prompt.ts   fresh worker and validator prompts
+│  ├─ execute-attempt.ts          claim → spawn → check → judge → merge → complete
+│  ├─ build-attempt-env.ts        the WORKSHOP_* variables
+│  ├─ render-agent-prompt.ts      node instructions plus the packet contract
+│  └─ judge-output.ts             the node's validator
+├─ service/              owner lifecycle and private versioned Unix protocol
+│  ├─ acquire-service-lock.ts    kernel flock with process identity metadata
+│  ├─ locate-service-socket.ts   short private path for long installations
+│  ├─ open-v2-service-runtime.ts Durable Harness handlers, reconciliation, and close
+│  ├─ parse-service-protocol.ts  checks bounded v1 requests and responses
+│  ├─ probe-service-health.ts    checks metadata against a live socket
+│  ├─ project-v2-service-reads.ts status, bounded run pages, and logs
+│  ├─ send-service-request.ts    correlated response reassembly and retry
+│  ├─ serve-v2-service-process.ts service-only process lifecycle
+│  ├─ serve-workshop-service.ts  acquire-before-open, request dispatch, bounded shutdown
+│  └─ schema.ts                 strict service methods, requests, and responses
 ├─ daemon/               the `orchestrate` loop: schedules and recovery
+├─ model/                checked owner Pi model catalog and private Tally auth
+│  ├─ schema-owner-models.ts       checked owner configuration shapes
+│  ├─ create-workshop-models.ts    public pi-ai provider registry
+│  ├─ load-owner-models.ts         loads provider metadata without retaining keys
+│  ├─ parse-owner-models.ts        compiles supported model descriptors
+│  └─ resolve-owner-provider-auth.ts request-time credential resolution
 ├─ process/              launch, identify, and kill child processes
+│  ├─ launch-process.ts  bounded capture, stream evidence, and process groups
+│  └─ schema-v2.ts       typed incarnation, exit, cleanup, and capture evidence
+├─ proof/                isolated Pi Durable Hemingway experiment; not the CLI runtime
 ├─ worklog/              the packet and marker protocol, merges into WORKLOG.md
 ├─ storage/
+│  ├─ durable/                 production Durable SQLite ownership and record tokens
+│  │  ├─ open-durable-storage.ts      verifies FULL synchronization before opening
+│  │  ├─ define-workshop-records.ts   versioned documents and immutable entries
+│  │  ├─ admit-run.ts                 atomic prepared-run admission and idempotency
+│  │  ├─ define-scheduler-wakeup-task.ts durable fixed-rate scheduler and run admission
+│  │  ├─ commit-service-mutation.ts   atomic mutation effects and response receipts
+│  │  ├─ define-workshop-tasks.ts         Durable workflow and judgment orchestration
+│  │  ├─ define-node-attempt-task.ts       worker/validator execution, replay, stop, settlement
+│  │  ├─ define-process-execution-task.ts shared role-aware process supervision and capture
+│  │  ├─ define-capacity-gate-task.ts     persisted capacity wait and slot acquisition
+│  │  ├─ render-v2-worklog.ts             renders the canonical run as Markdown
+│  │  └─ materialize-run-views.ts          rebuilds local files from committed run state
 │  ├─ db/                      SQLite schema and every guarded transition
 │  └─ disk/                    run-directory paths, crash-safe writes, locks
 ├─ views/                versioned JSON and human renderings of state
+│  └─ schema-v2.ts       strict version-2 public DTOs for status, runs, details, logs
 ├─ tui/                  the `watch` terminal viewer (OpenTUI)
-└─ util/                 clock, ids, hashing, unit parsing
+└─ util/                 clock, ids, hashing, unit parsing, shared v2 schemas
+   ├─ parse-units.ts     bounded v1/v2 duration and byte-cap parsing
+   └─ schema-v2.ts      UTC timestamps, SHA-256 values, and shared replay policy
 ```
 
 Dependencies point one way: `cli/` and `daemon/` → `run/` → `attempt/` →
-`definition/`, `worklog/`, `storage/`, `process/`. Two rules keep it that way:
+`definition/`, `worklog/`, `storage/`, and `process/`. `service/` uses `model/` to assemble native-judgment providers. Two rules keep it that way:
 
 - `views/` is the contract for outside readers. `status --json` and
   `runs --json` have versioned shapes, and the viewer reads those, never SQLite
   or run directories.
-- Only `tui/` imports a UI library, and only `cli/watch.ts` loads it, lazily.
-  A test fails if runtime code imports it.
+- Only `tui/` imports a UI library; `cli/watch.ts` and `cli/watch-v4.ts` load
+  it lazily. A test fails if runtime code imports it.
 
 ## Quick start
 
@@ -273,6 +325,47 @@ and validates one sentence, and appends it to `hemingway.quotes.md`.
 | `orchestrate` | the daemon |
 
 Run any of them as `bun src/cli/main.ts <command>`.
+
+### Experimental Durable-backed v4 fixture
+
+The leading `--engine v4` selector remains opt-in; omitting it keeps the v3 CLI. To exercise the public v4 service without a live provider:
+
+```fish
+bun test tests/check-cli-engine-selector.test.ts tests/check-v2-service-restart.test.ts
+```
+
+The restart test creates a temporary installation and runs the deterministic Hemingway mock through `--engine v4 start`, `status`, `runs`, `logs`, and `node describe`. It restarts the service, checks the same Durable run, and removes the temporary installation. The mock needs no model credentials. These results come from the Durable-backed service, not v3 status data or the JSON printed by `src/proof/`.
+The v4 inspector also supports `runs --all`, `logs --run`, `logs --follow`, `logs --all`, frozen `node describe --run`, `diagram --run --mermaid`, and `watch`. The v4 viewer reads service-backed projections, shows selected historical chains, and retains the picker, occurrence navigation, follow/collated worklogs, narrow-terminal layout, and clean quit. Human run times use the machine-local clock; JSON retains UTC timestamps.
+V4 raw worker and validator streams retain a UTF-8-safe head/tail window after the process group retires. For successful command workers, semantic stdout is extracted before raw-file retention. `logs` reports total, retained, omitted, head, and tail byte counts. The cap applies to raw diagnostics, not extracted command output, and it is not a live disk quota. Use `stream_cap: unlimited` to opt out.
+
+V4 native failure judgment compiles Tally-backed provider entries from `~/.pi/agent/models.json` (or `PI_CODING_AGENT_DIR/models.json`) through public `@earendil-works/pi-ai` APIs. It accepts the checked OpenAI Responses, OpenAI Completions, and Anthropic Messages adapters at their fixed Tally routes. Model entries need explicit pricing; entries without rates are omitted rather than assigned a zero cost. Credentials and the `X-Tally-User`/`X-Tally-Hostname` headers are resolved from the owner file for each auth operation; command credentials, custom auth headers, and non-Tally endpoints are rejected. Fake-fetch tests check request URLs, auth and attribution headers, and a synthetic streamed response. This proves SDK wiring only, not Gateway availability or real-model judgment; no live or paid request ran.
+
+### V4 headless-agent command templates
+
+Choose one command for each agent site; Workshop uses the same supervised process and strict result-file contract for every harness. The model names below are syntax examples, not available provider claims. Workshop passes the rendered prompt through `WORKSHOP_PROMPT_FILE` and names `WORKSHOP_RESULT_FILE` in that prompt. The harness must write the checked JSON result there; stdout remains diagnostic output.
+
+```yaml
+pi:
+  model: example/pi-model:medium
+  model_env: [WORKSHOP_MODEL_WITH_THINKING]
+  prompt_env: WORKSHOP_PROMPT_FILE
+  result_env: WORKSHOP_RESULT_FILE
+  command: 'pi --print --approve --no-session --model "$WORKSHOP_MODEL_WITH_THINKING" -- "$(cat "$WORKSHOP_PROMPT_FILE")"'
+opencode:
+  model: example/opencode-model:medium
+  model_env: [WORKSHOP_MODEL, WORKSHOP_THINKING]
+  prompt_env: WORKSHOP_PROMPT_FILE
+  result_env: WORKSHOP_RESULT_FILE
+  command: 'opencode run --format json --auto --model "$WORKSHOP_MODEL" --variant "$WORKSHOP_THINKING" -- "$(cat "$WORKSHOP_PROMPT_FILE")"'
+claude-code:
+  model: example/claude-model:medium
+  model_env: [WORKSHOP_MODEL_ID, WORKSHOP_THINKING]
+  prompt_env: WORKSHOP_PROMPT_FILE
+  result_env: WORKSHOP_RESULT_FILE
+  command: 'claude --print --output-format text --permission-mode auto --no-session-persistence --model "$WORKSHOP_MODEL_ID" --effort "$WORKSHOP_THINKING" -- "$(cat "$WORKSHOP_PROMPT_FILE")"'
+```
+
+These shell flags have **not** been checked against installed Pi, OpenCode, or Claude Code binaries by the v4 tests. The automation checks the workflow contract and exercises two different mock harness mappings; it makes no vendor CLI or model call. Confirm each installed CLI's current flags and permission behavior before using a template. Approval/auto modes can grant broad project access; run only on a trusted machine.
 
 ## Configuration
 
@@ -306,7 +399,7 @@ Any CLI agent works if a shell command can launch it with a prompt file:
 | OpenCode 1.18 | `opencode run --format json --auto --model "$WORKSHOP_MODEL" --variant "$WORKSHOP_THINKING" -- "$(cat "$WORKSHOP_PROMPT_FILE")"` |
 | Claude Code 2.1 | `claude --print --output-format text --permission-mode auto --no-session-persistence --model "$WORKSHOP_MODEL_ID" --effort "$WORKSHOP_THINKING" -- "$(cat "$WORKSHOP_PROMPT_FILE")"` |
 
-These flags auto-approve tool use, so run them only on a trusted machine.
+These are legacy v1 templates. Their listed versions and flags are historical examples, not verified v4 support; check current CLI behavior before use. Approval modes can grant broad tool access, so run only on a trusted machine.
 
 ## Scope and status
 
@@ -323,6 +416,45 @@ is not.
 | POC-C | `$build-workflow` authoring skill | next |
 | POC-D | notification channels | later |
 
+## V4: Pi Durable proof
+
+The public CLI still uses v3. The proposed replacement uses Pi Durable for
+Workshop's task execution and one subprocess interface for every command,
+headless agent, and validator. Read the implementation contract in
+[workshop-spec-v4.md](.agents/dox/workshop-spec-v4.md).
+
+The isolated proof uses real Durable SQLite storage and launches a mock agent
+in a separate process. It checks result JSON, publishes one quote file per run,
+and preserves the same run on reopen:
+
+```fish
+set proof .workshop/state/proofs/hemingway/mock-(date +%s)
+bun src/proof/prove-hemingway.ts --state-dir $proof
+bun src/proof/prove-hemingway.ts --state-dir $proof
+bun test tests/proof/
+```
+
+Use a new state directory for a new run. Add `--pause-after timestamp` to
+close at a committed boundary, then reopen without that flag. To use real Pi
+with its configured default model and credentials:
+
+```fish
+set real .workshop/state/proofs/hemingway/real-(date +%s)
+bun src/proof/prove-hemingway.ts --state-dir $real \
+  --agent-command 'pi --print --approve --no-session --tools write -- "$(cat "$WORKSHOP_PROMPT_FILE")"'
+```
+
+The quoted agent command is a Bash template executed by the proof, not fish.
+The proof archives inside its own state directory; it leaves existing quotes
+and v3 state untouched. Tests cover actual reopen/crash/stop behavior, whole
+process-group cleanup, strict result checking, and upstream SQLite storage
+conformance under Bun with FULL synchronization.
+
+This is not the full v4 service: no workflow YAML loading, recurrence, semantic
+agent validator, or native failure judge yet. Its scratch-directory lock is
+not a production service ownership protocol. The spec names the remaining
+gates and proof limitations.
+
 ## Development
 
 ```bash
@@ -333,5 +465,6 @@ bunx tsc --noEmit # typecheck
 The real-model path has one manual check: the quick start above. Read
 `CONTRIBUTING.md` before adding or renaming a file.
 
-- Spec: `.agents/dox/workshop-spec-v3.md`
+- Current spec: `.agents/dox/workshop-spec-v3.md`
+- Proposed v4: `.agents/dox/workshop-spec-v4.md`
 - Build history and bug log: `.agents/dox/2026-09-10-workshop-execution.md`

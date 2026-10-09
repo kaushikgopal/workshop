@@ -18,6 +18,7 @@ const GLYPH: Record<string, string> = {
   completed: "◉",
   cancelled: "·",
   queued: "○",
+  paused: "‖",
 };
 
 /** Status glyph, with an unknown status degrading to the pending mark. */

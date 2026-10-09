@@ -34,6 +34,7 @@ const STATUS_COLOR: Record<string, string> = {
   cancelled: "#6e7681",
   pending: "#8b949e",
   queued: "#8b949e",
+  paused: "#a371f7",
 };
 
 const ACCENT = "#79c0ff";
@@ -167,7 +168,7 @@ export function renderRows(model: ViewerModel): {
 
 /** The first status mark on a row, wherever the spine or marker put it. */
 function firstStatusGlyph(line: string): string {
-  for (const ch of line) if ("◉◎◑⊘✗·○".includes(ch)) return ch;
+  for (const ch of line) if ("◉◎◑⊘✗·○‖".includes(ch)) return ch;
   return "";
 }
 
@@ -179,6 +180,8 @@ function glyphStatus(glyph: string): string {
     case "◎":
     case "◑":
       return "running";
+    case "‖":
+      return "paused";
     case "⊘":
       return "blocked";
     case "✗":
@@ -210,8 +213,14 @@ export interface OpenViewerOptions {
  * binding — a test that rebuilds its own layout would prove nothing about this
  * one.
  */
+export interface ViewerPaintOptions {
+  pollError?: string | null;
+  collated?: boolean;
+  picking?: boolean;
+}
+
 export interface ViewerMount {
-  paint(model: ViewerModel, extra?: { pollError?: string | null; collated?: boolean; picking?: boolean }): void;
+  paint(model: ViewerModel, extra?: ViewerPaintOptions): void;
 }
 
 /** One row of chrome: never allowed to wrap into a second. */
@@ -246,7 +255,7 @@ export function mountViewer(renderer: CliRenderer, opts: { rows?: number; runsRo
       const paneRows = renderRows(model);
       const tally = model.tally ? `   ${model.tally}` : "";
       header.content = extra.pollError
-        ? t`${fg(ACCENT)("WORKSHOP")}  ${fg(TEXT)(model.header)}${fg(DIM)(tally)}  ${fg("#ff7b72")(`poll failed: ${extra.pollError}`)}`
+        ? t`${fg(ACCENT)("WORKSHOP")}  ${fg(TEXT)(model.header)}${fg(DIM)(tally)}  ${fg("#ff7b72")(`STALE · poll failed: ${extra.pollError}`)}`
         : t`${fg(ACCENT)("WORKSHOP")}  ${fg(TEXT)(model.header)}${fg(DIM)(tally)}`;
       // The hints matter more than the run id when the terminal is narrow.
       const width = renderer.terminalWidth;
@@ -268,64 +277,180 @@ export function mountViewer(renderer: CliRenderer, opts: { rows?: number; runsRo
   };
 }
 
+export interface ViewerRefreshSelection {
+  readonly workflowId: string | null;
+  readonly selectedRunId: string | null;
+  readonly follow: boolean;
+  readonly collated: boolean;
+  readonly cursor: number;
+}
+
+export interface ViewerRefreshCommit {
+  status: StatusDto;
+  runIds: string[];
+  selectedRunId: string | null;
+}
+
 /**
- * Poll the projections and repaint. The viewer never blocks on the runtime's
- * own work: a failed poll reports itself in the header and the previous frame
- * stays legible.
+ * Refresh one immutable viewer selection at a time. Input changes invalidate
+ * an in-flight read and queue one read for the newest selection; timer ticks
+ * coalesce behind the same serial queue.
+ */
+export function createViewerRefresh(input: {
+  source: ViewerSource;
+  selection: () => ViewerRefreshSelection;
+  commit: (result: ViewerRefreshCommit) => void;
+  paint: (model: ViewerModel, extra?: ViewerPaintOptions) => void;
+  terminalWidth: () => number;
+  rows: number;
+  runsRows: number;
+}): { refresh: () => Promise<void>; invalidate: () => void } {
+  const emptyStatus: StatusDto = { version: 1, workflows: [] };
+  let generation = 0;
+  let queued = false;
+  let active: Promise<void> | null = null;
+  let lastFrame: { model: ViewerModel; extra: ViewerPaintOptions } | null = null;
+
+  const initialFrame = (selection: ViewerRefreshSelection): { model: ViewerModel; extra: ViewerPaintOptions } => {
+    if (!selection.workflowId) {
+      return { model: pickerModel({ dto: emptyStatus, cursor: selection.cursor }), extra: { picking: true } };
+    }
+    return {
+      model: buildViewerModel({
+        workflowId: selection.workflowId,
+        dto: emptyStatus,
+        feed: null,
+        logText: null,
+        selectedRunId: selection.selectedRunId,
+        collated: selection.collated,
+        streamHeight: input.rows,
+        runsHeight: input.runsRows,
+        terminalWidth: input.terminalWidth(),
+      }),
+      extra: { collated: selection.collated },
+    };
+  };
+
+  const showError = (selection: ViewerRefreshSelection, error: unknown): void => {
+    const frame = lastFrame ?? initialFrame(selection);
+    input.paint(frame.model, { ...frame.extra, pollError: error instanceof Error ? error.message : String(error) });
+  };
+
+  const refreshOnce = async (): Promise<void> => {
+    const requestGeneration = generation;
+    const selection = Object.freeze({ ...input.selection() });
+    const isCurrent = (): boolean => requestGeneration === generation;
+    let snapshot: Awaited<ReturnType<ViewerSource["snapshot"]>>;
+
+    try {
+      snapshot = await input.source.snapshot(
+        selection.workflowId,
+        selection.follow ? null : selection.selectedRunId,
+      );
+    } catch (error) {
+      if (isCurrent()) showError(selection, error);
+      return;
+    }
+    if (!isCurrent()) return;
+
+    if (!selection.workflowId) {
+      const ids = snapshot.status.workflows.map((workflow) => workflow.id);
+      const cursor = Math.max(0, Math.min(ids.length - 1, selection.cursor));
+      const model = pickerModel({ dto: snapshot.status, cursor });
+      input.commit({ status: snapshot.status, runIds: [], selectedRunId: null });
+      const extra = { picking: true };
+      input.paint(model, extra);
+      lastFrame = { model, extra };
+      return;
+    }
+
+    const feed = { ...snapshot.runs, workflowId: selection.workflowId };
+    const runIds = feed.runs.map((run) => run.id);
+    const selectedRunId = selection.follow && runIds[0]
+      ? runIds[0]
+      : selection.selectedRunId ?? runIds[0] ?? null;
+    let logText: string;
+    try {
+      logText = await input.source.log(selection.workflowId, selection.collated ? null : selectedRunId);
+    } catch (error) {
+      if (isCurrent()) showError(selection, error);
+      return;
+    }
+    if (!isCurrent()) return;
+
+    const model = buildViewerModel({
+      workflowId: selection.workflowId,
+      dto: snapshot.status,
+      feed,
+      logText,
+      selectedRunId,
+      collated: selection.collated,
+      streamHeight: input.rows,
+      runsHeight: input.runsRows,
+      terminalWidth: input.terminalWidth(),
+    });
+    const extra = { collated: selection.collated };
+    input.commit({ status: snapshot.status, runIds, selectedRunId });
+    input.paint(model, extra);
+    lastFrame = { model, extra };
+  };
+
+  const refresh = (): Promise<void> => {
+    queued = true;
+    if (!active) {
+      active = (async () => {
+        while (queued) {
+          queued = false;
+          await refreshOnce();
+        }
+      })().finally(() => {
+        active = null;
+      });
+    }
+    return active;
+  };
+
+  return {
+    refresh,
+    invalidate: () => {
+      generation++;
+    },
+  };
+}
+
+/**
+ * Poll the projections and repaint. A poll failure explicitly marks the last
+ * good frame stale; overlapping reads serialize and state changes supersede
+ * their in-flight result.
  */
 export async function openViewer(opts: OpenViewerOptions): Promise<void> {
   const renderer: CliRenderer = await createCliRenderer({ exitOnCtrlC: true });
   const state: ViewerState = { selectedRunId: null, follow: true, collated: false };
-  let pollError: string | null = null;
   let runIds: string[] = [];
   let workflowId = opts.workflowId ?? null;
   let cursor = 0;
   let lastStatus: StatusDto | null = null;
   const mount = mountViewer(renderer, { rows: opts.rows ?? 12, runsRows: opts.runsRows ?? 8 });
 
-  const refresh = async (): Promise<void> => {
-    try {
-      const { status, runs: feed } = await opts.source.snapshot(workflowId);
+  const refresh = createViewerRefresh({
+    source: opts.source,
+    selection: () => ({ workflowId, ...state, cursor }),
+    commit: ({ status, runIds: ids, selectedRunId }) => {
       lastStatus = status;
-
-      // No workflow chosen yet: the picker is just another frame.
-      if (!workflowId) {
-        const ids = status.workflows.map((w) => w.id);
-        cursor = Math.max(0, Math.min(ids.length - 1, cursor));
-        pollError = null;
-        mount.paint(pickerModel({ dto: status, cursor }), { picking: true });
-        return;
-      }
-
-      const scoped = { ...feed, workflowId };
-      runIds = scoped.runs.map((r) => r.id);
-      if (state.follow && runIds[0]) state.selectedRunId = runIds[0];
-      if (!state.selectedRunId && runIds[0]) state.selectedRunId = runIds[0];
-      const logText = await opts.source.log(workflowId, state.collated ? null : state.selectedRunId);
-      pollError = null;
-      mount.paint(
-        buildViewerModel({
-          workflowId,
-          dto: status,
-          feed: scoped,
-          logText,
-          selectedRunId: state.selectedRunId,
-          collated: state.collated,
-          streamHeight: opts.rows ?? 12,
-          runsHeight: opts.runsRows ?? 8,
-          // The model drops a detail rather than let a row be cut mid-identifier,
-          // so it needs to know how much room the pane actually has.
-          terminalWidth: renderer.terminalWidth,
-        }),
-        { pollError, collated: state.collated },
-      );
-    } catch (e) {
-      pollError = e instanceof Error ? e.message : String(e);
+      runIds = ids;
+      if (workflowId) state.selectedRunId = selectedRunId;
+    },
+    paint: (model, extra) => {
+      mount.paint(model, extra);
       renderer.requestRender();
-    }
-  };
+    },
+    terminalWidth: () => renderer.terminalWidth,
+    rows: opts.rows ?? 12,
+    runsRows: opts.runsRows ?? 8,
+  });
 
-  const timer = setInterval(() => void refresh(), opts.refreshMs ?? 1000);
+  const timer = setInterval(() => void refresh.refresh(), opts.refreshMs ?? 1000);
+
 
   const shutdown = makeShutdown({
     clear: () => clearInterval(timer),
@@ -346,8 +471,8 @@ export async function openViewer(opts: OpenViewerOptions): Promise<void> {
       const ids = lastStatus?.workflows.map((w) => w.id) ?? [];
       const name = key.name.toLowerCase();
       if (name === "q" || (key.ctrl && name === "c")) return shutdown();
-      if (name === "j" || name === "down") cursor = Math.min(ids.length - 1, cursor + 1);
-      else if (name === "k" || name === "up") cursor = Math.max(0, cursor - 1);
+      if ((name === "j" || name === "down") && ids.length > 0) cursor = Math.min(ids.length - 1, cursor + 1);
+      else if ((name === "k" || name === "up") && ids.length > 0) cursor = Math.max(0, cursor - 1);
       else if (name === "enter" || name === "return") {
         workflowId = ids[cursor] ?? null;
         // A fresh workflow starts with a fresh selection rather than carrying
@@ -356,18 +481,20 @@ export async function openViewer(opts: OpenViewerOptions): Promise<void> {
         state.follow = true;
         state.collated = false;
       }
-      void refresh();
+      refresh.invalidate();
+      void refresh.refresh();
       return;
     }
     const action = reduceKey(state, { name: key.name, ctrl: key.ctrl }, runIds);
     if (action === "quit") return shutdown();
-    void refresh();
+    refresh.invalidate();
+    void refresh.refresh();
   });
 
   process.once("SIGINT", onSignal);
   process.once("SIGTERM", onSignal);
   renderer.start();
-  await refresh();
+  await refresh.refresh();
 }
 
 /**

@@ -20,7 +20,7 @@ export interface ViewerSource {
    * answering for the workflow it was born with — which showed an empty viewer
    * the moment you picked one from the picker.
    */
-  snapshot(workflowId: string | null): Promise<{ status: StatusDto; runs: RunsFeed }>;
+  snapshot(workflowId: string | null, selectedRunId?: string | null): Promise<{ status: StatusDto; runs: RunsFeed }>;
   /**
    * One run's worklog, or the workflow's collated history when the run id is
    * null.

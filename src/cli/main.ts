@@ -16,7 +16,8 @@ import { cmdWatch } from "./watch.js";
  */
 const HELP = `workshop — durable linked-list runner for agent workflows
 
-Usage: workshop <command> [args]
+Usage: workshop [--engine v4] <command> [args]
+The default engine remains v3; --engine v4 selects the experimental Durable route.
 
 Commands:
   workshop help
@@ -69,8 +70,39 @@ Commands:
       Run the deterministic guardian daemon in the foreground.
 `;
 
+type EngineSelection =
+  | { readonly engine: "v3" | "v4"; readonly args: readonly string[] }
+  | { readonly error: string };
+
+function selectEngine(argv: readonly string[]): EngineSelection {
+  if (argv[0] === "--engine") {
+    const engine = argv[1];
+    if (engine === undefined) return { error: "missing engine after --engine; expected v4" };
+    if (engine !== "v4") return { error: `unsupported engine ${JSON.stringify(engine)}; omit --engine for v3 or choose v4` };
+    const args = argv.slice(2);
+    if (args.some(isEngineOption)) return { error: "--engine may be specified only once and must lead the command" };
+    return { engine: "v4", args };
+  }
+  if (argv.some(isEngineOption)) return { error: "--engine must lead the command; use --engine v4" };
+  return { engine: "v3", args: argv };
+}
+
+function isEngineOption(value: string): boolean {
+  return value === "--engine" || value.startsWith("--engine=");
+}
+
 async function main(): Promise<void> {
-  const [command, ...args] = process.argv.slice(2);
+  const selection = selectEngine(process.argv.slice(2));
+  if ("error" in selection) {
+    console.error(`error: ${selection.error}`);
+    process.exitCode = 64;
+    return;
+  }
+  if (selection.engine === "v4") {
+    const { dispatchV4Command } = await import("./dispatch-v4-command.js");
+    return dispatchV4Command(selection.args);
+  }
+  const [command, ...args] = selection.args;
   switch (command) {
     case undefined:
     case "help":

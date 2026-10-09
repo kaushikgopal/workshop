@@ -1,7 +1,8 @@
 import { describe, test, expect } from "bun:test";
 import { createTestRenderer } from "@opentui/core/testing";
-import { makeShutdown, mountViewer, reduceKey, type ViewerState } from "../src/tui/mount-viewer.js";
+import { createViewerRefresh, makeShutdown, mountViewer, reduceKey, type ViewerRefreshSelection, type ViewerState } from "../src/tui/mount-viewer.js";
 import { buildViewerModel, pickerModel } from "../src/tui/build-panes.js";
+import type { ViewerSource } from "../src/tui/data-source.js";
 import type { StatusDto } from "../src/views/build-status-json.js";
 import { buildRunsFeed, type RunsFeed } from "../src/views/build-runs-json.js";
 
@@ -134,7 +135,7 @@ describe("viewer frame — what an operator actually sees", () => {
     mount.paint(model, { pollError: "database is locked" });
     await renderOnce();
     const frame = captureCharFrame();
-    expect(frame).toContain("poll failed: database is locked");
+    expect(frame).toContain("STALE · poll failed: database is locked");
     // The last good frame is still on screen: a viewer that blanks on a hiccup
     // is worse than one that shows slightly stale truth.
     expect(frame).toContain("node-timestamp");
@@ -280,6 +281,195 @@ describe("viewer frame — picker and a scrolled feed", () => {
     expect(selectedRow).toContain("007");
     // And the title says which slice is shown, so the viewport is never a mystery.
     expect(frame).toMatch(/runs · 20 · \d+–\d+\/20/);
+  });
+});
+
+function deferred<T>() {
+  let resolvePromise = (_value: T): void => { throw new Error("deferred promise is not initialized"); };
+  let rejectPromise = (_reason: unknown): void => { throw new Error("deferred promise is not initialized"); };
+  const promise = new Promise<T>((resolve, reject) => {
+    resolvePromise = resolve;
+    rejectPromise = reject;
+  });
+  return { promise, resolve: resolvePromise, reject: rejectPromise };
+}
+
+describe("viewer refresh — serial, selection-safe, and visibly stale", () => {
+  const snapshot = { status: dto, runs: feed };
+  const defaultSelection = (): ViewerRefreshSelection => ({
+    workflowId: "wf",
+    selectedRunId: "wf-20260924-003",
+    follow: false,
+    collated: false,
+    cursor: 0,
+  });
+
+  test("a selection and collation change discards the old result and reads the new mode", async () => {
+    const oldSnapshot = deferred<typeof snapshot>();
+    const currentSnapshot = deferred<typeof snapshot>();
+    const oldStarted = deferred<void>();
+    const currentStarted = deferred<void>();
+    const requests: Array<{ workflowId: string | null; selectedRunId?: string | null }> = [];
+    const logRequests: Array<{ workflowId: string | null; runId: string | null }> = [];
+    let activeSnapshots = 0;
+    let maxActiveSnapshots = 0;
+    const source: ViewerSource = {
+      snapshot: async (workflowId, selectedRunId) => {
+        requests.push({ workflowId, selectedRunId });
+        activeSnapshots++;
+        maxActiveSnapshots = Math.max(maxActiveSnapshots, activeSnapshots);
+        try {
+          if (requests.length === 1) {
+            oldStarted.resolve(undefined);
+            return await oldSnapshot.promise;
+          }
+          currentStarted.resolve(undefined);
+          return await currentSnapshot.promise;
+        } finally {
+          activeSnapshots--;
+        }
+      },
+      log: async (workflowId, runId) => {
+        logRequests.push({ workflowId, runId });
+        return "new collated log";
+      },
+    };
+    let selection = defaultSelection();
+    const painted: Array<{ model: ReturnType<typeof buildViewerModel>; extra?: { collated?: boolean; picking?: boolean; pollError?: string | null } }> = [];
+    const refresh = createViewerRefresh({
+      source,
+      selection: () => selection,
+      commit: () => {},
+      paint: (model, extra) => painted.push({ model, extra }),
+      terminalWidth: () => 100,
+      rows: 6,
+      runsRows: 6,
+    });
+
+    const oldPoll = refresh.refresh();
+    await oldStarted.promise;
+    selection = { ...selection, selectedRunId: "wf-20260924-002", collated: true };
+    refresh.invalidate();
+    const currentPoll = refresh.refresh();
+    const coalescedPoll = refresh.refresh();
+    oldSnapshot.resolve(snapshot);
+    await currentStarted.promise;
+    expect(requests).toEqual([
+      { workflowId: "wf", selectedRunId: "wf-20260924-003" },
+      { workflowId: "wf", selectedRunId: "wf-20260924-002" },
+    ]);
+    expect(logRequests).toEqual([]); // the invalidated selection never reaches the log read
+    currentSnapshot.resolve(snapshot);
+    await Promise.all([oldPoll, currentPoll, coalescedPoll]);
+
+    expect(maxActiveSnapshots).toBe(1);
+    expect(logRequests).toEqual([{ workflowId: "wf", runId: null }]);
+    expect(painted).toHaveLength(1);
+    expect(painted[0]!.model.stream.title).toBe("log · all runs");
+    expect(painted[0]!.model.stream.lines).toContain("new collated log");
+    expect(painted[0]!.extra?.collated).toBe(true);
+  });
+
+  test("overlapping slow polls serialize and coalesce into one follow-up", async () => {
+    const firstSnapshot = deferred<typeof snapshot>();
+    const secondSnapshot = deferred<typeof snapshot>();
+    const firstStarted = deferred<void>();
+    const secondStarted = deferred<void>();
+    let snapshotCalls = 0;
+    let activeSnapshots = 0;
+    let maxActiveSnapshots = 0;
+    const source: ViewerSource = {
+      snapshot: async () => {
+        const call = snapshotCalls++;
+        activeSnapshots++;
+        maxActiveSnapshots = Math.max(maxActiveSnapshots, activeSnapshots);
+        try {
+          if (call === 0) {
+            firstStarted.resolve(undefined);
+            return await firstSnapshot.promise;
+          }
+          secondStarted.resolve(undefined);
+          return await secondSnapshot.promise;
+        } finally {
+          activeSnapshots--;
+        }
+      },
+      log: async (_workflowId, runId) => `log for ${runId}`,
+    };
+    const painted: string[] = [];
+    const refresh = createViewerRefresh({
+      source,
+      selection: defaultSelection,
+      commit: () => {},
+      paint: (model) => painted.push(model.stream.lines.join("\n")),
+      terminalWidth: () => 100,
+      rows: 6,
+      runsRows: 6,
+    });
+
+    const firstPoll = refresh.refresh();
+    await firstStarted.promise;
+    const secondPoll = refresh.refresh();
+    const thirdPoll = refresh.refresh();
+    firstSnapshot.resolve(snapshot);
+    await secondStarted.promise;
+    secondSnapshot.resolve(snapshot);
+    await Promise.all([firstPoll, secondPoll, thirdPoll]);
+
+    expect(snapshotCalls).toBe(2);
+    expect(maxActiveSnapshots).toBe(1);
+    expect(painted).toHaveLength(2);
+    expect(painted[1]).toContain("log for wf-20260924-003");
+  });
+
+  test("initial failures render an error, then recover and preserve stale data on a later failure", async () => {
+    const { renderer, renderOnce, captureCharFrame } = await createTestRenderer({ width: 100, height: 24 });
+    const mount = mountViewer(renderer, { rows: 6, runsRows: 6 });
+    let poll = 0;
+    const source: ViewerSource = {
+      snapshot: async () => {
+        poll++;
+        if (poll === 1) throw new Error("initial read failed");
+        if (poll === 3) throw new Error("temporary read failure");
+        return snapshot;
+      },
+      log: async (_workflowId, runId) => runId === "wf-20260924-003" ? `fresh log after poll ${poll}` : "unexpected run",
+    };
+    const refresh = createViewerRefresh({
+      source,
+      selection: defaultSelection,
+      commit: () => {},
+      paint: (model, extra) => mount.paint(model, extra),
+      terminalWidth: () => renderer.terminalWidth,
+      rows: 6,
+      runsRows: 6,
+    });
+
+    await refresh.refresh();
+    await renderOnce();
+    const initialErrorFrame = captureCharFrame();
+    expect(initialErrorFrame).toContain("STALE · poll failed: initial read failed");
+    expect(initialErrorFrame).toContain("(no runs yet)");
+
+    await refresh.refresh();
+    await renderOnce();
+    const recoveredFrame = captureCharFrame();
+    expect(recoveredFrame).not.toContain("STALE · poll failed");
+    expect(recoveredFrame).toContain("node-timestamp");
+    expect(recoveredFrame).toContain("fresh log after poll 2");
+
+    await refresh.refresh();
+    await renderOnce();
+    const staleFrame = captureCharFrame();
+    expect(staleFrame).toContain("STALE · poll failed: temporary read failure");
+    expect(staleFrame).toContain("node-timestamp");
+    expect(staleFrame).toContain("fresh log after poll 2");
+
+    await refresh.refresh();
+    await renderOnce();
+    const recoveredAgain = captureCharFrame();
+    expect(recoveredAgain).not.toContain("STALE · poll failed");
+    expect(recoveredAgain).toContain("fresh log after poll 4");
   });
 });
 

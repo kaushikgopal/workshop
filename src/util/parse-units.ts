@@ -57,3 +57,36 @@ export function parseByteSize(value: string): StreamCap {
   if (unit === "mb") return size * 1024 * 1024;
   return size;
 }
+
+const V2_DURATION_UNITS_MS: Record<string, number> = {
+  ms: 1,
+  ...UNIT_MS,
+};
+
+/** Parse a v2 duration; keep the v1 grammar unchanged for the default runtime. */
+export function parseV2Duration(raw: string): DurationMs {
+  const match = /^([1-9][0-9]*)(ms|[smhdw])$/.exec(raw);
+  if (!match || !match[1] || !match[2]) {
+    throw new Error(
+      `invalid duration "${raw}" — expected a positive integer with unit ms|s|m|h|d|w, e.g. "10ms"`,
+    );
+  }
+  const unit = V2_DURATION_UNITS_MS[match[2]];
+  if (unit === undefined) {
+    throw new Error(`invalid duration unit in "${raw}"`);
+  }
+  const durationMs = Number(match[1]) * unit;
+  if (!Number.isSafeInteger(durationMs)) {
+    throw new Error(`duration "${raw}" exceeds the finite safe-integer millisecond range`);
+  }
+  return durationMs;
+}
+
+/** Reject v2 byte caps that overflow the numeric limit representation. */
+export function parseV2ByteSize(raw: string): StreamCap {
+  const cap = parseByteSize(raw);
+  if (typeof cap === "number" && !Number.isSafeInteger(cap)) {
+    throw new Error(`byte size "${raw}" exceeds the finite safe-integer byte value`);
+  }
+  return cap;
+}

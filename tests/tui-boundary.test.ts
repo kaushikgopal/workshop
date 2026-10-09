@@ -71,8 +71,8 @@ describe("TUI boundary — the folder says what a file is for", () => {
     const importers = rest.filter((file) =>
       allImports(readFileSync(file, "utf8")).some(isTuiSpec),
     );
-    // `watch` loads the viewer on demand; nothing else may reach for it at all.
-    expect(importers.map(relative)).toEqual(["src/cli/watch.ts"]);
+    // Both engine-specific watch entry points load the viewer on demand.
+    expect(importers.map(relative)).toEqual(["src/cli/watch.ts", "src/cli/watch-v4.ts"]);
 
     const cli = readFileSync(join(REPO_ROOT, "src/cli/watch.ts"), "utf8");
     const { typeOnly, value, dynamic } = importsOf(cli);
@@ -84,6 +84,13 @@ describe("TUI boundary — the folder says what a file is for", () => {
     // A static value import would pull OpenTUI into every invocation, including
     // `validate` and `status`.
     expect(cli).toContain('await import("../tui/mount-viewer.js")');
+
+    const v4Cli = readFileSync(join(REPO_ROOT, "src/cli/watch-v4.ts"), "utf8");
+    const v4Imports = importsOf(v4Cli);
+    expect(v4Imports.value.filter(isTuiSpec)).toEqual([]);
+    expect(v4Imports.dynamic.filter(isTuiSpec)).toEqual(["../tui/mount-viewer.js"]);
+    expect(v4Imports.typeOnly.filter(isTuiSpec)).toEqual(["../tui/data-source.js"]);
+    expect(v4Cli).toContain('await import("../tui/mount-viewer.js")');
   });
 
   test("the viewer never reaches past the CLI contract, transitively", () => {

@@ -1,0 +1,14 @@
+# Test fixture copied to .workshop/config/workshop.yaml by v4 tests.
+version: 2
+project_dir: ../..
+shell: /bin/bash
+max_concurrent_runs: 1
+default_timeout: 10m
+stream_cap: 256kb
+agent:
+  harness:
+    command: 'bun tests/mock/hemingway-node.ts'
+  model: "fixture/mock-model:medium"
+orchestrator:
+  model: "fixture/mock-model:low"
+  timeout: 5m

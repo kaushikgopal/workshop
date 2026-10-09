@@ -3,6 +3,7 @@ import { buildRunsFeed, DEFAULT_RUNS_LIMIT, RUNS_DTO_VERSION } from "../src/view
 import { buildViewerModel, failureLabel, nodeLines, pickerModel, windowRuns } from "../src/tui/build-panes.js";
 import type { StatusDto, NodeStatusDto } from "../src/views/build-status-json.js";
 import type { RunRow } from "../src/storage/db/store.js";
+import { glyph } from "../src/views/format-for-terminal.js";
 
 /**
  * The viewer contract: the runs feed's shape, and the panes built from it.
@@ -48,6 +49,9 @@ const CHAIN: NodeStatusDto[] = [
 ];
 
 describe("runs feed — the occurrences projection", () => {
+  test("marks a paused occurrence distinctly from pending work", () => {
+    expect(glyph("paused")).toBe("‖");
+  });
   test("reverses runtime chronology so the newest occurrence leads", () => {
     const feed = buildRunsFeed({
       workflowId: "wf",
