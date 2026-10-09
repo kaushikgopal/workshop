@@ -1,9 +1,8 @@
-import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import { loadCheckedV2Workflow, findV2Installation } from "../installation/load-v2-installation.js";
 import type { V2Installation } from "../installation/load-v2-installation.js";
-import { probeServiceHealth } from "../service/probe-service-health.js";
+import { launchV2ServiceProcess } from "../service/launch-v2-service-process.js";
 import { readServiceWorklog, sendServiceRequest, streamServiceLogChunks, ServiceConnectionError } from "../service/send-service-request.js";
 import { runIdV2Schema } from "../run/schema-v2.js";
 import { glyph, localClock } from "../views/format-for-terminal.js";
@@ -54,7 +53,7 @@ async function startCommand(args: readonly string[]): Promise<void> {
   const detach = args.includes("--detach");
   const positional = args.filter((argument) => argument !== "--detach");
   if (positional.length !== 1 || args.some((argument) => argument.startsWith("-") && argument !== "--detach")) {
-    return usage("usage: workshop --engine v4 start <workflow> [--detach]");
+    return usage("usage: workshop start <workflow> [--detach]");
   }
   const installation = loadInstallationForCommand();
   try { loadCheckedV2Workflow(installation, positional[0]!); }
@@ -78,7 +77,7 @@ async function startCommand(args: readonly string[]): Promise<void> {
 
 async function controlCommand(command: "pause" | "resume" | "stop", args: readonly string[]): Promise<void> {
   if (args.length !== 1 || args[0]!.startsWith("-")) {
-    return usage(`usage: workshop --engine v4 ${command} <workflow>`);
+    return usage(`usage: workshop ${command} <workflow>`);
   }
   const workflowId = args[0]!;
   const installation = loadInstallationForCommand();
@@ -164,7 +163,7 @@ async function resolveCommand(args: readonly string[]): Promise<void> {
     positional.push(argument);
   }
   if (positional.length !== 1 || action === undefined || reason === undefined || reason.trim() === "") {
-    return usage("usage: workshop --engine v4 resolve <workflow> --action retry|accept|fail --reason <text> [--run <id>] [--target judgment] [--allow-repeat] [--extra-attempt] [--result-file <path> --acknowledge-effects]");
+    return usage("usage: workshop resolve <workflow> --action retry|accept|fail --reason <text> [--run <id>] [--target judgment] [--allow-repeat] [--extra-attempt] [--result-file <path> --acknowledge-effects]");
   }
   if ((action === "accept") !== (resultFile !== undefined && acknowledgeEffects)) {
     return usage("accept requires both --result-file and --acknowledge-effects");
@@ -205,7 +204,7 @@ async function statusCommand(args: readonly string[]): Promise<void> {
   const json = args.includes("--json");
   const positional = args.filter((argument) => argument !== "--json");
   if (positional.length > 1 || args.some((argument) => argument.startsWith("-") && argument !== "--json")) {
-    return usage("usage: workshop --engine v4 status [<workflow>] [--json]");
+    return usage("usage: workshop status [<workflow>] [--json]");
   }
   const installation = loadInstallationForCommand();
   const socketPath = await ensureService(installation);
@@ -233,7 +232,7 @@ async function runsCommand(args: readonly string[]): Promise<void> {
   const all = args.includes("--all");
   const positional = args.filter((argument) => argument !== "--json" && argument !== "--all");
   if (positional.length !== 1 || args.some((argument) => argument.startsWith("-") && argument !== "--json" && argument !== "--all")) {
-    return usage("usage: workshop --engine v4 runs <workflow> [--json] [--all]");
+    return usage("usage: workshop runs <workflow> [--json] [--all]");
   }
   const installation = loadInstallationForCommand();
   const socketPath = await ensureService(installation);
@@ -308,7 +307,7 @@ async function logsCommand(args: readonly string[]): Promise<void> {
     if (argument.startsWith("-")) return usage(`unsupported v4 logs option: ${argument}`);
     positional.push(argument);
   }
-  const usageText = "usage: workshop --engine v4 logs <workflow> [--run <run-id>] [--follow | --all] [--json]";
+  const usageText = "usage: workshop logs <workflow> [--run <run-id>] [--follow | --all] [--json]";
   if (positional.length !== 1) return usage(usageText);
   if ((follow && all) || (all && runId !== undefined)) return usage("--all cannot be combined with --follow or --run");
   const workflowId = positional[0]!;
@@ -490,7 +489,7 @@ async function diagramCommand(args: readonly string[]): Promise<void> {
     positional.push(argument);
   }
   if (positional.length !== 1) {
-    return usage("usage: workshop --engine v4 diagram <workflow> [--run <run-id>] [--mermaid]");
+    return usage("usage: workshop diagram <workflow> [--run <run-id>] [--mermaid]");
   }
   const checkedRunId = runId === undefined ? undefined : parseRunIdArgument(runId);
   const installation = loadInstallationForCommand();
@@ -588,7 +587,7 @@ async function findRunSummary(socketPath: string, workflowId: string, runId: Run
 
 async function watchCommand(args: readonly string[]): Promise<void> {
   if (args.length > 1 || args.some((argument) => argument.startsWith("-"))) {
-    return usage("usage: workshop --engine v4 watch [<workflow>]");
+    return usage("usage: workshop watch [<workflow>]");
   }
   const installation = loadInstallationForCommand();
   const socketPath = await ensureService(installation);
@@ -611,7 +610,7 @@ async function nodeDescribeCommand(args: readonly string[]): Promise<void> {
     if (argument.startsWith("-")) return usage(`unsupported v4 node describe option: ${argument}`);
     positional.push(argument);
   }
-  if (positional.length !== 2) return usage("usage: workshop --engine v4 node describe <workflow> <node> [--run <run-id>] [--json]");
+  if (positional.length !== 2) return usage("usage: workshop node describe <workflow> <node> [--run <run-id>] [--json]");
   const checkedRunId = runId === undefined ? undefined : parseRunIdArgument(runId);
   const installation = loadInstallationForCommand();
   const socketPath = await ensureService(installation);
@@ -657,28 +656,13 @@ async function waitForRun(socketPath: string, workflowId: string, runId: string)
 }
 
 async function ensureService(installation: V2Installation): Promise<string> {
-  const existing = await probeServiceHealth(installation.stateDirectory);
-  if (existing.kind === "ready") return existing.metadata.socketPath;
-  const child = spawn(process.execPath, [CLI_PATH, "--engine", "v4", "service", "serve"], {
-    cwd: installation.root,
-    detached: true,
-    stdio: "ignore",
+  const launched = await launchV2ServiceProcess({
+    root: installation.root,
+    stateDirectory: installation.stateDirectory,
+    serveArguments: [CLI_PATH, "--engine", "v4", "service", "serve"],
+    timeoutMs: SERVICE_START_TIMEOUT_MS,
   });
-  let spawnError: Error | undefined;
-  child.once("error", (error) => { spawnError = error; });
-  child.unref();
-
-  const deadline = Date.now() + SERVICE_START_TIMEOUT_MS;
-  while (Date.now() < deadline) {
-    if (spawnError !== undefined) throw new ServiceConnectionError("could not start the v4 service", { cause: spawnError });
-    if (child.exitCode !== null) throw new ServiceConnectionError(`v4 service exited during startup with code ${child.exitCode}`);
-    const probe = await probeServiceHealth(installation.stateDirectory, 500);
-    if (probe.kind === "ready") return probe.metadata.socketPath;
-    await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
-  }
-  const finalProbe = await probeServiceHealth(installation.stateDirectory, 500);
-  if (finalProbe.kind === "ready") return finalProbe.metadata.socketPath;
-  throw new ServiceConnectionError(`v4 service did not become ready: ${finalProbe.reason}`);
+  return launched.metadata.socketPath;
 }
 
 function request(socketPath: string, value: ServiceRequestV1) {

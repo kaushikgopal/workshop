@@ -1,0 +1,90 @@
+# Legacy v3 example (version 1). Run it only with `workshop --engine v3`;
+# new installations use ../hemingway-clock.yaml (version 2).
+version: 1
+id: hemingway-clock
+description: Generate an original Hemingway-inspired line on a schedule and append it to hemingway.quotes.md.
+
+schedule:
+  every: 10m
+  max_runs: 6
+
+defaults:
+  max_attempts: 2
+  timeout: 10m
+  agent:
+    harness:
+      # Pi 0.85
+      command: 'pi --print --mode json --approve --no-session --model "$WORKSHOP_MODEL_WITH_THINKING" -- "$(cat "$WORKSHOP_PROMPT_FILE")"'
+
+      # OpenCode 1.18
+      # command: 'opencode run --format json --auto --model "$WORKSHOP_MODEL" --variant "$WORKSHOP_THINKING" -- "$(cat "$WORKSHOP_PROMPT_FILE")"'
+
+      # Claude Code 2.1
+      # command: 'claude --print --output-format text --permission-mode auto --no-session-persistence --model "$WORKSHOP_MODEL_ID" --effort "$WORKSHOP_THINKING" -- "$(cat "$WORKSHOP_PROMPT_FILE")"'
+
+    model: "openai-codex/gpt-5.3-codex:medium"
+
+orchestrator:
+  agent:
+    harness:
+      command: 'pi --print --mode json --approve --no-session --model "$WORKSHOP_MODEL_WITH_THINKING" -- "$(cat "$WORKSHOP_PROMPT_FILE")"'
+    model: "instacart-openai/gpt-5.6-luna:low"
+  timeout: 5m
+
+environment:
+  preflight:
+    command: 'command -v pi >/dev/null'
+
+nodes:
+  node-timestamp:
+    run:
+      command: "date -u +%FT%TZ"
+
+    validator:
+      command: 'test -n "$(cat "$WORKSHOP_NODE_OUTPUT_FILE")"'
+
+    next: node-generate-line
+
+  node-generate-line:
+    run:
+      agent:
+        instructions: |
+          Read your assigned work packet and the previous node handoff.
+          Before generating, read .workshop/config/workflows/hemingway.quotes.md if it exists.
+          Generate one original Hemingway-inspired sentence that is materially distinct
+          from every archived line: do not repeat or closely paraphrase a prior line's
+          central subject/situation, concrete imagery, key wording, or sentence
+          structure; changing only synonyms is insufficient.
+          Do not claim that it is a real Hemingway quotation.
+          Record progress only in your assigned packet file.
+          Keep the packet's scaffolded headings (#### Attempt, ##### Progress,
+          ##### Decisions, ##### Validation, ##### Blockers) intact.
+          Put the final sentence between the packet's scaffolded output marker lines.
+
+    validator:
+      agent:
+        model: "openai-codex/gpt-5.3-codex:high"
+        instructions: |
+          Read .workshop/config/workflows/hemingway.quotes.md if it exists and
+          independently compare the candidate against every archived line before passing.
+          Pass only if the workflow output is one original sentence, does not
+          attribute it to Hemingway, is valid Markdown, and is materially distinct
+          from every archived line on the same dimensions: central subject/situation,
+          concrete imagery, key wording, sentence structure.
+          Fail a same-scene, same-image, or same-structure paraphrase even when
+          synonyms differ.
+
+    max_attempts: 2
+    next: node-append-quote
+
+  node-append-quote:
+    run:
+      command: |
+        file=".workshop/config/workflows/hemingway.quotes.md"
+        [ -f "$file" ] || printf '# Hemingway clock quotes\n\n' > "$file"
+        printf '<quote run-id="%s">\n%s\n</quote>\n\n' \
+          "$WORKSHOP_RUN_ID" "$(cat "$WORKSHOP_PREVIOUS_OUTPUT_FILE")" >> "$file"
+    # Appending to a shared file is not repeat-safe: a retry would
+    # duplicate the quote, so this node gets exactly one attempt.
+    max_attempts: 1
+    next: null

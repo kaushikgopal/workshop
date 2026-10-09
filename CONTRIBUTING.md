@@ -86,11 +86,14 @@ overlap one in the table; if it will recur, add it to the table.
 ## This project
 
 - Domain nouns: **workflow** (the YAML definition), **run** (one occurrence of
-  a workflow), **attempt** (one try at one node). These match the SQLite tables
-  and the run-directory layout.
+  a workflow), **attempt** (one try at one node). These match the stored
+  records and the run-directory layout.
 - `orchestrate` has a fixed meaning: an agent decides what happens after an
-  attempt fails. The daemon's command is also named `orchestrate`, for
-  historical reasons, but its code lives under `daemon/`.
+  attempt fails. The legacy v3 daemon's command is also named `orchestrate`
+  (`--engine v3 orchestrate`), for historical reasons, but its code lives under
+  `daemon/`. The default v4 engine replaces it with `service`.
+- v4 is the default engine. Files for the legacy engine stay reachable only
+  through `cli/dispatch-v3-command.ts`; new behavior goes to v4.
 - Checks before review:
 
   ```bash

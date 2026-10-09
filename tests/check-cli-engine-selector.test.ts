@@ -10,48 +10,55 @@ import { REPO_ROOT } from "./helpers.js";
 
 const cliPath = join(REPO_ROOT, "src/cli/main.ts");
 
-describe("explicit CLI engine selector", () => {
-  test("keeps v3 as the default and routes v4 help before installation discovery", () => {
+describe("CLI engine selector", () => {
+  test("defaults help to v4, keeps v3 help behind --engine v3, and stays offline", () => {
     const directory = mkdtempSync(join(tmpdir(), "workshop-engine-selector-"));
     try {
-      const legacy = runCli(directory, ["help"]);
-      expect(legacy.status).toBe(0);
-      expect(legacy.stdout).toContain("durable linked-list runner");
-      expect(legacy.stdout).toContain("The default engine remains v3");
+      for (const args of [[], ["help"], ["--help"], ["--engine", "v4", "help"]]) {
+        const help = runCli(directory, args);
+        expect(help.status).toBe(0);
+        expect(help.stdout).toContain("v4 is the default engine");
+        expect(help.stdout).toContain("--engine v3");
+        expect(help.stdout).toContain("watch [<workflow>]");
+        expect(help.stdout).toContain("service start | serve | status [--json] | stop");
+        expect(help.stdout).not.toContain("experimental");
+      }
 
-      const v4 = runCli(directory, ["--engine", "v4", "--help"]);
-      expect(v4.status).toBe(0);
-      expect(v4.stdout).toContain("experimental Durable-backed CLI");
-      expect(v4.stdout).not.toContain("durable linked-list runner");
-      expect(v4.stdout).toContain("watch [<workflow>]");
+      const legacy = runCli(directory, ["--engine", "v3", "help"]);
+      expect(legacy.status).toBe(0);
+      expect(legacy.stdout).toContain("workshop v3 — legacy SQLite runner");
+      expect(legacy.stdout).toContain("workshop --engine v3 orchestrate");
       expect(existsSync(join(directory, ".workshop"))).toBe(false);
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
   });
 
-  test("rejects unsupported, misplaced, and repeated selectors without entering v3", () => {
+  test("rejects unsupported, misplaced, and repeated selectors without falling back", () => {
     const directory = mkdtempSync(join(tmpdir(), "workshop-engine-selector-invalid-"));
     try {
       const invalidArguments = [
         ["--engine"],
-        ["--engine", "v3", "help"],
+        ["--engine", "v5", "help"],
         ["--engine=v4", "help"],
         ["help", "--engine", "v4"],
+        ["status", "--engine", "v3"],
         ["--engine", "v4", "--engine", "v4", "help"],
+        ["--engine", "v3", "--engine", "v3", "help"],
       ];
       for (const args of invalidArguments) {
         const result = runCli(directory, args);
         expect(result.status).toBe(64);
         expect(result.stderr).toContain("error:");
+        expect(result.stdout).toBe("");
       }
 
-      const unavailable = runCli(directory, ["--engine", "v4", "unknown-command"]);
-      expect(unavailable.status).toBe(64);
-      expect(unavailable.stderr).toContain("v4 command is not available yet");
-      const invalidWatch = runCli(directory, ["--engine", "v4", "watch", "--json"]);
+      const unknown = runCli(directory, ["unknown-command"]);
+      expect(unknown.status).toBe(64);
+      expect(unknown.stderr).toContain("unknown command: unknown-command");
+      const invalidWatch = runCli(directory, ["watch", "--json"]);
       expect(invalidWatch.status).toBe(64);
-      expect(invalidWatch.stderr).toContain("usage: workshop --engine v4 watch");
+      expect(invalidWatch.stderr).toContain("usage: workshop watch");
       expect(existsSync(join(directory, ".workshop"))).toBe(false);
     } finally {
       rmSync(directory, { recursive: true, force: true });

@@ -31,7 +31,7 @@ interface Driven {
 }
 
 function drive(...args: string[]): Driven {
-  const child = spawn("bun", [join(REPO_ROOT, "src/cli/main.ts"), "watch", ...args], {
+  const child = spawn("bun", [join(REPO_ROOT, "src/cli/main.ts"), "--engine", "v3", "watch", ...args], {
     cwd: REPO_ROOT,
     stdio: ["pipe", "pipe", "ignore"],
   });

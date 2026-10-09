@@ -1,9 +1,12 @@
 import { loadCheckedV2Workflow, findV2Installation } from "../installation/load-v2-installation.js";
 import { errorText } from "./errors.js";
 
-const HELP = `workshop v4 — experimental Durable-backed CLI
+const HELP = `workshop — local agent workflows on a Durable-backed service (v4)
 
-Usage: workshop --engine v4 <command> [args]
+Usage: workshop [--engine v3|v4] <command> [args]
+v4 is the default engine and reads version 2 YAML. A leading --engine v3 runs
+the legacy engine against existing version 1 YAML and v3 state; see
+\`workshop --engine v3 help\`. Workshop never migrates v3 files or state.
 
 Commands:
   validate <workflow>
@@ -30,9 +33,13 @@ Commands:
       Read frozen settings and execution evidence for one node.
   watch [<workflow>]
       Follow the selected run, or choose a workflow from the service-backed list.
+  service start | serve | status [--json] | stop
+      Start the detached service owner (idempotent), serve it in the
+      foreground, read its health and identity, or shut it down gracefully.
+      The service runs schedules; it replaces v3's \`orchestrate\` daemon.
 `;
 
-/** Keep every v4 route isolated from the v3 runtime; unsupported commands fail closed. */
+/** Keep every v4 route isolated from the v3 runtime; unknown commands fail closed. */
 export async function dispatchV4Command(args: readonly string[]): Promise<void> {
   const [command, ...rest] = args;
   if (command === undefined || command === "help" || command === "--help" || command === "-h") {
@@ -41,7 +48,7 @@ export async function dispatchV4Command(args: readonly string[]): Promise<void> 
   }
   if (command === "validate") {
     if (rest.length !== 1) {
-      return usage("usage: workshop --engine v4 validate <workflow>");
+      return usage("usage: workshop validate <workflow>");
     }
     try {
       const installation = findV2Installation();
@@ -59,10 +66,10 @@ export async function dispatchV4Command(args: readonly string[]): Promise<void> 
     return dispatchV4PublicCommand(command === "node" ? "node.describe" : command, command === "node" ? rest.slice(1) : rest);
   }
   if (command === "service") {
-    const { serveV2ServiceProcess } = await import("../service/serve-v2-service-process.js");
-    return serveV2ServiceProcess(rest);
+    const { cmdService } = await import("./service-v4.js");
+    return cmdService(rest);
   }
-  return usage(`v4 command is not available yet: ${command}`);
+  return usage(`unknown command: ${command}; run \`workshop help\``);
 }
 
 function usage(message: string): void {

@@ -1,90 +1,56 @@
 #!/usr/bin/env bun
-import { findInstallation, ensureDirs } from "../load-installation.js";
-import { DaemonLockHeld } from "../daemon/acquire-daemon-lock.js";
-import { cmdRuntime } from "./agent-callbacks.js";
 import { die, errorText } from "./errors.js";
-import { cmdDiagram, cmdLogs, cmdNode, cmdRuns, cmdStatus, cmdValidate } from "./inspect.js";
-import { cmdPause, cmdResume, cmdStart, cmdStop } from "./run-controls.js";
-import { cmdWatch } from "./watch.js";
 
 /**
- * Workshop CLI. Public surface:
- *   help | validate | start | pause | resume | stop | status |
- *   node describe | logs | diagram | orchestrate
- * Internal (agent-facing, not in help):
- *   runtime progress | runtime block
+ * Workshop entry point. Unqualified commands use the v4 Durable engine; a
+ * leading `--engine v3` selects the legacy fallback and `--engine v4` names the
+ * default explicitly. Each engine is imported lazily so help and offline
+ * validation never load the other engine's storage or the viewer.
  */
-const HELP = `workshop — durable linked-list runner for agent workflows
-
-Usage: workshop [--engine v4] <command> [args]
-The default engine remains v3; --engine v4 selects the experimental Durable route.
-
-Commands:
-  workshop help
-      List commands and briefly explain each one.
-
-  workshop validate <workflow-id>
-      Validate the current YAML definition and print warnings; it does not run
-      environment preflight.
-
-  workshop start <workflow-id>
-      Start a one-shot run, or enable recurrence and start run 1 immediately.
-      Idempotent while a run is unresolved.
-
-  workshop pause <workflow-id>
-      Disable future occurrences, let the current node finish, and pause
-      before its successor.
-
-  workshop resume <workflow-id>
-      Continue a paused or repaired run and re-enable its schedule.
-
-  workshop stop <workflow-id>
-      Disable future occurrences, abort the active process, and cancel the run.
-
-  workshop status [<workflow-id>] [--json]
-      Show workflows, activations, and each workflow's unresolved current run
-      with its nodes, attempts, progress, validators, and blockers.
-
-  workshop node describe <workflow-id> <node-id> [--json]
-      Show the run's YAML snapshot properties, resolved agent settings,
-      successor, validator, and runtime status.
-
-  workshop logs <workflow-id> [--follow | --all]
-      Print or follow the workflow's most recent run: its WORKLOG.md and
-      process logs. --all instead collates every run's worklog, oldest first,
-      each under a run header.
-
-  workshop runs <workflow-id> [--all] [--json]
-      List the workflow's occurrences, newest first, with status and timing;
-      --json emits the versioned runs feed.
-
-  workshop watch [<workflow-id>]
-      Follow one workflow live: its chain, its log stream, and its occurrences,
-      refreshed as the run progresses. Omit the id to pick from the configured
-      workflows first.
-
-  workshop diagram <workflow-id> [--mermaid]
-      Render the current chain and overlay runtime status.
-
-  workshop orchestrate
-      Run the deterministic guardian daemon in the foreground.
-`;
+type Engine = "v3" | "v4";
 
 type EngineSelection =
-  | { readonly engine: "v3" | "v4"; readonly args: readonly string[] }
-  | { readonly error: string };
+  | { readonly _tag: "explicit"; readonly engine: Engine; readonly args: readonly string[] }
+  | { readonly _tag: "default"; readonly args: readonly string[] }
+  | { readonly _tag: "invalid"; readonly error: string };
+
+type Route =
+  | { readonly _tag: "engine"; readonly engine: Engine; readonly args: readonly string[] }
+  | { readonly _tag: "usage-error"; readonly error: string };
+
+const ORCHESTRATE_GUIDANCE = [
+  "`workshop orchestrate` was the v3 daemon and is not part of the default v4 engine.",
+  "  v4 runs schedules in its service: `workshop service start` (detached) or `workshop service serve` (foreground).",
+  "  To keep running the legacy v3 daemon, use `workshop --engine v3 orchestrate`.",
+].join("\n");
 
 function selectEngine(argv: readonly string[]): EngineSelection {
   if (argv[0] === "--engine") {
     const engine = argv[1];
-    if (engine === undefined) return { error: "missing engine after --engine; expected v4" };
-    if (engine !== "v4") return { error: `unsupported engine ${JSON.stringify(engine)}; omit --engine for v3 or choose v4` };
+    if (engine === undefined) return { _tag: "invalid", error: "missing engine after --engine; expected v3 or v4" };
+    if (engine !== "v3" && engine !== "v4") {
+      return { _tag: "invalid", error: `unsupported engine ${JSON.stringify(engine)}; choose v3 or v4, or omit --engine for v4` };
+    }
     const args = argv.slice(2);
-    if (args.some(isEngineOption)) return { error: "--engine may be specified only once and must lead the command" };
-    return { engine: "v4", args };
+    if (args.some(isEngineOption)) return { _tag: "invalid", error: "--engine may be specified only once and must lead the command" };
+    return { _tag: "explicit", engine, args };
   }
-  if (argv.some(isEngineOption)) return { error: "--engine must lead the command; use --engine v4" };
-  return { engine: "v3", args: argv };
+  if (argv.some(isEngineOption)) return { _tag: "invalid", error: "--engine must lead the command, e.g. workshop --engine v3 <command>" };
+  return { _tag: "default", args: argv };
+}
+
+/**
+ * Two unqualified commands keep legacy meaning. Running v3 agents call back
+ * through `"$WORKSHOP_CLI" runtime ...`, which carries no selector and has no
+ * v4 equivalent, so it stays on v3. `orchestrate` would start the v3 daemon,
+ * which must never happen implicitly.
+ */
+function routeCommand(selection: Exclude<EngineSelection, { readonly _tag: "invalid" }>): Route {
+  if (selection._tag === "explicit") return { _tag: "engine", engine: selection.engine, args: selection.args };
+  const command = selection.args[0];
+  if (command === "runtime") return { _tag: "engine", engine: "v3", args: selection.args };
+  if (command === "orchestrate") return { _tag: "usage-error", error: ORCHESTRATE_GUIDANCE };
+  return { _tag: "engine", engine: "v4", args: selection.args };
 }
 
 function isEngineOption(value: string): boolean {
@@ -93,62 +59,23 @@ function isEngineOption(value: string): boolean {
 
 async function main(): Promise<void> {
   const selection = selectEngine(process.argv.slice(2));
-  if ("error" in selection) {
+  if (selection._tag === "invalid") {
     console.error(`error: ${selection.error}`);
     process.exitCode = 64;
     return;
   }
-  if (selection.engine === "v4") {
+  const route = routeCommand(selection);
+  if (route._tag === "usage-error") {
+    console.error(`error: ${route.error}`);
+    process.exitCode = 64;
+    return;
+  }
+  if (route.engine === "v4") {
     const { dispatchV4Command } = await import("./dispatch-v4-command.js");
-    return dispatchV4Command(selection.args);
+    return dispatchV4Command(route.args);
   }
-  const [command, ...args] = selection.args;
-  switch (command) {
-    case undefined:
-    case "help":
-    case "--help":
-    case "-h":
-      process.stdout.write(HELP);
-      return;
-    case "validate":
-      return cmdValidate(args);
-    case "start":
-      return cmdStart(args);
-    case "status":
-      return cmdStatus(args);
-    case "runtime":
-      return cmdRuntime(args);
-    case "pause":
-      return cmdPause(args);
-    case "resume":
-      await cmdResume(args);
-      process.exit(0);
-    case "stop":
-      await cmdStop(args);
-      process.exit(0);
-    case "runs":
-      return cmdRuns(args);
-    case "watch":
-      return await cmdWatch(args);
-    case "logs":
-      return cmdLogs(args);
-    case "diagram":
-      return cmdDiagram(args);
-    case "node":
-      return cmdNode(args);
-    case "orchestrate": {
-      const inst = findInstallation();
-      ensureDirs(inst);
-      const { reconcileForever } = await import("../daemon/reconcile-loop.js");
-      try {
-        await reconcileForever(inst);
-      } catch (e) {
-        if (e instanceof DaemonLockHeld) die(e.message);
-        throw e;
-      }
-      return;
-    }
-  }
+  const { dispatchV3Command } = await import("./dispatch-v3-command.js");
+  return dispatchV3Command(route.args);
 }
 
 process.on("unhandledRejection", (e) => {

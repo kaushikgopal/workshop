@@ -58,7 +58,7 @@ nodes:
     });
 
     // Start run 1 (completes node-timestamp, parks on the sleeping agent node).
-    const child = spawn("bun", [join(import.meta.dir, "..", "src/cli/main.ts"), "start", "clock-fixture"], {
+    const child = spawn("bun", [join(import.meta.dir, "..", "src/cli/main.ts"), "--engine", "v3", "start", "clock-fixture"], {
       cwd: inst.root,
       stdio: "ignore",
     });

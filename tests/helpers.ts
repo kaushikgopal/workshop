@@ -33,7 +33,7 @@ export interface CliResult {
 
 /** Run the workshop CLI against an installation. */
 export function runCli(inst: TestInstallation, args: string, timeoutMs = 60_000): CliResult {
-  const r = spawnSync("bun", [join(REPO_ROOT, "src/cli/main.ts"), ...args.split(" ").filter(Boolean)], {
+  const r = spawnSync("bun", [join(REPO_ROOT, "src/cli/main.ts"), "--engine", "v3", ...args.split(" ").filter(Boolean)], {
     cwd: inst.root,
     encoding: "utf8",
     timeout: timeoutMs,

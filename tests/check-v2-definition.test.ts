@@ -57,7 +57,7 @@ describe("v2 workflow and machine schemas", () => {
       const harnessDir = join(root, "tests", "mock");
       mkdirSync(workflowsDir, { recursive: true });
       mkdirSync(harnessDir, { recursive: true });
-      const workflowSource = join(import.meta.dir, "..", "examples", "workflows", "v4", "hemingway-clock.yaml");
+      const workflowSource = join(import.meta.dir, "..", "examples", "workflows", "hemingway-clock.yaml");
       const machineSource = join(import.meta.dir, "fixtures", "v4", "machine.yaml");
       const harnessSource = join(import.meta.dir, "mock", "hemingway-node.ts");
       const workflowPath = join(workflowsDir, "hemingway-clock.yaml");
@@ -83,9 +83,9 @@ describe("v2 workflow and machine schemas", () => {
 
   test("checks the documented Pi, OpenCode, and Claude Code command templates as v2 workflow sites", () => {
     const readme = readFileSync(join(import.meta.dir, "..", "README.md"), "utf8");
-    const heading = "### V4 headless-agent command templates";
+    const heading = "### Headless-agent command templates";
     const start = readme.indexOf(heading);
-    if (start < 0) throw new Error("README is missing the v4 harness-template section");
+    if (start < 0) throw new Error("README is missing the harness-template section");
     const yaml = /```yaml\n([\s\S]*?)\n```/u.exec(readme.slice(start))?.[1];
     if (yaml === undefined) throw new Error("README harness templates are missing their YAML mapping");
 

@@ -108,7 +108,7 @@ describe("gate 13 — crash recovery", () => {
   test("a killed worker recovers only the interrupted node and never repeats a completed predecessor", async () => {
     const inst = makeInstallation({ "crash-chain": twoNodeWorkflow() });
     // Start in the background: node-fast completes, node-slow sleeps 30s.
-    const child = spawn("bun", [join(import.meta.dir, "..", "src/cli/main.ts"), "start", "crash-chain"], {
+    const child = spawn("bun", [join(import.meta.dir, "..", "src/cli/main.ts"), "--engine", "v3", "start", "crash-chain"], {
       cwd: inst.root,
       stdio: "ignore",
     });
@@ -249,7 +249,7 @@ describe("gate 15 — stop fencing", () => {
 
   test("workshop stop kills the recorded process group and cancels the run", async () => {
     const inst = makeInstallation({ "crash-chain": twoNodeWorkflow() });
-    const child = spawn("bun", [join(import.meta.dir, "..", "src/cli/main.ts"), "start", "crash-chain"], {
+    const child = spawn("bun", [join(import.meta.dir, "..", "src/cli/main.ts"), "--engine", "v3", "start", "crash-chain"], {
       cwd: inst.root,
       stdio: "ignore",
     });
@@ -268,7 +268,7 @@ describe("gate 15 — stop fencing", () => {
     };
     await waitFor(() => pollDb().some((r) => r.node_id === "node-slow" && r.status === "running"));
 
-    const stopped = spawnSync("bun", [join(import.meta.dir, "..", "src/cli/main.ts"), "stop", "crash-chain"], {
+    const stopped = spawnSync("bun", [join(import.meta.dir, "..", "src/cli/main.ts"), "--engine", "v3", "stop", "crash-chain"], {
       cwd: inst.root,
       encoding: "utf8",
       timeout: 30_000,

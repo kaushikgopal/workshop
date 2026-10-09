@@ -334,7 +334,7 @@ const NY = "America/New_York";
 /** Run the CLI in a subprocess with a controlled TZ; the test process
  *  environment itself is never mutated, so no state needs restoring. */
 function runCliWithTz(inst: TestInstallation, args: string, tz: string): CliResult {
-  const r = spawnSync("bun", [join(REPO_ROOT, "src/cli/main.ts"), ...args.split(" ").filter(Boolean)], {
+  const r = spawnSync("bun", [join(REPO_ROOT, "src/cli/main.ts"), "--engine", "v3", ...args.split(" ").filter(Boolean)], {
     cwd: inst.root,
     encoding: "utf8",
     timeout: 60_000,

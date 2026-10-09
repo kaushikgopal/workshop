@@ -4,7 +4,7 @@ import { ServiceShutdownError } from "./serve-workshop-service.js";
 
 export async function serveV2ServiceProcess(args: readonly string[]): Promise<void> {
   if (args.length !== 1 || args[0] !== "serve") {
-    console.error("error: usage: workshop --engine v4 service serve");
+    console.error("error: usage: workshop service serve");
     process.exitCode = 64;
     return;
   }

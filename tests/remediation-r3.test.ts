@@ -186,7 +186,7 @@ nodes:
     });
     // The chain runs inline in the CLI process: the harness child (a shell
     // running sleep) is spawned detached there, and the CLI reaps it.
-    const child = spawn("bun", [join(import.meta.dir, "..", "src/cli/main.ts"), "start", "chain"], {
+    const child = spawn("bun", [join(import.meta.dir, "..", "src/cli/main.ts"), "--engine", "v3", "start", "chain"], {
       cwd: inst.root,
       stdio: "ignore",
     });
