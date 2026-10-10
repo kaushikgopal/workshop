@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
-import { resolve as resolvePath } from "node:path";
+import { existsSync } from "node:fs";
+import { join, resolve as resolvePath } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { Models } from "@earendil-works/pi-ai/models";
 import { createWorkshopModels } from "../model/create-workshop-models.js";
-import { createRegistry, Harness, type ConversationId, type TaskId, type Tx } from "@earendil-works/pi-durable";
+import { createRegistry, Harness, type ConversationId, type TaskGraph, type TaskGraphWatch, type TaskId, type Tx } from "@earendil-works/pi-durable";
 import { canonicalHash } from "../definition/hash-canonical-json.js";
 import { loadCheckedWorkflow, type CheckedWorkflow, type Installation } from "../installation/load-installation.js";
 import {
@@ -11,7 +12,6 @@ import {
   installationDocumentV1Schema,
   serviceMutationReceiptV1Schema,
   serviceMutationReceiptsDocumentV1Schema,
-  workflowInstallationIndexSchema,
   type ActivationIndex,
 } from "../installation/schema.js";
 import {
@@ -42,7 +42,9 @@ import { resolveWorkerArtifacts } from "../storage/durable/define-node-attempt-t
 import { parseValidatorVerdictFile, parseWorkerResultFile } from "../attempt/parse-result.js";
 import { workflowRunDocumentV1Schema, workshopEventV1Schema, workshopProcessV1Schema } from "../run/records.js";
 import { WorkshopEventEntry, WorkshopInstallationDoc, WorkshopRunDoc, WorkshopServiceReceiptsDoc } from "../storage/durable/define-workshop-records.js";
+import { checkpointDurableWal } from "../storage/durable/checkpoint-durable-wal.js";
 import { openDurableStorage } from "../storage/durable/open-durable-storage.js";
+import { removeRunFiles } from "../storage/disk/remove-run-files.js";
 import { readInstallation, readRun, projectServiceRead } from "./project-service-reads.js";
 import { ServiceRequestError, ServiceShutdownError, serveWorkshopService, type WorkshopServiceRuntime } from "./serve-workshop-service.js";
 import type { ServiceMetadataV1, ServiceRequestV1 } from "./schema.js";
@@ -68,6 +70,11 @@ async function openServiceRuntime(
   const storage = opened.storage;
   let harness: Harness | undefined;
   let tasks: ReturnType<typeof defineWorkshopTasks> | undefined;
+  let taskGraphWatch: TaskGraphWatch | undefined;
+  let idleCheckpoint = Promise.resolve();
+  let idleRetryTimer: ReturnType<typeof setTimeout> | undefined;
+  let taskGraphIdle = false;
+  let shuttingDown = false;
   const openCleanupErrors: unknown[] = [];
   let opening = true;
 
@@ -85,8 +92,7 @@ async function openServiceRuntime(
     });
     const registry = createRegistry();
     registry.install({
-      // Durable can store extension names in conversation state, so existing installations keep this v4 literal.
-      name: "workshop-v4-service-runtime",
+      name: "workshop-service-runtime",
       tasks: [tasks.WorkflowRunTask, tasks.NodeAttemptTask, tasks.ProcessExecutionTask, tasks.CapacityGateTask, tasks.FailureJudgmentTask, scheduleWakeupTask],
     });
     registry.install(tasks.FailureJudgmentExtension);
@@ -103,10 +109,48 @@ async function openServiceRuntime(
     await assertNoUnreconciledProcessEvidence(harness, Date.now() + STARTUP_RECONCILIATION_MS, metadata.bootId);
     tasks.openStartupLaunchGate();
     harness.resume();
-    opening = false;
+    await removeLeftoverCompletedRunFiles(harness, installation.runsDirectory);
 
     const activeHarness = harness;
     const activeTasks = tasks;
+    const schedulerWakeupKind = scheduleWakeupTask.definition.name;
+    const checkpointIfTaskGraphIdle = async (graph: TaskGraph): Promise<void> => {
+      if (shuttingDown) return;
+      // The scheduler's durable timer is not active workflow work and must not keep an idle WAL alive.
+      const hasRunnableWork = Object.values(graph.tasks).some((task) =>
+        task.kind !== schedulerWakeupKind && task.state.status !== "waiting",
+      );
+      if (hasRunnableWork) {
+        taskGraphIdle = false;
+        if (idleRetryTimer !== undefined) {
+          clearTimeout(idleRetryTimer);
+          idleRetryTimer = undefined;
+        }
+        return;
+      }
+      if (taskGraphIdle) return;
+      taskGraphIdle = true;
+      idleCheckpoint = (async () => {
+        try {
+          const checkpointed = await checkpointDurableWal(installation.databasePath);
+          if (!checkpointed) {
+            taskGraphIdle = false;
+            idleRetryTimer = setTimeout(() => {
+              idleRetryTimer = undefined;
+              if (taskGraphWatch !== undefined) void checkpointIfTaskGraphIdle(taskGraphWatch.value);
+            }, 250);
+          }
+        } catch (error) {
+          console.error(`Durable idle WAL checkpoint failed: ${errorText(error)}`);
+        }
+      })();
+      await idleCheckpoint;
+    };
+    taskGraphWatch = await activeHarness.watchTaskGraph(BACKGROUND_CONTEXT);
+    taskGraphWatch.start(checkpointIfTaskGraphIdle);
+    void checkpointIfTaskGraphIdle(taskGraphWatch.value);
+    opening = false;
+
     let closed = false;
     return {
       async handleRequest(request) {
@@ -129,21 +173,46 @@ async function openServiceRuntime(
       },
       async shutdown(deadlineMs) {
         if (closed) return;
+        shuttingDown = true;
         activeTasks.stopLaunching();
+        if (idleRetryTimer !== undefined) {
+          clearTimeout(idleRetryTimer);
+          idleRetryTimer = undefined;
+        }
+        if (taskGraphWatch !== undefined) {
+          await beforeDeadline(taskGraphWatch.stop().then(() => undefined), deadlineMs, "idle WAL checkpoint observer close");
+          taskGraphWatch = undefined;
+        }
+        await beforeDeadline(idleCheckpoint, deadlineMs, "idle WAL checkpoint");
         await reconcileLiveProcessTasks(activeHarness, activeTasks, deadlineMs);
         await assertNoUnreconciledProcessEvidence(activeHarness, deadlineMs);
         try {
           await beforeDeadline(activeHarness.close(BACKGROUND_CONTEXT), deadlineMs, "Durable Harness and storage close");
+          await beforeDeadline(checkpointDurableWal(installation.databasePath), deadlineMs, "shutdown WAL checkpoint");
           closed = true;
         } catch (error) {
-          throw new ServiceShutdownError("Durable Harness and storage did not close before the service deadline", { cause: error });
+          throw new ServiceShutdownError("Durable runtime and shutdown WAL checkpoint did not close before the service deadline", { cause: error });
         }
       },
     };
   } catch (error) {
     opening = false;
+    shuttingDown = true;
     tasks?.stopLaunching();
+    if (idleRetryTimer !== undefined) {
+      clearTimeout(idleRetryTimer);
+      idleRetryTimer = undefined;
+    }
     const cleanupErrors = [...openCleanupErrors];
+    if (taskGraphWatch !== undefined) {
+      try {
+        await taskGraphWatch.stop();
+        await beforeDeadline(idleCheckpoint, Date.now() + STARTUP_RECONCILIATION_MS, "partial idle WAL checkpoint");
+      } catch (cleanupError) {
+        cleanupErrors.push(cleanupError);
+      }
+      taskGraphWatch = undefined;
+    }
     if (harness !== undefined) {
       try {
         if (tasks !== undefined) await reconcileLiveProcessTasks(harness, tasks, Date.now() + STARTUP_RECONCILIATION_MS, true);
@@ -165,6 +234,17 @@ async function openServiceRuntime(
       });
     }
     throw error;
+  }
+}
+
+/** Finishes a completed run's folder cleanup that a crash interrupted. */
+async function removeLeftoverCompletedRunFiles(harness: Harness, runsDirectory: string): Promise<void> {
+  const installation = await readInstallation(harness);
+  for (const workflow of Object.values(installation.workflows)) {
+    for (const reference of workflow.runs) {
+      if (reference.status !== "completed" || !existsSync(join(runsDirectory, reference.runId))) continue;
+      removeRunFiles(await readRun(harness, reference));
+    }
   }
 }
 
@@ -235,9 +315,11 @@ async function startWorkflow(
   const prepared = prepareRunAdmission({
     sourceText: checked.sourceText,
     sourceLabel: checked.sourcePath,
+    workflowId: checked.workflowId,
     machineConfig: installation.machine,
     projectCwd: installation.projectCwd,
     runsDirectory: installation.runsDirectory,
+    archiveDirectory: installation.archiveDirectory,
     resolvedSettings: checked.resolvedSettings,
     runtimeManifest: {
       durableVersion: "1.0.2",
@@ -533,7 +615,6 @@ async function resolveBlockedWorkflow(
   let run: ReadyRunForResolution;
   let processRecords: RunProcessEvidence[];
   let sourceBlock: NonNullable<ReadyRunForResolution["block"]>;
-  let location: ReturnType<typeof findRunAttempt>;
   let repeatRequired: boolean;
   let extraAttemptRequired: boolean;
   let at: string;
@@ -625,7 +706,6 @@ async function resolveBlockedWorkflow(
     run = selectedRun;
     processRecords = checkedProcesses;
     sourceBlock = source;
-    location = attemptLocation;
     repeatRequired = needsRepeat;
     extraAttemptRequired = needsExtraAttempt;
     at = resolvedAt;

@@ -26,7 +26,6 @@ import {
   attemptDetailDtoSchema,
   logsDtoSchema,
   nodeDescriptionDtoSchema,
-  runDetailDtoSchema,
   runSummaryDtoSchema,
   runsDtoSchema,
   statusDtoSchema,
@@ -428,18 +427,9 @@ describe("domain outcomes and process evidence", () => {
       verdict: evidence("verdict", "verdict-from-known-nonzero-exit", HASH_B),
       operatorAcceptances: [validatorAcceptance], blocks: [validatorUnknownBlock],
     };
-    const acceptedKnownFailureRun = {
-      version: 2,
-      summary: runSummary({
-        status: "completed", currentNodeId: "node-a", currentAttemptNumber: 1, terminalOutput: "candidate",
-      }),
-      preflight: null, resolutions: [],
-      nodes: [nodeDetail({
-        status: "succeeded", successfulOutput: "candidate", resolvedSettings: agentSettings,
-        attempts: [acceptedKnownFailure],
-      })],
-    };
-    expect(() => runDetailDtoSchema.parse(acceptedKnownFailureRun)).toThrow(
+    expect(() => nodeDetailDtoSchema.parse({
+      ...agentNode, attempts: [acceptedKnownFailure],
+    })).toThrow(
       /acceptance requires an unknown target-process outcome without an exit receipt/,
     );
 
@@ -633,111 +623,31 @@ describe("public JSON projections", () => {
     })).toThrow(/run IDs must be unique/);
   });
 
-  test("preserves a selected historical chain in position order", () => {
+  test("validates standalone attempt and node detail projections", () => {
     const first = nodeDetail({
-      nodeId: "node-a",
-      position: 1,
-      predecessorId: null,
-      successorId: "node-b",
       status: "succeeded",
       successfulOutput: "first output",
       attempts: [succeededAttempt()],
     });
-    const second = nodeDetail({
-      nodeId: "node-b",
-      position: 2,
-      predecessorId: "node-a",
-      successorId: null,
-    });
-    const preflightFinishedAt = "2026-10-05T12:00:00.500Z";
     const preflightProcess = processIncarnation({
       executionId: "execution-preflight", incarnationId: "incarnation-preflight-a", role: "preflight", replay: "safe",
-      launchIntentAt: ADMITTED_AT, startedAt: ADMITTED_AT, finishedAt: preflightFinishedAt,
+      launchIntentAt: ADMITTED_AT, startedAt: ADMITTED_AT, finishedAt: "2026-10-05T12:00:00.500Z",
     });
-    const preflight = {
-      cacheKeyHash: HASH_B, outcome: "passed", reusedFrom: null,
-      checks: [{
-        checkId: "preflight-check-a", outcome: "passed", startedAt: ADMITTED_AT, finishedAt: preflightFinishedAt,
-        failure: null, block: null, processes: [preflightProcess],
-      }],
-    };
-    const detail = {
-      version: 2, summary: runSummary({ currentNodeId: "node-b", currentAttemptNumber: null }),
-      preflight, resolutions: [], nodes: [first, second],
-    };
-    const parsed = runDetailDtoSchema.parse(detail);
-    expect(parsed.nodes.map((node) => node.nodeId)).toEqual(["node-a", "node-b"]);
-    expect(String(parsed.preflight?.checks[0]?.processes[0]?.executionId)).toBe("execution-preflight");
-    expect(() => attemptDetailDtoSchema.parse({ ...succeededAttempt(), processes: [preflightProcess] })).toThrow(/preflight processes belong to the run/);
+    expect(() => attemptDetailDtoSchema.parse({ ...succeededAttempt(), processes: [preflightProcess] }))
+      .toThrow(/preflight processes belong to the run/);
     const interruptedBlock = blockInfo({ blockId: "block-interrupted" });
     const interrupted = succeededAttempt({
       status: "interrupted", candidate: null, blocks: [interruptedBlock],
       processes: [processIncarnation({ status: "blocked", exit: null, cleanupState: "unconfirmed" })],
     });
     expect(attemptDetailDtoSchema.parse(interrupted).blocks[0]?.kind).toBe("process_death_unconfirmed");
-    expect(() => attemptDetailDtoSchema.parse({ ...interrupted, status: "succeeded" })).toThrow(/succeeded attempts require/);
-    expect(() => runDetailDtoSchema.parse({ ...detail, nodes: [second, first] })).toThrow(/chain position|chain/);
+    expect(() => attemptDetailDtoSchema.parse({ ...interrupted, status: "succeeded" }))
+      .toThrow(/succeeded attempts require/);
     expect(() => nodeDescriptionDtoSchema.parse({
       version: 2, workflowId: "clock", definitionHash: HASH_A, runId: null, runStatus: null, runFailure: null, node: first,
     })).toThrow(/no runtime history/);
   });
 
-  test("allows pending successors after the current running or blocked node", () => {
-    const pendingSuccessor = nodeDetail({
-      nodeId: "node-b", position: 2, predecessorId: "node-a", successorId: null,
-    });
-    const runningProcess = processIncarnation({
-      status: "running", finishedAt: null, exit: null, cleanupState: "pending",
-    });
-    const runningAttempt = succeededAttempt({
-      status: "executing", phase: "awaitWorker", finishedAt: null, elapsedMs: null,
-      candidate: null, processes: [runningProcess],
-    });
-    const runningNode = nodeDetail({
-      status: "running", successorId: "node-b", attempts: [runningAttempt],
-    });
-    const runningDetail = {
-      version: 2, summary: runSummary({ currentNodeId: "node-a", currentAttemptNumber: 1 }),
-      preflight: null, resolutions: [], nodes: [runningNode, pendingSuccessor],
-    };
-    expect(runDetailDtoSchema.parse(runningDetail).nodes.map((node) => node.status))
-      .toEqual(["running", "pending"]);
-
-    const block = blockInfo({
-      blockId: "block-pending-successor", kind: "external_outcome_unknown",
-      reason: "the worker outcome is unknown", nodeId: "node-a", attemptId: "attempt-a",
-    });
-    const interruptedAttempt = succeededAttempt({
-      status: "interrupted", candidate: null, blocks: [block],
-      processes: [processIncarnation({ status: "blocked", exit: null, cleanupState: "unconfirmed" })],
-    });
-    const blockedNode = nodeDetail({
-      status: "blocked", block, successorId: "node-b", attempts: [interruptedAttempt],
-    });
-    const blockedDetail = {
-      version: 2, summary: runSummary({
-        status: "blocked", block, currentNodeId: "node-a", currentAttemptNumber: 1,
-      }),
-      preflight: null, resolutions: [], nodes: [blockedNode, pendingSuccessor],
-    };
-    expect(runDetailDtoSchema.parse(blockedDetail).nodes.map((node) => node.status))
-      .toEqual(["blocked", "pending"]);
-
-    const succeededLaterAttempt = succeededAttempt({
-      attemptId: "attempt-b", workerExecutionId: "execution-worker-b",
-      candidate: evidence("candidate", "evidence-candidate-b"),
-      processes: [processIncarnation({
-        executionId: "execution-worker-b", incarnationId: "incarnation-worker-b-1",
-      })],
-    });
-    const succeededLaterNode = nodeDetail({
-      nodeId: "node-b", position: 2, predecessorId: "node-a", successorId: null,
-      status: "succeeded", successfulOutput: "later output", attempts: [succeededLaterAttempt],
-    });
-    expect(() => runDetailDtoSchema.parse({
-      ...runningDetail, nodes: [runningNode, succeededLaterNode],
-    })).toThrow(/succeeded nodes form a prefix/);
-  });
 
   test("validates process replay history and millisecond timestamps", () => {
     const firstIncarnation = processIncarnation({
@@ -786,22 +696,6 @@ describe("public JSON projections", () => {
     };
     expect(() => attemptDetailDtoSchema.parse(validatorRerolledAfterFailure))
       .toThrow(/exitless blocked incarnation/);
-    const unresolvedReplayBlock = blockInfo({
-      blockId: "block-replay-without-resolution", kind: "external_outcome_unknown",
-      blockedAt: "2026-10-05T12:00:01.500Z",
-    });
-    const replayAfterCommittedBlock = { ...replayedAttempt, blocks: [unresolvedReplayBlock] };
-    expect(() => runDetailDtoSchema.parse({
-      version: 2,
-      summary: runSummary({
-        status: "completed", finishedAt: "2026-10-05T12:00:04.000Z",
-        terminalOutput: "replayed output",
-      }),
-      preflight: null, resolutions: [],
-      nodes: [nodeDetail({
-        status: "succeeded", successfulOutput: "replayed output", attempts: [replayAfterCommittedBlock],
-      })],
-    })).toThrow(/every block remains current or has an audited resolution/);
     expect(() => attemptDetailDtoSchema.parse({
       ...replayedAttempt, processes: [firstIncarnation, { ...secondIncarnation, replay: "never" }],
     })).toThrow(/replay=safe/);
@@ -862,108 +756,19 @@ describe("public JSON projections", () => {
       kind: "operator", resolutionId: "resolution-fail-a", provenance: "operator",
       reason: resolution.reason, failedAt: FINISHED_AT, processGroupsConfirmedDead: true, sourceBlock,
     };
-    const summary = runSummary({
-      status: "failed", desiredState: "stopped", finishedAt: FINISHED_AT,
-      currentNodeId: "node-a", currentAttemptNumber: 1, failure: runFailure,
-    });
-    const detail = { version: 2, summary, preflight: null, resolutions: [resolution], nodes: [failedNode] };
     expect(operatorResolutionSchema.parse(resolution).action).toBe("fail");
-    expect(runDetailDtoSchema.parse(detail).summary.failure?.kind).toBe("operator");
     expect(nodeDescriptionDtoSchema.parse({
       version: 2, workflowId: "clock", definitionHash: HASH_A, runId: "run-a", runStatus: "failed", runFailure, node: failedNode,
     }).runFailure?.kind).toBe("operator");
-    expect(() => runDetailDtoSchema.parse({ ...detail, resolutions: [] })).toThrow(/match its fail resolution/);
-    expect(() => runDetailDtoSchema.parse({
-      ...detail, summary: { ...summary, failure: { ...runFailure, sourceBlock: blockInfo({ blockId: "block-other" }) } },
-    })).toThrow(/retained historical evidence/);
   });
 
-  test("retains preflight failure evidence and rejects contradictory terminal runs", () => {
-    const preflightBlock = blockInfo({
-      blockId: "block-preflight", kind: "preflight_failed", nodeId: null, attemptId: null,
-    });
-    const preflightProcess = processIncarnation({
-      executionId: "execution-preflight-fail", incarnationId: "incarnation-preflight-fail",
-      role: "preflight", replay: "safe", exit: { kind: "code", code: 1 },
-    });
-    const failedPreflight = {
-      cacheKeyHash: HASH_B, outcome: "failed", reusedFrom: null,
-      checks: [{
-        checkId: "preflight-check-failed", outcome: "failed", startedAt: STARTED_AT, finishedAt: FINISHED_AT,
-        failure: failureInfo({ kind: "process_error", nodeId: null, attemptId: null }),
-        block: preflightBlock, processes: [preflightProcess],
-      }],
-    };
-    const blockedSummary = runSummary({
-      status: "blocked", currentNodeId: null, currentAttemptNumber: null, block: preflightBlock,
-    });
-    const preflightDetail = {
-      version: 2, summary: blockedSummary, preflight: failedPreflight, resolutions: [],
-      nodes: [nodeDetail()],
-    };
-    expect(runDetailDtoSchema.parse(preflightDetail).preflight?.outcome).toBe("failed");
-    expect(() => runDetailDtoSchema.parse({ ...preflightDetail, preflight: null })).toThrow(/preflight failure requires/);
-    expect(() => runDetailDtoSchema.parse({
-      ...preflightDetail, preflight: {
-        ...failedPreflight, checks: [{ ...failedPreflight.checks[0], processes: [{ ...preflightProcess, replay: "never" }] }],
-      },
-    })).toThrow(/preflight must be repeat-safe/);
 
-    const succeeded = nodeDetail({
-      status: "succeeded", successfulOutput: "done", attempts: [succeededAttempt()],
-    });
-    const impossibleFailure = runSummary({
-      status: "failed", currentNodeId: null, currentAttemptNumber: null, finishedAt: FINISHED_AT,
-      failure: failureInfo({ kind: "runtime_fault", nodeId: null, attemptId: null }),
-    });
-    expect(() => runDetailDtoSchema.parse({
-      version: 2, summary: impossibleFailure, preflight: null, resolutions: [], nodes: [succeeded],
-    })).toThrow(/failed runs retain/);
-
-    const uncertainBlock = blockInfo({ blockId: "block-cancelled" });
-    const interrupted = succeededAttempt({
-      status: "interrupted", candidate: null, blocks: [uncertainBlock],
-      processes: [processIncarnation({ status: "blocked", exit: null, cleanupState: "unconfirmed" })],
-    });
-    const cancelled = runSummary({
-      status: "cancelled", desiredState: "stopped", finishedAt: FINISHED_AT,
-      currentNodeId: null, currentAttemptNumber: null,
-    });
-    expect(() => runDetailDtoSchema.parse({
-      version: 2, summary: cancelled, preflight: null, resolutions: [],
-      nodes: [nodeDetail({ status: "cancelled", attempts: [interrupted] })],
-    })).toThrow(/terminal runs have no live or uncertain process groups/);
-    const reconcilingAttempt = {
-      ...interrupted,
-      processes: [processIncarnation({ status: "reconciling", exit: null, cleanupState: "confirmed_dead" })],
-    };
-    expect(() => runDetailDtoSchema.parse({
-      version: 2, summary: cancelled, preflight: null, resolutions: [],
-      nodes: [nodeDetail({ status: "cancelled", attempts: [reconcilingAttempt] })],
-    })).toThrow(/only prepared or reconciled process incarnations/);
-    const preparedProcess = processIncarnation({
-      status: "prepared", launchIntentAt: null, startedAt: null, finishedAt: null, deadlineAt: null,
-      identity: null, exit: null, cleanupState: "not_started", captures: [],
-    });
-    const cancelledBeforeStart = succeededAttempt({
-      status: "cancelled", phase: null, startedAt: null, finishedAt: FINISHED_AT, elapsedMs: null,
-      candidate: null, processes: [preparedProcess],
-    });
-    expect(runDetailDtoSchema.parse({
-      version: 2, summary: cancelled, preflight: null, resolutions: [],
-      nodes: [nodeDetail({ status: "cancelled", attempts: [cancelledBeforeStart] })],
-    }).nodes[0]?.attempts[0]?.startedAt).toBeNull();
-    expect(() => runDetailDtoSchema.parse({
-      version: 2, summary: cancelled, preflight: null, resolutions: [], nodes: [succeeded],
-    })).toThrow(/fully successful chain is completed rather than cancelled/);
-  });
-
-  test("requires explicit log-capture availability and projection truncation metadata", () => {
+  test("accepts only ordered worklog and capture log sections", () => {
     const logs = {
       version: 2,
       runId: "run-a",
       sections: [
-        { kind: "worklog", sectionId: "worklog", order: 0, label: "Worklog", content: "completed", omittedBytes: 0 },
+        { kind: "worklog", sectionId: "worklog", order: 0, label: "Worklog", content: "completed" },
         {
           kind: "capture",
           sectionId: "stdout-a",
@@ -973,33 +778,27 @@ describe("public JSON projections", () => {
           incarnationNumber: 1,
           capture: capture({ totalBytes: 8, retainedBytes: 5, truncatedBytes: 3, complete: false }),
           content: "hello",
-          unavailableReason: null,
-          omittedBytes: 0,
         },
       ],
-      projection: { truncated: false, omittedSections: 0, omittedBytes: 0 },
     };
     expect(logsDtoSchema.parse(logs).sections).toHaveLength(2);
     expect(logsDtoSchema.parse({
-      ...logs, sections: [{
-        ...logs.sections[1],
-        capture: capture({ totalBytes: 3, retainedBytes: 2, truncatedBytes: 1, complete: false }),
-        content: "�",
-      }],
-    }).sections).toHaveLength(1);
-    expect(() => logsDtoSchema.parse({ ...logs, projection: { truncated: false, omittedSections: 0, omittedBytes: 4 } })).toThrow(/truncation flag/);
-    expect(() => logsDtoSchema.parse({ ...logs, sections: [...logs.sections].reverse() })).toThrow(/uniquely ordered/);
+      ...logs, sections: [logs.sections[0], { ...logs.sections[1], content: null }],
+    }).sections[1]?.content).toBeNull();
+    const parsedLogs = logsDtoSchema.parse(logs);
+    const parsedCapture = parsedLogs.sections[1];
+    expect(parsedCapture?.kind).toBe("capture");
+    if (parsedCapture?.kind !== "capture") throw new Error("capture section is missing");
+    expect(Object.hasOwn(parsedCapture.capture, "content")).toBe(false);
+    expect(() => logsDtoSchema.parse({ ...logs, sections: [...logs.sections].reverse() })).toThrow(/logs begin with their worklog/);
     expect(() => logsDtoSchema.parse({
-      ...logs,
-      sections: [
-        { kind: "event", sectionId: "event-a", order: 0, label: "First", content: "", omittedBytes: Number.MAX_SAFE_INTEGER },
-        { kind: "event", sectionId: "event-b", order: 1, label: "Second", content: "", omittedBytes: Number.MAX_SAFE_INTEGER },
-      ],
-      projection: { truncated: true, omittedSections: 0, omittedBytes: Number.MAX_SAFE_INTEGER },
-    })).toThrow(/aggregate omitted bytes exceed/);
+      ...logs, sections: [{ kind: "event", sectionId: "event-a", order: 0, label: "Event", content: "" }],
+    })).toThrow();
   });
 
-  test("links operator acceptance to exact supplied bytes and reconciled process groups", () => {
+
+
+  test("validates operator acceptance in node details", () => {
     const sourceBlock = blockInfo({ blockId: "block-accepted", kind: "external_outcome_unknown" });
     const acceptance = {
       kind: "operator_acceptance", resolutionId: "resolution-accepted", provenance: "operator",
@@ -1013,30 +812,22 @@ describe("public JSON projections", () => {
       blocks: [sourceBlock],
       processes: [processIncarnation({ status: "blocked", exit: null, cleanupState: "confirmed_dead" })],
     });
-    const acceptedNode = nodeDetail({ status: "succeeded", successfulOutput: "accepted output", attempts: [acceptedAttempt] });
-    const acceptedRun = runSummary({
-      status: "completed", finishedAt: FINISHED_AT, currentNodeId: null, currentAttemptNumber: null,
-      terminalOutput: "accepted output",
+    const acceptedNode = nodeDetail({
+      status: "succeeded", successfulOutput: "accepted output", attempts: [acceptedAttempt],
     });
-    const detail = { version: 2, summary: acceptedRun, preflight: null, resolutions: [], nodes: [acceptedNode] };
-    expect(runDetailDtoSchema.parse(detail).nodes[0]?.attempts[0]?.operatorAcceptances[0]?.resultBytesHash).toBe(HASH_B);
-    const invalidRetryOfAcceptedResult = {
-      action: "retry", resolutionId: "resolution-retry-accepted", provenance: "operator",
-      reason: "Retry a result that was already accepted.", resolvedAt: FINISHED_AT,
-      processGroupsConfirmedDead: true, sourceBlock, allowRepeat: true, extraAttempt: false,
-    };
-    expect(() => runDetailDtoSchema.parse({ ...detail, resolutions: [invalidRetryOfAcceptedResult] }))
-      .toThrow(/each block has at most one resolution or acceptance/);
-    expect(() => runDetailDtoSchema.parse({
-      ...detail, nodes: [nodeDetail({ ...acceptedNode, attempts: [{
+    expect(nodeDetailDtoSchema.parse(acceptedNode).attempts[0]?.operatorAcceptances[0]?.resultBytesHash)
+      .toBe(HASH_B);
+    expect(() => nodeDetailDtoSchema.parse(nodeDetail({
+      ...acceptedNode, attempts: [{
         ...acceptedAttempt, operatorAcceptances: [{ ...acceptance, resultBytesHash: HASH_A }],
-      }] })],
-    })).toThrow(/acceptance hash must match/);
-    expect(() => runDetailDtoSchema.parse({
-      ...detail, nodes: [nodeDetail({ ...acceptedNode, attempts: [{
-        ...acceptedAttempt, processes: [processIncarnation({ status: "blocked", exit: null, cleanupState: "unconfirmed" })],
-      }] })],
-    })).toThrow(/target process groups to be reconciled/);
+      }],
+    }))).toThrow(/acceptance hash must match/);
+    expect(() => nodeDetailDtoSchema.parse(nodeDetail({
+      ...acceptedNode, attempts: [{
+        ...acceptedAttempt,
+        processes: [processIncarnation({ status: "blocked", exit: null, cleanupState: "unconfirmed" })],
+      }],
+    }))).toThrow(/target process groups to be reconciled/);
     const olderSourceBlock = {
       ...sourceBlock, blockId: "block-older-acceptance-source", blockedAt: "2026-10-05T12:00:01.500Z",
     };
@@ -1044,22 +835,18 @@ describe("public JSON projections", () => {
       ...sourceBlock, blockId: "block-newer-acceptance-source",
       kind: "process_death_unconfirmed", blockedAt: "2026-10-05T12:00:01.750Z",
     };
-    expect(() => runDetailDtoSchema.parse({
-      ...detail, nodes: [nodeDetail({ ...acceptedNode, attempts: [{
+    expect(() => nodeDetailDtoSchema.parse(nodeDetail({
+      ...acceptedNode, attempts: [{
         ...acceptedAttempt, blocks: [olderSourceBlock, newerSourceBlock],
         operatorAcceptances: [{ ...acceptance, sourceBlock: olderSourceBlock }],
-      }] })],
-    })).toThrow(/acceptance identifies the latest block at its resolution time/);
+      }],
+    }))).toThrow(/acceptance identifies the latest block at its resolution time/);
 
     const validatorProcess = processIncarnation({
       executionId: "execution-validator-a", incarnationId: "incarnation-validator-a-1", role: "validator",
       launchIntentAt: "2026-10-05T12:00:02.001Z", startedAt: "2026-10-05T12:00:02.001Z",
       finishedAt: "2026-10-05T12:00:03.000Z",
     });
-    const acceptedWithValidator = {
-      ...acceptedAttempt, finishedAt: "2026-10-05T12:00:03.000Z", elapsedMs: 2_000,
-      validatorExecutionId: "execution-validator-a", processes: [acceptedAttempt.processes[0], validatorProcess],
-    };
     const validatorSettings = {
       ...commandSettings(),
       validator: {
@@ -1067,61 +854,31 @@ describe("public JSON projections", () => {
         timeoutMs: null, streamCapBytes: "unlimited", replay: "never",
       },
     };
-    const acceptedWithConfiguredValidator = {
-      ...detail,
-      summary: { ...acceptedRun, finishedAt: "2026-10-05T12:00:03.000Z" },
-      nodes: [nodeDetail({
-        ...acceptedNode, resolvedSettings: validatorSettings,
-        attempts: [acceptedWithValidator],
-      })],
+    const acceptedWithValidator = {
+      ...acceptedAttempt, finishedAt: "2026-10-05T12:00:03.000Z", elapsedMs: 2_000,
+      validatorExecutionId: "execution-validator-a",
+      processes: [acceptedAttempt.processes[0], validatorProcess],
     };
-    expect(runDetailDtoSchema.parse(acceptedWithConfiguredValidator).nodes[0]?.attempts[0]?.processes).toHaveLength(2);
-    const validatorFailure = failureInfo({
-      kind: "validator_rejection", message: "The command validator rejected the accepted worker result.",
-      failedAt: "2026-10-05T12:00:03.000Z",
-    });
-    const failedAfterWorkerAcceptance = {
-      ...acceptedWithValidator, status: "failed", failure: validatorFailure,
-      processes: [acceptedAttempt.processes[0], { ...validatorProcess, exit: { kind: "code", code: 1 } }],
-    };
-    expect(runDetailDtoSchema.parse({
-      version: 2,
-      summary: runSummary({
-        status: "failed", desiredState: "stopped", finishedAt: "2026-10-05T12:00:03.000Z",
-        currentNodeId: "node-a", currentAttemptNumber: 1, failure: validatorFailure,
-      }),
-      preflight: null, resolutions: [],
-      nodes: [nodeDetail({
-        status: "failed", resolvedSettings: validatorSettings, attempts: [failedAfterWorkerAcceptance],
-      })],
-    }).summary.failure?.kind).toBe("validator_rejection");
-    expect(() => runDetailDtoSchema.parse({
-      ...acceptedWithConfiguredValidator,
-      nodes: [nodeDetail({
-        ...acceptedNode, resolvedSettings: validatorSettings, attempts: [acceptedAttempt],
-      })],
-    })).toThrow(/configured validation requires validator execution evidence/);
+    expect(nodeDetailDtoSchema.parse(nodeDetail({
+      ...acceptedNode, resolvedSettings: validatorSettings, attempts: [acceptedWithValidator],
+    })).attempts[0]?.processes).toHaveLength(2);
+    expect(() => nodeDetailDtoSchema.parse(nodeDetail({
+      ...acceptedNode, resolvedSettings: validatorSettings, attempts: [acceptedAttempt],
+    }))).toThrow(/configured validation requires validator execution evidence/);
     const commandValidatorBlock = blockInfo({
-      blockId: "block-command-validator-acceptance", kind: "external_outcome_unknown",
-      blockedAt: FINISHED_AT,
+      blockId: "block-command-validator-acceptance", kind: "external_outcome_unknown", blockedAt: FINISHED_AT,
     });
     const commandValidatorAcceptance = {
       ...acceptance, resolutionId: "resolution-command-validator-acceptance", target: "validator",
       sourceBlock: commandValidatorBlock,
     };
     const acceptedValidatorProcess = {
-      ...validatorProcess,
-      status: "blocked",
-      exit: null,
-      launchIntentAt: "2026-10-05T12:00:01.500Z",
-      startedAt: "2026-10-05T12:00:01.500Z",
-      finishedAt: null,
-      cleanupState: "confirmed_dead",
+      ...validatorProcess, status: "blocked", exit: null,
+      launchIntentAt: "2026-10-05T12:00:01.500Z", startedAt: "2026-10-05T12:00:01.500Z",
+      finishedAt: null, cleanupState: "confirmed_dead",
     };
     const committedWorkerProcess = {
-      ...acceptedAttempt.processes[0],
-      status: "exited",
-      exit: { kind: "code", code: 0 },
+      ...acceptedAttempt.processes[0], status: "exited", exit: { kind: "code", code: 0 },
       finishedAt: "2026-10-05T12:00:01.300Z",
     };
     const acceptedCommandValidatorAttempt = {
@@ -1133,166 +890,12 @@ describe("public JSON projections", () => {
       processes: [committedWorkerProcess, acceptedValidatorProcess],
     };
     expect(nodeDetailDtoSchema.parse(nodeDetail({
-      ...acceptedNode,
-      resolvedSettings: validatorSettings,
-      attempts: [acceptedCommandValidatorAttempt],
+      ...acceptedNode, resolvedSettings: validatorSettings, attempts: [acceptedCommandValidatorAttempt],
     })).attempts[0]?.operatorAcceptances[0]?.target).toBe("validator");
   });
 
-  test("requires safe resolution before attempt successors and preserves failure linkage", () => {
-    const sourceBlock = blockInfo({ blockId: "block-retry" });
-    const interrupted = succeededAttempt({
-      status: "interrupted", candidate: null, blocks: [sourceBlock],
-      processes: [processIncarnation({ status: "blocked", exit: null, cleanupState: "unconfirmed" })],
-    });
-    const preparedProcess = processIncarnation({
-      executionId: "execution-worker-b", incarnationId: "incarnation-worker-b-1", status: "prepared",
-      launchIntentAt: null, startedAt: null, finishedAt: null, deadlineAt: null, identity: null,
-      exit: null, cleanupState: "not_started", captures: [],
-    });
-    const preparedAttempt = succeededAttempt({
-      attemptId: "attempt-b", number: 2, status: "prepared", phase: "prepare",
-      startedAt: null, finishedAt: null, elapsedMs: null, workerExecutionId: "execution-worker-b",
-      candidate: null, blocks: [], processes: [preparedProcess],
-    });
-    const retryNode = nodeDetail({ status: "running", attempts: [interrupted, preparedAttempt] });
-    const running = runSummary({ currentAttemptNumber: 2 });
-    const withoutResolution = { version: 2, summary: running, preflight: null, resolutions: [], nodes: [retryNode] };
-    expect(() => runDetailDtoSchema.parse(withoutResolution)).toThrow(/successor waits|interrupted attempt resumes/);
 
-    const reconciledAttempt = {
-      ...interrupted,
-      processes: [processIncarnation({ status: "blocked", exit: null, cleanupState: "confirmed_dead" })],
-    };
-    const retryResolution = {
-      action: "retry", resolutionId: "resolution-retry", provenance: "operator",
-      reason: "Retry after confirming the process group is dead.", resolvedAt: FINISHED_AT,
-      processGroupsConfirmedDead: true, sourceBlock, allowRepeat: true, extraAttempt: false,
-    };
-    const retriedNode = nodeDetail({ status: "running", attempts: [reconciledAttempt, preparedAttempt] });
-    expect(runDetailDtoSchema.parse({
-      version: 2, summary: running, preflight: null, resolutions: [retryResolution], nodes: [retriedNode],
-    }).resolutions).toHaveLength(1);
-    const cancelledPreparedAttempt = {
-      ...preparedAttempt, status: "cancelled", phase: null, finishedAt: "2026-10-05T12:00:02.001Z",
-    };
-    const stoppedAfterRetry = runDetailDtoSchema.parse({
-      version: 2,
-      summary: runSummary({
-        status: "cancelled", desiredState: "stopped", finishedAt: "2026-10-05T12:00:02.001Z",
-        currentNodeId: "node-a", currentAttemptNumber: 2,
-      }),
-      preflight: null, resolutions: [retryResolution],
-      nodes: [nodeDetail({
-        status: "cancelled", attempts: [reconciledAttempt, cancelledPreparedAttempt],
-      })],
-    });
-    expect(stoppedAfterRetry.nodes[0]?.attempts[1]?.startedAt).toBeNull();
-    const successfulRetryBlock = blockInfo({
-      blockId: "block-retry-after-success", kind: "retry_exhausted",
-    });
-    const successfulAttemptWithBlock = succeededAttempt({ blocks: [successfulRetryBlock] });
-    const invalidRetryOfSuccess = {
-      ...retryResolution, resolutionId: "resolution-retry-after-success",
-      resolvedAt: "2026-10-05T12:00:02.001Z", sourceBlock: successfulRetryBlock,
-    };
-    expect(() => runDetailDtoSchema.parse({
-      version: 2,
-      summary: runSummary({
-        status: "completed", finishedAt: "2026-10-05T12:00:02.001Z", terminalOutput: "completed output",
-      }),
-      preflight: null, resolutions: [invalidRetryOfSuccess],
-      nodes: [nodeDetail({
-        status: "succeeded", successfulOutput: "completed output", attempts: [successfulAttemptWithBlock],
-      })],
-    })).toThrow(/attempt-scoped retry requires a failed or interrupted source attempt/);
-    expect(() => runDetailDtoSchema.parse({
-      version: 2, summary: runSummary({ status: "blocked", block: sourceBlock }), preflight: null,
-      resolutions: [retryResolution], nodes: [nodeDetail({ status: "blocked", block: sourceBlock, attempts: [reconciledAttempt] })],
-    })).toThrow(/resolved blocks are no longer current/);
-
-    const safeFailure = failureInfo({ kind: "process_error", message: "safe worker exited unsuccessfully" });
-    const safeFailedAttempt = succeededAttempt({
-      status: "failed", candidate: null, failure: safeFailure,
-      judgments: [evidence("judgment", "judgment-retry", null, "retry")],
-      processes: [processIncarnation({ replay: "safe", exit: { kind: "code", code: 1 } })],
-    });
-    const safeSettings = {
-      ...commandSettings(), run: { ...commandSettings().run, replay: "safe" },
-    };
-    const safePreparedAttempt = {
-      ...preparedAttempt, processes: [{ ...preparedProcess, replay: "safe" }],
-    };
-    const safeRetryNode = nodeDetail({
-      status: "running", resolvedSettings: safeSettings, attempts: [safeFailedAttempt, safePreparedAttempt],
-    });
-    const parsedSafeRetry = runDetailDtoSchema.parse({
-      version: 2, summary: running, preflight: null, resolutions: [], nodes: [safeRetryNode],
-    });
-    const retryEvidence = parsedSafeRetry.nodes[0]?.attempts[0]?.judgments[0];
-    expect(retryEvidence?.kind).toBe("judgment");
-    if (retryEvidence?.kind === "judgment") expect(retryEvidence.decision.action).toBe("retry");
-    const unsafeRetryNode = nodeDetail({
-      status: "running", resolvedSettings: commandSettings(),
-      attempts: [
-        { ...safeFailedAttempt, judgments: [evidence("judgment", "judgment-unsafe-retry", null, "retry")],
-          processes: [processIncarnation({ replay: "never", exit: { kind: "code", code: 1 } })] },
-        preparedAttempt,
-      ],
-    });
-    expect(() => runDetailDtoSchema.parse({
-      version: 2, summary: running, preflight: null, resolutions: [], nodes: [unsafeRetryNode],
-    })).toThrow(/safe replay for every previously launched role/);
-    const exhaustedRetryNode = nodeDetail({
-      status: "running", resolvedSettings: { ...safeSettings, maxAttempts: 1 },
-      attempts: [safeFailedAttempt, safePreparedAttempt],
-    });
-    expect(() => runDetailDtoSchema.parse({
-      version: 2, summary: running, preflight: null, resolutions: [], nodes: [exhaustedRetryNode],
-    })).toThrow(/maxAttempts|remaining semantic attempts/);
-
-    const processFailure = failureInfo({ kind: "process_error", message: "worker exited unsuccessfully" });
-    const failedAttempt = succeededAttempt({
-      status: "failed", candidate: null, failure: processFailure, workerExecutionId: null, processes: [],
-    });
-    const failedNode = nodeDetail({ status: "failed", attempts: [failedAttempt] });
-    const failedSummary = runSummary({
-      status: "failed", desiredState: "stopped", finishedAt: FINISHED_AT,
-      currentNodeId: "node-a", currentAttemptNumber: 1, failure: processFailure,
-    });
-    expect(runDetailDtoSchema.parse({
-      version: 2, summary: failedSummary, preflight: null, resolutions: [], nodes: [failedNode],
-    }).summary.failure?.kind).toBe("process_error");
-    expect(() => runDetailDtoSchema.parse({
-      version: 2, summary: { ...failedSummary, failure: { ...processFailure, message: "different failure" } },
-      preflight: null, resolutions: [], nodes: [failedNode],
-    })).toThrow(/latest attempt/);
-    const pendingFailure = runSummary({
-      status: "failed", desiredState: "stopped", finishedAt: FINISHED_AT, currentAttemptNumber: null,
-      failure: failureInfo({ kind: "runtime_fault", nodeId: "node-a", attemptId: null }),
-    });
-    expect(() => runDetailDtoSchema.parse({
-      version: 2, summary: pendingFailure, preflight: null, resolutions: [], nodes: [nodeDetail()],
-    })).toThrow(/failed node|latest attempt|exactly one failed node/);
-  });
-
-  test("rejects active terminal attempts and validator launch before candidate commit", () => {
-    const preparedProcess = processIncarnation({
-      status: "prepared", launchIntentAt: null, startedAt: null, finishedAt: null, deadlineAt: null,
-      identity: null, exit: null, cleanupState: "not_started", captures: [],
-    });
-    const activeAttempt = succeededAttempt({
-      status: "executing", phase: "awaitWorker", finishedAt: null, elapsedMs: null,
-      candidate: null, processes: [preparedProcess],
-    });
-    const cancelled = runSummary({
-      status: "cancelled", desiredState: "stopped", finishedAt: FINISHED_AT, currentAttemptNumber: null,
-    });
-    expect(() => runDetailDtoSchema.parse({
-      version: 2, summary: cancelled, preflight: null, resolutions: [],
-      nodes: [nodeDetail({ status: "cancelled", attempts: [activeAttempt] })],
-    })).toThrow(/terminal semantic attempts|cancelled nodes end/);
-
+  test("requires committed candidate before validator launch", () => {
     const candidate = evidence("candidate", "evidence-before-validator");
     const validatorProcess = processIncarnation({
       executionId: "execution-validator-a", incarnationId: "incarnation-validator-a-1", role: "validator",
@@ -1303,49 +906,24 @@ describe("public JSON projections", () => {
       status: "validating", phase: "awaitValidator", finishedAt: null, elapsedMs: null,
       candidate, validatorExecutionId: "execution-validator-a", processes: [processIncarnation(), validatorProcess],
     });
-    expect(() => attemptDetailDtoSchema.parse(validatingAttempt)).toThrow(/validator launch follows worker completion/);
-    expect(() => attemptDetailDtoSchema.parse({
-      ...validatingAttempt, candidate: null,
-    })).toThrow(/validator execution requires a committed candidate/);
+    expect(() => attemptDetailDtoSchema.parse(validatingAttempt))
+      .toThrow(/validator launch follows worker completion/);
+    expect(() => attemptDetailDtoSchema.parse({ ...validatingAttempt, candidate: null }))
+      .toThrow(/validator execution requires a committed candidate/);
   });
 
-  test("allows operator fail after a failed attempt or a pre-attempt block", () => {
+  test("validates node descriptions against runtime failure scope", () => {
     const attemptFailure = failureInfo({ kind: "process_error", message: "the semantic attempt failed" });
     const failedAttempt = succeededAttempt({
       status: "failed", candidate: null, failure: attemptFailure, blocks: [],
       processes: [processIncarnation({ exit: { kind: "code", code: 1 } })],
     });
     const failedNode = nodeDetail({ status: "failed", attempts: [failedAttempt] });
-    const cancelledAttempt = { ...failedAttempt, blocks: [] };
-    const cancelledNode = nodeDetail({ status: "failed", attempts: [cancelledAttempt] });
-    const cancelledSummary = runSummary({
-      status: "cancelled", desiredState: "stopped", finishedAt: FINISHED_AT,
-      currentNodeId: "node-a", currentAttemptNumber: 1,
-    });
-    const cancelledDetail = {
-      version: 2, summary: cancelledSummary, preflight: null, resolutions: [], nodes: [cancelledNode],
-    };
-    expect(runDetailDtoSchema.parse(cancelledDetail).nodes[0]?.status).toBe("failed");
     expect(nodeDescriptionDtoSchema.parse({
       version: 2, workflowId: "clock", definitionHash: HASH_A, runId: "run-a",
-      runStatus: "cancelled", runFailure: null, node: cancelledNode,
+      runStatus: "cancelled", runFailure: null, node: failedNode,
     }).node.status).toBe("failed");
-    const unresolvedPostFinishBlock = blockInfo({
-      blockId: "block-stop-while-blocked", kind: "retry_exhausted", blockedAt: FINISHED_AT,
-    });
-    expect(() => runDetailDtoSchema.parse({
-      version: 2, summary: cancelledSummary, preflight: null, resolutions: [],
-      nodes: [nodeDetail({ status: "failed", attempts: [{ ...failedAttempt, blocks: [unresolvedPostFinishBlock] }] })],
-    })).toThrow(/every block remains current or has an audited resolution/);
-    expect(() => runDetailDtoSchema.parse({
-      version: 2,
-      summary: runSummary({
-        status: "failed", desiredState: "stopped", finishedAt: FINISHED_AT,
-        currentNodeId: null, currentAttemptNumber: null,
-        failure: failureInfo({ kind: "runtime_fault", nodeId: null, attemptId: null }),
-      }),
-      preflight: null, resolutions: [], nodes: [nodeDetail({ status: "cancelled" })],
-    })).toThrow(/failed runs have no running, blocked, or cancelled nodes/);
+
     const blockWithoutAttempt = blockInfo({
       blockId: "block-missing-attempt", kind: "retry_exhausted", nodeId: "node-a", attemptId: null,
     });
@@ -1353,14 +931,6 @@ describe("public JSON projections", () => {
       ...failedNode, status: "blocked", block: blockWithoutAttempt,
     });
     expect(blockedAfterAttempt.status).toBe("blocked");
-    const blockedAfterAttemptSummary = runSummary({
-      status: "blocked", block: blockWithoutAttempt, currentNodeId: "node-a", currentAttemptNumber: 1,
-      failure: attemptFailure,
-    });
-    expect(runDetailDtoSchema.parse({
-      version: 2, summary: blockedAfterAttemptSummary, preflight: null, resolutions: [],
-      nodes: [blockedAfterAttempt],
-    }).nodes[0]?.block?.attemptId).toBeNull();
     const nodeRunResolution = {
       action: "fail", resolutionId: "resolution-node-run-fail", provenance: "operator",
       reason: "End the blocked node after reviewing the prior failed attempt.", resolvedAt: FINISHED_AT,
@@ -1371,78 +941,18 @@ describe("public JSON projections", () => {
       reason: nodeRunResolution.reason, failedAt: FINISHED_AT, processGroupsConfirmedDead: true,
       sourceBlock: blockWithoutAttempt,
     };
-    const failedAtNodeBlock = {
-      version: 2,
-      summary: runSummary({
-        status: "failed", desiredState: "stopped", finishedAt: FINISHED_AT,
-        currentNodeId: "node-a", currentAttemptNumber: 1, failure: nodeRunFailure,
-      }),
-      preflight: null, resolutions: [nodeRunResolution], nodes: [failedNode],
-    };
-    expect(runDetailDtoSchema.parse(failedAtNodeBlock).summary.failure?.kind).toBe("operator");
     expect(nodeDescriptionDtoSchema.parse({
       version: 2, workflowId: "clock", definitionHash: HASH_A, runId: "run-a",
       runStatus: "failed", runFailure: nodeRunFailure, node: failedNode,
     }).runFailure?.kind).toBe("operator");
-    const interruptedNodeBlock = blockInfo({
-      blockId: "block-node-interrupted-no-attempt", kind: "process_death_unconfirmed",
-      nodeId: "node-a", attemptId: null,
-    });
-    const interruptedWithoutAttemptLink = succeededAttempt({
-      status: "interrupted", candidate: null, blocks: [interruptedNodeBlock],
-      processes: [processIncarnation({ status: "blocked", exit: null, cleanupState: "confirmed_dead" })],
-    });
-    const failedAfterInterruptedBlock = {
-      action: "fail", resolutionId: "resolution-node-interrupted-fail", provenance: "operator",
-      reason: "End the run after confirming the interrupted process group is dead.",
-      resolvedAt: FINISHED_AT, processGroupsConfirmedDead: true, sourceBlock: interruptedNodeBlock,
-    };
-    const operatorFailureAfterInterruptedBlock = {
-      kind: "operator", resolutionId: failedAfterInterruptedBlock.resolutionId, provenance: "operator",
-      reason: failedAfterInterruptedBlock.reason, failedAt: FINISHED_AT,
-      processGroupsConfirmedDead: true, sourceBlock: interruptedNodeBlock,
-    };
-    const failedInterruptedRun = runDetailDtoSchema.parse({
-      version: 2,
-      summary: runSummary({
-        status: "failed", desiredState: "stopped", finishedAt: FINISHED_AT,
-        currentNodeId: "node-a", currentAttemptNumber: 1, failure: operatorFailureAfterInterruptedBlock,
-      }),
-      preflight: null, resolutions: [failedAfterInterruptedBlock],
-      nodes: [nodeDetail({ status: "failed", attempts: [interruptedWithoutAttemptLink] })],
-    });
-    expect(failedInterruptedRun.summary.failure?.kind).toBe("operator");
-
     const runBlock = blockInfo({
       blockId: "block-run-level", kind: "orchestrator_unavailable", nodeId: null, attemptId: null,
     });
-    const blockedSummary = runSummary({
-      status: "blocked", block: runBlock, currentNodeId: "node-a", currentAttemptNumber: 1,
-      failure: attemptFailure,
-    });
-    expect(runDetailDtoSchema.parse({
-      version: 2, summary: blockedSummary, preflight: null, resolutions: [], nodes: [failedNode],
-    }).summary.block?.kind).toBe("orchestrator_unavailable");
-
-    const runResolution = {
-      action: "fail", resolutionId: "resolution-run-fail", provenance: "operator",
-      reason: "End the blocked run after reviewing its state.", resolvedAt: FINISHED_AT,
+    const runFailure = {
+      kind: "operator", resolutionId: "resolution-run-fail", provenance: "operator",
+      reason: "End the blocked run after reviewing its state.", failedAt: FINISHED_AT,
       processGroupsConfirmedDead: true, sourceBlock: runBlock,
     };
-    const runFailure = {
-      kind: "operator", resolutionId: runResolution.resolutionId, provenance: "operator",
-      reason: runResolution.reason, failedAt: FINISHED_AT, processGroupsConfirmedDead: true,
-      sourceBlock: runBlock,
-    };
-    const operatorTerminatedSummary = runSummary({
-      status: "failed", desiredState: "stopped", finishedAt: FINISHED_AT, currentAttemptNumber: 1,
-      failure: runFailure,
-    });
-    const operatorTerminatedRun = {
-      version: 2, summary: operatorTerminatedSummary, preflight: null,
-      resolutions: [runResolution], nodes: [failedNode],
-    };
-    expect(runDetailDtoSchema.parse(operatorTerminatedRun).summary.failure?.kind).toBe("operator");
     expect(nodeDescriptionDtoSchema.parse({
       version: 2, workflowId: "clock", definitionHash: HASH_A, runId: "run-a",
       runStatus: "failed", runFailure, node: failedNode,
@@ -1460,31 +970,11 @@ describe("public JSON projections", () => {
       blockId: "block-unstarted", kind: "orchestrator_unavailable", nodeId: "node-a", attemptId: null,
     });
     const unstartedNode = nodeDetail({ status: "blocked", block: unstartedBlock });
-    const unstartedSummary = runSummary({
-      status: "blocked", block: unstartedBlock, currentNodeId: "node-a", currentAttemptNumber: null,
-    });
-    expect(runDetailDtoSchema.parse({
-      version: 2, summary: unstartedSummary, preflight: null, resolutions: [], nodes: [unstartedNode],
-    }).summary.block?.kind).toBe("orchestrator_unavailable");
-    const unstartedResolution = {
-      action: "fail", resolutionId: "resolution-unstarted-fail", provenance: "operator",
-      reason: "End the run before starting its first attempt.", resolvedAt: FINISHED_AT,
+    const unstartedFailure = {
+      kind: "operator", resolutionId: "resolution-unstarted-fail", provenance: "operator",
+      reason: "End the run before starting its first attempt.", failedAt: FINISHED_AT,
       processGroupsConfirmedDead: true, sourceBlock: unstartedBlock,
     };
-    const unstartedFailure = {
-      kind: "operator", resolutionId: unstartedResolution.resolutionId, provenance: "operator",
-      reason: unstartedResolution.reason, failedAt: FINISHED_AT, processGroupsConfirmedDead: true,
-      sourceBlock: unstartedBlock,
-    };
-    expect(runDetailDtoSchema.parse({
-      version: 2,
-      summary: runSummary({
-        status: "failed", desiredState: "stopped", finishedAt: FINISHED_AT,
-        currentNodeId: null, currentAttemptNumber: null, failure: unstartedFailure,
-      }),
-      preflight: null, resolutions: [unstartedResolution], nodes: [nodeDetail()],
-    }).summary.failure?.kind).toBe("operator");
-
     const unstartedDescription = {
       version: 2, workflowId: "clock", definitionHash: HASH_A, runId: "run-a",
       runStatus: "failed", runFailure: unstartedFailure, node: nodeDetail(),
@@ -1525,361 +1015,6 @@ describe("public JSON projections", () => {
       ...unstartedDescription,
       runFailure: failureInfo({ kind: "runtime_fault", nodeId: "node-a", attemptId: null }),
     })).toThrow(/node-scoped run failures identify their failed latest attempt/);
-
-
-    expect(() => runDetailDtoSchema.parse({
-      version: 2,
-      summary: runSummary({
-        status: "blocked", block: runBlock, currentNodeId: "node-a", currentAttemptNumber: null,
-      }),
-      preflight: null, resolutions: [], nodes: [unstartedNode],
-    })).toThrow(/summary and blocked node identify the same current block/);
-
-
-    const unconfirmedPreflightProcess = processIncarnation({
-      executionId: "execution-preflight-pending", incarnationId: "incarnation-preflight-pending",
-      role: "preflight", replay: "safe", status: "blocked",
-      startedAt: null, finishedAt: null, identity: null, exit: null, cleanupState: "unconfirmed", captures: [],
-    });
-    const pendingPreflight = {
-      cacheKeyHash: HASH_A, outcome: "pending", reusedFrom: null,
-      checks: [{
-        checkId: "preflight-pending", outcome: "pending", startedAt: null, finishedAt: null,
-        failure: null, block: null, processes: [unconfirmedPreflightProcess],
-      }],
-    };
-    const blockedRunForCleanup = runSummary({
-      status: "blocked", block: runBlock, currentNodeId: null, currentAttemptNumber: null,
-    });
-    expect(runDetailDtoSchema.parse({
-      version: 2, summary: blockedRunForCleanup, preflight: pendingPreflight, resolutions: [], nodes: [nodeDetail()],
-    }).summary.status).toBe("blocked");
-    const cleanupResolution = {
-      action: "fail", resolutionId: "resolution-cleanup-blocked", provenance: "operator",
-      reason: "Cannot end the run until its process group is reconciled.", resolvedAt: FINISHED_AT,
-      processGroupsConfirmedDead: true, sourceBlock: runBlock,
-    };
-    const cleanupFailure = {
-      kind: "operator", resolutionId: cleanupResolution.resolutionId, provenance: "operator",
-      reason: cleanupResolution.reason, failedAt: FINISHED_AT, processGroupsConfirmedDead: true,
-      sourceBlock: runBlock,
-    };
-    expect(() => runDetailDtoSchema.parse({
-      version: 2,
-      summary: runSummary({
-        status: "failed", desiredState: "stopped", finishedAt: FINISHED_AT,
-        currentNodeId: null, currentAttemptNumber: null, failure: cleanupFailure,
-      }),
-      preflight: pendingPreflight, resolutions: [cleanupResolution], nodes: [nodeDetail()],
-    })).toThrow(/every source process group to be reconciled/);
   });
 
-  test("allows attemptless retries to launch new work after resolution", () => {
-    const resolutionAt = "2026-10-05T12:00:03.000Z";
-    const firstWorkAt = "2026-10-05T12:00:04.000Z";
-    const sourceBlock = blockInfo({
-      blockId: "block-node-before-attempt", kind: "orchestrator_unavailable",
-      blockedAt: FINISHED_AT, nodeId: "node-a", attemptId: null,
-    });
-    const nodeRetry = {
-      action: "retry", resolutionId: "resolution-node-retry", provenance: "operator",
-      reason: "Retry the unstarted node after the service recovers.", resolvedAt: resolutionAt,
-      processGroupsConfirmedDead: true, sourceBlock, allowRepeat: false, extraAttempt: false,
-    };
-    const activeWorker = processIncarnation({
-      executionId: "execution-node-retry", incarnationId: "incarnation-node-retry-1",
-      status: "running", launchIntentAt: firstWorkAt, startedAt: firstWorkAt, finishedAt: null,
-      identity: { pid: 401, pgid: 401, startIdentity: "pid-start-node-retry", serviceBootId: "boot-a" },
-      exit: null, cleanupState: "pending", captures: [],
-    });
-    const activeAttempt = succeededAttempt({
-      status: "executing", phase: "awaitWorker", startedAt: firstWorkAt, finishedAt: null, elapsedMs: null,
-      workerExecutionId: "execution-node-retry", candidate: null, processes: [activeWorker],
-    });
-    expect(runDetailDtoSchema.parse({
-      version: 2,
-      summary: runSummary({ status: "running", currentNodeId: "node-a", currentAttemptNumber: 1 }),
-      preflight: null, resolutions: [nodeRetry],
-      nodes: [nodeDetail({ status: "running", attempts: [activeAttempt] })],
-    }).nodes[0]?.attempts[0]?.status).toBe("executing");
-    const prematureStartedAt = "2026-10-05T12:00:02.500Z";
-    const prematureFinishedAt = "2026-10-05T12:00:02.800Z";
-    const prematureWorker = {
-      ...activeWorker, launchIntentAt: prematureStartedAt, startedAt: prematureStartedAt,
-      finishedAt: prematureFinishedAt, status: "exited", exit: { kind: "code", code: 0 },
-      cleanupState: "confirmed_dead",
-    };
-    expect(() => runDetailDtoSchema.parse({
-      version: 2,
-      summary: runSummary({ status: "running", currentNodeId: "node-a", currentAttemptNumber: 1 }),
-      preflight: null, resolutions: [nodeRetry],
-      nodes: [nodeDetail({
-        status: "running", attempts: [{ ...activeAttempt, startedAt: prematureStartedAt, processes: [prematureWorker] }],
-      })],
-    })).toThrow(/first semantic attempt starts at or after/);
-
-    const runLevelBlock = blockInfo({
-      blockId: "block-run-level-retry-window", kind: "orchestrator_unavailable",
-      blockedAt: FINISHED_AT, nodeId: null, attemptId: null,
-    });
-    const runLevelResolution = {
-      ...nodeRetry, resolutionId: "resolution-run-level-retry-window",
-      sourceBlock: runLevelBlock,
-    };
-    const runLevelLaunchAt = "2026-10-05T12:00:02.500Z";
-    const runLevelExitAt = "2026-10-05T12:00:02.800Z";
-    const runLevelProcess = processIncarnation({
-      executionId: "execution-run-level-retry-window", incarnationId: "incarnation-run-level-retry-window-1",
-      replay: "safe", launchIntentAt: runLevelLaunchAt, startedAt: runLevelLaunchAt, finishedAt: runLevelExitAt,
-      identity: { pid: 405, pgid: 405, startIdentity: "pid-start-run-level-retry-window", serviceBootId: "boot-a" },
-      exit: { kind: "code", code: 0 }, cleanupState: "confirmed_dead", captures: [],
-    });
-    const attemptInBlockedWindow = succeededAttempt({
-      status: "executing", phase: "awaitWorker", startedAt: runLevelLaunchAt, finishedAt: null, elapsedMs: null,
-      workerExecutionId: "execution-run-level-retry-window", candidate: null, processes: [runLevelProcess],
-    });
-    expect(() => runDetailDtoSchema.parse({
-      version: 2,
-      summary: runSummary({ status: "running", currentNodeId: "node-a", currentAttemptNumber: 1 }),
-      preflight: null, resolutions: [runLevelResolution],
-      nodes: [nodeDetail({
-        status: "running", resolvedSettings: {
-          ...commandSettings(), run: { ...commandSettings().run, replay: "safe" },
-        }, attempts: [attemptInBlockedWindow],
-      })],
-    })).toThrow(/semantic attempts cannot start while a source block is unresolved/);
-    expect(() => runDetailDtoSchema.parse({
-      version: 2,
-      summary: runSummary({
-        status: "blocked", block: runLevelBlock, currentNodeId: "node-a", currentAttemptNumber: 1,
-      }),
-      preflight: null, resolutions: [],
-      nodes: [nodeDetail({
-        status: "running", resolvedSettings: {
-          ...commandSettings(), run: { ...commandSettings().run, replay: "safe" },
-        }, attempts: [attemptInBlockedWindow],
-      })],
-    })).toThrow(/a current block has no later attempt, process, or preflight starts/);
-
-    const preflightBlock = blockInfo({
-      blockId: "block-preflight-retry", kind: "preflight_failed",
-      blockedAt: FINISHED_AT, nodeId: null, attemptId: null,
-    });
-    const preflightFailure = failureInfo({
-      kind: "runtime_fault", message: "environment check failed", failedAt: FINISHED_AT,
-      nodeId: null, attemptId: null,
-    });
-    const failedCheckProcess = processIncarnation({
-      executionId: "execution-preflight-failed", incarnationId: "incarnation-preflight-failed-1",
-      role: "preflight", replay: "safe", captures: [],
-      exit: { kind: "code", code: 1 },
-    });
-    const passedCheckStartedAt = "2026-10-05T12:00:04.000Z";
-    const passedCheckFinishedAt = "2026-10-05T12:00:05.000Z";
-    const passedCheckProcess = processIncarnation({
-      executionId: "execution-preflight-passed", incarnationId: "incarnation-preflight-passed-1",
-      role: "preflight", replay: "safe", captures: [],
-      launchIntentAt: passedCheckStartedAt, startedAt: passedCheckStartedAt, finishedAt: passedCheckFinishedAt,
-      identity: { pid: 402, pgid: 402, startIdentity: "pid-start-preflight-pass", serviceBootId: "boot-a" },
-      exit: { kind: "code", code: 0 },
-    });
-    const preflight = {
-      cacheKeyHash: HASH_A, outcome: "passed", reusedFrom: null,
-      checks: [
-        {
-          checkId: "preflight-first", outcome: "failed", startedAt: STARTED_AT, finishedAt: FINISHED_AT,
-          failure: preflightFailure, block: preflightBlock, processes: [failedCheckProcess],
-        },
-        {
-          checkId: "preflight-retry", outcome: "passed",
-          startedAt: passedCheckStartedAt, finishedAt: passedCheckFinishedAt,
-          failure: null, block: null, processes: [passedCheckProcess],
-        },
-      ],
-    };
-    const preflightRetry = {
-      action: "retry", resolutionId: "resolution-preflight-retry", provenance: "operator",
-      reason: "Retry the environment check after fixing the host.", resolvedAt: resolutionAt,
-      processGroupsConfirmedDead: true, sourceBlock: preflightBlock, allowRepeat: false, extraAttempt: false,
-    };
-    const nodeStartedAt = "2026-10-05T12:00:06.000Z";
-    const nodeFinishedAt = "2026-10-05T12:00:07.000Z";
-    const terminalOutput = "candidate after successful preflight";
-    const workerAfterPreflight = processIncarnation({
-      executionId: "execution-after-preflight", incarnationId: "incarnation-after-preflight-1",
-      launchIntentAt: nodeStartedAt, startedAt: nodeStartedAt, finishedAt: nodeFinishedAt,
-      identity: { pid: 403, pgid: 403, startIdentity: "pid-start-after-preflight", serviceBootId: "boot-a" },
-      captures: [], exit: { kind: "code", code: 0 },
-    });
-    const completedAttempt = succeededAttempt({
-      startedAt: nodeStartedAt, finishedAt: nodeFinishedAt, elapsedMs: 1_000,
-      workerExecutionId: "execution-after-preflight",
-      candidate: {
-        ...evidence("candidate", "candidate-after-preflight"), recordedAt: nodeFinishedAt,
-      },
-      processes: [workerAfterPreflight],
-    });
-    const completed = runDetailDtoSchema.parse({
-      version: 2,
-      summary: runSummary({
-        status: "completed", finishedAt: "2026-10-05T12:00:08.000Z",
-        currentNodeId: "node-a", currentAttemptNumber: 1, terminalOutput,
-      }),
-      preflight, resolutions: [preflightRetry],
-      nodes: [nodeDetail({ status: "succeeded", successfulOutput: terminalOutput, attempts: [completedAttempt] })],
-    });
-    expect(completed.preflight?.outcome).toBe("passed");
-    expect(completed.resolutions[0]?.action).toBe("retry");
-    expect(() => runDetailDtoSchema.parse({
-      ...completed, summary: { ...completed.summary, terminalOutput: "mismatched terminal output" },
-    })).toThrow(/terminal output matches the final node's successful output/);
-    const prematureCheckStartedAt = "2026-10-05T12:00:02.500Z";
-    const prematureCheckFinishedAt = "2026-10-05T12:00:02.800Z";
-    const prematureCheckProcess = {
-      ...passedCheckProcess, launchIntentAt: prematureCheckStartedAt, startedAt: prematureCheckStartedAt,
-      finishedAt: prematureCheckFinishedAt,
-    };
-    const prematurePreflight = {
-      ...preflight, checks: [preflight.checks[0], {
-        ...preflight.checks[1], startedAt: prematureCheckStartedAt, finishedAt: prematureCheckFinishedAt,
-        processes: [prematureCheckProcess],
-      }],
-    };
-    expect(() => runDetailDtoSchema.parse({ ...completed, preflight: prematurePreflight }))
-      .toThrow(/retried preflight checks start at or after resolution/);
-    const earlyNodeStart = "2026-10-05T12:00:04.999Z";
-    const workerBeforePreflight = {
-      ...workerAfterPreflight, launchIntentAt: earlyNodeStart, startedAt: earlyNodeStart,
-    };
-    const attemptBeforePreflight = {
-      ...completedAttempt, startedAt: earlyNodeStart, elapsedMs: 2_001, processes: [workerBeforePreflight],
-    };
-    expect(() => runDetailDtoSchema.parse({
-      ...completed,
-      nodes: [nodeDetail({
-        status: "succeeded", successfulOutput: terminalOutput, attempts: [attemptBeforePreflight],
-      })],
-    })).toThrow(/node attempts start after the final passed preflight check/);
-  });
-
-  test("allows workflow decisions after a failed attempt finishes", () => {
-    const blockAt = "2026-10-05T12:00:03.000Z";
-    const resolvedAt = "2026-10-05T12:00:04.000Z";
-    const failure = failureInfo({ kind: "process_error", message: "worker exited unsuccessfully" });
-    const retryBlock = blockInfo({
-      blockId: "block-retry-exhausted-late", kind: "retry_exhausted", blockedAt: blockAt,
-    });
-    const failedAttempt = succeededAttempt({
-      status: "failed", candidate: null, failure, blocks: [retryBlock],
-      processes: [processIncarnation({ exit: { kind: "code", code: 1 } })],
-    });
-    const boundedSettings = { ...commandSettings(), maxAttempts: 1 };
-    const blockedNode = nodeDetail({
-      status: "blocked", block: retryBlock, resolvedSettings: boundedSettings, attempts: [failedAttempt],
-    });
-    expect(runDetailDtoSchema.parse({
-      version: 2,
-      summary: runSummary({
-        status: "blocked", block: retryBlock, currentNodeId: "node-a", currentAttemptNumber: 1, failure,
-      }),
-      preflight: null, resolutions: [], nodes: [blockedNode],
-    }).nodes[0]?.block?.kind).toBe("retry_exhausted");
-
-    const retryResolution = {
-      action: "retry", resolutionId: "resolution-extra-attempt", provenance: "operator",
-      reason: "Authorize the final semantic attempt after inspecting the failure.", resolvedAt,
-      processGroupsConfirmedDead: true, sourceBlock: retryBlock, allowRepeat: true, extraAttempt: true,
-    };
-    const preparedProcess = processIncarnation({
-      executionId: "execution-worker-b", incarnationId: "incarnation-worker-b-1", status: "prepared",
-      launchIntentAt: null, startedAt: null, finishedAt: null, deadlineAt: null, identity: null,
-      exit: null, cleanupState: "not_started", captures: [],
-    });
-    const preparedAttempt = succeededAttempt({
-      attemptId: "attempt-b", number: 2, status: "prepared", phase: "prepare",
-      startedAt: null, finishedAt: null, elapsedMs: null, workerExecutionId: "execution-worker-b",
-      candidate: null, blocks: [], processes: [preparedProcess],
-    });
-    const retried = runDetailDtoSchema.parse({
-      version: 2,
-      summary: runSummary({ status: "running", currentNodeId: "node-a", currentAttemptNumber: 2 }),
-      preflight: null, resolutions: [retryResolution],
-      nodes: [nodeDetail({ status: "running", resolvedSettings: boundedSettings, attempts: [failedAttempt, preparedAttempt] })],
-    });
-    expect(retried.nodes[0]?.attempts).toHaveLength(2);
-    expect(retried.resolutions[0]).toMatchObject({ extraAttempt: true, allowRepeat: true });
-
-    const retryableSettings = {
-      ...commandSettings(), maxAttempts: 2,
-      run: { ...commandSettings().run, replay: "safe" },
-    };
-    const judgedAttempt = {
-      ...failedAttempt, blocks: [],
-      processes: [processIncarnation({ replay: "safe", exit: { kind: "code", code: 1 } })],
-      judgments: [{ ...evidence("judgment", "judgment-after-block", null, "retry"), recordedAt: blockAt }],
-    };
-    const safePreparedAttempt = {
-      ...preparedAttempt, processes: [{ ...preparedProcess, replay: "safe" }],
-    };
-    expect(runDetailDtoSchema.parse({
-      version: 2,
-      summary: runSummary({ status: "running", currentNodeId: "node-a", currentAttemptNumber: 2 }),
-      preflight: null, resolutions: [],
-      nodes: [nodeDetail({
-        status: "running", resolvedSettings: retryableSettings, attempts: [judgedAttempt, safePreparedAttempt],
-      })],
-    }).nodes[0]?.status).toBe("running");
-    const judgedAttemptWithBlock = { ...judgedAttempt, blocks: [retryBlock] };
-    expect(() => runDetailDtoSchema.parse({
-      version: 2,
-      summary: runSummary({ status: "running", currentNodeId: "node-a", currentAttemptNumber: 2 }),
-      preflight: null, resolutions: [],
-      nodes: [nodeDetail({
-        status: "running", resolvedSettings: retryableSettings, attempts: [judgedAttemptWithBlock, safePreparedAttempt],
-      })],
-    })).toThrow(/every block remains current or has an audited resolution/);
-
-    expect(() => runDetailDtoSchema.parse({
-      version: 2,
-      summary: runSummary({
-        status: "failed", desiredState: "stopped", finishedAt: resolvedAt,
-        currentNodeId: "node-a", currentAttemptNumber: 1, failure,
-      }),
-      preflight: null, resolutions: [],
-      nodes: [nodeDetail({ status: "failed", resolvedSettings: boundedSettings, attempts: [failedAttempt] })],
-    })).toThrow(/every block remains current or has an audited resolution/);
-
-    const earlierBlock = blockInfo({
-      blockId: "block-earlier-than-current", kind: "retry_exhausted",
-      blockedAt: "2026-10-05T12:00:02.500Z",
-    });
-    const twoBlockAttempt = { ...failedAttempt, blocks: [earlierBlock, retryBlock] };
-    const staleSourceRetry = { ...retryResolution, sourceBlock: earlierBlock };
-    expect(() => runDetailDtoSchema.parse({
-      version: 2,
-      summary: runSummary({ status: "running", currentNodeId: "node-a", currentAttemptNumber: 2 }),
-      preflight: null, resolutions: [staleSourceRetry],
-      nodes: [nodeDetail({ status: "running", resolvedSettings: boundedSettings, attempts: [twoBlockAttempt, preparedAttempt] })],
-    })).toThrow(/attempt-scoped resolution identifies the latest block/);
-
-    const failResolution = {
-      action: "fail", resolutionId: "resolution-fail-late-block", provenance: "operator",
-      reason: "End the run after reviewing the failed attempt.", resolvedAt,
-      processGroupsConfirmedDead: true, sourceBlock: retryBlock,
-    };
-    const runFailure = {
-      kind: "operator", resolutionId: failResolution.resolutionId, provenance: "operator",
-      reason: failResolution.reason, failedAt: resolvedAt, processGroupsConfirmedDead: true,
-      sourceBlock: retryBlock,
-    };
-    expect(runDetailDtoSchema.parse({
-      version: 2,
-      summary: runSummary({
-        status: "failed", desiredState: "stopped", finishedAt: resolvedAt,
-        currentNodeId: "node-a", currentAttemptNumber: 1, failure: runFailure,
-      }),
-      preflight: null, resolutions: [failResolution],
-      nodes: [nodeDetail({ status: "failed", resolvedSettings: boundedSettings, attempts: [failedAttempt] })],
-    }).summary.failure?.kind).toBe("operator");
-  });
 });

@@ -122,9 +122,11 @@ export async function admitPreparedRun<
   const checked = prepareRunAdmission({
     sourceText: original.sourceText,
     sourceLabel: original.sourceLabel,
+    workflowId: original.workflowId,
     machineConfig: original.machineConfig,
     projectCwd: original.projectCwd,
     runsDirectory: original.runsDirectory,
+    archiveDirectory: original.archiveDirectory,
     resolvedSettings: original.resolvedSettings,
     runtimeManifest: original.runtimeManifest,
     runId: original.runId,

@@ -319,26 +319,9 @@ export const runOutcomeSchema = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("cancelled") }),
 ]);
 
-export type RunId = z.infer<typeof runIdSchema>;
-export type ActivationId = z.infer<typeof activationIdSchema>;
-export type OccurrenceId = z.infer<typeof occurrenceIdSchema>;
-export type AttemptId = z.infer<typeof attemptIdSchema>;
-export type JudgmentId = z.infer<typeof judgmentIdSchema>;
-export type EvidenceId = z.infer<typeof evidenceIdSchema>;
-export type BlockId = z.infer<typeof blockIdSchema>;
-export type ResolutionId = z.infer<typeof resolutionIdSchema>;
-export type RunStatus = z.infer<typeof runStatusSchema>;
-export type DesiredState = z.infer<typeof desiredStateSchema>;
-export type AttemptStatus = z.infer<typeof attemptStatusSchema>;
-export type AttemptPhase = z.infer<typeof attemptPhaseSchema>;
-export type BlockKind = z.infer<typeof blockKindSchema>;
-export type FailureKind = z.infer<typeof failureKindSchema>;
 export type FailureInfo = z.infer<typeof failureInfoSchema>;
 export type BlockInfo = z.infer<typeof blockInfoSchema>;
 export type JudgmentDecision = z.infer<typeof judgmentDecisionSchema>;
-export type OperatorAcceptance = z.infer<typeof operatorAcceptanceSchema>;
-export type OperatorResolution = z.infer<typeof operatorResolutionSchema>;
-export type RunFailureInfo = z.infer<typeof runFailureInfoSchema>;
 export type NodeResult = z.infer<typeof nodeResultSchema>;
 export type ValidatorOutcome = z.infer<typeof validatorOutcomeSchema>;
 export type NodeAttemptOutcome = z.infer<typeof nodeAttemptOutcomeSchema>;

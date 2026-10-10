@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { Context } from "@earendil-works/chord";
-import { defineTask, type ConversationId, type Task, type TaskRuntime, type Tx } from "@earendil-works/pi-durable";
+import { defineTask, type ConversationId, type Task, type Tx } from "@earendil-works/pi-durable";
 import { z } from "zod";
 import { workflowIdSchema } from "../../definition/schema.js";
 import { installationDocumentV1Schema } from "../../installation/schema.js";
@@ -41,12 +40,9 @@ export const capacityGateOutcomeSchema = z.discriminatedUnion("kind", [
 export type CapacityGateOutcome = z.infer<typeof capacityGateOutcomeSchema>;
 
 export type CapacityGateTaskDefinition = Task<CapacityGateTaskInput, CapacityGateCheckpoint, CapacityGateOutcome, object>;
-type CapacityGateRuntime = TaskRuntime<CapacityGateTaskInput, CapacityGateCheckpoint, CapacityGateOutcome, object>;
 type ReadyRun = Extract<WorkflowRunDocumentV1, { state: "ready" }>;
 
-export function defineCapacityGateTask(
-  refreshViews: (runtime: CapacityGateRuntime, context: Context) => Promise<unknown>,
-): CapacityGateTaskDefinition {
+export function defineCapacityGateTask(): CapacityGateTaskDefinition {
   return defineTask<CapacityGateTaskInput, CapacityGateCheckpoint, CapacityGateOutcome>({
     name: "workshop.capacity-gate",
     version: 1,
@@ -99,7 +95,6 @@ export function defineCapacityGateTask(
           });
           return { status: "terminal", outcome: { status: "completed", result: { kind: "acquired" } } };
         }, context);
-        await refreshViews(runtime, context);
       },
       wait: async (task, runtime, context) => {
         const checkpoint = capacityGateCheckpointSchema.parse(task.state.checkpoint);

@@ -3,10 +3,10 @@
 Workshop runs agent workflows on your machine, once or on a schedule, and
 survives crashes while it does.
 
-A workflow is a YAML file that describes a **chain of steps** (nodes). Each node
-runs either a shell command or a headless AI agent (Pi, Claude Code, OpenCode,
-…). Each node's output feeds the next node, and an optional validator checks
-each result before the chain moves on. Normal progress never needs a model. A
+A workflow is a YAML file that lists a **chain of steps**. Each step runs
+either a shell command or a headless AI agent (Pi, Claude Code, OpenCode, …).
+Each step's output feeds the next step, and an optional check validates each
+result before the chain moves on. Normal progress never needs a model. A
 built-in judge model is asked only when an attempt fails.
 
 ## Quick start
@@ -17,12 +17,12 @@ project you run it from.
 ```bash
 alias workshop="bun $PWD/src/cli/main.ts"   # run from this repo after `bun install`
 
-mkdir -p ~/scratch/hemingway/.workshop/config/workflows && cd ~/scratch/hemingway
-cp $OLDPWD/examples/workshop.yaml .workshop/config/
-cp $OLDPWD/examples/workflows/hemingway-*.yaml .workshop/config/workflows/
+mkdir -p ~/scratch/hemingway/.workshop/workflows && cd ~/scratch/hemingway
+cp $OLDPWD/examples/workshop.yaml .workshop/
+cp $OLDPWD/examples/workflows/hemingway-*.yaml .workshop/workflows/
 ```
 
-Edit `.workshop/config/workshop.yaml` before the first run. Its models are
+Edit `.workshop/workshop.yaml` before the first run. Its models are
 placeholders: set `agent.model` to a model your Pi installation can use, and
 `orchestrator.model` to a priced model from `~/.pi/agent/models.json` (see
 [The failure judge](#the-failure-judge)).
@@ -30,7 +30,7 @@ placeholders: set `agent.model` to a model your Pi installation can use, and
 ### Watch it work
 
 `hemingway-judge` is the most instructive example. Its first attempt at the
-timestamp node is rigged to fail, so you see the judge decide a retry. One run
+timestamp step is rigged to fail, so you see the judge decide a retry. One run
 makes about three agent calls and one judge call.
 
 ```bash
@@ -42,20 +42,19 @@ workshop watch hemingway-judge             # live viewer; q quits
 When the run finishes, inspect what happened:
 
 ```bash
-workshop status                                          # every workflow and its schedule
-workshop diagram hemingway-judge                         # the chain with node status
-workshop node describe hemingway-judge node-timestamp    # attempt 1 rejected, judge said retry
-workshop logs hemingway-judge                            # WORKLOG.md plus every process capture
-ls .workshop/state/runs/*/captures                       # prompts, result.json, stdout, stderr
-cat .workshop/state/quotes-judge/*.md                    # the published sentence
+workshop status                                     # every workflow and its schedule
+workshop diagram hemingway-judge                    # the chain with step status
+workshop step describe hemingway-judge timestamp    # attempt 1 rejected, judge said retry
+workshop logs hemingway-judge                       # worklog plus every kept process capture
+cat .workshop/archive/hemingway-judge/*.md          # the published sentence
 workshop service stop
 ```
 
 To see crash recovery, run `workshop start hemingway-clock --detach`. While
-`node-generate-line` is running, find the service pid with
+`generate-line` is running, find the service pid with
 `workshop service status` and `kill -9` it. The next `workshop status` starts a
 new service, which retires the orphaned process group before doing anything
-else. That node says `replay: safe`, so it then runs again on its own. A node
+else. That step says `replay: safe`, so it then runs again on its own. A step
 without `replay: safe` would block until you decide with `workshop resolve`.
 The example schedules six runs ten minutes apart; `workshop stop
 hemingway-clock` ends the schedule.
@@ -65,17 +64,17 @@ hemingway-clock` ends the schedule.
 You drive Workshop through its CLI. Behind it, one background service per
 project owns all state and runs your schedules. It keeps going after `start`
 returns, until `workshop service stop`. The service records each step before it
-takes the next one, so after a crash or reboot a run resumes where it stopped.
+takes the next action, so after a crash or reboot a run resumes where it stopped.
 
-A run walks the chain one node at a time:
+A run walks the chain one step at a time:
 
 ```mermaid
 flowchart TD
   S[start or schedule] --> PF[preflight, optional]
-  PF --> W[node worker]
+  PF --> W[step worker]
   W --> R{result accepted?}
-  R -->|yes| V{validator passes?}
-  V -->|yes| N[next node, or done]
+  R -->|yes| V{check passes?}
+  V -->|yes| N[next step, or done]
   R -->|no| J[failure judge]
   V -->|no| J
   J -->|retry| W
@@ -83,31 +82,32 @@ flowchart TD
   J -->|fail| F[run fails]
 ```
 
-Every process leaves its prompt, result, stdout, and stderr in the run
-directory, and `WORKLOG.md` tells the story of the run. When
+Each process gets a folder with its inputs, prompt, result, and any stdout or
+stderr. A completed run deletes its folder; failed, blocked, and stopped runs
+keep theirs. `workshop logs` renders the run's story from the database. When
 `max_concurrent_runs` runs are already going, a new run waits for a slot.
 
 ### Things that are easy to get wrong
 
 - **There are two kinds of model call.**
-  - Workers and validators run your harness command (`pi --print …`) as
-    ordinary subprocesses, so any headless agent can replace `pi`.
+  - Workers and agent checks run a harness command (`pi --print …` by
+    default) as ordinary subprocesses, so any headless agent can replace `pi`.
   - Only the failure judge is a direct model call. Its model comes from
     `~/.pi/agent/models.json` through Tally, and it can only record one
     decision.
 - **The definition freezes when the run is admitted.** Editing the YAML
   mid-run changes nothing; the next run picks it up.
-- **Replay is opt-in per node.** After a crash, a node marked `replay: safe`
+- **Replay is opt-in per step.** After a crash, a step marked `replay: safe`
   reruns. Anything else blocks, because the service cannot prove the process
   had no side effects yet.
 - **A retry needs more than `max_attempts`.** The judge may choose retry only
-  when the worker, and its validator if there is one, are both `replay: safe`
+  when the step, and its check if there is one, are both `replay: safe`
   and attempts remain. Otherwise it can only block or fail.
 - **The service owns the state.** Every command, `watch` included, asks the
   service instead of reading files. `status --json` is the stable,
   machine-readable view.
-- **Agent stdout is not the output.** An agent node succeeds only by writing
-  checked JSON to `WORKSHOP_RESULT_FILE`. For command nodes, stdout is the
+- **Agent stdout is not the output.** An agent step succeeds only by writing
+  checked JSON to `WORKSHOP_RESULT_FILE`. For command steps, stdout is the
   output.
 - **A blocked run stalls its schedule.** Slots that come due while a run is
   unresolved are skipped. After service downtime, only the latest missed slot
@@ -121,49 +121,47 @@ To see how the code is structured, see
 The bundled example, trimmed
 ([full file](examples/workflows/hemingway-clock.yaml)):
 
-```yaml
-version: 2
-id: hemingway-clock
-schedule: { every: 10m, max_runs: 6 }   # omit for a one-shot workflow
+Save it as `.workshop/workflows/hemingway-clock.yaml`; the file name is the
+workflow id.
 
+```yaml
+schedule: { every: 10m, max_runs: 6 }   # omit for a one-shot workflow
 defaults:
   max_attempts: 2
-  replay: never                         # nodes opt in to automatic repeats
-  agent:
-    harness:
-      command: 'pi --print --approve --no-session --model "$WORKSHOP_MODEL_WITH_THINKING" -- "$(cat "$WORKSHOP_PROMPT_FILE")"'
+  replay: safe                          # steps rerun after a crash; the default is never
 
-nodes:
-  node-timestamp:                       # 1. shell command
-    run: { command: "date -u +%FT%TZ" }
-    replay: safe
-    validator: { command: 'test -s "$WORKSHOP_NODE_OUTPUT_FILE"', replay: safe }
-    next: node-generate-line
-
-  node-generate-line:                   # 2. AI agent, checked by a second agent
-    run:
-      agent:
-        instructions: Generate one original Hemingway-inspired sentence …
-    replay: safe
-    validator:
-      agent:
-        instructions: Pass only if it is one original sentence …
-      replay: safe
-    next: node-publish-quote
-
-  node-publish-quote:                   # 3. shell command, consumes node 2's output
-    run:
-      command: … copy "$WORKSHOP_PREVIOUS_OUTPUT_FILE" to one quote file per run …
-    replay: safe                        # rewriting the same per-run file is idempotent
-    max_attempts: 1
-    next: null
+steps:
+  - timestamp: date -u +%FT%TZ          # 1. shell command
+  - generate-line:                      # 2. AI agent, checked by a second agent
+      agent: Generate one original Hemingway-inspired sentence …
+      check: Pass only if it is one original sentence …
+  - publish-quote:                      # 3. shell command, consumes step 2's output
+      run: cp "$WORKSHOP_PREVIOUS_OUTPUT_FILE" "$WORKSHOP_ARCHIVE/$WORKSHOP_RUN_ID.md"
+      max_attempts: 1
 ```
+
+A step is a command string, `run: <command>`, or `agent: <instructions>` (or
+`agent: { instructions, model, harness }`), plus optional `check`,
+`max_attempts`, `timeout`, `stream_cap`, and `replay`. A string `check` is the
+same kind as its step; write `check: { run: … }` or `check: { agent: … }` to
+mix kinds, with optional `timeout` and `replay`. An agent check uses the
+workflow and machine agent settings, not its step's.
 
 Commands produce their output on stdout. Agents get their prompt in
 `WORKSHOP_PROMPT_FILE` and must write checked JSON to `WORKSHOP_RESULT_FILE`;
-their stdout is diagnostic only. The next node reads the output from
-`WORKSHOP_PREVIOUS_OUTPUT_FILE`. An optional `environment.preflight` command
-runs before the first node.
+their stdout is diagnostic only. Every process also sees:
+
+| Variable | Holds |
+| --- | --- |
+| `WORKSHOP_RUN_ID`, `WORKSHOP_WORKFLOW_ID` | the run and workflow |
+| `WORKSHOP_STEP_ID`, `WORKSHOP_ATTEMPT` | the step and its attempt number |
+| `WORKSHOP_PREVIOUS_OUTPUT_FILE` | the previous step's output |
+| `WORKSHOP_STEP_OUTPUT_FILE` | the candidate output, for a check |
+| `WORKSHOP_WORKLOG_FILE` | the compact run log at launch |
+| `WORKSHOP_ARCHIVE` | `.workshop/archive/<workflow>/`, kept across runs |
+
+An optional `environment.preflight` command runs before the first step and
+sees the run, workflow, and archive variables.
 
 ## Commands
 
@@ -175,10 +173,10 @@ runs before the first node.
 | `resolve <id> --action retry\|accept\|fail --reason <text>` | decide a blocked run |
 | `status [<id>] [--json]` | workflows, activations, and each unresolved run |
 | `runs <id> [--json] [--all]` | run history, newest first |
-| `logs <id> [--run <id>] [--follow \| --all] [--json]` | worklog and process captures |
+| `logs <id> [--run <id>] [--follow \| --all] [--json \| --verbose]` | worklog and kept process captures; `--verbose` adds hashes and settings |
 | `watch [<id>]` | live TUI: `j`/`k` history, `f` follow, `a` all logs, `q` quit |
 | `diagram <id> [--run <id>] [--mermaid]` | the chain with run status |
-| `node describe <id> <node> [--run <id>] [--json]` | frozen settings and attempt evidence |
+| `step describe <id> <step> [--run <id>] [--json]` | frozen settings and attempt evidence |
 | `service start` | start the detached service; does nothing if it is running |
 | `service serve` | run the service in the foreground |
 | `service status [--json]` | health, PID, and boot ID; exit 3 when not running |
@@ -197,27 +195,32 @@ then waits up to 15 s for it to exit. If it cannot verify the process, it exits
 
 ## Configuration
 
-`.workshop/config/workshop.yaml` holds machine defaults and must declare
-`version: 2` ([example](examples/workshop.yaml)):
+`.workshop/workshop.yaml` holds optional machine defaults
+([example](examples/workshop.yaml)):
 
 ```yaml
-version: 2
 shell: /bin/bash
 max_concurrent_runs: 1
 default_timeout: 10m
 stream_cap: 256kb     # per captured stream: bytes | kb | mb | unlimited
+keep_files: failed    # failed: delete a completed run's folder | always: keep it
 agent:
   model: "example/pi-model:medium"
 orchestrator:
   model: "example/judge-model:low"
 ```
 
-Agent settings resolve field by field: node, then workflow `defaults`, then
-machine. Models take the form `<provider>/<model-id>:<thinking-level>`.
+Agent settings resolve field by field: step, then workflow `defaults`, then
+machine. Models take the form `<provider>/<model-id>:<thinking-level>`; there
+is no default model. The harness defaults to `pi`, the first template below.
+`project_dir` resolves relative to `.workshop/`.
+
+Neither file needs a `version`. If one is present it must be `3`; older
+formats fail with a message naming the change.
 
 ### Headless-agent command templates
 
-Choose one command for each agent site; Workshop uses the same supervised process and strict result-file contract for every harness. The model names below are syntax examples, not available provider claims. Workshop passes the rendered prompt through `WORKSHOP_PROMPT_FILE` and names `WORKSHOP_RESULT_FILE` in that prompt. The harness must write the checked JSON result there; stdout remains diagnostic output.
+Set `harness: pi` (the default) or `harness: { command: … }` for each agent; Workshop uses the same supervised process and strict result-file contract for every harness. The model names below are syntax examples, not available provider claims. Workshop passes the rendered prompt through `WORKSHOP_PROMPT_FILE` and names `WORKSHOP_RESULT_FILE` in that prompt. The harness must write the checked JSON result there; stdout remains diagnostic output.
 
 ```yaml
 pi:
@@ -225,7 +228,7 @@ pi:
   model_env: [WORKSHOP_MODEL_WITH_THINKING]
   prompt_env: WORKSHOP_PROMPT_FILE
   result_env: WORKSHOP_RESULT_FILE
-  command: 'pi --print --approve --no-session --model "$WORKSHOP_MODEL_WITH_THINKING" -- "$(cat "$WORKSHOP_PROMPT_FILE")"'
+  command: 'pi --print --approve --no-session --no-extensions --no-skills --no-context-files --no-mcp --model "$WORKSHOP_MODEL_WITH_THINKING" -- "$(cat "$WORKSHOP_PROMPT_FILE")"'
 opencode:
   model: example/opencode-model:medium
   model_env: [WORKSHOP_MODEL, WORKSHOP_THINKING]
@@ -257,33 +260,38 @@ are rejected.
 
 ### Worker processes
 
-Workers, validators, and preflight run as `<shell> -lc '<command>'` in their
+Workers, checks, and preflight run as `<shell> -lc '<command>'` in their
 own process group. The login flag sources your shell profile, so anything the
 profile prints to stderr shows up in every process's stderr capture.
 
 Raw stdout and stderr keep a UTF-8-safe head and tail window of `stream_cap`
 bytes each; `logs` reports total, retained, and omitted byte counts. A command
-node's output is saved before the cap applies.
+step's output is saved before the cap applies.
 
 ## What lands on disk
 
 ```text
 .workshop/                          machine-local, gitignored
-├─ config/
-│  ├─ workshop.yaml                 machine defaults, `version: 2`
-│  └─ workflows/<id>.yaml           your workflows, `version: 2`
+├─ workshop.yaml                    machine defaults, optional
+├─ workflows/<id>.yaml              your workflows
+├─ archive/<workflow>/              WORKSHOP_ARCHIVE, kept across runs
 └─ state/
    ├─ durable.db                    run database, owned by the service
    ├─ service.json  service.lock  service.sock
-   └─ runs/<workflow>-<uuid>/
-      ├─ definition.yaml            frozen YAML
-      ├─ WORKLOG.md                 rendered run log
-      ├─ input/  output/            each node's previous and extracted output
-      └─ captures/                  prompt, result.json, stdout, stderr per process
+   └─ runs/<workflow>-<uuid>/       deleted on completion unless keep_files: always
+      ├─ preflight/                 preflight.stdout, preflight.stderr
+      └─ <step>.<attempt>/
+         ├─ previous-output.txt     predecessor output, empty for the first step
+         ├─ candidate-output.txt    the worker's candidate, for the check
+         ├─ worklog.md              compact run log at launch
+         └─ <role>.prompt.md  <role>.result.json  <role>.stdout  <role>.stderr
 ```
 
-Workflows may write elsewhere. The Hemingway examples publish to
-`.workshop/state/quotes*/<run-id>.md`.
+`<role>` is `worker` or `validator` (the check). A safe replay adds the incarnation
+number, as in `worker.2.stdout`. Empty stdout and stderr files are removed.
+
+Workflows may write anywhere. The Hemingway examples publish one
+`<run-id>.md` per run to their archive.
 
 ## Status and limitations
 
@@ -293,7 +301,7 @@ no budgets. Starting a workflow authorizes every command and agent in it.
 
 | Stage | Proves | Status |
 | --- | --- | --- |
-| POC-A | runtime: durable chain, worklog, SQLite, validators, recovery | done |
+| POC-A | runtime: durable chain, worklog, SQLite, checks, recovery | done |
 | POC-B | status viewer over the CLI projections | done |
 | Service | background service on Pi Durable with crash recovery | done |
 | POC-C | `$build-workflow` authoring skill | next |

@@ -19,7 +19,6 @@ import {
   workflowRunDocumentV1Schema,
   workshopJudgmentV1Schema,
   type PersistedJudgment,
-  type WorkflowRunDocumentV1,
 } from "../../run/records.js";
 import { WorkshopJudgmentEntry, WorkshopRunDoc } from "./define-workshop-records.js";
 

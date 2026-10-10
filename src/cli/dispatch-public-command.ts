@@ -25,7 +25,7 @@ import { errorText } from "./errors.js";
 const CLI_PATH = fileURLToPath(new URL("./main.ts", import.meta.url));
 const SERVICE_START_TIMEOUT_MS = 10_000;
 
-type PublicCommand = "start" | "pause" | "resume" | "stop" | "resolve" | "status" | "runs" | "logs" | "diagram" | "watch" | "node.describe";
+type PublicCommand = "start" | "pause" | "resume" | "stop" | "resolve" | "status" | "runs" | "logs" | "diagram" | "watch" | "step.describe";
 
 export async function dispatchPublicCommand(command: PublicCommand, args: readonly string[]): Promise<void> {
   try {
@@ -40,7 +40,7 @@ export async function dispatchPublicCommand(command: PublicCommand, args: readon
       case "logs": await logsCommand(args); return;
       case "diagram": await diagramCommand(args); return;
       case "watch": await watchCommand(args); return;
-      case "node.describe": await nodeDescribeCommand(args); return;
+      case "step.describe": await stepDescribeCommand(args); return;
     }
   } catch (error) {
     console.error(`error: ${errorText(error)}`);
@@ -289,13 +289,14 @@ async function runsCommand(args: readonly string[]): Promise<void> {
 
 async function logsCommand(args: readonly string[]): Promise<void> {
   const json = args.includes("--json");
+  const verbose = json || args.includes("--verbose");
   let all = false;
   let follow = false;
   let runId: string | undefined;
   const positional: string[] = [];
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index]!;
-    if (argument === "--json") continue;
+    if (argument === "--json" || argument === "--verbose") continue;
     if (argument === "--all") { all = true; continue; }
     if (argument === "--follow") { follow = true; continue; }
     if (argument === "--run") {
@@ -307,7 +308,7 @@ async function logsCommand(args: readonly string[]): Promise<void> {
     if (argument.startsWith("-")) return usage(`unsupported logs option: ${argument}`);
     positional.push(argument);
   }
-  const usageText = "usage: workshop logs <workflow> [--run <run-id>] [--follow | --all] [--json]";
+  const usageText = "usage: workshop logs <workflow> [--run <run-id>] [--follow | --all] [--json | --verbose]";
   if (positional.length !== 1) return usage(usageText);
   if ((follow && all) || (all && runId !== undefined)) return usage("--all cannot be combined with --follow or --run");
   const workflowId = positional[0]!;
@@ -329,7 +330,7 @@ async function logsCommand(args: readonly string[]): Promise<void> {
       }
       firstRun = false;
       let firstSection = true;
-      const result = await streamServiceLogChunks(socketPath, workflowId, run.runId, async (section, selectedRunId, chunk) => {
+      await streamServiceLogChunks(socketPath, workflowId, run.runId, async (section, selectedRunId, chunk) => {
         if (chunk.offsetBytes === 0) {
           if (json) {
             if (!firstSection) await writeStdout(",");
@@ -337,7 +338,7 @@ async function logsCommand(args: readonly string[]): Promise<void> {
             await writeJsonLogSectionStart(section);
           } else {
             await writeTextLogSectionStart(section);
-            if (section.kind === "capture" && section.content === null) await writeStdout(`[unavailable: ${section.unavailableReason}]\n`);
+            if (section.kind === "capture" && section.content === null) await writeStdout("[unavailable]\n");
           }
           firstSection = false;
         }
@@ -348,8 +349,8 @@ async function logsCommand(args: readonly string[]): Promise<void> {
           await writeStdout(section.content);
           if (chunk.complete) await writeStdout("\n");
         }
-      });
-      if (json) await writeStdout(`],"projection":${JSON.stringify(result.projection)}}`);
+      }, 10_000, verbose);
+      if (json) await writeStdout("]}");
     }
     if (json) await writeStdout("]}\n");
     return;
@@ -358,26 +359,26 @@ async function logsCommand(args: readonly string[]): Promise<void> {
   if (follow) {
     const followedRunId = checkedRunId ?? await readNewestRunId(socketPath, workflowId);
     if (!json) {
-      await followRunWorklog(socketPath, workflowId, followedRunId);
+      await followRunWorklog(socketPath, workflowId, followedRunId, verbose);
       await streamServiceLogChunks(socketPath, workflowId, followedRunId, async (section, _selectedRunId, chunk) => {
         if (section.kind !== "capture") return;
         if (chunk.offsetBytes === 0) {
           await writeTextLogSectionStart(section);
-          if (section.content === null) await writeStdout(`[unavailable: ${section.unavailableReason}]\n`);
+          if (section.content === null) await writeStdout("[unavailable]\n");
         }
         if (section.content !== null) {
           await writeStdout(section.content);
           if (chunk.complete) await writeStdout("\n");
         }
-      });
+      }, 10_000, verbose);
       return;
     }
     await waitForTerminalRun(socketPath, workflowId, followedRunId);
-    await writeSingleRunLogs(socketPath, workflowId, followedRunId, true);
+    await writeSingleRunLogs(socketPath, workflowId, followedRunId, true, true);
     return;
   }
 
-  await writeSingleRunLogs(socketPath, workflowId, checkedRunId, json);
+  await writeSingleRunLogs(socketPath, workflowId, checkedRunId, json, verbose);
 }
 
 async function writeSingleRunLogs(
@@ -385,9 +386,10 @@ async function writeSingleRunLogs(
   workflowId: string,
   runId: RunSummaryDto["runId"] | undefined,
   json: boolean,
+  verbose: boolean,
 ): Promise<void> {
   let firstSection = true;
-  const result = await streamServiceLogChunks(socketPath, workflowId, runId, async (section, selectedRunId, chunk) => {
+  await streamServiceLogChunks(socketPath, workflowId, runId, async (section, selectedRunId, chunk) => {
     if (chunk.offsetBytes === 0) {
       if (json) {
         if (firstSection) await writeStdout(`{"version":2,"runId":${JSON.stringify(selectedRunId)},"sections":[`);
@@ -395,7 +397,7 @@ async function writeSingleRunLogs(
         await writeJsonLogSectionStart(section);
       } else {
         await writeTextLogSectionStart(section);
-        if (section.kind === "capture" && section.content === null) await writeStdout(`[unavailable: ${section.unavailableReason}]\n`);
+        if (section.kind === "capture" && section.content === null) await writeStdout("[unavailable]\n");
       }
       firstSection = false;
     }
@@ -406,10 +408,10 @@ async function writeSingleRunLogs(
       await writeStdout(section.content);
       if (chunk.complete) await writeStdout("\n");
     }
-  });
+  }, 10_000, verbose);
   if (json) {
     if (firstSection) throw new Error("service returned no log sections");
-    await writeStdout(`],"projection":${JSON.stringify(result.projection)}}\n`);
+    await writeStdout("]}\n");
   }
 }
 
@@ -435,12 +437,14 @@ async function writeTextLogSectionStart(section: PublicLogSection): Promise<void
   await writeStdout(`\n── ${section.label} ──${captureSummary}\n`);
 }
 
-async function followRunWorklog(socketPath: string, workflowId: string, runId: RunSummaryDto["runId"]): Promise<void> {
-  let previous = await readWorklogSnapshot(socketPath, workflowId, runId);
+async function followRunWorklog(
+  socketPath: string, workflowId: string, runId: RunSummaryDto["runId"], verbose: boolean,
+): Promise<void> {
+  let previous = await readWorklogSnapshot(socketPath, workflowId, runId, verbose);
   await writeStdout(previous);
   for (;;) {
     const summary = await findRunSummary(socketPath, workflowId, runId);
-    const current = await readWorklogSnapshot(socketPath, workflowId, runId);
+    const current = await readWorklogSnapshot(socketPath, workflowId, runId, verbose);
     if (current.startsWith(previous)) await writeStdout(current.slice(previous.length));
     else if (current !== previous) {
       await writeStdout("\n[worklog updated]\n");
@@ -452,8 +456,10 @@ async function followRunWorklog(socketPath: string, workflowId: string, runId: R
   }
 }
 
-async function readWorklogSnapshot(socketPath: string, workflowId: string, runId: RunSummaryDto["runId"]): Promise<string> {
-  return readServiceWorklog(socketPath, workflowId, runId);
+async function readWorklogSnapshot(
+  socketPath: string, workflowId: string, runId: RunSummaryDto["runId"], verbose: boolean,
+): Promise<string> {
+  return readServiceWorklog(socketPath, workflowId, runId, 10_000, verbose);
 }
 
 async function waitForTerminalRun(socketPath: string, workflowId: string, runId: RunSummaryDto["runId"]): Promise<void> {
@@ -595,7 +601,7 @@ async function watchCommand(args: readonly string[]): Promise<void> {
   await openWatch(socketPath, args[0] ?? null);
 }
 
-async function nodeDescribeCommand(args: readonly string[]): Promise<void> {
+async function stepDescribeCommand(args: readonly string[]): Promise<void> {
   let runId: string | undefined;
   const positional: string[] = [];
   let json = false;
@@ -607,10 +613,10 @@ async function nodeDescribeCommand(args: readonly string[]): Promise<void> {
       if (runId === undefined) return usage("--run requires a run ID");
       continue;
     }
-    if (argument.startsWith("-")) return usage(`unsupported node describe option: ${argument}`);
+    if (argument.startsWith("-")) return usage(`unsupported step describe option: ${argument}`);
     positional.push(argument);
   }
-  if (positional.length !== 2) return usage("usage: workshop node describe <workflow> <node> [--run <run-id>] [--json]");
+  if (positional.length !== 2) return usage("usage: workshop step describe <workflow> <step> [--run <run-id>] [--json]");
   const checkedRunId = runId === undefined ? undefined : parseRunIdArgument(runId);
   const installation = loadInstallationForCommand();
   const socketPath = await ensureService(installation);

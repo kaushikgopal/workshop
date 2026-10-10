@@ -157,7 +157,7 @@ describe("recurring Hemingway acceptance", () => {
       const runId = await startSingleRun(fixture.root, "hemingway-invalid");
       const blocked = await waitForRunStatus(fixture.root, "hemingway-invalid", runId, "blocked");
       expect(blocked.block).not.toBeNull();
-      expect(existsSync(fixture.archiveDirectory)).toBe(false);
+      expect(readdirSync(fixture.archiveDirectory)).toEqual([]);
       const activity = readActivity(fixture.activityLog);
       expect(activity.filter((record) => record.role === "generator" && record.event === "start")).toHaveLength(1);
       expect(activity.some((record) => record.role === "validator" || record.role === "publisher")).toBe(false);
@@ -177,22 +177,21 @@ function createFixture(options: {
   readonly malformedGenerator?: boolean;
 }) {
   const root = mkdtempSync(join(tmpdir(), `workshop-${options.id}-`));
-  const configDirectory = join(root, ".workshop", "config");
-  const workflowDirectory = join(configDirectory, "workflows");
-  const stateDirectory = join(root, ".workshop", "state");
-  const archiveDirectory = join(root, ".workshop", "state", "quotes");
+  const workshopDirectory = join(root, ".workshop");
+  const workflowDirectory = join(workshopDirectory, "workflows");
+  const stateDirectory = join(workshopDirectory, "state");
+  const archiveDirectory = join(workshopDirectory, "archive", options.id);
   const activityLog = join(stateDirectory, "mock-activity.jsonl");
   mkdirSync(workflowDirectory, { recursive: true });
   mkdirSync(stateDirectory, { recursive: true });
 
-  const generatorCommand = agentCommand("generator", activityLog, archiveDirectory, {
+  const generatorCommand = agentCommand("generator", activityLog, {
     sleepMs: options.generatorSleepMs ?? 0,
     ...(options.fixedOutput === undefined ? {} : { fixedOutput: options.fixedOutput }),
     ...(options.malformedGenerator === true ? { malformed: true } : {}),
   });
-  const validatorCommand = agentCommand("validator", activityLog, archiveDirectory, { sleepMs: options.validatorSleepMs ?? 0 });
-  writeFileSync(join(configDirectory, "workshop.yaml"), [
-    "version: 2",
+  const validatorCommand = agentCommand("validator", activityLog, { sleepMs: options.validatorSleepMs ?? 0 });
+  writeFileSync(join(workshopDirectory, "workshop.yaml"), [
     `project_dir: ${JSON.stringify(root)}`,
     "shell: /bin/bash",
     "max_concurrent_runs: 1",
@@ -205,33 +204,27 @@ function createFixture(options: {
     "",
   ].join("\n"), "utf8");
 
-  const publication = publicationCommand(activityLog, archiveDirectory);
+  const publication = publicationCommand(activityLog);
   const workflowLines = [
-    "version: 2",
-    `id: ${options.id}`,
     "description: Exercise scheduled Hemingway generation, independent validation, and per-run publication.",
     ...(options.schedule ? ["schedule:", "  every: 50ms", "  max_runs: 6"] : []),
     "defaults:",
     "  max_attempts: 1",
     "  replay: safe",
-    "nodes:",
-    "  generate:",
-    "    run:",
+    "steps:",
+    "  - generate:",
     "      agent:",
     "        instructions: Write one distinct original sentence to the supplied result path.",
-    "    validator:",
-    "      agent:",
-    `        harness:\n          command: ${JSON.stringify(validatorCommand)}`,
-    "        instructions: Compare the candidate with archived quotes and write a checked verdict.",
-    "      replay: safe",
-    "    next: publish",
-    "  publish:",
-    "    run:",
-    "      command: |",
+    "      check:",
+    "        agent:",
+    `          harness:\n            command: ${JSON.stringify(validatorCommand)}`,
+    "          instructions: Compare the candidate with archived quotes and write a checked verdict.",
+    "        replay: safe",
+    "  - publish:",
+    "      run: |",
     ...publication.split("\n").map((line) => `        ${line}`),
-    "    max_attempts: 1",
-    "    replay: safe",
-    "    next: null",
+    "      max_attempts: 1",
+    "      replay: safe",
     "",
   ];
   writeFileSync(join(workflowDirectory, `${options.id}.yaml`), workflowLines.join("\n"), "utf8");
@@ -241,13 +234,12 @@ function createFixture(options: {
 function agentCommand(
   role: "generator" | "validator",
   activityLog: string,
-  archiveDirectory: string,
   options: { readonly sleepMs: number; readonly fixedOutput?: string; readonly malformed?: boolean },
 ): string {
   return [
     `WORKSHOP_MOCK_ROLE=${role}`,
     `WORKSHOP_MOCK_LAUNCH_LOG=${shellDoubleQuote(activityLog)}`,
-    `WORKSHOP_MOCK_ARCHIVE_DIR=${shellDoubleQuote(archiveDirectory)}`,
+    `WORKSHOP_MOCK_ARCHIVE_DIR="$WORKSHOP_ARCHIVE"`,
     `WORKSHOP_MOCK_SLEEP_MS=${options.sleepMs}`,
     ...(options.fixedOutput === undefined ? [] : [`WORKSHOP_MOCK_OUTPUT=${shellDoubleQuote(options.fixedOutput)}`]),
     ...(options.malformed === true ? ["WORKSHOP_MOCK_GENERATOR_RESULT=malformed"] : []),
@@ -255,19 +247,17 @@ function agentCommand(
   ].join(" ");
 }
 
-function publicationCommand(activityLog: string, archiveDirectory: string): string {
+function publicationCommand(activityLog: string): string {
   return [
     `activity_log=${shellDoubleQuote(activityLog)}`,
-    `archive_directory=${shellDoubleQuote(archiveDirectory)}`,
+    `archive_directory="$WORKSHOP_ARCHIVE"`,
     `printf '{"event":"start","role":"publisher","runId":"%s","pid":%s}\\n' "$WORKSHOP_RUN_ID" "$$" >> "$activity_log"`,
     `mkdir -p "$archive_directory"`,
     `target="$archive_directory/$WORKSHOP_RUN_ID.md"`,
     `if [ -f "$target" ]; then`,
     `  cmp -s "$target" "$WORKSHOP_PREVIOUS_OUTPUT_FILE" || exit 1`,
     `else`,
-    `  temporary="$target.tmp.$WORKSHOP_EXECUTION_ID"`,
-    `  cp "$WORKSHOP_PREVIOUS_OUTPUT_FILE" "$temporary"`,
-    `  mv "$temporary" "$target"`,
+    `  cp "$WORKSHOP_PREVIOUS_OUTPUT_FILE" "$target"`,
     `fi`,
     `printf '{"event":"finish","role":"publisher","runId":"%s","pid":%s}\\n' "$WORKSHOP_RUN_ID" "$$" >> "$activity_log"`,
     `printf '%s\\n' "$target"`,

@@ -130,9 +130,6 @@ function captureIdentity(pid: number): { pid: number; pgid: number; startId: str
   throw new Error(`cannot capture process-start identity for pid ${pid}`);
 }
 
-function emptyCaptureStats(): TrackedCaptureStats {
-  return { totalBytes: 0, retainedBytes: 0, truncatedBytes: 0, limitExceeded: false, error: null };
-}
 
 function createSemanticStdoutCapture(limit: number, onTooLarge: () => void) {
   const chunks: Buffer[] = [];

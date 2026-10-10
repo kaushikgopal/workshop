@@ -59,7 +59,6 @@ export const ownerProviderCatalogSchema = z.object({
   baseUrl: z.string().min(1),
   models: z.array(ownerModelDescriptorSchema).nonempty(),
 });
-export type OwnerProviderCatalog = z.infer<typeof ownerProviderCatalogSchema>;
 
 /** Request-time auth fields. This schema deliberately omits the provider model catalog. */
 export const ownerProviderCredentialSchema = z.object({
@@ -69,7 +68,6 @@ export const ownerProviderCredentialSchema = z.object({
   headers: z.record(z.string(), z.string()).optional(),
   authHeader: z.string().nullable().optional(),
 });
-export type OwnerProviderCredential = z.infer<typeof ownerProviderCredentialSchema>;
 
 export const ownerModelsFileSchema = z.object({
   providers: z.record(z.string(), z.unknown()),

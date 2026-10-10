@@ -1,4 +1,4 @@
-import { closeSync, fsyncSync, mkdirSync, openSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, fsyncSync, mkdirSync, openSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 
 /** Write + fsync + rename, so readers never see a partial file. */
@@ -17,16 +17,6 @@ export function atomicWriteFileSync(path: string, content: string): string {
   return content;
 }
 
-/** Remove a derived file and flush its containing directory. */
-export function removeFileSync(path: string): void {
-  try {
-    unlinkSync(path);
-  } catch (error) {
-    if (error !== null && typeof error === "object" && "code" in error && error.code === "ENOENT") return;
-    throw error;
-  }
-  fsyncDirectory(dirname(path));
-}
 
 function fsyncDirectory(dir: string): void {
   try {

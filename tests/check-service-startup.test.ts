@@ -36,9 +36,9 @@ const LongCheckpointTask = defineTask<Record<string, never>, { phase: "hold" }, 
 describe("service startup reconciliation", () => {
   test("publishes readiness without waiting for an unrelated long checkpoint", async () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-startup-checkpoint-"));
-    const config = join(root, ".workshop", "config");
+    const config = join(root, ".workshop");
     mkdirSync(join(config, "workflows"), { recursive: true });
-    writeFileSync(join(config, "workshop.yaml"), "version: 2\nshell: /bin/bash\n", "utf8");
+    writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\n", "utf8");
     const originalOpen = Harness.open;
     let openedHarness: Harness | undefined;
     let owner: Awaited<ReturnType<typeof startWorkshopService>> | undefined;

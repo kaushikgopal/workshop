@@ -5,7 +5,8 @@ import { join } from "node:path";
 import { z } from "zod";
 import { checkDefinitionText } from "../src/definition/check-definition.js";
 import { parseModel } from "../src/definition/parse-model.js";
-import { resolveAgent, unresolvedAgentSites } from "../src/definition/resolve-agent-settings.js";
+import { resolveAgent, PI_HARNESS_COMMAND } from "../src/definition/resolve-agent-settings.js";
+import { resolveWorkflowSettings } from "../src/definition/resolve-workflow-settings.js";
 import {
   machineConfigSchema,
   workflowSchema,
@@ -16,7 +17,6 @@ import { parseByteSize, parseDuration } from "../src/util/parse-units.js";
 
 function baseDefinition(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
-    version: 2,
     id: "clock",
     nodes: {
       "node-a": {
@@ -28,31 +28,45 @@ function baseDefinition(overrides: Record<string, unknown> = {}): Record<string,
   };
 }
 
-function yaml(nodes: string, prefix = ""): string {
-  return `version: 2\nid: clock\n${prefix}nodes:\n${nodes}`;
-}
-
-function definitionText(nodes: string): string {
-  return yaml(nodes).trimEnd();
-}
-
 describe("workflow and machine schemas", () => {
-  test("accepts the strict machine and workflow shapes", () => {
-    expect(workflowSchema.parse(baseDefinition())).toMatchObject({ version: 2, id: "clock" });
+  test("accepts the internal chain shape and optional version 3 machine config", () => {
+    expect(workflowSchema.parse(baseDefinition())).toMatchObject({ id: "clock" });
+    expect(workflowSchema.parse(baseDefinition())).not.toHaveProperty("version");
     expect(machineConfigSchema.parse({
-      version: 2,
+      version: 3,
       shell: "/bin/bash",
       agent: { harness: { command: "mock-agent" }, model: "provider/model:low" },
       orchestrator: { model: "provider/judge:medium", timeout: "5m" },
-    })).toMatchObject({ version: 2, shell: "/bin/bash" });
-    expect(machineConfigSchema.parse({ version: 2 })).toEqual({ version: 2 });
+    })).toMatchObject({ version: 3, shell: "/bin/bash" });
+    expect(machineConfigSchema.parse({})).toEqual({});
+  });
+
+  test("resolves keep_files from workflow defaults, machine defaults, and the failed default", () => {
+    const definition = workflowSchema.parse(baseDefinition());
+    const machine = machineConfigSchema.parse({});
+    const resolve = (workflow: WorkflowDefinition, config: typeof machine) =>
+      resolveWorkflowSettings({ definition: workflow, machine: config, projectCwd: "/tmp" }).keepFiles;
+
+    expect(resolve(definition, machine)).toBe("failed");
+    expect(resolve(definition, machineConfigSchema.parse({ keep_files: "always" }))).toBe("always");
+    expect(resolve(
+      workflowSchema.parse(baseDefinition({ defaults: { keep_files: "always" } })),
+      machine,
+    )).toBe("always");
+    expect(resolve(
+      workflowSchema.parse(baseDefinition({ defaults: { keep_files: "failed" } })),
+      machineConfigSchema.parse({ keep_files: "always" }),
+    )).toBe("failed");
+
+    expect(() => machineConfigSchema.parse({ keep_files: "success" })).toThrow();
+    expect(() => workflowSchema.parse(baseDefinition({ defaults: { keep_files: "success" } }))).toThrow();
   });
 
   test("loads the copyable workflow and fixture machine in a temporary installation", () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-fixture-"));
     try {
-      const configDir = join(root, ".workshop", "config");
-      const workflowsDir = join(configDir, "workflows");
+      const workshopDir = join(root, ".workshop");
+      const workflowsDir = join(workshopDir, "workflows");
       const harnessDir = join(root, "tests", "mock");
       mkdirSync(workflowsDir, { recursive: true });
       mkdirSync(harnessDir, { recursive: true });
@@ -60,13 +74,13 @@ describe("workflow and machine schemas", () => {
       const machineSource = join(import.meta.dir, "fixtures", "machine.yaml");
       const harnessSource = join(import.meta.dir, "mock", "hemingway-node.ts");
       const workflowPath = join(workflowsDir, "hemingway-clock.yaml");
-      const machinePath = join(configDir, "workshop.yaml");
+      const machinePath = join(workshopDir, "workshop.yaml");
       copyFileSync(workflowSource, workflowPath);
       copyFileSync(machineSource, machinePath);
       copyFileSync(harnessSource, join(harnessDir, "hemingway-node.ts"));
 
-      const checked = checkDefinitionText(readFileSync(workflowPath, "utf8"), workflowPath);
-      expect(checked.chain.order).toEqual(["node-timestamp", "node-generate-line", "node-publish-quote"]);
+      const checked = checkDefinitionText(readFileSync(workflowPath, "utf8"), workflowPath, "hemingway-clock");
+      expect(checked.chain.order).toEqual(["timestamp", "generate-line", "publish-quote"]);
       expect(checked.def.id).toBe("hemingway-clock");
       const machine = machineConfigSchema.parse(
         parseStrictYaml(readFileSync(machinePath, "utf8"), machinePath),
@@ -125,20 +139,12 @@ describe("workflow and machine schemas", () => {
         .toMatchObject({ harnessCommand: template.command, model: { full: template.model } });
     }
 
-    const checked = workflowSchema.parse({ version: 2, id: "harness-templates", nodes });
+    const checked = workflowSchema.parse({ id: "harness-templates", nodes });
     expect(Object.keys(checked.nodes)).toEqual(["node-pi", "node-opencode", "node-claude-code"]);
     expect(readme.slice(start)).toContain("Claude Code flags have not been checked against installed binaries");
   });
 
-  test("rejects a workflow version other than 2, or none, with a plain schema error", () => {
-    const nodes = "nodes:\n  node-a:\n    run: { command: echo hi }\n    next: null\n";
-    expect(() => checkDefinitionText(`version: 1\nid: old\n${nodes}`, "old.yaml"))
-      .toThrow("old.yaml: unsupported workflow version 1; expected version: 2");
-    expect(() => checkDefinitionText(`id: old\n${nodes}`, "unversioned.yaml"))
-      .toThrow("unversioned.yaml: workflow does not declare a version; add version: 2");
-  });
-
-  test("rejects unknown keys at every schema depth and prohibits instructions in defaults", () => {
+  test("rejects unknown keys at every internal schema depth and prohibits instructions in defaults", () => {
     const extraTop = baseDefinition({ extra: true });
     const extraNode = baseDefinition({
       nodes: { "node-a": { run: { command: "echo" }, next: null, extra: true } },
@@ -161,25 +167,25 @@ describe("workflow and machine schemas", () => {
       expect(() => workflowSchema.parse(value)).toThrow();
     }
 
-    expect(() => machineConfigSchema.parse({ version: 2, surprise: true })).toThrow();
-    expect(() => machineConfigSchema.parse({ version: 1 })).toThrow();
+    expect(() => workflowSchema.parse(baseDefinition({ version: 3 }))).toThrow();
+    expect(() => machineConfigSchema.parse({ version: 3, surprise: true })).toThrow();
+    expect(() => machineConfigSchema.parse({ version: 2 })).toThrow();
   });
 
-  test("enforces workflow identifiers, description bytes, nonempty chains, and required next", () => {
+  test("enforces internal workflow identifiers, description bytes, nonempty chains, and required next", () => {
     expect(() => workflowSchema.parse(baseDefinition({ id: "Upper" }))).toThrow();
     expect(() => workflowSchema.parse(baseDefinition({ id: `a${"b".repeat(80)}` }))).toThrow(/80 characters/);
     expect(() => workflowSchema.parse(baseDefinition({ description: "é".repeat(2049) }))).toThrow(/4 KiB in UTF-8/);
     expect(workflowSchema.parse(baseDefinition({ description: "é".repeat(2048) })).description).toHaveLength(2048);
-    expect(() => workflowSchema.parse(baseDefinition({ nodes: {} }))).toThrow(/at least one node/);
+    expect(() => workflowSchema.parse(baseDefinition({ nodes: {} }))).toThrow(/at least one step/);
     expect(() => workflowSchema.parse({
-      version: 2,
       id: "clock",
       nodes: { "node-a": { run: { command: "echo" } } },
     })).toThrow();
   });
 
   test("requires an absolute shell path and a nonempty command template", () => {
-    expect(() => machineConfigSchema.parse({ version: 2, shell: "bash" })).toThrow(/absolute executable path/);
+    expect(() => machineConfigSchema.parse({ shell: "bash" })).toThrow(/absolute executable path/);
     expect(() => workflowSchema.parse(baseDefinition({
       nodes: { "node-a": { run: { command: "  " }, next: null } },
     }))).toThrow(/command must be nonempty/);
@@ -219,8 +225,7 @@ describe("workflow and machine schemas", () => {
     expect(() => workflowSchema.parse(baseDefinition({
       schedule: { every: "1s", max_runs: aboveSafeInteger },
     }))).toThrow(/safe integer/);
-    expect(() => machineConfigSchema.parse({ version: 2, max_concurrent_runs: aboveSafeInteger }))
-      .toThrow(/safe integer/);
+    expect(() => machineConfigSchema.parse({ max_concurrent_runs: aboveSafeInteger })).toThrow(/safe integer/);
   });
 
   test("schedule requires a finite positive interval and a positive count or unlimited", () => {
@@ -271,44 +276,116 @@ describe("workflow and machine schemas", () => {
   });
 });
 
-describe("definition text and linear chain", () => {
-  test("derives order and predecessors from edges instead of YAML insertion order", () => {
-    const checked = checkDefinitionText(definitionText(
-      `  node-c:\n    run: { command: echo c }\n    next: null\n  node-a:\n    run: { command: echo a }\n    next: node-b\n  node-b:\n    run: { command: echo b }\n    next: node-c\n`,
-    ), "fixture.yaml");
-    expect(checked.chain.order).toEqual(["node-a", "node-b", "node-c"]);
-    expect(checked.chain.prev.get("node-a")).toBeNull();
-    expect(checked.chain.prev.get("node-c")).toBe("node-b");
+describe("authored workflow text", () => {
+  test("uses the file name as the workflow id", () => {
+    const checked = checkDefinitionText("steps:\n  - greet: echo hello\n", "/project/.workshop/workflows/greeting.yaml", "greeting");
+    expect(checked.def.id).toBe("greeting");
+    expect(checked.chain.order).toEqual(["greet"]);
   });
 
-  test("accepts a non-Hemingway two-node chain", () => {
-    const checked = checkDefinitionText(
-      "version: 2\nid: release\nnodes:\n  prepare-report:\n    run: { command: echo prepare }\n    next: publish-summary\n  publish-summary:\n    run: { command: echo publish }\n    next: null\n",
-      "release.yaml",
-    );
-    expect(checked.chain.order).toEqual(["prepare-report", "publish-summary"]);
-    expect(checked.chain.prev.get("publish-summary")).toBe("prepare-report");
+  test("allows an omitted version and version 3", () => {
+    const text = "steps:\n  - greet: echo hello\n";
+    expect(checkDefinitionText(text, "clock.yaml", "clock").def.id).toBe("clock");
+    expect(checkDefinitionText(`version: 3\n${text}`, "clock.yaml", "clock").def.id).toBe("clock");
   });
 
-  test("rejects missing targets, cycles, multiple starts, detached nodes, and YAML anchors", () => {
+  test("normalizes ordered steps and string checks to same-kind validators", () => {
+    const checked = checkDefinitionText([
+      "steps:",
+      "  - command-shortcut: echo shortcut",
+      "  - command-step:",
+      "      run: echo command",
+      "      check: test -s output.txt",
+      "  - agent-step:",
+      "      agent: Write the result.",
+      "      check: Judge the result.",
+      "",
+    ].join("\n"), "clock.yaml", "clock");
+
+    expect(checked.chain.order).toEqual(["command-shortcut", "command-step", "agent-step"]);
+    expect(checked.chain.prev.get("command-shortcut")).toBeNull();
+    expect(checked.chain.prev.get("agent-step")).toBe("command-step");
+    expect(checked.def.nodes).toMatchObject({
+      "command-shortcut": { run: { command: "echo shortcut" }, next: "command-step" },
+      "command-step": {
+        run: { command: "echo command" },
+        validator: { command: "test -s output.txt" },
+        next: "agent-step",
+      },
+      "agent-step": {
+        run: { agent: { instructions: "Write the result." } },
+        validator: { agent: { instructions: "Judge the result." } },
+        next: null,
+      },
+    });
+  });
+
+  test("normalizes explicit run and agent checks with their limits", () => {
+    const checked = checkDefinitionText([
+      "steps:",
+      "  - command-step:",
+      "      run: echo command",
+      "      check:",
+      "        run: test -s output.txt",
+      "        timeout: 5s",
+      "        replay: safe",
+      "  - agent-step:",
+      "      agent:",
+      "        instructions: Write the result.",
+      "        model: provider/model:low",
+      "        harness: pi",
+      "      check:",
+      "        agent:",
+      "          instructions: Judge the result.",
+      "          model: provider/judge:medium",
+      "        timeout: 10s",
+      "        replay: never",
+      "",
+    ].join("\n"), "clock.yaml", "clock");
+
+    expect(checked.def.nodes).toMatchObject({
+      "command-step": {
+        validator: { command: "test -s output.txt", timeout: "5s", replay: "safe" },
+        next: "agent-step",
+      },
+      "agent-step": {
+        run: { agent: { instructions: "Write the result.", model: "provider/model:low", harness: "pi" } },
+        validator: { agent: { instructions: "Judge the result.", model: "provider/judge:medium" }, timeout: "10s", replay: "never" },
+        next: null,
+      },
+    });
+  });
+
+  test("rejects legacy keys with the replacement named", () => {
     const cases = [
-      ["missing target", `  node-a:\n    run: { command: echo }\n    next: ghost\n`, /no such node/],
-      ["cycle without a start", `  node-a:\n    run: { command: echo }\n    next: node-b\n  node-b:\n    run: { command: echo }\n    next: node-a\n`, /no start node/],
-      ["reachable cycle", `  node-a:\n    run: { command: echo }\n    next: node-b\n  node-b:\n    run: { command: echo }\n    next: node-c\n  node-c:\n    run: { command: echo }\n    next: node-b\n`, /cycle at node/],
-      ["multiple starts", `  node-a:\n    run: { command: echo }\n    next: null\n  node-b:\n    run: { command: echo }\n    next: null\n`, /multiple start nodes/],
-      ["detached nodes", `  node-a:\n    run: { command: echo }\n    next: null\n  node-b:\n    run: { command: echo }\n    next: node-c\n  node-c:\n    run: { command: echo }\n    next: node-b\n`, /unreachable nodes/],
+      ["id", "id: old\nsteps:\n  - one: echo hi\n", /id:.*file name/],
+      ["nodes", "nodes:\n  one:\n    run: { command: echo hi }\n    next: null\n", /nodes:.*steps:/],
+      ["next", "steps:\n  - one:\n      run: echo hi\n      next: two\n", /next:.*steps run in list order/],
+      ["validator", "steps:\n  - one:\n      run: echo hi\n      validator: true\n", /validator:.*check:/],
+      ["run mapping", "steps:\n  - one:\n      run: { command: echo hi }\n", /run: takes a command string/],
+      ["version 2", "version: 2\nsteps:\n  - one: echo hi\n", /version 2.*remove version:.*id:.*steps:/],
     ] as const;
 
-    for (const [, nodes, message] of cases) {
-      expect(() => checkDefinitionText(definitionText(nodes), "bad.yaml")).toThrow(message);
+    for (const [label, text, message] of cases) {
+      expect(() => checkDefinitionText(text, `${label}.yaml`, "clock")).toThrow(message);
     }
+  });
+
+  test("rejects duplicate step ids, YAML anchors, and duplicate YAML keys", () => {
     expect(() => checkDefinitionText(
-      "version: 2\nid: clock\nnodes:\n  node-a: &a { run: { command: echo }, next: null }\n",
+      "steps:\n  - repeat: echo first\n  - repeat: echo second\n",
+      "duplicate-steps.yaml",
+      "clock",
+    )).toThrow(/step id "repeat" appears more than once/);
+    expect(() => checkDefinitionText(
+      "steps:\n  - one: &a { run: echo hi }\n",
       "anchor.yaml",
+      "clock",
     )).toThrow(/anchors are rejected/);
     expect(() => checkDefinitionText(
-      "version: 2\nid: clock\nid: duplicate\nnodes:\n  node-a: { run: { command: echo }, next: null }\n",
-      "duplicate.yaml",
+      "steps:\n  - one: echo hi\nsteps:\n  - two: echo bye\n",
+      "duplicate-key.yaml",
+      "clock",
     )).toThrow(/duplicate|unique/i);
   });
 });
@@ -335,25 +412,18 @@ describe("field-by-field agent resolution", () => {
     expect(harnessOnly.model?.full).toBe("workflow/model:medium");
   });
 
-  test("machine defaults fill only missing fields and unresolved sites are reported", () => {
+  test("machine defaults fill only missing fields", () => {
     const resolved = resolveAgent({ workflowDefault: { model: "workflow/model:low" }, machine });
     expect(resolved.harnessCommand).toBe("machine-harness");
     expect(resolved.model?.full).toBe("workflow/model:low");
+  });
 
-    const unresolved = {
-      version: 2,
-      id: "clock",
-      nodes: {
-        "node-a": {
-          run: { agent: { instructions: "write" } },
-          validator: { agent: { instructions: "judge" } },
-          next: null,
-        },
-      },
-    } satisfies WorkflowDefinition;
-    expect(unresolvedAgentSites(unresolved, undefined)).toEqual([
-      'node "node-a" run',
-      'node "node-a" validator',
-    ]);
+  test("the Pi preset is used for an explicit or unset harness", () => {
+    const explicit = resolveAgent({ site: { harness: "pi", model: "provider/model:low" } });
+    const unset = resolveAgent({ site: { model: "provider/model:low" } });
+    expect(explicit.harnessCommand).toBe(PI_HARNESS_COMMAND);
+    expect(unset.harnessCommand).toBe(PI_HARNESS_COMMAND);
+    expect(explicit.model?.full).toBe("provider/model:low");
+    expect(unset.model?.full).toBe("provider/model:low");
   });
 });

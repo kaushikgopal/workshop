@@ -22,9 +22,11 @@ const admissionRequestSchema = z.strictObject({
     "workflow source must be at most 1 MiB in UTF-8",
   ),
   sourceLabel: z.string().min(1).max(1024),
+  workflowId: z.string().min(1).max(80),
   machineConfig: z.unknown(),
   projectCwd: z.string().min(1).refine((path) => isAbsolute(path) && !path.includes("\u0000")),
   runsDirectory: z.string().min(1).refine((path) => isAbsolute(path) && !path.includes("\u0000")),
+  archiveDirectory: z.string().min(1).refine((path) => isAbsolute(path) && !path.includes("\u0000")),
   resolvedSettings: z.unknown(),
   runtimeManifest: z.unknown(),
   runId: safeRunId,
@@ -57,15 +59,12 @@ export type PreparedRunAdmission = {
   readonly admittedAt: string;
   readonly projectCwd: string;
   readonly runsDirectory: string;
+  readonly archiveDirectory: string;
   readonly runDirectory: string;
   readonly paths: {
     readonly projectCwd: string;
     readonly runDirectory: string;
-    readonly definitionSnapshot: string;
-    readonly worklog: string;
-    readonly inputDirectory: string;
-    readonly outputDirectory: string;
-    readonly captureDirectory: string;
+    readonly archiveDirectory: string;
   };
   readonly preflightCacheKey: string | null;
 };
@@ -105,7 +104,7 @@ export function prepareRunAdmission(input: unknown): AdmissionPreparation {
 
   let checked: ReturnType<typeof checkDefinitionText>;
   try {
-    checked = checkDefinitionText(raw.sourceText, raw.sourceLabel);
+    checked = checkDefinitionText(raw.sourceText, raw.sourceLabel, raw.workflowId);
   } catch (cause) {
     return {
       ok: false,
@@ -165,6 +164,7 @@ export function prepareRunAdmission(input: unknown): AdmissionPreparation {
   const projectCwd = resolve(raw.projectCwd);
   const runsDirectory = resolve(raw.runsDirectory);
   const runDirectory = join(runsDirectory, raw.runId);
+  const archiveDirectory = resolve(raw.archiveDirectory);
   const sourceHash = hashSourceText(raw.sourceText);
   const canonicalDefinitionHash = canonicalHash(checked.def);
   const predecessors = Object.fromEntries(checked.chain.order.map((nodeId) => [
@@ -196,15 +196,12 @@ export function prepareRunAdmission(input: unknown): AdmissionPreparation {
       admittedAt: raw.admittedAt,
       projectCwd,
       runsDirectory,
+      archiveDirectory,
       runDirectory,
       paths: {
         projectCwd,
         runDirectory,
-        definitionSnapshot: join(runDirectory, "definition.yaml"),
-        worklog: join(runDirectory, "WORKLOG.md"),
-        inputDirectory: join(runDirectory, "input"),
-        outputDirectory: join(runDirectory, "output"),
-        captureDirectory: join(runDirectory, "captures"),
+        archiveDirectory: join(archiveDirectory, checked.def.id),
       },
       preflightCacheKey,
     },

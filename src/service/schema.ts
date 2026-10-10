@@ -39,7 +39,6 @@ export const serviceRequestIdV1Schema = z.string().min(1).max(128).refine(
 const requestBase = { version: z.literal(1) } as const;
 const mutationBase = { ...requestBase, requestId: serviceRequestIdV1Schema, workflowId: workflowIdSchema };
 
-export const serviceMutationMethodV1Schema = z.enum(["start", "pause", "resume", "stop", "resolve"]);
 
 export const serviceRequestV1Schema = z.discriminatedUnion("method", [
   z.strictObject({ ...requestBase, method: z.literal("health") }),
@@ -77,6 +76,7 @@ export const serviceRequestV1Schema = z.discriminatedUnion("method", [
     workflowId: workflowIdSchema,
     runId: runIdSchema.optional(),
     cursor: z.string().min(1).max(4_096).optional(),
+    verbose: z.boolean().optional(),
   }),
   z.strictObject({
     ...requestBase,
@@ -125,11 +125,6 @@ export const serviceLogSectionPageV1Schema = z.strictObject({
     totalBytes: z.number().int().nonnegative().safe(),
     complete: z.boolean(),
   }),
-  projection: z.strictObject({
-    truncated: z.boolean(),
-    omittedSections: z.number().int().nonnegative().safe(),
-    omittedBytes: z.number().int().nonnegative().safe(),
-  }),
 }).superRefine((page, context) => {
   const path = ["chunk"] as (string | number)[];
   if (page.sectionIndex >= page.totalSections || page.section.order !== page.sectionIndex) {
@@ -169,7 +164,6 @@ export const serviceStartResultV1Schema = z.strictObject({
   workflowTaskId: z.number().int().positive().safe(),
   duplicate: z.boolean(),
 });
-export type ServiceStartResultV1 = z.infer<typeof serviceStartResultV1Schema>;
 
 export const serviceResolveResultV1Schema = z.strictObject({
   workflowId: workflowIdSchema,

@@ -6,8 +6,6 @@ import { resolveWorkflowSettings } from "../src/definition/resolve-workflow-sett
 import { prepareRunAdmission } from "../src/run/prepare-admission.js";
 
 const sourceText = [
-  "version: 2",
-  "id: release",
   "defaults:",
   "  max_attempts: 3",
   "  timeout: 2m",
@@ -17,28 +15,30 @@ const sourceText = [
   "  preflight:",
   "    command: echo preflight",
   "    timeout: 5s",
-  "nodes:",
-  "  prepare-report:",
-  "    run: { command: echo prepare }",
-  "    validator: { command: test -f output, timeout: 30s, replay: safe }",
-  "    next: null",
+  "steps:",
+  "  - prepare-report:",
+  "      run: echo prepare",
+  "      check: { run: test -f output, timeout: 30s, replay: safe }",
   "",
 ].join("\n");
-const machineConfig = { version: 2, shell: "/bin/bash", default_timeout: "90s", stream_cap: "128kb" } as const;
+const machineConfig = { shell: "/bin/bash", default_timeout: "90s", stream_cap: "128kb" } as const;
 const projectCwd = "/tmp/workshop-project";
+const archiveDirectory = "/tmp/workshop-archive";
 
 function preparedRequest(resolvedSettings = resolveWorkflowSettings({
-  definition: checkDefinitionText(sourceText, "release.yaml").def,
+  definition: checkDefinitionText(sourceText, "release.yaml", "release").def,
   machine: machineConfig,
   projectCwd,
 })) {
   return {
     sourceText,
     sourceLabel: "release.yaml",
+    workflowId: "release",
     machineConfig,
     projectCwd,
     runsDirectory: "/tmp/workshop-state/runs",
     resolvedSettings,
+    archiveDirectory,
     runtimeManifest: {
       durableVersion: "1.0.2",
       integrationManifestHash: `sha256:${"b".repeat(64)}`,
@@ -60,7 +60,7 @@ describe("prepareRunAdmission", () => {
     if (!result.ok) throw new Error(result.failure.message);
 
     const expectedSourceHash = `sha256:${createHash("sha256").update(sourceText, "utf8").digest("hex")}`;
-    const definition = checkDefinitionText(sourceText, "release.yaml").def;
+    const definition = checkDefinitionText(sourceText, "release.yaml", "release").def;
     expect(result.value.sourceHash).toBe(expectedSourceHash);
     expect(result.value.canonicalHash).toBe(canonicalHash(definition));
     expect(result.value.chain).toEqual({
@@ -85,11 +85,7 @@ describe("prepareRunAdmission", () => {
     expect(result.value.paths).toEqual({
       projectCwd,
       runDirectory: "/tmp/workshop-state/runs/release-run-001",
-      definitionSnapshot: "/tmp/workshop-state/runs/release-run-001/definition.yaml",
-      worklog: "/tmp/workshop-state/runs/release-run-001/WORKLOG.md",
-      inputDirectory: "/tmp/workshop-state/runs/release-run-001/input",
-      outputDirectory: "/tmp/workshop-state/runs/release-run-001/output",
-      captureDirectory: "/tmp/workshop-state/runs/release-run-001/captures",
+      archiveDirectory: "/tmp/workshop-archive/release",
     });
   });
 
@@ -100,7 +96,7 @@ describe("prepareRunAdmission", () => {
     if (!base.ok) throw new Error(base.failure.message);
 
     const changedText = sourceText.replace("command: echo preflight", "command: echo preflight && true");
-    const changedDefinition = checkDefinitionText(changedText, "release.yaml").def;
+    const changedDefinition = checkDefinitionText(changedText, "release.yaml", "release").def;
     const changedDefinitionSettings = resolveWorkflowSettings({
       definition: changedDefinition,
       machine: machineConfig,
@@ -117,7 +113,7 @@ describe("prepareRunAdmission", () => {
 
     const anotherCwd = "/tmp/workshop-project-other";
     const cwdSettings = resolveWorkflowSettings({
-      definition: checkDefinitionText(sourceText, "release.yaml").def,
+      definition: checkDefinitionText(sourceText, "release.yaml", "release").def,
       machine: machineConfig,
       projectCwd: anotherCwd,
     });
@@ -127,7 +123,7 @@ describe("prepareRunAdmission", () => {
     expect(cwdResult.value.preflightCacheKey).not.toBe(base.value.preflightCacheKey);
 
     const inheritedTimeoutText = sourceText.replace("    timeout: 5s\n", "");
-    const inheritedDefinition = checkDefinitionText(inheritedTimeoutText, "release.yaml").def;
+    const inheritedDefinition = checkDefinitionText(inheritedTimeoutText, "release.yaml", "release").def;
     const inheritedSettings = resolveWorkflowSettings({ definition: inheritedDefinition, machine: machineConfig, projectCwd });
     const inheritedRequest = { ...request, sourceText: inheritedTimeoutText, resolvedSettings: inheritedSettings };
     const inheritedResult = prepareRunAdmission(inheritedRequest);
@@ -149,7 +145,7 @@ describe("prepareRunAdmission", () => {
 
   test("rejects resolved values that differ from the checked source and machine", () => {
     const resolved = resolveWorkflowSettings({
-      definition: checkDefinitionText(sourceText, "release.yaml").def,
+      definition: checkDefinitionText(sourceText, "release.yaml", "release").def,
       machine: machineConfig,
       projectCwd,
     });

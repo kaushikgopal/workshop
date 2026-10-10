@@ -1,10 +1,7 @@
 import { isAbsolute } from "node:path";
 import { z } from "zod";
 import { nodeIdSchema, workflowIdSchema } from "../definition/schema.js";
-import {
-  resolvedExecutionSiteSchema,
-  resolvedNodeSettingsSchema,
-} from "../definition/schema-resolved.js";
+import { resolvedNodeSettingsSchema } from "../definition/schema-resolved.js";
 import {
   activationIdSchema,
   attemptIdSchema,
@@ -17,7 +14,6 @@ import {
   judgmentDecisionSchema,
   occurrenceIdSchema,
   operatorAcceptanceSchema,
-  operatorResolutionSchema,
   runIdSchema,
   runStatusSchema,
   runFailureInfoSchema,
@@ -36,7 +32,6 @@ import {
 
 const positiveSafeInteger = z.number().int().positive().refine(Number.isSafeInteger);
 const nonnegativeSafeInteger = z.number().int().nonnegative().refine(Number.isSafeInteger);
-const preflightCheckIdSchema = z.string().min(1).brand<"PreflightCheckId">();
 const boundedText = (maxBytes: number) => z.string().refine(
   (value) => new TextEncoder().encode(value).byteLength <= maxBytes,
   `text must be at most ${maxBytes} UTF-8 bytes`,
@@ -56,10 +51,6 @@ function compareCodeUnits(left: string, right: string): number {
 function sameBlock(left: BlockInfoValue, right: BlockInfoValue): boolean {
   return left.blockId === right.blockId && left.kind === right.kind && left.reason === right.reason
     && left.blockedAt === right.blockedAt && left.nodeId === right.nodeId && left.attemptId === right.attemptId;
-}
-
-function processGroupsReconciled(processes: readonly ProcessIncarnationValue[]): boolean {
-  return processes.every((process) => process.status === "prepared" || process.cleanupState === "confirmed_dead");
 }
 
 function sameFailure(
@@ -123,9 +114,9 @@ function checkProcessIncarnations(
 }
 
 
-export const activationStateSchema = z.enum(["active", "paused", "stopped", "exhausted"]);
+const activationStateSchema = z.enum(["active", "paused", "stopped", "exhausted"]);
 
-export const workflowActivationDtoSchema = z.strictObject({
+const workflowActivationDtoSchema = z.strictObject({
   activationId: activationIdSchema,
   state: activationStateSchema,
   admittedCount: nonnegativeSafeInteger,
@@ -136,7 +127,7 @@ export const workflowActivationDtoSchema = z.strictObject({
   lastSkippedSlotAt: utcTimestampSchema.nullable().default(null),
 });
 
-export const serviceMetadataDtoSchema = z.strictObject({
+const serviceMetadataDtoSchema = z.strictObject({
   state: z.enum(["starting", "running", "stopping", "stopped", "unavailable"]),
   pid: positiveSafeInteger.nullable(),
   bootId: z.string().min(1).nullable(),
@@ -211,7 +202,7 @@ export const runSummaryDtoSchema = z.strictObject({
   }
 });
 
-export const workflowStatusDtoSchema = z.strictObject({
+const workflowStatusDtoSchema = z.strictObject({
   workflowId: workflowIdSchema,
   description: boundedText(4 * 1024).nullable(),
   definitionHash: sha256Schema.nullable(),
@@ -274,16 +265,9 @@ export const runsDtoSchema = z.strictObject({
   }
 });
 
-export const resolvedExecutionSiteDtoSchema = resolvedExecutionSiteSchema;
-export const resolvedNodeSettingsDtoSchema = resolvedNodeSettingsSchema;
-
 const attemptProcessSchema = processIncarnationSchema.refine(
   (process) => process.role !== "preflight",
   "preflight processes belong to the run, not a semantic attempt",
-);
-const preflightProcessSchema = processIncarnationSchema.refine(
-  (process) => process.role === "preflight",
-  "run preflight evidence must have the preflight role",
 );
 
 /** `sha256` hashes retained evidence; result `sourceBytesHash` hashes exact checked file bytes. */
@@ -293,7 +277,7 @@ const evidenceReferenceFields = {
   byteCount: byteCountSchema,
   recordedAt: utcTimestampSchema,
 };
-export const evidenceReferenceDtoSchema = z.discriminatedUnion("kind", [
+const evidenceReferenceDtoSchema = z.discriminatedUnion("kind", [
   z.strictObject({
     ...evidenceReferenceFields,
     kind: z.literal("candidate"),
@@ -574,141 +558,7 @@ export const attemptDetailDtoSchema = z.strictObject({
   }
 });
 
-const preflightOutcomeSchema = z.enum(["pending", "passed", "failed"]);
-const preflightCheckDtoSchema = z.strictObject({
-  checkId: preflightCheckIdSchema,
-  outcome: preflightOutcomeSchema,
-  startedAt: utcTimestampSchema.nullable(),
-  finishedAt: utcTimestampSchema.nullable(),
-  failure: failureInfoSchema.nullable(),
-  block: blockInfoSchema.nullable(),
-  processes: z.array(preflightProcessSchema),
-}).superRefine((check, context) => {
-  const report: ReportIssue = (path, message) => context.addIssue({ code: "custom", path, message });
-  checkProcessIncarnations(check.processes, report, ["processes"], "preflight");
-  for (const [index, process] of check.processes.entries()) {
-    if (process.replay !== "safe") report(["processes", index, "replay"], "preflight must be repeat-safe");
-    if (check.startedAt !== null && process.launchIntentAt !== null
-      && timestampMilliseconds(process.launchIntentAt) < timestampMilliseconds(check.startedAt)) {
-      report(["processes", index, "launchIntentAt"], "preflight process cannot launch before its check");
-    }
-    if (check.finishedAt !== null && process.finishedAt !== null
-      && timestampMilliseconds(process.finishedAt) > timestampMilliseconds(check.finishedAt)) {
-      report(["processes", index, "finishedAt"], "preflight process cannot finish after its check");
-    }
-  }
-  if (check.startedAt !== null && check.finishedAt !== null
-    && timestampMilliseconds(check.finishedAt) < timestampMilliseconds(check.startedAt)) {
-    report(["finishedAt"], "preflight check cannot finish before it starts");
-  }
-  if (check.outcome === "pending") {
-    if (check.finishedAt !== null || check.failure !== null || check.block !== null) {
-      report(["outcome"], "pending preflight checks have no result, failure, or block");
-    }
-  } else {
-    if (check.startedAt === null || check.finishedAt === null || check.processes.length === 0) {
-      report(["finishedAt"], "settled preflight checks require timestamps and process evidence");
-    }
-    if (check.processes.some((process) => {
-      const settledStatus = process.status === "exited" || process.status === "blocked";
-      return !settledStatus || process.cleanupState !== "confirmed_dead";
-    })) {
-      report(["processes"], "settled preflight checks require reconciled process groups");
-    }
-    const finalProcess = check.processes[check.processes.length - 1];
-    if (check.outcome === "passed") {
-      if (check.failure !== null || check.block !== null) report(["failure"], "passed preflight has no failure or block");
-      if (finalProcess === undefined || finalProcess.status !== "exited" || finalProcess.exit?.kind !== "code" || finalProcess.exit.code !== 0) {
-        report(["processes"], "passed preflight ends with exit code zero");
-      }
-    } else {
-      if (check.failure === null || check.block?.kind !== "preflight_failed") {
-        report(["failure"], "failed preflight requires typed failure and preflight_failed block evidence");
-      }
-      if (check.failure !== null && (check.failure.nodeId !== null || check.failure.attemptId !== null)) {
-        report(["failure"], "preflight failure has no node or attempt");
-      }
-      if (check.block !== null && (check.block.nodeId !== null || check.block.attemptId !== null)) {
-        report(["block"], "preflight block has no node or attempt");
-      }
-    }
-  }
-  if (check.failure !== null && check.startedAt !== null
-    && timestampMilliseconds(check.failure.failedAt) < timestampMilliseconds(check.startedAt)) {
-    report(["failure", "failedAt"], "preflight failure cannot precede check start");
-  }
-  if (check.failure !== null && check.finishedAt !== null
-    && timestampMilliseconds(check.failure.failedAt) > timestampMilliseconds(check.finishedAt)) {
-    report(["failure", "failedAt"], "preflight failure cannot follow check completion");
-  }
-  if (check.block !== null && check.startedAt !== null
-    && timestampMilliseconds(check.block.blockedAt) < timestampMilliseconds(check.startedAt)) {
-    report(["block", "blockedAt"], "preflight block cannot precede check start");
-  }
-  if (check.block !== null && check.finishedAt !== null
-    && timestampMilliseconds(check.block.blockedAt) > timestampMilliseconds(check.finishedAt)) {
-    report(["block", "blockedAt"], "preflight block cannot follow check completion");
-  }
-});
-
-export const preflightDtoSchema = z.strictObject({
-  cacheKeyHash: sha256Schema,
-  outcome: preflightOutcomeSchema,
-  reusedFrom: z.strictObject({
-    runId: runIdSchema,
-    passedAt: utcTimestampSchema,
-    cacheKeyHash: sha256Schema,
-  }).nullable(),
-  checks: z.array(preflightCheckDtoSchema),
-}).superRefine((preflight, context) => {
-  const report: ReportIssue = (path, message) => context.addIssue({ code: "custom", path, message });
-  const checkIds = new Set<string>();
-  const executionChecks = new Map<string, string>();
-  const incarnationIds = new Set<string>();
-  let previousFinishedAt: number | undefined;
-  let hasPendingCheck = false;
-  for (const [index, check] of preflight.checks.entries()) {
-    if (checkIds.has(check.checkId)) report(["checks", index, "checkId"], "preflight check IDs must be unique");
-    checkIds.add(check.checkId);
-    if (hasPendingCheck) report(["checks", index], "pending preflight check must be last");
-    hasPendingCheck = check.outcome === "pending";
-    if (previousFinishedAt !== undefined && check.startedAt !== null
-      && timestampMilliseconds(check.startedAt) < previousFinishedAt) {
-      report(["checks", index, "startedAt"], "preflight checks must be chronological");
-    }
-    if (check.finishedAt !== null) previousFinishedAt = timestampMilliseconds(check.finishedAt);
-    for (const process of check.processes) {
-      const ownerCheck = executionChecks.get(process.executionId);
-      if (ownerCheck !== undefined && ownerCheck !== check.checkId) {
-        report(["checks", index, "processes"], "each preflight check has a distinct process execution ID");
-      }
-      executionChecks.set(process.executionId, check.checkId);
-      if (incarnationIds.has(process.incarnationId)) {
-        report(["checks", index, "processes"], "preflight incarnation IDs are unique within a run");
-      }
-      incarnationIds.add(process.incarnationId);
-    }
-  }
-  if (preflight.reusedFrom !== null) {
-    if (preflight.outcome !== "passed" || preflight.checks.length !== 0
-      || preflight.reusedFrom.cacheKeyHash !== preflight.cacheKeyHash) {
-      report(["reusedFrom"], "reused preflight passes match the cache key and have no local executions");
-    }
-  } else {
-    const lastCheck = preflight.checks[preflight.checks.length - 1];
-    if (preflight.outcome === "pending" && lastCheck?.outcome === "passed") {
-      report(["outcome"], "a passed preflight check cannot return to pending");
-    }
-    if (preflight.outcome !== "pending" && (lastCheck === undefined || lastCheck.outcome !== preflight.outcome)) {
-      report(["outcome"], "settled preflight outcome matches its final check");
-    }
-  }
-});
-
-export type PreflightCheckDto = z.infer<typeof preflightCheckDtoSchema>;
-export type PreflightDto = z.infer<typeof preflightDtoSchema>;
-
-export const nodeStatusDtoSchema = z.enum(["pending", "running", "succeeded", "failed", "blocked", "cancelled"]);
+const nodeStatusDtoSchema = z.enum(["pending", "running", "succeeded", "failed", "blocked", "cancelled"]);
 
 export const nodeDetailDtoSchema = z.strictObject({
   nodeId: nodeIdSchema,
@@ -717,7 +567,7 @@ export const nodeDetailDtoSchema = z.strictObject({
   successorId: nodeIdSchema.nullable(),
   status: nodeStatusDtoSchema,
   block: blockInfoSchema.nullable(),
-  resolvedSettings: resolvedNodeSettingsDtoSchema,
+  resolvedSettings: resolvedNodeSettingsSchema,
   successfulOutput: boundedText(1024 * 1024).nullable(),
   attempts: z.array(attemptDetailDtoSchema),
 }).superRefine((node, context) => {
@@ -862,579 +712,6 @@ export const nodeDetailDtoSchema = z.strictObject({
   }
 });
 
-export const runDetailDtoSchema = z.strictObject({
-  version: z.literal(2),
-  summary: runSummaryDtoSchema,
-  preflight: preflightDtoSchema.nullable(),
-  resolutions: z.array(operatorResolutionSchema),
-  nodes: z.array(nodeDetailDtoSchema).min(1),
-}).superRefine((detail, context) => {
-  const report: ReportIssue = (path, message) => context.addIssue({ code: "custom", path, message });
-  const nodeIds = new Set<string>();
-  const nodesById = new Map<string, z.infer<typeof nodeDetailDtoSchema>>();
-  const attemptsById = new Map<string, { nodeId: string; attempt: z.infer<typeof attemptDetailDtoSchema> }>();
-  const historyBlocks = new Map<string, BlockInfoValue>();
-  const historicalBlockIds = new Set<string>();
-  const processRecords: ProcessIncarnationValue[] = [];
-  const processOwners = new Map<string, string>();
-  const resolutionIds = new Set<string>();
-  const resolvedBlockIds = new Set<string>();
-  const evidenceIds = new Set<string>();
-  let nonSuccessPosition: number | undefined;
-  let pendingSuffixStarted = false;
-
-  const rememberHistoryBlock = (block: BlockInfoValue, path: IssuePath): void => {
-    if (historicalBlockIds.has(block.blockId)) report([...path, "blockId"], "historical block IDs must be unique within a run");
-    historicalBlockIds.add(block.blockId);
-    historyBlocks.set(block.blockId, block);
-  };
-  const requireKnownBlock = (block: BlockInfoValue, path: IssuePath): void => {
-    const recorded = historyBlocks.get(block.blockId);
-    if (recorded === undefined || !sameBlock(recorded, block)) report([...path, "blockId"], "block reference must match retained historical evidence");
-  };
-
-  for (const [nodeIndex, node] of detail.nodes.entries()) {
-    if (nodeIds.has(node.nodeId)) report(["nodes", nodeIndex, "nodeId"], "node IDs must be unique");
-    nodeIds.add(node.nodeId);
-    nodesById.set(node.nodeId, node);
-    if (node.position !== nodeIndex + 1) report(["nodes", nodeIndex, "position"], "nodes must be ordered by contiguous chain position");
-    const expectedPredecessor = detail.nodes[nodeIndex - 1]?.nodeId ?? null;
-    const expectedSuccessor = detail.nodes[nodeIndex + 1]?.nodeId ?? null;
-    if (node.predecessorId !== expectedPredecessor || node.successorId !== expectedSuccessor) {
-      report(["nodes", nodeIndex], "node links must match the selected historical chain");
-    }
-    if (node.status === "pending") {
-      pendingSuffixStarted = true;
-    } else if (node.status === "succeeded") {
-      if (pendingSuffixStarted || nonSuccessPosition !== undefined) {
-        report(["nodes", nodeIndex, "status"], "succeeded nodes form a prefix before the current node");
-      }
-    } else {
-      if (pendingSuffixStarted) report(["nodes", nodeIndex, "status"], "active or terminal nodes cannot follow pending nodes");
-      if (nonSuccessPosition !== undefined) report(["nodes", nodeIndex, "status"], "the linear chain has at most one active or terminal non-success node");
-      nonSuccessPosition = nodeIndex;
-    }
-
-    for (const [attemptIndex, attempt] of node.attempts.entries()) {
-      if (attemptsById.has(attempt.attemptId)) report(["nodes", nodeIndex, "attempts", attemptIndex, "attemptId"], "attempt IDs must be unique within a run");
-      attemptsById.set(attempt.attemptId, { nodeId: node.nodeId, attempt });
-      for (const [blockIndex, block] of attempt.blocks.entries()) {
-        rememberHistoryBlock(block, ["nodes", nodeIndex, "attempts", attemptIndex, "blocks", blockIndex]);
-      }
-      for (const process of attempt.processes) {
-        processRecords.push(process);
-        const owner = `attempt:${attempt.attemptId}`;
-        const previousOwner = processOwners.get(process.executionId);
-        if (previousOwner !== undefined && previousOwner !== owner) {
-          report(["nodes", nodeIndex, "attempts", attemptIndex, "processes"], "semantic attempts use distinct process execution IDs");
-        }
-        processOwners.set(process.executionId, owner);
-      }
-      for (const acceptance of attempt.operatorAcceptances) {
-        if (resolutionIds.has(acceptance.resolutionId)) report(["nodes", nodeIndex, "attempts", attemptIndex, "operatorAcceptances"], "operator resolution IDs are unique within a run");
-        resolutionIds.add(acceptance.resolutionId);
-        if (resolvedBlockIds.has(acceptance.sourceBlock.blockId)) {
-          report(["nodes", nodeIndex, "attempts", attemptIndex, "operatorAcceptances"], "each block has at most one resolution or acceptance");
-        }
-        resolvedBlockIds.add(acceptance.sourceBlock.blockId);
-        requireKnownBlock(acceptance.sourceBlock, ["nodes", nodeIndex, "attempts", attemptIndex, "operatorAcceptances"]);
-      }
-      for (const evidence of [attempt.candidate, attempt.verdict]) {
-        if (evidence !== null) {
-          if (evidenceIds.has(evidence.evidenceId)) report(["nodes", nodeIndex, "attempts", attemptIndex], "evidence IDs must be unique within a run");
-          evidenceIds.add(evidence.evidenceId);
-        }
-      }
-      for (const judgment of attempt.judgments) {
-        if (evidenceIds.has(judgment.evidenceId)) report(["nodes", nodeIndex, "attempts", attemptIndex, "judgments"], "evidence IDs must be unique within a run");
-        evidenceIds.add(judgment.evidenceId);
-      }
-    }
-
-    if (node.block !== null) {
-      if (node.block.attemptId !== null && !attemptsById.has(node.block.attemptId)) {
-        report(["nodes", nodeIndex, "block", "attemptId"], "node block attempt ID must resolve in the run");
-      }
-      const recorded = historyBlocks.get(node.block.blockId);
-      if (recorded === undefined && node.block.attemptId !== null) {
-        report(["nodes", nodeIndex, "block", "blockId"], "attempt-linked node blocks remain in attempt history");
-      } else if (recorded === undefined) {
-        historyBlocks.set(node.block.blockId, node.block);
-      } else if (!sameBlock(recorded, node.block)) {
-        report(["nodes", nodeIndex, "block"], "current node block must match retained evidence");
-      }
-    }
-  }
-
-  if (detail.preflight !== null) {
-    const preflightProcesses = detail.preflight.checks.flatMap((check) => check.processes);
-    for (const process of preflightProcesses) processRecords.push(process);
-    checkProcessIncarnations(preflightProcesses, report, ["preflight", "checks", "processes"], "preflight");
-    for (const [checkIndex, check] of detail.preflight.checks.entries()) {
-      if (check.block !== null) rememberHistoryBlock(check.block, ["preflight", "checks", checkIndex, "block"]);
-      for (const process of check.processes) {
-        const owner = `preflight:${check.checkId}`;
-        const previousOwner = processOwners.get(process.executionId);
-        if (previousOwner !== undefined && previousOwner !== owner) {
-          report(["preflight", "checks", checkIndex, "processes"], "preflight execution IDs are distinct from node attempts");
-        }
-        processOwners.set(process.executionId, owner);
-      }
-    }
-    if (detail.preflight.reusedFrom !== null
-      && timestampMilliseconds(detail.preflight.reusedFrom.passedAt) > timestampMilliseconds(detail.summary.admittedAt)) {
-      report(["preflight", "reusedFrom", "passedAt"], "reused preflight pass predates this run admission");
-    }
-    if (detail.preflight.reusedFrom?.runId === detail.summary.runId) {
-      report(["preflight", "reusedFrom", "runId"], "a run cannot reuse its own preflight pass");
-    }
-    if (detail.preflight.outcome !== "passed" && detail.nodes.some((node) => node.attempts.length > 0)) {
-      report(["nodes"], "node attempts require a successful configured preflight");
-    }
-    if (detail.preflight.outcome === "failed" && detail.summary.status === "blocked"
-      && detail.summary.block?.kind !== "preflight_failed") {
-      report(["summary", "block"], "failed preflight remains the current run block");
-    }
-    if (detail.summary.block?.kind === "preflight_failed" && detail.preflight.outcome !== "failed") {
-      report(["preflight", "outcome"], "current preflight block requires a failed check");
-    }
-  } else if (detail.summary.block?.kind === "preflight_failed") {
-    report(["preflight"], "preflight failure requires its check history");
-  }
-
-  for (const [checkIndex, check] of detail.preflight?.checks.entries() ?? []) {
-    if (check.block !== null) requireKnownBlock(check.block, ["preflight", "checks", checkIndex, "block"]);
-  }
-  checkProcessIncarnations(processRecords, report, ["processes"]);
-
-  const checkNoWorkInsideBlockWindow = (source: BlockInfoValue, resolvedAt: number, path: IssuePath): void => {
-    const blockedAt = timestampMilliseconds(source.blockedAt);
-    if (detail.nodes.some((node) => node.attempts.some((attempt) => attempt.startedAt !== null
-      && timestampMilliseconds(attempt.startedAt) >= blockedAt
-      && timestampMilliseconds(attempt.startedAt) < resolvedAt))) {
-      report(path, "semantic attempts cannot start while a source block is unresolved");
-    }
-    if (processRecords.some((process) => process.launchIntentAt !== null
-      && timestampMilliseconds(process.launchIntentAt) >= blockedAt
-      && timestampMilliseconds(process.launchIntentAt) < resolvedAt)) {
-      report(path, "process launches cannot occur while a source block is unresolved");
-    }
-    if ((detail.preflight?.checks ?? []).some((check) => check.startedAt !== null
-      && timestampMilliseconds(check.startedAt) >= blockedAt
-      && timestampMilliseconds(check.startedAt) < resolvedAt)) {
-      report(path, "preflight checks cannot start while a source block is unresolved");
-    }
-  };
-
-  const operatorResolutions = new Map<string, z.infer<typeof operatorResolutionSchema>>();
-  let previousResolutionAt: number | undefined;
-  for (const [index, resolution] of detail.resolutions.entries()) {
-    if (resolutionIds.has(resolution.resolutionId)) report(["resolutions", index, "resolutionId"], "operator resolution IDs are unique within a run");
-    resolutionIds.add(resolution.resolutionId);
-    if (resolvedBlockIds.has(resolution.sourceBlock.blockId)) {
-      report(["resolutions", index, "sourceBlock"], "each block has at most one resolution or acceptance");
-    }
-    resolvedBlockIds.add(resolution.sourceBlock.blockId);
-    operatorResolutions.set(resolution.resolutionId, resolution);
-    const resolvedAt = timestampMilliseconds(resolution.resolvedAt);
-    if (previousResolutionAt !== undefined && resolvedAt < previousResolutionAt) report(["resolutions", index, "resolvedAt"], "operator resolutions must be ordered by time");
-    previousResolutionAt = resolvedAt;
-    const knownSource = historyBlocks.get(resolution.sourceBlock.blockId);
-    if (knownSource === undefined && resolution.sourceBlock.attemptId === null) {
-      historyBlocks.set(resolution.sourceBlock.blockId, resolution.sourceBlock);
-    } else {
-      requireKnownBlock(resolution.sourceBlock, ["resolutions", index, "sourceBlock"]);
-    }
-    const source = resolution.sourceBlock;
-    checkNoWorkInsideBlockWindow(source, resolvedAt, ["resolutions", index, "resolvedAt"]);
-    const recordedSourceProcesses = source.attemptId !== null
-      ? attemptsById.get(source.attemptId)?.attempt.processes
-      : processRecords;
-    const sourceProcesses = recordedSourceProcesses?.filter((process) => process.launchIntentAt !== null
-      && timestampMilliseconds(process.launchIntentAt) <= resolvedAt);
-    if (sourceProcesses === undefined) {
-      report(["resolutions", index, "sourceBlock"], "resolution source process history must resolve");
-    } else {
-      if (!processGroupsReconciled(sourceProcesses)) {
-        report(["resolutions", index, "processGroupsConfirmedDead"], "operator resolution requires every source process group to be reconciled");
-      }
-      if (sourceProcesses.some((process) => process.finishedAt !== null
-        && timestampMilliseconds(process.finishedAt) > resolvedAt)) {
-        report(["resolutions", index, "resolvedAt"], "operator resolution follows recorded process completion");
-      }
-      if (source.kind === "external_outcome_unknown"
-        && !sourceProcesses.some((process) => process.launchIntentAt !== null)) {
-        report(["resolutions", index, "sourceBlock"], "unknown external outcomes retain a launched process record");
-      }
-    }
-    if (resolution.action === "fail" && processRecords.some((process) => process.launchIntentAt !== null
-      && timestampMilliseconds(process.launchIntentAt) > resolvedAt)) {
-      report(["resolutions", index, "resolvedAt"], "a fail resolution cannot precede later process launches");
-    }
-    if (resolution.action === "retry" && source.attemptId !== null
-      && attemptsById.get(source.attemptId)?.attempt.processes.some((process) => process.launchIntentAt !== null
-        && timestampMilliseconds(process.launchIntentAt) > resolvedAt)) {
-      report(["resolutions", index, "resolvedAt"], "an attempt-scoped retry cannot precede more launches in its source attempt");
-    }
-    if ((detail.summary.block !== null && sameBlock(detail.summary.block, source))
-      || detail.nodes.some((node) => node.block !== null && sameBlock(node.block, source))) {
-      report(["resolutions", index, "sourceBlock"], "resolved blocks are no longer current");
-    }
-    if (source.attemptId !== null) {
-      const attemptRecord = attemptsById.get(source.attemptId);
-      if (attemptRecord === undefined || attemptRecord.nodeId !== source.nodeId) {
-        report(["resolutions", index, "sourceBlock"], "resolution source node and attempt must resolve together");
-      }
-      if (attemptRecord !== undefined && !attemptRecord.attempt.blocks.some((block) => sameBlock(block, source))) {
-        report(["resolutions", index, "sourceBlock"], "attempt resolution source remains in block history");
-      }
-      if (attemptRecord !== undefined && resolution.action === "retry"
-        && attemptRecord.attempt.status !== "failed" && attemptRecord.attempt.status !== "interrupted") {
-        report(["resolutions", index, "sourceBlock"], "attempt-scoped retry requires a failed or interrupted source attempt");
-      }
-      if (attemptRecord !== undefined && (resolution.action === "retry" || resolution.action === "fail")) {
-        const blocksBeforeResolution = attemptRecord.attempt.blocks.filter((block) =>
-          timestampMilliseconds(block.blockedAt) <= resolvedAt);
-        const latestBlock = blocksBeforeResolution.at(-1);
-        if (latestBlock !== undefined && !sameBlock(latestBlock, source)) {
-          report(["resolutions", index, "sourceBlock"], "attempt-scoped resolution identifies the latest block at its resolution time");
-        }
-        if (attemptRecord.attempt.blocks.some((block) => timestampMilliseconds(block.blockedAt) > resolvedAt)) {
-          report(["resolutions", index, "resolvedAt"], "all source attempt blocks precede its resolution");
-        }
-      }
-      if (attemptRecord !== undefined && resolution.action === "retry") {
-        const node = nodesById.get(attemptRecord.nodeId);
-        if (node !== undefined) {
-          const exhausted = attemptRecord.attempt.number >= node.resolvedSettings.maxAttempts;
-          if (resolution.extraAttempt !== exhausted) report(["resolutions", index, "extraAttempt"], "extra-attempt override is required exactly when the semantic bound is exhausted");
-          const repeatRequired = source.kind === "external_outcome_unknown"
-            || attemptRecord.attempt.processes.some((process) => process.replay === "never");
-          if (resolution.allowRepeat !== repeatRequired) report(["resolutions", index, "allowRepeat"], "repeat override records whether this retry may repeat external work");
-        }
-      }
-    }
-    if (source.nodeId !== null && !nodesById.has(source.nodeId)) report(["resolutions", index, "sourceBlock", "nodeId"], "resolution source node must resolve in run history");
-    if (source.attemptId === null && resolution.action === "retry"
-      && (resolution.allowRepeat || resolution.extraAttempt)) {
-      report(["resolutions", index], "run-level retries do not consume or repeat semantic attempts");
-    }
-    if (source.attemptId === null && resolution.action === "retry" && source.kind === "preflight_failed") {
-      const sourceCheckIndex = detail.preflight?.checks.findIndex((check) =>
-        check.block !== null && sameBlock(check.block, source)) ?? -1;
-      if (sourceCheckIndex < 0) {
-        report(["resolutions", index, "sourceBlock"], "preflight retry identifies its retained failed check");
-      } else {
-        for (const [checkIndex, check] of (detail.preflight?.checks ?? []).entries()) {
-          if (checkIndex <= sourceCheckIndex) continue;
-          if (check.startedAt !== null && timestampMilliseconds(check.startedAt) < resolvedAt) {
-            report(["preflight", "checks", checkIndex, "startedAt"], "retried preflight checks start at or after resolution");
-          }
-          if (check.processes.some((process) => process.launchIntentAt !== null
-            && timestampMilliseconds(process.launchIntentAt) < resolvedAt)) {
-            report(["preflight", "checks", checkIndex, "processes"], "retried preflight launches follow resolution");
-          }
-        }
-      }
-    }
-    if (source.attemptId === null && source.nodeId !== null && resolution.action === "retry") {
-      const sourceNode = nodesById.get(source.nodeId);
-      const firstAttempt = sourceNode?.attempts[0];
-      if (firstAttempt?.startedAt !== null && firstAttempt?.startedAt !== undefined
-        && timestampMilliseconds(firstAttempt.startedAt) < resolvedAt) {
-        report(["nodes"], "a node's first semantic attempt starts at or after its pre-attempt retry resolution");
-      }
-      if (firstAttempt?.processes.some((process) => process.launchIntentAt !== null
-        && timestampMilliseconds(process.launchIntentAt) < resolvedAt)) {
-        report(["nodes"], "a node's first process launch follows its pre-attempt retry resolution");
-      }
-    }
-  }
-
-  for (const [nodeIndex, node] of detail.nodes.entries()) {
-    for (const [attemptIndex, attempt] of node.attempts.entries()) {
-      for (const [acceptanceIndex, acceptance] of attempt.operatorAcceptances.entries()) {
-        const resolvedAt = timestampMilliseconds(acceptance.resolvedAt);
-        checkNoWorkInsideBlockWindow(acceptance.sourceBlock, resolvedAt, [
-          "nodes", nodeIndex, "attempts", attemptIndex, "operatorAcceptances", acceptanceIndex, "resolvedAt",
-        ]);
-      }
-    }
-  }
-  for (const block of historyBlocks.values()) {
-    const isCurrent = (detail.summary.status === "blocked" && detail.summary.block !== null
-      && sameBlock(detail.summary.block, block))
-      || detail.nodes.some((node) => node.status === "blocked" && node.block !== null
-        && sameBlock(node.block, block));
-    const hasResolution = detail.resolutions.some((resolution) => sameBlock(resolution.sourceBlock, block));
-    const hasAcceptance = detail.nodes.some((node) => node.attempts.some((attempt) =>
-      attempt.operatorAcceptances.some((acceptance) => sameBlock(acceptance.sourceBlock, block))));
-    if (!isCurrent && !hasResolution && !hasAcceptance) {
-      report(["blocks", block.blockId], "every block remains current or has an audited resolution");
-    }
-  }
-
-  const passedPreflightAt = detail.preflight?.outcome === "passed"
-    ? detail.preflight.reusedFrom?.passedAt ?? detail.preflight.checks.at(-1)?.finishedAt ?? null
-    : null;
-  if (passedPreflightAt !== null) {
-    const preflightFinishedAt = timestampMilliseconds(passedPreflightAt);
-    for (const [nodeIndex, node] of detail.nodes.entries()) {
-      for (const [attemptIndex, attempt] of node.attempts.entries()) {
-        if (attempt.startedAt !== null && timestampMilliseconds(attempt.startedAt) < preflightFinishedAt) {
-          report(["nodes", nodeIndex, "attempts", attemptIndex, "startedAt"], "node attempts start after the final passed preflight check");
-        }
-        if (attempt.processes.some((process) => process.launchIntentAt !== null
-          && timestampMilliseconds(process.launchIntentAt) < preflightFinishedAt)) {
-          report(["nodes", nodeIndex, "attempts", attemptIndex, "processes"], "node process launches follow the final passed preflight check");
-        }
-      }
-    }
-  }
-
-  const runFailure = detail.summary.failure;
-  if (runFailure !== null && runFailure.kind !== "operator") {
-    if (runFailure.attemptId !== null && !attemptsById.has(runFailure.attemptId)) report(["summary", "failure", "attemptId"], "run failure attempt must resolve in run history");
-    if (runFailure.nodeId !== null && !nodesById.has(runFailure.nodeId)) report(["summary", "failure", "nodeId"], "run failure node must resolve in selected chain");
-    if (runFailure.attemptId !== null) {
-      const attemptRecord = attemptsById.get(runFailure.attemptId);
-      if (attemptRecord !== undefined && runFailure.nodeId !== attemptRecord.nodeId) report(["summary", "failure", "nodeId"], "run failure node and attempt must agree");
-    }
-    if (runFailure.nodeId !== null) {
-      const node = nodesById.get(runFailure.nodeId);
-      const lastAttempt = node?.attempts.at(-1);
-      const currentBlockedAttempt = node?.status === "blocked" && (node.block?.attemptId === runFailure.attemptId
-        || (node.block?.attemptId === null && node.block.nodeId === runFailure.nodeId));
-      if ((node?.status !== "failed" && !currentBlockedAttempt)
-        || lastAttempt?.status !== "failed" || lastAttempt.failure === null
-        || runFailure.attemptId !== lastAttempt.attemptId || !sameFailure(runFailure, lastAttempt.failure)) {
-        report(["summary", "failure"], "node-scoped run failure matches the failed or currently blocked attempt");
-      }
-    }
-    if (detail.summary.finishedAt !== null && timestampMilliseconds(runFailure.failedAt) > timestampMilliseconds(detail.summary.finishedAt)) {
-      report(["summary", "failure", "failedAt"], "run failure cannot follow terminal completion");
-    }
-  }
-  if (runFailure?.kind === "operator") {
-    requireKnownBlock(runFailure.sourceBlock, ["summary", "failure", "sourceBlock"]);
-    const resolution = operatorResolutions.get(runFailure.resolutionId);
-    if (resolution?.action !== "fail" || resolution.reason !== runFailure.reason
-      || resolution.resolvedAt !== runFailure.failedAt
-      || !sameBlock(resolution.sourceBlock, runFailure.sourceBlock)) {
-      report(["summary", "failure", "resolutionId"], "operator run failure must match its fail resolution");
-    }
-    if (runFailure.sourceBlock.attemptId !== null) {
-      const attemptRecord = attemptsById.get(runFailure.sourceBlock.attemptId);
-      const node = runFailure.sourceBlock.nodeId === null ? undefined : nodesById.get(runFailure.sourceBlock.nodeId);
-      const lastAttempt = node?.attempts.at(-1);
-      if (attemptRecord === undefined || attemptRecord.nodeId !== runFailure.sourceBlock.nodeId
-        || node?.status !== "failed" || lastAttempt?.attemptId !== runFailure.sourceBlock.attemptId
-        || (lastAttempt.status !== "interrupted" && lastAttempt.status !== "failed")) {
-        report(["summary", "failure", "sourceBlock"], "operator failure source must be its failed node's latest attempt");
-      }
-    } else if (runFailure.sourceBlock.nodeId !== null) {
-      const sourceNode = nodesById.get(runFailure.sourceBlock.nodeId);
-      const lastAttempt = sourceNode?.attempts.at(-1);
-      const priorAttemptFailure = sourceNode?.status === "failed"
-        && (lastAttempt?.status === "failed" || lastAttempt?.status === "interrupted");
-      const unstartedNode = sourceNode?.status === "pending" && sourceNode.attempts.length === 0;
-      if (sourceNode === undefined || (!priorAttemptFailure && !unstartedNode)) {
-        report(["summary", "failure", "sourceBlock"], "a node-scoped operator failure without an attempt preserves a prior failure or ends an unstarted node");
-      }
-    }
-    if (detail.summary.finishedAt !== null && timestampMilliseconds(runFailure.failedAt) > timestampMilliseconds(detail.summary.finishedAt)) {
-      report(["summary", "failure", "failedAt"], "operator failure cannot follow terminal completion");
-    }
-  }
-  for (const [index, resolution] of detail.resolutions.entries()) {
-    if (resolution.action === "fail" && (runFailure?.kind !== "operator" || runFailure.resolutionId !== resolution.resolutionId)) {
-      report(["resolutions", index], "a fail resolution is retained as the terminal run failure");
-    }
-  }
-  for (const [nodeIndex, node] of detail.nodes.entries()) {
-    const lastAttempt = node.attempts.at(-1);
-    const operatorBlockRequiresNodeLink = runFailure?.kind === "operator"
-      && runFailure.sourceBlock.nodeId !== null;
-    const requiresAttemptLinkedOperatorFailure = lastAttempt?.status === "interrupted"
-      || (lastAttempt?.status === "failed" && operatorBlockRequiresNodeLink);
-    const operatorFailureIdentifiesLatestAttempt = runFailure?.kind === "operator"
-      && (runFailure.sourceBlock.nodeId === null || runFailure.sourceBlock.nodeId === node.nodeId)
-      && (runFailure.sourceBlock.attemptId === null
-        || (runFailure.sourceBlock.nodeId === node.nodeId
-          && runFailure.sourceBlock.attemptId === lastAttempt?.attemptId
-          && lastAttempt.blocks.some((block) => sameBlock(block, runFailure.sourceBlock))));
-    if (node.status === "failed" && lastAttempt !== undefined && requiresAttemptLinkedOperatorFailure
-      && !operatorFailureIdentifiesLatestAttempt) {
-      report(["nodes", nodeIndex, "status"], "operator-ended attempts require a retained fail resolution for their current block");
-    }
-    for (const [attemptIndex, attempt] of node.attempts.entries()) {
-      for (const [acceptanceIndex, acceptance] of attempt.operatorAcceptances.entries()) {
-        if ((detail.summary.block !== null && sameBlock(detail.summary.block, acceptance.sourceBlock))
-          || detail.nodes.some((otherNode) => otherNode.block !== null && sameBlock(otherNode.block, acceptance.sourceBlock))) {
-          report(["nodes", nodeIndex, "attempts", attemptIndex, "operatorAcceptances", acceptanceIndex], "accepted blocks are no longer current");
-        }
-      }
-      const nextAttempt = node.attempts[attemptIndex + 1];
-      if (nextAttempt === undefined) continue;
-      if (attempt.status !== "failed" && attempt.status !== "interrupted") {
-        report(["nodes", nodeIndex, "attempts", attemptIndex, "status"], "only a failed or interrupted attempt can have a successor");
-      }
-      if (!processGroupsReconciled(attempt.processes)) {
-        report(["nodes", nodeIndex, "attempts", attemptIndex, "processes"], "a successor waits for every prior process group to be confirmed dead");
-      }
-      const retry = detail.resolutions.find((resolution) =>
-        resolution.action === "retry" && resolution.sourceBlock.attemptId === attempt.attemptId);
-      if (attempt.status === "interrupted" && retry === undefined) {
-        report(["nodes", nodeIndex, "attempts", attemptIndex], "an interrupted attempt resumes only through its linked operator retry resolution");
-      }
-      if (retry !== undefined) {
-        if (attempt.finishedAt !== null && timestampMilliseconds(retry.resolvedAt) < timestampMilliseconds(attempt.finishedAt)) {
-          report(["resolutions"], "retry resolution follows its source attempt");
-        }
-        if (nextAttempt.startedAt !== null && timestampMilliseconds(retry.resolvedAt) > timestampMilliseconds(nextAttempt.startedAt)) {
-          report(["resolutions"], "retry resolution precedes the successor attempt");
-        }
-      }
-      if (nextAttempt.number > node.resolvedSettings.maxAttempts && !(retry?.action === "retry" && retry.extraAttempt)) {
-        report(["nodes", nodeIndex, "attempts", attemptIndex], "attempts above maxAttempts require an operator extra-attempt resolution");
-      }
-      if (attempt.status === "failed" && retry === undefined) {
-        const judgment = attempt.judgments.at(-1);
-        if (judgment?.kind !== "judgment" || judgment.decision.action !== "retry") {
-          report(["nodes", nodeIndex, "attempts", attemptIndex, "judgments"], "a failed attempt's successor requires a checked retry decision or operator resolution");
-        }
-        if (attempt.number >= node.resolvedSettings.maxAttempts) {
-          report(["nodes", nodeIndex, "attempts", attemptIndex], "judge retry requires remaining semantic attempts");
-        }
-        const workerWasLaunched = attempt.processes.some((process) => process.role === "worker" && process.launchIntentAt !== null);
-        const validatorWasLaunched = attempt.processes.some((process) => process.role === "validator" && process.launchIntentAt !== null);
-        const unsafeWorkerRepeat = workerWasLaunched && node.resolvedSettings.run.replay !== "safe";
-        const unsafeValidatorRepeat = validatorWasLaunched
-          && node.resolvedSettings.validator?.replay !== "safe";
-        if (unsafeWorkerRepeat || unsafeValidatorRepeat) {
-          report(["nodes", nodeIndex, "attempts", attemptIndex], "judge retry requires safe replay for every previously launched role");
-        }
-      }
-    }
-  }
-
-  if (detail.summary.currentNodeId !== null) {
-    const currentNode = nodesById.get(detail.summary.currentNodeId);
-    if (currentNode === undefined) {
-      report(["summary", "currentNodeId"], "current node must resolve in selected chain");
-    } else {
-      const expectedAttemptNumber = currentNode.attempts.at(-1)?.number ?? null;
-      if (detail.summary.currentAttemptNumber !== expectedAttemptNumber) {
-        report(["summary", "currentAttemptNumber"], "current attempt number must match the selected node's latest attempt");
-      }
-    }
-  }
-
-  if (detail.summary.block !== null) {
-    const currentBlock = detail.summary.block;
-    const recorded = historyBlocks.get(currentBlock.blockId);
-    if (recorded === undefined && currentBlock.nodeId === null && currentBlock.attemptId === null) {
-      historyBlocks.set(currentBlock.blockId, currentBlock);
-    } else if (recorded === undefined || !sameBlock(recorded, currentBlock)) {
-      report(["summary", "block"], "current run block must match retained evidence");
-    }
-    if (currentBlock.attemptId !== null && !attemptsById.has(currentBlock.attemptId)) report(["summary", "block", "attemptId"], "run block attempt must resolve in run history");
-    if (currentBlock.nodeId !== null) {
-      const blockedNode = nodesById.get(currentBlock.nodeId);
-      if (blockedNode?.status !== "blocked" || blockedNode.block === null || !sameBlock(blockedNode.block, currentBlock)) {
-        report(["summary", "block"], "node-specific run block must match the currently blocked node");
-      }
-    }
-    const currentBlockAt = timestampMilliseconds(currentBlock.blockedAt);
-    if (detail.nodes.some((node) => node.attempts.some((attempt) => attempt.startedAt !== null
-      && timestampMilliseconds(attempt.startedAt) >= currentBlockAt))
-      || processRecords.some((process) => process.launchIntentAt !== null
-        && timestampMilliseconds(process.launchIntentAt) >= currentBlockAt)
-      || (detail.preflight?.checks ?? []).some((check) => check.startedAt !== null
-        && timestampMilliseconds(check.startedAt) >= currentBlockAt)) {
-      report(["summary", "block"], "a current block has no later attempt, process, or preflight starts");
-    }
-  }
-
-  const blockedNodes = detail.nodes.filter((node) => node.status === "blocked");
-  if (blockedNodes.length > 1 || (blockedNodes.length > 0 && detail.summary.status !== "blocked")) {
-    report(["nodes"], "a blocked run has at most one currently blocked node");
-  }
-  const blockedNode = blockedNodes[0];
-  if (blockedNode !== undefined
-    && (detail.summary.block === null || blockedNode.block === null
-      || !sameBlock(detail.summary.block, blockedNode.block))) {
-    report(["summary", "block"], "the summary and blocked node identify the same current block");
-  }
-  if (detail.summary.status === "completed" && detail.nodes.some((node) => node.status !== "succeeded")) {
-    report(["nodes"], "completed runs require every node to have succeeded");
-  }
-  if (detail.summary.status === "completed"
-    && detail.summary.terminalOutput !== detail.nodes.at(-1)?.successfulOutput) {
-    report(["summary", "terminalOutput"], "terminal output matches the final node's successful output");
-  }
-  if (detail.summary.status === "failed") {
-    if (detail.nodes.some((node) => node.status === "running" || node.status === "blocked" || node.status === "cancelled")) {
-      report(["nodes"], "failed runs have no running, blocked, or cancelled nodes");
-    }
-    const failedNodes = detail.nodes.filter((node) => node.status === "failed");
-    const failedAtPreflight = runFailure?.kind === "operator"
-      && runFailure.sourceBlock.kind === "preflight_failed" && detail.preflight?.outcome === "failed";
-    const failedAtRunLevel = runFailure?.kind === "operator"
-      && runFailure.sourceBlock.attemptId === null
-      && runFailure.sourceBlock.kind !== "preflight_failed";
-    if (failedAtPreflight) {
-      if (detail.nodes.some((node) => node.status !== "pending")) {
-        report(["nodes"], "operator-failed preflight leaves every node unstarted");
-      }
-    } else if (failedAtRunLevel) {
-      const sourceBlock = runFailure.sourceBlock;
-      const failedNode = failedNodes[0];
-      const failedAttempt = failedNode?.attempts.at(-1);
-      const preservedPriorFailure = failedNodes.length === 1
-        && (sourceBlock.nodeId === null || sourceBlock.nodeId === failedNode?.nodeId)
-        && (failedAttempt?.status === "failed" || failedAttempt?.status === "interrupted");
-      const unstartedNodeBlock = sourceBlock.nodeId !== null && failedNodes.length === 0
-        && nodesById.get(sourceBlock.nodeId)?.status === "pending"
-        && nodesById.get(sourceBlock.nodeId)?.attempts.length === 0;
-      if (failedNodes.length > 0 && !preservedPriorFailure) {
-        report(["nodes"], "run-level operator failure preserves at most one already failed node");
-      }
-      if (sourceBlock.nodeId !== null && !unstartedNodeBlock && !preservedPriorFailure) {
-        report(["summary", "failure", "sourceBlock"], "node-scoped run-level failure applies to an unstarted node or its preserved failed attempt");
-      }
-    } else if (failedNodes.length !== 1) {
-      report(["nodes"], "failed runs retain one failed node, a run-level operator failure, or a failed preflight");
-    } else if (runFailure?.kind !== "operator") {
-      const failedNode = failedNodes[0];
-      const lastAttempt = failedNode?.attempts.at(-1);
-      if (failedNode === undefined || lastAttempt?.status !== "failed" || lastAttempt.failure === null
-        || runFailure?.nodeId !== failedNode.nodeId || runFailure.attemptId !== lastAttempt.attemptId
-        || !sameFailure(runFailure, lastAttempt.failure)) {
-        report(["summary", "failure"], "failed run cause matches its failed node's latest attempt");
-      }
-    }
-  }
-  if (detail.summary.status === "cancelled" && detail.nodes.some((node) => node.status === "running" || node.status === "blocked")) {
-    report(["nodes"], "cancelled runs have no running or blocked nodes");
-  }
-  if (detail.summary.status === "cancelled" && detail.nodes.every((node) => node.status === "succeeded")) {
-    report(["summary", "status"], "a fully successful chain is completed rather than cancelled");
-  }
-  const terminalRun = ["completed", "failed", "cancelled"].includes(detail.summary.status);
-  if (terminalRun && detail.nodes.some((node) => node.attempts.some((attempt) =>
-    !["succeeded", "failed", "interrupted", "cancelled"].includes(attempt.status)))) {
-    report(["nodes"], "terminal runs contain only terminal semantic attempts");
-  }
-  if (terminalRun && processRecords.some((process) => {
-    const settledStatus = process.status === "prepared" || process.status === "exited" || process.status === "blocked";
-    const confirmed = process.status === "prepared" || process.cleanupState === "confirmed_dead";
-    return !settledStatus || !confirmed;
-  })) {
-    report(["summary", "status"], "terminal runs have no live or uncertain process groups; only prepared or reconciled process incarnations are valid");
-  }
-});
-
 export const nodeDescriptionDtoSchema = z.strictObject({
   version: z.literal(2),
   workflowId: workflowIdSchema,
@@ -1555,12 +832,11 @@ export const diagramDtoSchema = z.strictObject({
 });
 
 const textLogSectionSchema = z.strictObject({
-  kind: z.enum(["worklog", "event", "attempt", "judgment"]),
+  kind: z.literal("worklog"),
   sectionId: z.string().min(1),
   order: nonnegativeSafeInteger,
   label: z.string().min(1),
   content: logContent,
-  omittedBytes: byteCountSchema,
 });
 
 const captureLogSectionSchema = z.strictObject({
@@ -1572,15 +848,6 @@ const captureLogSectionSchema = z.strictObject({
   incarnationNumber: positiveSafeInteger,
   capture: processCaptureSchema,
   content: logContent.nullable(),
-  unavailableReason: boundedText(64 * 1024).nullable(),
-  omittedBytes: byteCountSchema,
-}).superRefine((section, context) => {
-  if ((section.content === null) !== (section.unavailableReason !== null)) {
-    context.addIssue({ code: "custom", path: ["unavailableReason"], message: "unavailable captures require a reason; loaded captures forbid one" });
-  }
-  if (section.content === null && section.omittedBytes !== 0) {
-    context.addIssue({ code: "custom", path: ["omittedBytes"], message: "unavailable captures have no projection omission count" });
-  }
 });
 
 export const logSectionDtoSchema = z.discriminatedUnion("kind", [textLogSectionSchema, captureLogSectionSchema]);
@@ -1589,48 +856,24 @@ export const logsDtoSchema = z.strictObject({
   version: z.literal(2),
   runId: runIdSchema,
   sections: z.array(logSectionDtoSchema),
-  projection: z.strictObject({
-    truncated: z.boolean(),
-    omittedSections: nonnegativeSafeInteger,
-    omittedBytes: byteCountSchema,
-  }),
 }).superRefine((logs, context) => {
-  let previousOrder: number | undefined;
-  let omittedBytes = 0;
   const sectionIds = new Set<string>();
+  if (logs.sections[0]?.kind !== "worklog") {
+    context.addIssue({ code: "custom", path: ["sections", 0], message: "logs begin with their worklog" });
+  }
   for (const [index, section] of logs.sections.entries()) {
-    if (previousOrder !== undefined && previousOrder >= section.order) {
-      context.addIssue({ code: "custom", path: ["sections", index], message: "log sections must be uniquely ordered" });
+    if (section.order !== index) {
+      context.addIssue({ code: "custom", path: ["sections", index, "order"], message: "log sections are contiguous and ordered" });
     }
-    previousOrder = section.order;
     if (sectionIds.has(section.sectionId)) {
       context.addIssue({ code: "custom", path: ["sections", index, "sectionId"], message: "log section IDs must be unique" });
     }
     sectionIds.add(section.sectionId);
-    if (section.omittedBytes > Number.MAX_SAFE_INTEGER - omittedBytes) {
-      context.addIssue({ code: "custom", path: ["sections", index, "omittedBytes"], message: "aggregate omitted bytes exceed exact numeric range" });
-    } else {
-      omittedBytes += section.omittedBytes;
-    }
-  }
-  if (logs.projection.omittedBytes < omittedBytes) {
-    context.addIssue({ code: "custom", path: ["projection", "omittedBytes"], message: "projection omission total must include section omissions" });
-  }
-  if (logs.projection.truncated !== (logs.projection.omittedSections > 0 || logs.projection.omittedBytes > 0)) {
-    context.addIssue({ code: "custom", path: ["projection", "truncated"], message: "truncation flag must reflect omitted sections or bytes" });
   }
 });
 
 export type StatusDto = z.infer<typeof statusDtoSchema>;
-export type WorkflowStatusDto = z.infer<typeof workflowStatusDtoSchema>;
 export type RunSummaryDto = z.infer<typeof runSummaryDtoSchema>;
-export type RunsDto = z.infer<typeof runsDtoSchema>;
-export type ResolvedExecutionSiteDto = z.infer<typeof resolvedExecutionSiteDtoSchema>;
-export type ResolvedNodeSettingsDto = z.infer<typeof resolvedNodeSettingsDtoSchema>;
-export type EvidenceReferenceDto = z.infer<typeof evidenceReferenceDtoSchema>;
-export type AttemptDetailDto = z.infer<typeof attemptDetailDtoSchema>;
-export type NodeDetailDto = z.infer<typeof nodeDetailDtoSchema>;
-export type RunDetailDto = z.infer<typeof runDetailDtoSchema>;
 export type NodeDescriptionDto = z.infer<typeof nodeDescriptionDtoSchema>;
 export type LogsDto = z.infer<typeof logsDtoSchema>;
 export type DiagramDto = z.infer<typeof diagramDtoSchema>;

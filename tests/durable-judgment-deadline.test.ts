@@ -24,7 +24,6 @@ import { openDurableStorage } from "../src/storage/durable/open-durable-storage.
 
 const JUDGE_TIMEOUT_MS = 30_000;
 const machineConfig = {
-  version: 2,
   shell: "/bin/bash",
   orchestrator: { model: "faux/failure-judge:low", timeout: `${JUDGE_TIMEOUT_MS / 1_000}s` },
 } as const;
@@ -36,18 +35,15 @@ type ReadyRun = Extract<ReturnType<typeof workflowRunDocumentV1Schema.parse>, { 
 
 function judgedWorkflowSource(workflowId: string): string {
   return [
-    "version: 2",
-    `id: ${workflowId}`,
-    "nodes:",
-    "  verify:",
-    "    replay: safe",
-    "    max_attempts: 2",
-    "    run: { command: \"printf 'candidate'\" }",
-    "    validator:",
+    "steps:",
+    "  - verify:",
     "      replay: safe",
-    "      command: >-",
-    "        if [ -f .validator-failed-once ]; then exit 0; else touch .validator-failed-once; exit 7; fi",
-    "    next: null",
+    "      max_attempts: 2",
+    "      run: \"printf 'candidate'\"",
+    "      check:",
+    "        run: >-",
+    "          if [ -f .validator-failed-once ]; then exit 0; else touch .validator-failed-once; exit 7; fi",
+    "        replay: safe",
     "",
   ].join("\n");
 }
@@ -68,14 +64,16 @@ async function openHarness(databasePath: string, harnessClock: () => number, dec
 
 function prepare(directory: string, workflowId: string, admittedAt: number) {
   const source = judgedWorkflowSource(workflowId);
-  const checked = checkDefinitionText(source, `${workflowId}.yaml`);
+  const checked = checkDefinitionText(source, `${workflowId}.yaml`, workflowId);
   const resolvedSettings = resolveWorkflowSettings({ definition: checked.def, machine: machineConfig, projectCwd: directory });
   const prepared = prepareRunAdmission({
     sourceText: source,
     sourceLabel: `${workflowId}.yaml`,
+    workflowId,
     machineConfig,
     projectCwd: directory,
     runsDirectory: join(directory, "state", "runs"),
+    archiveDirectory: join(directory, ".workshop", "archive"),
     resolvedSettings,
     runtimeManifest: {
       durableVersion: "1.0.2",

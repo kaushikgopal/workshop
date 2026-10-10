@@ -21,15 +21,11 @@ import { encodeServiceRequestLine, parseServiceResponseLine } from "../src/servi
 import { openDurableStorage } from "../src/storage/durable/open-durable-storage.js";
 
 const sourceText = [
-  "version: 2",
-  "id: release",
-  "nodes:",
-  "  prepare-report:",
-  "    run: { command: echo prepare }",
-  "    next: null",
+  "steps:",
+  "  - prepare-report: echo prepare",
   "",
 ].join("\n");
-const machineConfig = { version: 2, shell: "/bin/bash" } as const;
+const machineConfig = { shell: "/bin/bash" } as const;
 const hash = (value: string) => `sha256:${createHash("sha256").update(value).digest("hex")}`;
 
 const admissionTestTaskInputSchema = z.strictObject({ runId: z.string().min(1) });
@@ -62,7 +58,7 @@ async function openAdmissionHarness(path: string) {
 }
 
 function prepare(directory: string, overrides: Record<string, unknown> = {}) {
-  const checked = checkDefinitionText(sourceText, "release.yaml");
+  const checked = checkDefinitionText(sourceText, "release.yaml", "release");
   const resolvedSettings = resolveWorkflowSettings({
     definition: checked.def,
     machine: machineConfig,
@@ -71,9 +67,11 @@ function prepare(directory: string, overrides: Record<string, unknown> = {}) {
   const result = prepareRunAdmission({
     sourceText,
     sourceLabel: "release.yaml",
+    workflowId: "release",
     machineConfig,
     projectCwd: directory,
     runsDirectory: join(directory, "state", "runs"),
+    archiveDirectory: join(directory, "archive"),
     resolvedSettings,
     runtimeManifest: {
       durableVersion: "1.0.2",
@@ -167,7 +165,7 @@ describe("Durable admission transaction seam (test-only task)", () => {
       expect(retried.value).toEqual({ ...firstValue, duplicate: true });
 
       const changedSource = `${sourceText}# a formatting-only source change\n`;
-      const checked = checkDefinitionText(changedSource, "release.yaml");
+      const checked = checkDefinitionText(changedSource, "release.yaml", "release");
       const changedSettings = resolveWorkflowSettings({
         definition: checked.def,
         machine: machineConfig,

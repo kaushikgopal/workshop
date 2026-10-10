@@ -3,10 +3,11 @@ import type { WorkflowRunDocumentV1, PersistedNodeAttempt } from "../../run/reco
 import type { NodeResult, ValidatorOutcome } from "../../run/schema.js";
 import type { ProcessExit } from "../../process/schema.js";
 
-/** Render committed run state as a Markdown view; user-authored text stays quoted. */
-export function renderWorklog(value: WorkflowRunDocumentV1): string {
+/** Render committed run state as Markdown: one line per attempt, or every setting and hash when verbose. */
+export function renderWorklog(value: WorkflowRunDocumentV1, options: { readonly verbose?: boolean } = {}): string {
   if (value.state !== "ready") throw new Error("cannot render an uninitialized run");
   const run = value;
+  if (!options.verbose) return renderCompactWorklog(run);
   const lines = [
     `# Workflow run: ${run.workflowId}`,
     "",
@@ -28,7 +29,7 @@ export function renderWorklog(value: WorkflowRunDocumentV1): string {
     lines.push(`- Failure judge model: ${run.resolvedSettings.orchestrator.model}`);
   }
 
-  lines.push("", "## Node attempts", "");
+  lines.push("", "## Step attempts", "");
   for (const node of run.nodes) {
     const settings = run.resolvedSettings.nodes[node.nodeId];
     lines.push(`### ${node.nodeId} — ${node.status}`, "");
@@ -54,7 +55,6 @@ export function renderWorklog(value: WorkflowRunDocumentV1): string {
       if (candidate !== null) {
         lines.push(`- Candidate source: ${candidate.source}`);
         lines.push(`- Candidate SHA-256: ${candidate.sourceBytesHash}`);
-        lines.push(`- Output view: ${inlineCode(`${node.nodeId}.output.txt`)}`);
         if (candidate.source === "operator") {
           lines.push(`- Operator acceptance: ${inlineCode(candidate.acceptance.resolutionId)}`);
           lines.push(...quote(candidate.acceptance.reason));
@@ -94,16 +94,17 @@ export function renderWorklog(value: WorkflowRunDocumentV1): string {
     }
   }
 
-  lines.push("## Global decision log", "");
-  if (run.resolutions.length === 0) lines.push("No operator resolutions.", "");
-  for (const resolution of run.resolutions) {
-    lines.push(`- ${resolution.resolvedAt}: ${resolution.action} (${inlineCode(resolution.resolutionId)})`);
-    lines.push(...quote(resolution.reason));
+  if (run.resolutions.length > 0) {
+    lines.push("## Global decision log", "");
+    for (const resolution of run.resolutions) {
+      lines.push(`- ${resolution.resolvedAt}: ${resolution.action} (${inlineCode(resolution.resolutionId)})`);
+      lines.push(...quote(resolution.reason));
+    }
   }
 
   lines.push("", "## Run outcome", "", `- Status: ${run.status}`, `- Desired state: ${run.desiredState}`);
   if (run.finishedAt !== null) lines.push(`- Finished: ${run.finishedAt}`);
-  if (run.terminalOutput !== null) lines.push("- Terminal output is materialized in the final node output view.");
+  if (run.terminalOutput !== null) lines.push(`- Terminal output: ${Buffer.byteLength(run.terminalOutput, "utf8")} bytes from the final step`);
   if (run.failure !== null) {
     const reason = run.failure.kind === "operator" ? run.failure.reason : run.failure.message;
     lines.push(`- Failure: ${run.failure.kind} —`, ...quote(reason));
@@ -164,4 +165,44 @@ function inlineCode(value: string): string {
   const delimiter = "`".repeat(longestRun + 1);
   const padding = value.trim() !== value || value.startsWith("`") || value.endsWith("`") ? " " : "";
   return `${delimiter}${padding}${value}${padding}${delimiter}`;
+}
+
+function renderCompactWorklog(run: Extract<WorkflowRunDocumentV1, { state: "ready" }>): string {
+  const lines = [
+    `# ${run.workflowId} — ${run.status}`,
+    `Run ${run.runId} · admitted ${run.admittedAt}`,
+    "",
+  ];
+  for (const node of run.nodes) {
+    for (const attempt of node.attempts) {
+      const outcome = attempt.result.kind === "settled" ? attempt.result.outcome.kind : attempt.status;
+      const duration = attempt.elapsedMs === null ? "—" : `${attempt.elapsedMs}ms`;
+      const candidate = candidateOf(attempt);
+      const outcomeDetail = attempt.result.kind === "settled"
+        ? attempt.result.outcome.kind === "failed" ? attempt.result.outcome.failure.message
+          : attempt.result.outcome.kind === "blocked" ? attempt.result.outcome.block.reason
+            : ""
+        : "";
+      const summary = compactText(candidate?.summary || outcomeDetail || "no summary");
+      const validator = validatorOf(attempt);
+      const verdictReason = validator?.kind === "agent" || validator?.kind === "operator"
+        ? compactText(validator.verdict.reason)
+        : null;
+      lines.push(`- ${node.nodeId} #${attempt.number} ${outcome} · ${duration} · ${summary}${verdictReason === null ? "" : ` · verdict: ${verdictReason}`}`);
+    }
+  }
+  if (run.resolutions.length > 0) {
+    lines.push("", "## Global decision log");
+    for (const resolution of run.resolutions) {
+      lines.push(`- ${resolution.resolvedAt}: ${resolution.action} — ${compactText(resolution.reason)}`);
+    }
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+function compactText(value: string, maximumCharacters = 180): string {
+  const oneLine = value.replace(/\s+/gu, " ").trim();
+  const characters = Array.from(oneLine);
+  if (characters.length <= maximumCharacters) return oneLine;
+  return `${characters.slice(0, maximumCharacters - 1).join("").trimEnd()}…`;
 }

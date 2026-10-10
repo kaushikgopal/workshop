@@ -143,12 +143,5 @@ export const processIncarnationSchema = z.strictObject({
   }
 });
 
-export type ExecutionId = z.infer<typeof executionIdSchema>;
-export type IncarnationId = z.infer<typeof incarnationIdSchema>;
-export type ProcessRole = z.infer<typeof processRoleSchema>;
-export type ProcessStatus = z.infer<typeof processStatusSchema>;
-export type ProcessCleanupState = z.infer<typeof processCleanupStateSchema>;
-export type ProcessIdentity = z.infer<typeof processIdentitySchema>;
 export type ProcessExit = z.infer<typeof processExitSchema>;
 export type ProcessCapture = z.infer<typeof processCaptureSchema>;
-export type ProcessIncarnation = z.infer<typeof processIncarnationSchema>;

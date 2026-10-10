@@ -1,6 +1,6 @@
 import { isAbsolute } from "node:path";
 import { z } from "zod";
-import { nodeIdSchema } from "./schema.js";
+import { keepFilesValue, nodeIdSchema } from "./schema.js";
 import { replayPolicySchema } from "../util/schema.js";
 
 const positiveSafeInteger = z.number().int().positive().refine(Number.isSafeInteger);
@@ -55,6 +55,7 @@ export const resolvedOrchestratorSettingsSchema = z.strictObject({
 
 /** Frozen policy for every node, preflight, and the optional internal judge. */
 export const resolvedWorkflowSettingsSchema = z.strictObject({
+  keepFiles: keepFilesValue,
   nodes: z.record(nodeIdSchema, resolvedNodeSettingsSchema),
   preflight: resolvedPreflightSettingsSchema.nullable(),
   orchestrator: resolvedOrchestratorSettingsSchema,
@@ -63,6 +64,4 @@ export const resolvedWorkflowSettingsSchema = z.strictObject({
 export type ResolvedExecutionSite = z.infer<typeof resolvedExecutionSiteSchema>;
 export type ResolvedNodeSettings = z.infer<typeof resolvedNodeSettingsSchema>;
 export type ResolvedPreflightSettings = z.infer<typeof resolvedPreflightSettingsSchema>;
-export type ResolvedOrchestratorSettings = z.infer<typeof resolvedOrchestratorSettingsSchema>;
-export type ResolvedWorkflowSettings = z.infer<typeof resolvedWorkflowSettingsSchema>;
 

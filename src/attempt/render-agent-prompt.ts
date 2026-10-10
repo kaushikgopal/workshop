@@ -15,7 +15,7 @@ export function renderWorkerPrompt(input: AgentPromptIdentity): string {
 
 Workflow: ${input.workflowId}
 Run: ${input.runId}
-Node: ${input.nodeId}
+Step: ${input.nodeId}
 Attempt: ${input.attemptNumber}
 
 ## Instructions
@@ -45,7 +45,7 @@ export function renderValidatorPrompt(input: AgentPromptIdentity & { candidatePa
 
 Workflow: ${input.workflowId}
 Run: ${input.runId}
-Node: ${input.nodeId}
+Step: ${input.nodeId}
 Attempt: ${input.attemptNumber}
 
 ## Instructions

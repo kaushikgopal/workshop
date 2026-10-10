@@ -14,13 +14,8 @@ import { REPO_ROOT } from "./helpers.js";
 const cliPath = join(REPO_ROOT, "src/cli/main.ts");
 
 const CLOCK_WORKFLOW = [
-  "version: 2",
-  "id: clock",
-  "nodes:",
-  "  tick:",
-  "    run:",
-  "      command: printf fixture-output",
-  "    next: null",
+  "steps:",
+  "  - tick: printf fixture-output",
   "",
 ].join("\n");
 
@@ -34,6 +29,9 @@ describe("CLI commands", () => {
         expect(help.stdout).toContain("Usage: workshop <command> [args]");
         expect(help.stdout).toContain("watch [<workflow>]");
         expect(help.stdout).toContain("service start | serve | status [--json] | stop");
+        expect(help.stdout).toContain("Workflows live in .workshop/workflows/<id>.yaml; machine defaults in .workshop/workshop.yaml.");
+        expect(help.stdout).toContain("step describe <workflow> <step>");
+        expect(help.stdout).toContain("Pause new work and let the active step finish.");
         expect(help.stdout).not.toMatch(/\bv[34]\b|experimental|engine|orchestrate|legacy/i);
       }
       expect(existsSync(join(directory, ".workshop"))).toBe(false);
@@ -63,50 +61,78 @@ describe("CLI commands", () => {
   test("validates the shipped example without creating state", () => {
     const root = makeRoot({ machine: null, workflows: {} });
     try {
-      copyFileSync(join(REPO_ROOT, "examples", "workshop.yaml"), join(root, ".workshop", "config", "workshop.yaml"));
+      copyFileSync(join(REPO_ROOT, "examples", "workshop.yaml"), join(root, ".workshop", "workshop.yaml"));
       copyFileSync(
         join(REPO_ROOT, "examples", "workflows", "hemingway-clock.yaml"),
-        join(root, ".workshop", "config", "workflows", "hemingway-clock.yaml"),
+        join(root, ".workshop", "workflows", "hemingway-clock.yaml"),
       );
 
       const result = runCli(root, ["validate", "hemingway-clock"]);
       expect(result.stderr).toBe("");
       expect(result.status).toBe(0);
-      expect(result.stdout).toBe('valid workflow "hemingway-clock" (3 nodes)\n');
+      expect(result.stdout).toBe('valid workflow "hemingway-clock" (3 steps)\n');
       expect(existsSync(join(root, ".workshop", "state"))).toBe(false);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
   });
 
-  test("a version 1 workflow or machine config fails with a plain schema error", () => {
-    const v1Workflow = CLOCK_WORKFLOW.replace("version: 2", "version: 1");
-    const oldWorkflow = makeRoot({ machine: "version: 2\nshell: /bin/bash\n", workflows: { clock: v1Workflow } });
+  test("rejects obsolete versions, accepts omitted versions, and explains legacy workflow keys", () => {
+    const oldWorkflow = makeRoot({
+      machine: null,
+      workflows: { clock: `version: 1\n${CLOCK_WORKFLOW}` },
+    });
     const oldMachine = makeRoot({ machine: "version: 1\nshell: /bin/bash\n", workflows: { clock: CLOCK_WORKFLOW } });
     const unversionedMachine = makeRoot({ machine: "shell: /bin/bash\n", workflows: { clock: CLOCK_WORKFLOW } });
+    const legacyId = makeRoot({
+      machine: null,
+      workflows: { clock: [
+        "id: clock",
+        "nodes:",
+        "  tick:",
+        "    run:",
+        "      command: echo tick",
+        "    next: null",
+        "",
+      ].join("\n") },
+    });
+    const legacyNodes = makeRoot({
+      machine: null,
+      workflows: { clock: ["nodes:", "  tick:", "    run: echo tick", ""].join("\n") },
+    });
     try {
       const workflow = runCli(oldWorkflow, ["validate", "clock"]);
       expect(workflow.status).toBe(64);
-      expect(workflow.stderr).toContain("unsupported workflow version 1; expected version: 2");
+      expect(workflow.stderr).toContain("workflow version 1 is no longer supported; remove version: and id:, and list steps: in order (or declare version: 3)");
 
       const machine = runCli(oldMachine, ["validate", "clock"]);
       expect(machine.status).toBe(64);
-      expect(machine.stderr).toContain("unsupported machine config version 1; expected version: 2");
+      expect(machine.stderr).toContain("machine config version 1 is no longer supported; remove version: (or declare version: 3)");
 
-      const unversioned = runCli(unversionedMachine, ["status"]);
-      expect(unversioned.status).not.toBe(0);
-      expect(unversioned.stderr).toContain("machine config does not declare a version; add version: 2");
+      const unversioned = runCli(unversionedMachine, ["validate", "clock"]);
+      expect(unversioned.status).toBe(0);
+      expect(unversioned.stdout).toBe('valid workflow "clock" (1 steps)\n');
 
-      for (const root of [oldWorkflow, oldMachine, unversionedMachine]) {
+      const legacyIdResult = runCli(legacyId, ["validate", "clock"]);
+      expect(legacyIdResult.status).toBe(64);
+      expect(legacyIdResult.stderr).toContain("id: is not accepted; the workflow id is the file name");
+
+      const legacyNodesResult = runCli(legacyNodes, ["validate", "clock"]);
+      expect(legacyNodesResult.status).toBe(64);
+      expect(legacyNodesResult.stderr).toContain("nodes: is replaced by an ordered steps: list");
+
+      for (const root of [oldWorkflow, oldMachine, unversionedMachine, legacyId, legacyNodes]) {
         expect(existsSync(join(root, ".workshop", "state"))).toBe(false);
       }
     } finally {
-      for (const root of [oldWorkflow, oldMachine, unversionedMachine]) rmSync(root, { recursive: true, force: true });
+      for (const root of [oldWorkflow, oldMachine, unversionedMachine, legacyId, legacyNodes]) {
+        rmSync(root, { recursive: true, force: true });
+      }
     }
   });
 
   test("service start, status, and stop manage one owner idempotently", async () => {
-    const root = makeRoot({ machine: "version: 2\nshell: /bin/bash\n", workflows: { clock: CLOCK_WORKFLOW } });
+    const root = makeRoot({ machine: "shell: /bin/bash\n", workflows: { clock: CLOCK_WORKFLOW } });
     const metadataPath = join(root, ".workshop", "state", "service.json");
     try {
       const absent = runCli(root, ["service", "status", "--json"]);
@@ -156,7 +182,7 @@ describe("CLI commands", () => {
   }, 30_000);
 
   test("service stop never signals a PID it cannot verify as the healthy owner", async () => {
-    const root = makeRoot({ machine: "version: 2\nshell: /bin/bash\n", workflows: {} });
+    const root = makeRoot({ machine: "shell: /bin/bash\n", workflows: {} });
     const stateDirectory = join(root, ".workshop", "state");
     mkdirSync(stateDirectory, { recursive: true });
     const bystander = spawn("sleep", ["30"], { stdio: "ignore" });
@@ -193,68 +219,46 @@ describe("CLI commands", () => {
 
   test("routes public commands through one temporary YAML installation and canonical run", async () => {
     const directory = mkdtempSync(join(tmpdir(), "workshop-public-cli-"));
-    const configDirectory = join(directory, ".workshop", "config");
-    const workflowsDirectory = join(configDirectory, "workflows");
+    const workshopDirectory = join(directory, ".workshop");
+    const workflowsDirectory = join(workshopDirectory, "workflows");
     mkdirSync(workflowsDirectory, { recursive: true });
-    writeFileSync(join(configDirectory, "workshop.yaml"), "version: 2\nshell: /bin/bash\n", "utf8");
+    writeFileSync(join(workshopDirectory, "workshop.yaml"), "shell: /bin/bash\nkeep_files: always\n", "utf8");
     writeFileSync(join(workflowsDirectory, "clock.yaml"), [
-      "version: 2",
-      "id: clock",
       "description: Public CLI fixture",
-      "nodes:",
-      "  tick:",
-      "    run:",
-      "      command: sleep 2; printf 'fixture-output'",
-      "    next: null",
+      "steps:",
+      "  - tick:",
+      "      run: sleep 2; printf 'fixture-output'",
       "",
     ].join("\n"), "utf8");
     writeFileSync(join(workflowsDirectory, "big.yaml"), [
-      "version: 2",
-      "id: big",
-      "nodes:",
-      "  tick:",
-      "    run:",
-      "      command: >-",
+      "steps:",
+      "  - tick:",
+      "      run: >-",
       "        printf HEAD; head -c 699992 /dev/zero | tr '\\000' '\"'; printf TAIL",
-      "    stream_cap: 1kb",
-      "    next: null",
+      "      stream_cap: 1kb",
       "",
     ].join("\n"), "utf8");
     writeFileSync(join(workflowsDirectory, "unlimited.yaml"), [
-      "version: 2",
-      "id: unlimited",
-      "nodes:",
-      "  tick:",
-      "    run:",
-      "      command: printf 'unlimited-output'",
-      "    stream_cap: unlimited",
-      "    next: null",
+      "steps:",
+      "  - tick:",
+      "      run: printf 'unlimited-output'",
+      "      stream_cap: unlimited",
       "",
     ].join("\n"), "utf8");
     writeFileSync(join(workflowsDirectory, "oversize.yaml"), [
-      "version: 2",
-      "id: oversize",
-      "nodes:",
-      "  first:",
-      "    run:",
-      "      command: head -c 700000 /dev/zero",
-      "    stream_cap: 1mb",
-      "    next: second",
-      "  second:",
-      "    run:",
-      "      command: head -c 700000 /dev/zero",
-      "    stream_cap: 1mb",
-      "    next: third",
-      "  third:",
-      "    run:",
-      "      command: head -c 700000 /dev/zero",
-      "    stream_cap: 1mb",
-      "    next: fourth",
-      "  fourth:",
-      "    run:",
-      "      command: head -c 700000 /dev/zero",
-      "    stream_cap: 1mb",
-      "    next: null",
+      "steps:",
+      "  - first:",
+      "      run: head -c 700000 /dev/zero",
+      "      stream_cap: 1mb",
+      "  - second:",
+      "      run: head -c 700000 /dev/zero",
+      "      stream_cap: 1mb",
+      "  - third:",
+      "      run: head -c 700000 /dev/zero",
+      "      stream_cap: 1mb",
+      "  - fourth:",
+      "      run: head -c 700000 /dev/zero",
+      "      stream_cap: 1mb",
       "",
     ].join("\n"), "utf8");
 
@@ -325,7 +329,8 @@ describe("CLI commands", () => {
       expect(viewerSnapshot.runs.runs.find((run) => run.id === secondRunId)?.nodes).toEqual([]);
       const worklogSection = logs.sections.find((section) => section.kind === "worklog");
       if (worklogSection?.kind !== "worklog") throw new Error("worklog section is missing");
-      expect(await viewerSource.log("clock", runId)).toBe(worklogSection.content);
+      expect(worklogSection.content).toStartWith("# Workflow run: clock");
+      expect(await viewerSource.log("clock", runId)).toStartWith(`# clock — completed\nRun ${runId}`);
       const collatedViewerLog = await viewerSource.log("clock", null);
       const firstViewerLog = collatedViewerLog.indexOf(`━━ run ${runId} — completed ━━`);
       const secondViewerLog = collatedViewerLog.indexOf(`━━ run ${secondRunId} — completed ━━`);
@@ -431,10 +436,10 @@ describe("CLI commands", () => {
 
 function makeRoot(input: { machine: string | null; workflows: Record<string, string> }): string {
   const root = mkdtempSync(join(tmpdir(), "workshop-cli-"));
-  const config = join(root, ".workshop", "config");
-  mkdirSync(join(config, "workflows"), { recursive: true });
-  if (input.machine !== null) writeFileSync(join(config, "workshop.yaml"), input.machine, "utf8");
-  for (const [id, text] of Object.entries(input.workflows)) writeFileSync(join(config, "workflows", `${id}.yaml`), text, "utf8");
+  const workshopDirectory = join(root, ".workshop");
+  mkdirSync(join(workshopDirectory, "workflows"), { recursive: true });
+  if (input.machine !== null) writeFileSync(join(workshopDirectory, "workshop.yaml"), input.machine, "utf8");
+  for (const [id, text] of Object.entries(input.workflows)) writeFileSync(join(workshopDirectory, "workflows", `${id}.yaml`), text, "utf8");
   return root;
 }
 

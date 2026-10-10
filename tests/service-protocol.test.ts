@@ -13,12 +13,10 @@ import { openDurableStorage } from "../src/storage/durable/open-durable-storage.
 import {
   encodeServiceRequestLine,
   encodeServiceResponseFrames,
-  encodeServiceResponseLine,
   MAX_SERVICE_FRAGMENT_PAYLOAD_BYTES,
   MAX_SERVICE_FRAME_BYTES,
   MAX_SERVICE_RESPONSE_BYTES,
   parseServiceRequestLine,
-  parseServiceResponseLine,
   serviceSuccess,
 } from "../src/service/parse-service-protocol.js";
 import { serveWorkshopService } from "../src/service/serve-workshop-service.js";
@@ -66,18 +64,6 @@ describe("service protocol v1", () => {
     expect(parseServiceRequestLine(line.slice(0, -1))).toMatchObject({ ok: true, request: { method: "start", requestId: "start-1" } });
   });
 
-  test("validates responses and replaces oversized results with a typed error", () => {
-    const response = serviceSuccess("request-1", { runId: "release-1" });
-    const line = encodeServiceResponseLine(response);
-    expect(parseServiceResponseLine(line.slice(0, -1))).toMatchObject({ ok: true, response: { ok: true, requestId: "request-1" } });
-
-    const oversized = encodeServiceResponseLine(serviceSuccess("request-1", { payload: "x".repeat(MAX_SERVICE_FRAME_BYTES) }));
-    expect(Buffer.byteLength(oversized)).toBeLessThanOrEqual(MAX_SERVICE_FRAME_BYTES);
-    expect(parseServiceResponseLine(oversized.slice(0, -1))).toMatchObject({
-      ok: true,
-      response: { ok: false, error: { code: "response_too_large" } },
-    });
-  });
   test("reassembles large Unicode and escaped responses and rejects dropped fragments", async () => {
     const payload = `λ\"🙂`.repeat(200_000);
     const response = serviceSuccess("start-fragmented", { payload });

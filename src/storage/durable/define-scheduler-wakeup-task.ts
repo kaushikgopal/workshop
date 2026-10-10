@@ -170,9 +170,11 @@ async function admitScheduledOccurrence(
   const prepared = prepareRunAdmission({
     sourceText: checked.sourceText,
     sourceLabel: checked.sourcePath,
+    workflowId: checked.workflowId,
     machineConfig: definition.installation.machine,
     projectCwd: definition.installation.projectCwd,
     runsDirectory: definition.installation.runsDirectory,
+    archiveDirectory: definition.installation.archiveDirectory,
     resolvedSettings: checked.resolvedSettings,
     runtimeManifest: definition.runtimeManifest,
     runId,

@@ -1,14 +1,13 @@
-# Machine defaults for a new installation. Copy to .workshop/config/workshop.yaml.
-# The harness and models are placeholders: replace the models with ones your
-# Pi installation can use, and confirm the pi flags against your installed CLI.
-version: 2
+# Machine defaults. Copy to .workshop/workshop.yaml.
+# The models are placeholders: replace them with ones your Pi installation can
+# use. `harness: pi` is the default and may be omitted.
 shell: /bin/bash
 max_concurrent_runs: 1
 default_timeout: 10m
 stream_cap: 256kb
+keep_files: failed
 agent:
-  harness:
-    command: 'pi --print --approve --no-session --model "$WORKSHOP_MODEL_WITH_THINKING" -- "$(cat "$WORKSHOP_PROMPT_FILE")"'
+  harness: pi
   model: "example/pi-model:medium"
 orchestrator:
   model: "example/judge-model:low"

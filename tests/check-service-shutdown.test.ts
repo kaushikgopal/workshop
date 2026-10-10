@@ -26,34 +26,26 @@ const taskVersions = { workflowRun: 10, nodeAttempt: 4, processExecution: 4, cap
 describe("Durable service shutdown", () => {
   test("does not admit scheduled work while shutdown reconciles a TERM-trapping process", async () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-shutdown-fence-"));
-    const config = join(root, ".workshop", "config");
+    const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
     const processMarker = join(root, "holder-events.txt");
     const scheduledMarker = join(root, "scheduled-launches.txt");
     mkdirSync(workflows, { recursive: true });
-    writeFileSync(join(config, "workshop.yaml"), "version: 2\nshell: /bin/bash\nmax_concurrent_runs: 2\n", "utf8");
+    writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\nmax_concurrent_runs: 2\n", "utf8");
     writeFileSync(join(workflows, "holder.yaml"), [
-      "version: 2",
-      "id: holder",
-      "nodes:",
-      "  hold:",
-      "    run:",
-      "      command: >-",
+      "steps:",
+      "  - hold:",
+      "      run: >-",
       `        trap "printf 'TERM\\n' >> '${processMarker}'; sleep 0.45; printf 'RETIRED\\n' >> '${processMarker}'; exit 0" TERM; printf 'STARTED\\n' >> '${processMarker}'; while :; do sleep 5; done`,
-      "    next: null",
       "",
     ].join("\n"), "utf8");
     writeFileSync(join(workflows, "scheduled.yaml"), [
-      "version: 2",
-      "id: scheduled",
       "schedule:",
       "  every: 2s",
       "  max_runs: 3",
-      "nodes:",
-      "  tick:",
-      "    run:",
-      `      command: 'printf x >> ${scheduledMarker}'`,
-      "    next: null",
+      "steps:",
+      "  - tick:",
+      `      run: 'printf x >> ${scheduledMarker}'`,
       "orchestrator:",
       "  model: faux/failure-judge:low",
       "  timeout: 10s",
@@ -144,7 +136,7 @@ describe("Durable service shutdown", () => {
       });
       const registry = createRegistry();
       registry.install({
-        name: "workshop-v4-service-runtime",
+        name: "workshop-service-runtime",
         tasks: [tasks.WorkflowRunTask, tasks.NodeAttemptTask, tasks.ProcessExecutionTask, tasks.CapacityGateTask, tasks.FailureJudgmentTask, scheduleWakeupTask],
       });
       registry.install(tasks.FailureJudgmentExtension);
@@ -200,51 +192,39 @@ describe("Durable service shutdown", () => {
 
   test("shutdown holds a failed judgment and prepared node until the next service boot", async () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-shutdown-held-dispatch-"));
-    const config = join(root, ".workshop", "config");
+    const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
     const processMarker = join(root, "holder-events.txt");
     const workerMarker = join(root, "judgment-worker.txt");
     const validatorMarker = join(root, "judgment-validator.txt");
     const preparedMarker = join(root, "prepared-worker.txt");
     mkdirSync(workflows, { recursive: true });
-    writeFileSync(join(config, "workshop.yaml"), "version: 2\nshell: /bin/bash\nmax_concurrent_runs: 3\n", "utf8");
+    writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\nmax_concurrent_runs: 3\n", "utf8");
     writeFileSync(join(workflows, "holder.yaml"), [
-      "version: 2",
-      "id: holder",
-      "nodes:",
-      "  hold:",
-      "    run:",
-      "      command: >-",
-      `        trap \"printf 'TERM\\n' >> '${processMarker}'; sleep 0.45; printf 'RETIRED\\n' >> '${processMarker}'; exit 0\" TERM; printf 'STARTED\\n' >> '${processMarker}'; while :; do sleep 5; done`,
-      "    next: null",
+      "steps:",
+      "  - hold:",
+      "      run: >-",
+      `        trap "printf 'TERM\\n' >> '${processMarker}'; sleep 0.45; printf 'RETIRED\\n' >> '${processMarker}'; exit 0" TERM; printf 'STARTED\\n' >> '${processMarker}'; while :; do sleep 5; done`,
       "",
     ].join("\n"), "utf8");
     writeFileSync(join(workflows, "judged.yaml"), [
-      "version: 2",
-      "id: judged",
-      "nodes:",
-      "  verify:",
-      "    run:",
-      "      command: >-",
+      "steps:",
+      "  - verify:",
+      "      run: >-",
       `        printf w >> '${workerMarker}'; printf candidate`,
-      "    validator:",
-      "      command: >-",
-      `        printf v >> '${validatorMarker}'; exit 7`,
-      "    next: null",
+      "      check:",
+      "        run: >-",
+      `          printf v >> '${validatorMarker}'; exit 7`,
       "orchestrator:",
       "  model: faux/failure-judge:low",
       "  timeout: 10s",
       "",
     ].join("\n"), "utf8");
     writeFileSync(join(workflows, "prepared.yaml"), [
-      "version: 2",
-      "id: prepared",
-      "nodes:",
-      "  work:",
-      "    run:",
-      "      command: >-",
+      "steps:",
+      "  - work:",
+      "      run: >-",
       `        printf c >> '${preparedMarker}'; printf prepared-result`,
-      "    next: null",
       "",
     ].join("\n"), "utf8");
 

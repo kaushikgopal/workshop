@@ -10,9 +10,9 @@ import { startWorkshopService } from "../src/service/open-service-runtime.js";
 describe("service partial-open cleanup", () => {
   test("closes actual Durable storage when an opened Harness rejects before runtime ownership transfers", async () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-partial-open-"));
-    const configDirectory = join(root, ".workshop", "config");
+    const configDirectory = join(root, ".workshop");
     mkdirSync(configDirectory, { recursive: true });
-    writeFileSync(join(configDirectory, "workshop.yaml"), "version: 2\n", "utf8");
+    writeFileSync(join(configDirectory, "workshop.yaml"), "\n", "utf8");
 
     const originalOpen = Harness.open;
     let openedHarnesses = 0;

@@ -13,18 +13,14 @@ import { startWorkshopService } from "../src/service/open-service-runtime.js";
 describe("service mutation retry", () => {
   test("replays a start request after its response is dropped without creating a second run", async () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-dropped-reply-"));
-    const config = join(root, ".workshop", "config");
+    const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
     mkdirSync(workflows, { recursive: true });
-    writeFileSync(join(config, "workshop.yaml"), "version: 2\nshell: /bin/bash\n", "utf8");
+    writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\n", "utf8");
     writeFileSync(join(workflows, "clock.yaml"), [
-      "version: 2",
-      "id: clock",
-      "nodes:",
-      "  tick:",
-      "    run:",
-      "      command: printf-tick",
-      "    next: null",
+      "steps:",
+      "  - tick:",
+      "      run: printf-tick",
       "",
     ].join("\n"), "utf8");
 

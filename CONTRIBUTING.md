@@ -52,9 +52,11 @@ overlap one in the table; if it will recur, add it to the table.
   important noun. A function named `runChain` or a file named `run-paths.ts`
   forces the reader to guess which meaning you meant. Use `execute`, `advance`,
   `launch`, or a more specific verb.
-- **Never use "validate" for two things.** If the product has a user-facing
-  concept called a validator, code that applies fixed rules says `check`, and
-  code that invokes the validator says `judge`.
+- **Never use "validate" for two things.** The user-facing step `check` is
+  called a validator in code. Code that applies fixed rules says `check`, and
+  code that invokes a validator says `judge`.
+- **Steps are nodes in code.** Authors write `steps:`; the frozen definition,
+  records, and tasks call them nodes (`NodeAttempt`, `nodeId`).
 - **Name the logic, not the area.** `run-paths.ts` leaves open whether the
   file builds, checks, or cleans paths. `locate-run-files.ts` does not.
 - **Match exported symbols to the file's verb.** `judge-output.ts` exports
@@ -120,7 +122,7 @@ flowchart TD
   PE --> P[pi / command process]
   WR -->|on failure| FJ[FailureJudgment]
   FJ -->|retry / block / fail| WR
-  WR --> V[WORKLOG.md + captures]
+  PE --> V[run folder: inputs + captures]
 ```
 
 ### One run
@@ -130,8 +132,9 @@ The task tree for one run, in `src/storage/durable/`:
 ```text
 WorkflowRun                                define-workshop-tasks.ts
   preflight → ProcessExecution
-  for each node in the frozen chain:
+  for each step (node) in the frozen chain:
     NodeAttempt                            define-node-attempt-task.ts
+      write process inputs                 write-process-inputs.ts
       worker    → ProcessExecution         define-process-execution-task.ts
       check result.json (strict envelope)
       validator → ProcessExecution
@@ -140,7 +143,7 @@ WorkflowRun                                define-workshop-tasks.ts
         retry → new NodeAttempt (needs replay: safe and attempts left)
         block → wait for `workshop resolve`
         fail  → the run ends
-  render WORKLOG.md
+  on completion: delete the run folder (unless keep_files: always)
 ```
 
 When the service is already running its limit of concurrent runs, a new run
@@ -221,20 +224,22 @@ src/
 │  ├─ define-failure-judgment-task.ts the judge conversation and decision tool
 │  ├─ define-workshop-records.ts  versioned documents and immutable entries
 │  ├─ commit-service-mutation.ts  receipts that make controls idempotent
-│  ├─ render-worklog.ts           WORKLOG.md from the committed run
-│  ├─ materialize-run-views.ts    rebuilds run files from committed state
+│  ├─ render-worklog.ts           compact or verbose worklog from the committed run
+│  ├─ write-process-inputs.ts     previous output, candidate, worklog before launch
+│  ├─ checkpoint-durable-wal.ts   truncates the WAL when the service is idle
 │  └─ open-durable-storage.ts     SQLite with FULL synchronization
 ├─ definition/                    YAML → checked, resolved definition
 │  ├─ parse-yaml.ts               strict YAML: no duplicate keys or anchors
 │  ├─ schema.ts, check-definition.ts, check-chain.ts
 │  ├─ resolve-agent-settings.ts, resolve-workflow-settings.ts
 │  └─ schema-resolved.ts, parse-model.ts, hash-canonical-json.ts
-├─ installation/                  find .workshop/, load config and workflows
-├─ run/                           run records, outcomes, admission, schedule math
+├─ installation/                  find .workshop/, load workshop.yaml and workflows/
+├─ run/                           run records, outcomes, admission, schedule math;
+│                                 locate-run-files.ts names each process's files
 ├─ attempt/                       result parsing and agent prompts
 ├─ model/                         models.json → pi-ai providers for the judge
 ├─ process/                       launch, identify, and kill process groups
-├─ storage/disk/                  crash-safe writes, stream caps
+├─ storage/disk/                  crash-safe writes, stream caps, run folder removal
 ├─ views/                         versioned JSON contracts and terminal text
 ├─ tui/                           the `watch` viewer (OpenTUI), loaded lazily;
 │                                 data-source.ts is the contract it renders

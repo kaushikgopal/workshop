@@ -33,14 +33,14 @@ const sentence = "The old man rowed until the sea forgot the shore.";
 describe("public service restart", () => {
   test("runs the deterministic Hemingway mock and reconnects across a service restart without replay", async () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-hemingway-cli-"));
-    const config = join(root, ".workshop", "config");
+    const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
     const state = join(root, ".workshop", "state");
     const launches = join(state, "mock-launches.jsonl");
     mkdirSync(workflows, { recursive: true });
     writeFileSync(join(config, "workshop.yaml"), [
-      "version: 2",
       "shell: /bin/bash",
+      "keep_files: always",
       "agent:",
       "  harness:",
       `    command: 'WORKSHOP_MOCK_SLEEP_MS=800 WORKSHOP_LAUNCH_LOG=${launches} bun ${mockAgentPath}'`,
@@ -50,17 +50,13 @@ describe("public service restart", () => {
       "",
     ].join("\n"), "utf8");
     writeFileSync(join(workflows, "hemingway.yaml"), [
-      "version: 2",
-      "id: hemingway",
       "description: Run the deterministic Hemingway worker mock.",
-      "nodes:",
-      "  generate:",
-      "    run:",
+      "steps:",
+      "  - generate:",
       "      agent:",
       "        instructions: Write one original sentence to the supplied result path.",
-      "    validator:",
-      "      command: 'printf mock-validator-passed; test -s \"$WORKSHOP_NODE_OUTPUT_FILE\"'",
-      "    next: null",
+      "      check:",
+      "        run: 'printf mock-validator-passed; test -s \"$WORKSHOP_STEP_OUTPUT_FILE\"'",
       "",
     ].join("\n"), "utf8");
 
@@ -88,6 +84,15 @@ describe("public service restart", () => {
       expect(logsBeforeRestart.runId).toBe(runId);
       expect(logsBeforeRestart.sections.some((section) => section.kind === "worklog" && section.content.includes("One Hemingway sentence, written by the deterministic mock."))).toBe(true);
       expect(logsBeforeRestart.sections.some((section) => section.kind === "capture" && section.content === "mock-validator-passed")).toBe(true);
+      const detailedWorklog = logsBeforeRestart.sections.find((section) => section.kind === "worklog");
+      expect(detailedWorklog?.kind).toBe("worklog");
+      if (detailedWorklog?.kind !== "worklog") throw new Error("detailed worklog is missing");
+      expect(detailedWorklog.content).toContain("Candidate SHA-256");
+      const compactLogs = runCli(root, ["logs", "hemingway", "--run", runId]);
+      expect(compactLogs.status).toBe(0);
+      expect(compactLogs.stdout).toMatch(/- generate #1 succeeded · \d+ms · One Hemingway sentence/u);
+      expect(compactLogs.stdout).not.toContain("Candidate SHA-256");
+      expect(compactLogs.stdout).not.toContain("## Global decision log");
       const firstLaunchCount = readLaunches(launches);
       expect(firstLaunchCount).toBe(1);
 
@@ -117,19 +122,16 @@ describe("public service restart", () => {
 
   test("runs two independently mapped mock harnesses through the same process contract", async () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-harness-parity-"));
-    const config = join(root, ".workshop", "config");
+    const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
     const traceFile = join(root, "harness-trace.jsonl");
     const argvHarnessPath = join(REPO_ROOT, "tests/mock/read-argv-harness.ts");
     const envHarnessPath = join(REPO_ROOT, "tests/mock/read-env-harness.ts");
     mkdirSync(workflows, { recursive: true });
-    writeFileSync(join(config, "workshop.yaml"), "version: 2\nshell: /bin/bash\n", "utf8");
+    writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\nkeep_files: always\n", "utf8");
     writeFileSync(join(workflows, "harness-parity.yaml"), [
-      "version: 2",
-      "id: harness-parity",
-      "nodes:",
-      "  argv-harness:",
-      "    run:",
+      "steps:",
+      "  - argv-harness:",
       "      agent:",
       "        model: mock-alpha/poet:high",
       "        harness:",
@@ -138,9 +140,7 @@ describe("public service restart", () => {
       "        instructions: |",
       "          MOCK_ALPHA_PROMPT_SENTINEL",
       "          Write checked result JSON to the supplied result path.",
-      "    next: env-harness",
-      "  env-harness:",
-      "    run:",
+      "  - env-harness:",
       "      agent:",
       "        model: mock-beta/editor:low",
       "        harness:",
@@ -149,7 +149,6 @@ describe("public service restart", () => {
       "        instructions: |",
       "          MOCK_BETA_PROMPT_SENTINEL",
       "          Write checked result JSON to the supplied result path.",
-      "    next: null",
       "",
     ].join("\n"), "utf8");
 
@@ -204,27 +203,23 @@ describe("public service restart", () => {
 
   test("supervises preflight, blocks workers on failure, retries after repair, and reuses only a matching pass", async () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-preflight-"));
-    const config = join(root, ".workshop", "config");
+    const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
     const workflowPath = join(workflows, "preflight-chain.yaml");
     const gatePath = join(root, "environment-ready.txt");
     const preflightLaunches = join(root, "preflight-launches.txt");
     const workerLaunches = join(root, "worker-launches.txt");
     mkdirSync(workflows, { recursive: true });
-    writeFileSync(join(config, "workshop.yaml"), "version: 2\nshell: /bin/bash\nmax_concurrent_runs: 1\n", "utf8");
+    writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\nmax_concurrent_runs: 1\n", "utf8");
     const workflow = (workerCommand: string) => [
-      "version: 2",
-      "id: preflight-chain",
       "environment:",
       "  preflight:",
       "    command: >-",
       `      printf preflight-check; printf run >> '${preflightLaunches}'; if test -f '${gatePath}'; then exit 0; else exit 7; fi`,
-      "nodes:",
-      "  work:",
-      "    run:",
-      "      command: >-",
+      "steps:",
+      "  - work:",
+      "      run: >-",
       `        printf worker >> '${workerLaunches}'; ${workerCommand}`,
-      "    next: null",
       "",
     ].join("\n");
     writeFileSync(workflowPath, workflow("printf first-result"), "utf8");
@@ -274,25 +269,21 @@ describe("public service restart", () => {
 
   test("stops an active preflight after checked process-group retirement without dispatching a worker", async () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-stop-preflight-"));
-    const config = join(root, ".workshop", "config");
+    const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
     const preflightGroupPath = join(root, "preflight-group.pid");
     const preflightChildPath = join(root, "preflight-child.pid");
     const workerStarted = join(root, "worker-started.txt");
     mkdirSync(workflows, { recursive: true });
-    writeFileSync(join(config, "workshop.yaml"), "version: 2\nshell: /bin/bash\n", "utf8");
+    writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\n", "utf8");
     writeFileSync(join(workflows, "preflight-stop.yaml"), [
-      "version: 2",
-      "id: preflight-stop",
       "environment:",
       "  preflight:",
       "    command: >-",
       `      echo $$ > '${preflightGroupPath}'; (sleep 60) & echo $! > '${preflightChildPath}'; wait`,
-      "nodes:",
-      "  work:",
-      "    run:",
-      `      command: 'printf started > ${workerStarted}; printf worker-result'`,
-      "    next: null",
+      "steps:",
+      "  - work:",
+      `      run: 'printf started > ${workerStarted}; printf worker-result'`,
       "",
     ].join("\n"), "utf8");
     try {
@@ -322,19 +313,15 @@ describe("public service restart", () => {
 
   test("client disconnect does not cancel a Durable run", async () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-client-disconnect-"));
-    const config = join(root, ".workshop", "config");
+    const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
     const workerStarted = join(root, "worker-started.txt");
     mkdirSync(workflows, { recursive: true });
-    writeFileSync(join(config, "workshop.yaml"), "version: 2\nshell: /bin/bash\n", "utf8");
+    writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\n", "utf8");
     writeFileSync(join(workflows, "disconnect.yaml"), [
-      "version: 2",
-      "id: disconnect",
-      "nodes:",
-      "  wait:",
-      "    run:",
-      `      command: 'printf started > ${workerStarted}; sleep 0.5; printf client-disconnected'`,
-      "    next: null",
+      "steps:",
+      "  - wait:",
+      `      run: 'printf started > ${workerStarted}; sleep 0.5; printf client-disconnected'`,
       "",
     ].join("\n"), "utf8");
 
@@ -358,41 +345,31 @@ describe("public service restart", () => {
 
   test("graceful pause finishes an active validator and holds successors until resume", async () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-pause-boundary-"));
-    const config = join(root, ".workshop", "config");
+    const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
     const workerStarted = join(root, "worker-started.txt");
     const validatorFinished = join(root, "validator-finished.txt");
     const successorStarted = join(root, "successor-started.txt");
     const otherStarted = join(root, "other-workflow-started.txt");
     mkdirSync(workflows, { recursive: true });
-    writeFileSync(join(config, "workshop.yaml"), "version: 2\nshell: /bin/bash\nmax_concurrent_runs: 1\n", "utf8");
+    writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\nmax_concurrent_runs: 1\n", "utf8");
     writeFileSync(join(workflows, "pause-chain.yaml"), [
-      "version: 2",
-      "id: pause-chain",
-      "nodes:",
-      "  first:",
-      "    run:",
-      "      command: >-",
+      "steps:",
+      "  - first:",
+      "      run: >-",
       `        printf started > '${workerStarted}'; sleep 1; printf first-result`,
-      "    validator:",
-      "      command: >-",
-      `        sleep 0.2; test -s \"$WORKSHOP_NODE_OUTPUT_FILE\" && printf done > '${validatorFinished}'`,
-      "    next: second",
-      "  second:",
-      "    run:",
-      "      command: >-",
+      "      check:",
+      "        run: >-",
+      `          sleep 0.2; test -s \"$WORKSHOP_STEP_OUTPUT_FILE\" && printf done > '${validatorFinished}'`,
+      "  - second:",
+      "      run: >-",
       `        printf started >> '${successorStarted}'; sleep 0.5; printf second-result`,
-      "    next: null",
       "",
     ].join("\n"), "utf8");
     writeFileSync(join(workflows, "other.yaml"), [
-      "version: 2",
-      "id: other",
-      "nodes:",
-      "  mark:",
-      "    run:",
-      `      command: 'printf started > ${otherStarted}; sleep 1; printf other-result'`,
-      "    next: null",
+      "steps:",
+      "  - mark:",
+      `      run: 'printf started > ${otherStarted}; sleep 1; printf other-result'`,
       "",
     ].join("\n"), "utf8");
 
@@ -475,7 +452,7 @@ describe("public service restart", () => {
 
   test("safe validator replay pauses, releases capacity, and waits for its persisted gate after restart", async () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-safe-replay-capacity-"));
-    const config = join(root, ".workshop", "config");
+    const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
     const workerLaunches = join(root, "worker-launches.txt");
     const validatorLaunches = join(root, "validator-launches.txt");
@@ -483,32 +460,24 @@ describe("public service restart", () => {
     const holderStarted = join(root, "holder-started.txt");
     const releaseHolder = join(root, "release-holder.txt");
     mkdirSync(workflows, { recursive: true });
-    writeFileSync(join(config, "workshop.yaml"), "version: 2\nshell: /bin/bash\nmax_concurrent_runs: 1\n", "utf8");
+    writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\nmax_concurrent_runs: 1\n", "utf8");
     writeFileSync(join(workflows, "safe-replay.yaml"), [
-      "version: 2",
-      "id: safe-replay",
-      "nodes:",
-      "  work:",
-      "    replay: safe",
-      "    run:",
-      "      command: >-",
-      `        printf w >> '${workerLaunches}'; printf candidate-output`,
-      "    validator:",
+      "steps:",
+      "  - work:",
       "      replay: safe",
-      "      command: >-",
-      `        printf v >> '${validatorLaunches}'; if [ "$(wc -c < '${validatorLaunches}')" -eq 1 ]; then printf '%s' "$$" > '${validatorPgidPath}'; sleep 60; else printf validator-replayed; fi`,
-      "    next: null",
+      "      run: >-",
+      `        printf w >> '${workerLaunches}'; printf candidate-output`,
+      "      check:",
+      "        replay: safe",
+      "        run: >-",
+      `          printf v >> '${validatorLaunches}'; if [ "$(wc -c < '${validatorLaunches}')" -eq 1 ]; then printf '%s' "$$" > '${validatorPgidPath}'; sleep 60; else printf validator-replayed; fi`,
       "",
     ].join("\n"), "utf8");
     writeFileSync(join(workflows, "holder.yaml"), [
-      "version: 2",
-      "id: holder",
-      "nodes:",
-      "  hold:",
-      "    run:",
-      "      command: >-",
+      "steps:",
+      "  - hold:",
+      "      run: >-",
       `        printf started > '${holderStarted}'; while [ ! -f '${releaseHolder}' ]; do sleep 0.02; done; printf holder-released`,
-      "    next: null",
       "",
     ].join("\n"), "utf8");
 
@@ -519,7 +488,7 @@ describe("public service restart", () => {
       await waitForFile(validatorPgidPath);
       const oldPgid = Number(readFileSync(validatorPgidPath, "utf8").trim());
       if (!Number.isSafeInteger(oldPgid) || oldPgid <= 0) throw new Error("validator fixture did not record its process group");
-      const beforePause = runCli(root, ["node", "describe", "safe-replay", "work", "--run", runId, "--json"]);
+      const beforePause = runCli(root, ["step", "describe", "safe-replay", "work", "--run", runId, "--json"]);
       expect(beforePause.status).toBe(0);
       const originalNode = nodeDescriptionDtoSchema.parse(JSON.parse(beforePause.stdout)).node;
       expect(originalNode.attempts).toHaveLength(1);
@@ -544,7 +513,7 @@ describe("public service restart", () => {
       expect(readFileSync(workerLaunches, "utf8")).toBe("w");
       expect(readFileSync(validatorLaunches, "utf8")).toBe("v");
 
-      const pausedNodeResult = runCli(root, ["node", "describe", "safe-replay", "work", "--run", runId, "--json"]);
+      const pausedNodeResult = runCli(root, ["step", "describe", "safe-replay", "work", "--run", runId, "--json"]);
       expect(pausedNodeResult.status).toBe(0);
       const pausedAttempt = nodeDescriptionDtoSchema.parse(JSON.parse(pausedNodeResult.stdout)).node.attempts[0];
       if (pausedAttempt === undefined) throw new Error("paused safe replay attempt is missing");
@@ -571,7 +540,7 @@ describe("public service restart", () => {
       expect(readFileSync(workerLaunches, "utf8")).toBe("w");
       expect(readFileSync(validatorLaunches, "utf8")).toBe("vv");
 
-      const finalNodeResult = runCli(root, ["node", "describe", "safe-replay", "work", "--run", runId, "--json"]);
+      const finalNodeResult = runCli(root, ["step", "describe", "safe-replay", "work", "--run", runId, "--json"]);
       expect(finalNodeResult.status).toBe(0);
       const finalNode = nodeDescriptionDtoSchema.parse(JSON.parse(finalNodeResult.stdout)).node;
       expect(finalNode.attempts).toHaveLength(1);
@@ -627,7 +596,7 @@ describe("public service restart", () => {
       expect(retryRun.status).toBe("completed");
       expect(retryRun.terminalOutput).toBe("retry-success");
       expect(readFileSync(retryMarker, "utf8")).toBe("ww");
-      const retryNodeResult = runCli(retryRoot, ["node", "describe", "retryable", "work", "--run", retry.runId, "--json"]);
+      const retryNodeResult = runCli(retryRoot, ["step", "describe", "retryable", "work", "--run", retry.runId, "--json"]);
       expect(retryNodeResult.status).toBe(0);
       const retryNode = nodeDescriptionDtoSchema.parse(JSON.parse(retryNodeResult.stdout)).node;
       expect(retryNode.attempts.map((attempt) => attempt.number)).toEqual([1, 2]);
@@ -645,7 +614,7 @@ describe("public service restart", () => {
     const acceptedValidatorMarker = join(acceptRoot, "validator-launches.txt");
     const acceptedValidatorStarted = join(acceptRoot, "accepted-validator-started.txt");
     try {
-      const blocked = await startBlockedCommandRun(acceptRoot, "acceptable", `printf w >> '${acceptMarker}'; sleep 60`, { validatorCommand: `printf v >> '${acceptedValidatorMarker}'; touch '${acceptedValidatorStarted}'; sleep 3; test -s "$WORKSHOP_NODE_OUTPUT_FILE"` });
+      const blocked = await startBlockedCommandRun(acceptRoot, "acceptable", `printf w >> '${acceptMarker}'; sleep 60`, { validatorCommand: `printf v >> '${acceptedValidatorMarker}'; touch '${acceptedValidatorStarted}'; sleep 3; test -s "$WORKSHOP_STEP_OUTPUT_FILE"` });
       const resultFile = join(acceptRoot, "accepted-result.json");
       const unpairedSurrogate = String.fromCharCode(0xd800);
       writeFileSync(resultFile, JSON.stringify({ version: 1, output: unpairedSurrogate, summary: "checked by the operator", artifacts: [] }), "utf8");
@@ -657,7 +626,7 @@ describe("public service restart", () => {
       expect(stillBlocked.terminalOutput).toBeNull();
       expect(readFileSync(acceptMarker, "utf8")).toBe("w");
       expect(existsSync(acceptedValidatorStarted)).toBe(false);
-      const blockedNode = runCli(acceptRoot, ["node", "describe", "acceptable", "work", "--run", blocked.runId, "--json"]);
+      const blockedNode = runCli(acceptRoot, ["step", "describe", "acceptable", "work", "--run", blocked.runId, "--json"]);
       expect(blockedNode.status).toBe(0);
       const blockedDescription = nodeDescriptionDtoSchema.parse(JSON.parse(blockedNode.stdout));
       expect(blockedDescription.node.successfulOutput).toBeNull();
@@ -683,7 +652,7 @@ describe("public service restart", () => {
       expect(acceptedRun.terminalOutput).toBe("operator-accepted");
       expect(readFileSync(acceptMarker, "utf8")).toBe("w");
       expect(readFileSync(acceptedValidatorMarker, "utf8")).toBe("v");
-      const acceptedNodeResult = runCli(acceptRoot, ["node", "describe", "acceptable", "work", "--run", blocked.runId, "--json"]);
+      const acceptedNodeResult = runCli(acceptRoot, ["step", "describe", "acceptable", "work", "--run", blocked.runId, "--json"]);
       expect(acceptedNodeResult.status).toBe(0);
       const acceptedAttempt = nodeDescriptionDtoSchema.parse(JSON.parse(acceptedNodeResult.stdout)).node.attempts[0];
       expect(acceptedAttempt?.candidate?.kind).toBe("candidate");
@@ -718,7 +687,7 @@ describe("public service restart", () => {
       expect(acceptedRun.terminalOutput).toBe("candidate");
       expect(readFileSync(workerMarker, "utf8")).toBe("w");
       expect(readFileSync(validatorMarker, "utf8")).toBe("v");
-      const nodeResult = runCli(validatorRoot, ["node", "describe", "acceptable-validator", "work", "--run", blocked.runId, "--json"]);
+      const nodeResult = runCli(validatorRoot, ["step", "describe", "acceptable-validator", "work", "--run", blocked.runId, "--json"]);
       expect(nodeResult.status).toBe(0);
       const acceptedAttempt = nodeDescriptionDtoSchema.parse(JSON.parse(nodeResult.stdout)).node.attempts[0];
       expect(acceptedAttempt?.verdict?.kind).toBe("verdict");
@@ -760,7 +729,7 @@ describe("public service restart", () => {
       expect(failureLogs.status).toBe(0);
       const failureSections = logsDtoSchema.parse(JSON.parse(failureLogs.stdout)).sections;
       expect(failureSections.map((section) => section.content).join("\n")).toContain("the external effect cannot be safely repeated");
-      const failureNodeResult = runCli(failRoot, ["node", "describe", "fail-run", "work", "--run", blocked.runId, "--json"]);
+      const failureNodeResult = runCli(failRoot, ["step", "describe", "fail-run", "work", "--run", blocked.runId, "--json"]);
       expect(failureNodeResult.status).toBe(0);
       expect(nodeDescriptionDtoSchema.parse(JSON.parse(failureNodeResult.stdout)).runFailure?.kind).toBe("operator");
     } finally {
@@ -772,39 +741,29 @@ describe("public service restart", () => {
 
   test("capacity waiting survives service restart without dispatching twice", async () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-capacity-restart-"));
-    const config = join(root, ".workshop", "config");
+    const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
     const waiterStarted = join(root, "waiter-started.txt");
     const holderStarted = join(root, "holder-started.txt");
     const holderPgid = join(root, "holder-pgid.txt");
     const successorStarted = join(root, "successor-started.txt");
     mkdirSync(workflows, { recursive: true });
-    writeFileSync(join(config, "workshop.yaml"), "version: 2\nshell: /bin/bash\nmax_concurrent_runs: 1\n", "utf8");
+    writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\nmax_concurrent_runs: 1\n", "utf8");
     writeFileSync(join(workflows, "waiter.yaml"), [
-      "version: 2",
-      "id: waiter",
-      "nodes:",
-      "  first:",
-      "    run:",
-      "      command: >-",
+      "steps:",
+      "  - first:",
+      "      run: >-",
       `        printf 'started\\n' >> '${waiterStarted}'; sleep 0.5; printf first-result`,
-      "    next: second",
-      "  second:",
-      "    run:",
-      "      command: >-",
+      "  - second:",
+      "      run: >-",
       `        printf started >> '${successorStarted}'; sleep 0.2; printf second-result`,
-      "    next: null",
       "",
     ].join("\n"), "utf8");
     writeFileSync(join(workflows, "holder.yaml"), [
-      "version: 2",
-      "id: holder",
-      "nodes:",
-      "  hold:",
-      "    run:",
-      "      command: >-",
+      "steps:",
+      "  - hold:",
+      "      run: >-",
       `        printf '%s' "$$" > '${holderPgid}'; printf started > '${holderStarted}'; sleep 10; printf holder-result`,
-      "    next: null",
       "",
     ].join("\n"), "utf8");
 
@@ -861,20 +820,16 @@ describe("public service restart", () => {
 
   test("pause defers failed-attempt finalization until resume", async () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-paused-failure-"));
-    const config = join(root, ".workshop", "config");
+    const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
     const workerStarted = join(root, "failing-worker-started.txt");
     mkdirSync(workflows, { recursive: true });
-    writeFileSync(join(config, "workshop.yaml"), "version: 2\nshell: /bin/bash\n", "utf8");
+    writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\n", "utf8");
     writeFileSync(join(workflows, "paused-failure.yaml"), [
-      "version: 2",
-      "id: paused-failure",
-      "nodes:",
-      "  fail:",
-      "    run:",
-      "      command: >-",
+      "steps:",
+      "  - fail:",
+      "      run: >-",
       `        printf started > '${workerStarted}'; sleep 1; exit 7`,
-      "    next: null",
       "",
     ].join("\n"), "utf8");
 
@@ -904,7 +859,7 @@ describe("public service restart", () => {
 
   test("stop cancels at a safe boundary and retires an active worker", async () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-stop-boundary-"));
-    const config = join(root, ".workshop", "config");
+    const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
     const safeWorkerStarted = join(root, "safe-worker-started.txt");
     const safeSuccessorStarted = join(root, "safe-successor-started.txt");
@@ -912,43 +867,29 @@ describe("public service restart", () => {
     const activeTermPath = join(root, "active-worker-term.txt");
     const afterStopStarted = join(root, "after-stop-started.txt");
     mkdirSync(workflows, { recursive: true });
-    writeFileSync(join(config, "workshop.yaml"), "version: 2\nshell: /bin/bash\nmax_concurrent_runs: 1\n", "utf8");
+    writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\nmax_concurrent_runs: 1\n", "utf8");
     writeFileSync(join(workflows, "safe-stop.yaml"), [
-      "version: 2",
-      "id: safe-stop",
-      "nodes:",
-      "  first:",
-      "    run:",
-      "      command: >-",
+      "steps:",
+      "  - first:",
+      "      run: >-",
       `        printf started > '${safeWorkerStarted}'; sleep 1; printf first-result`,
-      "    next: second",
-      "  second:",
-      "    run:",
-      `      command: 'printf started > ${safeSuccessorStarted}; printf second-result'`,
-      "    next: null",
+      "  - second:",
+      `      run: 'printf started > ${safeSuccessorStarted}; printf second-result'`,
       "",
     ].join("\n"), "utf8");
     writeFileSync(join(workflows, "active-stop.yaml"), [
-      "version: 2",
-      "id: active-stop",
-      "nodes:",
-      "  wait:",
-      "    run:",
-      "      command: >-",
+      "steps:",
+      "  - wait:",
+      "      run: >-",
       `        trap "printf term > '${activeTermPath}'; trap '' TERM; sleep 30" TERM;`,
       `        echo $$ > '${activePidPath}';`,
       "        while :; do sleep 1; done",
-      "    next: null",
       "",
     ].join("\n"), "utf8");
     writeFileSync(join(workflows, "after-stop.yaml"), [
-      "version: 2",
-      "id: after-stop",
-      "nodes:",
-      "  mark:",
-      "    run:",
-      `      command: 'printf started > ${afterStopStarted}; printf released-slot'`,
-      "    next: null",
+      "steps:",
+      "  - mark:",
+      `      run: 'printf started > ${afterStopStarted}; printf released-slot'`,
       "",
     ].join("\n"), "utf8");
 
@@ -997,7 +938,7 @@ describe("public service restart", () => {
       await waitForProcessGroupGone(processGroupId);
       const activeCancelled = await waitForRunStatus(root, "active-stop", activeRunId, "cancelled");
       expect(activeCancelled.status).toBe("cancelled");
-      const activeDescription = runCli(root, ["node", "describe", "active-stop", "wait", "--run", activeRunId, "--json"]);
+      const activeDescription = runCli(root, ["step", "describe", "active-stop", "wait", "--run", activeRunId, "--json"]);
       expect(activeDescription.status).toBe(0);
       const activeAttempt = nodeDescriptionDtoSchema.parse(JSON.parse(activeDescription.stdout)).node.attempts[0];
       expect(activeAttempt?.status).toBe("cancelled");
@@ -1017,25 +958,22 @@ describe("public service restart", () => {
 
   test("stops a validator process group with descendants and preserves its candidate", async () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-stop-validator-descendants-"));
-    const config = join(root, ".workshop", "config");
+    const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
     const validatorGroupPath = join(root, "validator-group.pid");
     const validatorChildPath = join(root, "validator-child.pid");
     mkdirSync(workflows, { recursive: true });
-    writeFileSync(join(config, "workshop.yaml"), "version: 2\nshell: /bin/bash\n", "utf8");
+    writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\n", "utf8");
     writeFileSync(join(workflows, "validator-stop.yaml"), [
-      "version: 2",
-      "id: validator-stop",
-      "nodes:",
-      "  validate:",
-      "    run: { command: \"printf candidate\" }",
-      "    validator:",
-      "      command: >-",
-      `        echo $$ > '${validatorGroupPath}';`,
-      "        (sleep 60) &",
-      `        echo $! > '${validatorChildPath}';`,
-      "        wait",
-      "    next: null",
+      "steps:",
+      "  - validate:",
+      "      run: \"printf candidate\"",
+      "      check:",
+      "        run: >-",
+      `          echo $$ > '${validatorGroupPath}';`,
+      "          (sleep 60) &",
+      `          echo $! > '${validatorChildPath}';`,
+      "          wait",
       "",
     ].join("\n"), "utf8");
 
@@ -1059,7 +997,7 @@ describe("public service restart", () => {
       await waitForProcessGroupGone(validatorGroupId);
       const run = await waitForRunStatus(root, "validator-stop", runId, "cancelled");
       expect(run.status).toBe("cancelled");
-      const description = runCli(root, ["node", "describe", "validator-stop", "validate", "--run", runId, "--json"]);
+      const description = runCli(root, ["step", "describe", "validator-stop", "validate", "--run", runId, "--json"]);
       expect(description.status).toBe(0);
       const node = nodeDescriptionDtoSchema.parse(JSON.parse(description.stdout)).node;
       const attempt = node.attempts[0];
@@ -1078,19 +1016,15 @@ describe("public service restart", () => {
 
   test("retires an uncertain process group on service restart without relaunching the run", async () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-uncertain-process-"));
-    const config = join(root, ".workshop", "config");
+    const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
     const pidPath = join(root, "worker.pid");
     mkdirSync(workflows, { recursive: true });
-    writeFileSync(join(config, "workshop.yaml"), "version: 2\nshell: /bin/bash\n", "utf8");
+    writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\n", "utf8");
     writeFileSync(join(workflows, "long-process.yaml"), [
-      "version: 2",
-      "id: long-process",
-      "nodes:",
-      "  wait:",
-      "    run:",
-      `      command: 'echo $$ > ${pidPath}; sleep 20'`,
-      "    next: null",
+      "steps:",
+      "  - wait:",
+      `      run: 'echo $$ > ${pidPath}; sleep 20'`,
       "",
     ].join("\n"), "utf8");
 
@@ -1131,7 +1065,7 @@ describe("public service restart", () => {
 
   test("recovers retained log metadata without confirming process death", async () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-retention-reopen-"));
-    const config = join(root, ".workshop", "config");
+    const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
     const state = join(root, ".workshop", "state");
     const workerLaunches = join(state, "worker-launches.jsonl");
@@ -1142,7 +1076,6 @@ describe("public service restart", () => {
     mkdirSync(workflows, { recursive: true });
     mkdirSync(state, { recursive: true });
     writeFileSync(join(config, "workshop.yaml"), [
-      "version: 2",
       "shell: /bin/bash",
       "stream_cap: 32mb",
       "agent:",
@@ -1154,27 +1087,21 @@ describe("public service restart", () => {
       "",
     ].join("\n"), "utf8");
     writeFileSync(join(workflows, "capture-recovery.yaml"), [
-      "version: 2",
-      "id: capture-recovery",
       "defaults:",
       "  max_attempts: 1",
       "  replay: never",
-      "nodes:",
-      "  capture:",
-      "    run:",
+      "steps:",
+      "  - capture:",
       "      agent:",
       "        instructions: Write one original sentence to the supplied result path.",
-      "    validator:",
-      "      command: |",
-      `        printf validator >> '${validatorLaunches}'`,
-      `        head -c ${totalBytes} /dev/zero | tr '\\000' x`,
-      "        test -s \"$WORKSHOP_NODE_OUTPUT_FILE\"",
-      "    next: finish",
-      "  finish:",
-      "    run:",
-      "      command: |",
+      "      check:",
+      "        run: |",
+      `          printf validator >> '${validatorLaunches}'`,
+      `          head -c ${totalBytes} /dev/zero | tr '\\000' x`,
+      "          test -s \"$WORKSHOP_STEP_OUTPUT_FILE\"",
+      "  - finish:",
+      "      run: |",
       `        printf successor >> '${successorLaunches}'`,
-      "    next: null",
       "",
     ].join("\n"), "utf8");
 
@@ -1183,7 +1110,7 @@ describe("public service restart", () => {
       expect(started.status).toBe(0);
       const runId = runIdSchema.parse(started.stdout.match(/Started run (\S+)/)?.[1]);
       const oldService = JSON.parse(readFileSync(join(state, "service.json"), "utf8")) as { pid: number; bootId: string };
-      const retainedPath = await waitForRetainedCapture(join(state, "runs", runId, "captures"), capBytes);
+      const retainedPath = await waitForRetainedCapture(join(state, "runs", runId, "capture.1"), capBytes);
       const receipt: unknown = JSON.parse(readFileSync(`${retainedPath}.retention.json`, "utf8"));
       const retained = readFileSync(retainedPath);
       expect(retained.byteLength).toBe(capBytes);
@@ -1249,35 +1176,27 @@ describe("public service restart", () => {
 
   test("gates a queued run until restart confirms an older process group is dead", async () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-startup-launch-gate-"));
-    const config = join(root, ".workshop", "config");
+    const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
     const state = join(root, ".workshop", "state");
     const oldPidPath = join(root, "old-worker.pid");
     const termPath = join(root, "old-worker-term.txt");
     const queuedStartPath = join(root, "queued-worker-started.txt");
     mkdirSync(workflows, { recursive: true });
-    writeFileSync(join(config, "workshop.yaml"), "version: 2\nshell: /bin/bash\nmax_concurrent_runs: 2\n", "utf8");
+    writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\nmax_concurrent_runs: 2\n", "utf8");
     writeFileSync(join(workflows, "long-process.yaml"), [
-      "version: 2",
-      "id: long-process",
-      "nodes:",
-      "  wait:",
-      "    run:",
-      "      command: >-",
+      "steps:",
+      "  - wait:",
+      "      run: >-",
       `        trap 'echo term > ${termPath}; trap "" TERM; sleep 5' TERM;`,
       `        echo $$ > ${oldPidPath};`,
       "        while :; do sleep 1; done",
-      "    next: null",
       "",
     ].join("\n"), "utf8");
     writeFileSync(join(workflows, "queued-clean.yaml"), [
-      "version: 2",
-      "id: queued-clean",
-      "nodes:",
-      "  mark:",
-      "    run:",
-      `      command: 'echo started > ${queuedStartPath}; sleep 0.2; echo queued-finished'`,
-      "    next: null",
+      "steps:",
+      "  - mark:",
+      `      run: 'echo started > ${queuedStartPath}; sleep 0.2; echo queued-finished'`,
       "",
     ].join("\n"), "utf8");
 
@@ -1320,11 +1239,11 @@ describe("public service restart", () => {
 
   test("describes nodes from the admitted definition and preserves run identity across public reads", async () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-frozen-node-describe-"));
-    const config = join(root, ".workshop", "config");
+    const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
     const workflowPath = join(workflows, "frozen-chain.yaml");
     mkdirSync(workflows, { recursive: true });
-    writeFileSync(join(config, "workshop.yaml"), "version: 2\nshell: /bin/bash\n", "utf8");
+    writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\n", "utf8");
     writeFileSync(workflowPath, frozenWorkflow("sleep 3; printf frozen-first", 'cat "$WORKSHOP_PREVIOUS_OUTPUT_FILE"'), "utf8");
 
     try {
@@ -1347,7 +1266,7 @@ describe("public service restart", () => {
       expect(logsResult.status).toBe(0);
       expect(logsDtoSchema.parse(JSON.parse(logsResult.stdout)).runId).toBe(runId);
 
-      const firstNodeResult = runCli(root, ["node", "describe", "frozen-chain", "first", "--run", runId, "--json"]);
+      const firstNodeResult = runCli(root, ["step", "describe", "frozen-chain", "first", "--run", runId, "--json"]);
       expect(firstNodeResult.status).toBe(0);
       const firstNode = nodeDescriptionDtoSchema.parse(JSON.parse(firstNodeResult.stdout));
       expect(firstNode.runId).toBe(runId);
@@ -1358,7 +1277,7 @@ describe("public service restart", () => {
       expect(firstNode.node.successfulOutput).toBe("frozen-first");
       expect(firstNode.node.attempts).toHaveLength(1);
 
-      const secondNodeResult = runCli(root, ["node", "describe", "frozen-chain", "second", "--run", runId, "--json"]);
+      const secondNodeResult = runCli(root, ["step", "describe", "frozen-chain", "second", "--run", runId, "--json"]);
       expect(secondNodeResult.status).toBe(0);
       const secondNode = nodeDescriptionDtoSchema.parse(JSON.parse(secondNodeResult.stdout));
       expect(secondNode.runId).toBe(runId);
@@ -1366,13 +1285,9 @@ describe("public service restart", () => {
       expect(secondNode.node.successfulOutput).toBe("frozen-first");
 
       writeFileSync(workflowPath, [
-        "version: 2",
-        "id: frozen-chain",
-        "nodes:",
-        "  replacement:",
-        "    run:",
-        "      command: 'printf replacement-output'",
-        "    next: null",
+        "steps:",
+        "  - replacement:",
+        "      run: 'printf replacement-output'",
         "",
       ].join("\n"), "utf8");
       const replacementStart = runCli(root, ["start", "frozen-chain", "--detach"]);
@@ -1401,22 +1316,18 @@ describe("public service restart", () => {
   }, 30_000);
   test("admits fixed-rate occurrences from the activation deadline until the finite limit", async () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-schedule-finite-"));
-    const config = join(root, ".workshop", "config");
+    const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
     const launches = join(root, "scheduled-launches.txt");
     mkdirSync(workflows, { recursive: true });
-    writeFileSync(join(config, "workshop.yaml"), "version: 2\nshell: /bin/bash\n", "utf8");
+    writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\n", "utf8");
     writeFileSync(join(workflows, "scheduled.yaml"), [
-      "version: 2",
-      "id: scheduled",
       "schedule:",
       "  every: 1s",
       "  max_runs: 2",
-      "nodes:",
-      "  tick:",
-      "    run:",
-      `      command: 'printf tick >> ${launches}'`,
-      "    next: null",
+      "steps:",
+      "  - tick:",
+      `      run: 'printf tick >> ${launches}'`,
       "",
     ].join("\n"), "utf8");
 
@@ -1427,16 +1338,12 @@ describe("public service restart", () => {
       const firstRun = await waitForRun(root, "scheduled", firstRunId);
       expect(firstRun.status).toBe("completed");
       writeFileSync(join(workflows, "scheduled.yaml"), [
-        "version: 2",
-        "id: scheduled",
         "schedule:",
         "  every: 1s",
         "  max_runs: 2",
-        "nodes:",
-        "  tick:",
-        "    run:",
-        `      command: 'printf future >> ${launches}'`,
-        "    next: null",
+        "steps:",
+        "  - tick:",
+        `      run: 'printf future >> ${launches}'`,
         "",
       ].join("\n"), "utf8");
 
@@ -1493,23 +1400,19 @@ describe("public service restart", () => {
   }, 20_000);
   test("disables scheduled admission without consuming an occurrence when YAML becomes invalid", async () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-schedule-invalid-yaml-"));
-    const config = join(root, ".workshop", "config");
+    const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
     const workflowPath = join(workflows, "scheduled.yaml");
     const launches = join(root, "scheduled-launches.txt");
     mkdirSync(workflows, { recursive: true });
-    writeFileSync(join(config, "workshop.yaml"), "version: 2\nshell: /bin/bash\n", "utf8");
+    writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\n", "utf8");
     writeFileSync(workflowPath, [
-      "version: 2",
-      "id: scheduled",
       "schedule:",
       "  every: 1s",
       "  max_runs: 5",
-      "nodes:",
-      "  tick:",
-      "    run:",
-      `      command: 'printf tick >> ${launches}'`,
-      "    next: null",
+      "steps:",
+      "  - tick:",
+      `      run: 'printf tick >> ${launches}'`,
       "",
     ].join("\n"), "utf8");
 
@@ -1518,7 +1421,7 @@ describe("public service restart", () => {
       expect(started.status).toBe(0);
       const firstRunId = runIdSchema.parse(started.stdout.match(/Started run (\S+)/)?.[1]);
       expect((await waitForRun(root, "scheduled", firstRunId)).status).toBe("completed");
-      writeFileSync(workflowPath, "version: 2\nid: scheduled\nschedule:\n  every: nope\n", "utf8");
+      writeFileSync(workflowPath, "schedule:\n  every: nope\n", "utf8");
 
       const deadline = Date.now() + 5_000;
       let status: ReturnType<typeof statusDtoSchema.parse> | undefined;
@@ -1543,22 +1446,18 @@ describe("public service restart", () => {
   }, 15_000);
   test("skips recurrence slots while the workflow has an unresolved run", async () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-schedule-overlap-"));
-    const config = join(root, ".workshop", "config");
+    const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
     const launches = join(root, "scheduled-launches.txt");
     mkdirSync(workflows, { recursive: true });
-    writeFileSync(join(config, "workshop.yaml"), "version: 2\nshell: /bin/bash\n", "utf8");
+    writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\n", "utf8");
     writeFileSync(join(workflows, "scheduled.yaml"), [
-      "version: 2",
-      "id: scheduled",
       "schedule:",
       "  every: 1s",
       "  max_runs: 2",
-      "nodes:",
-      "  tick:",
-      "    run:",
-      `      command: 'sleep 2.4; printf tick >> ${launches}'`,
-      "    next: null",
+      "steps:",
+      "  - tick:",
+      `      run: 'sleep 2.4; printf tick >> ${launches}'`,
       "",
     ].join("\n"), "utf8");
 
@@ -1595,32 +1494,24 @@ describe("public service restart", () => {
 
   test("does not persist a proposed activation when fail-fast admission lacks capacity", async () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-schedule-fail-fast-"));
-    const config = join(root, ".workshop", "config");
+    const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
     const holderStarted = join(root, "holder-started.txt");
     mkdirSync(workflows, { recursive: true });
-    writeFileSync(join(config, "workshop.yaml"), "version: 2\nshell: /bin/bash\nmax_concurrent_runs: 1\n", "utf8");
+    writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\nmax_concurrent_runs: 1\n", "utf8");
     writeFileSync(join(workflows, "holder.yaml"), [
-      "version: 2",
-      "id: holder",
-      "nodes:",
-      "  hold:",
-      "    run:",
-      `      command: 'touch ${holderStarted}; sleep 2; printf held'`,
-      "    next: null",
+      "steps:",
+      "  - hold:",
+      `      run: 'touch ${holderStarted}; sleep 2; printf held'`,
       "",
     ].join("\n"), "utf8");
     writeFileSync(join(workflows, "scheduled.yaml"), [
-      "version: 2",
-      "id: scheduled",
       "schedule:",
       "  every: 1s",
       "  max_runs: 2",
-      "nodes:",
-      "  tick:",
-      "    run:",
-      "      command: 'printf candidate'",
-      "    next: null",
+      "steps:",
+      "  - tick:",
+      "      run: 'printf candidate'",
       "",
     ].join("\n"), "utf8");
 
@@ -1646,22 +1537,18 @@ describe("public service restart", () => {
   }, 20_000);
   test("admits only the latest due slot after scheduler downtime", async () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-schedule-downtime-"));
-    const config = join(root, ".workshop", "config");
+    const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
     const launches = join(root, "scheduled-launches.txt");
     mkdirSync(workflows, { recursive: true });
-    writeFileSync(join(config, "workshop.yaml"), "version: 2\nshell: /bin/bash\n", "utf8");
+    writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\n", "utf8");
     writeFileSync(join(workflows, "scheduled.yaml"), [
-      "version: 2",
-      "id: scheduled",
       "schedule:",
       "  every: 1s",
       "  max_runs: 2",
-      "nodes:",
-      "  tick:",
-      "    run:",
-      `      command: 'printf tick >> ${launches}'`,
-      "    next: null",
+      "steps:",
+      "  - tick:",
+      `      run: 'printf tick >> ${launches}'`,
       "",
     ].join("\n"), "utf8");
 
@@ -1708,22 +1595,18 @@ describe("public service restart", () => {
 
   test("pause, resume, and stop preserve recurrence activation semantics", async () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-schedule-controls-"));
-    const config = join(root, ".workshop", "config");
+    const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
     const launches = join(root, "scheduled-launches.txt");
     mkdirSync(workflows, { recursive: true });
-    writeFileSync(join(config, "workshop.yaml"), "version: 2\nshell: /bin/bash\n", "utf8");
+    writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\n", "utf8");
     writeFileSync(join(workflows, "scheduled.yaml"), [
-      "version: 2",
-      "id: scheduled",
       "schedule:",
       "  every: 2s",
       "  max_runs: 4",
-      "nodes:",
-      "  tick:",
-      "    run:",
-      `      command: 'printf tick >> ${launches}'`,
-      "    next: null",
+      "steps:",
+      "  - tick:",
+      `      run: 'printf tick >> ${launches}'`,
       "",
     ].join("\n"), "utf8");
 
@@ -1798,34 +1681,26 @@ describe("public service restart", () => {
 
   test("retries a final scheduled occurrence after a full-capacity restart", async () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-schedule-capacity-restart-"));
-    const config = join(root, ".workshop", "config");
+    const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
     const holderPidPath = join(root, "holder.pid");
     const holderLaunches = join(root, "holder-launches.txt");
     const scheduledLaunches = join(root, "scheduled-launches.txt");
     mkdirSync(workflows, { recursive: true });
-    writeFileSync(join(config, "workshop.yaml"), "version: 2\nshell: /bin/bash\nmax_concurrent_runs: 1\n", "utf8");
+    writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\nmax_concurrent_runs: 1\n", "utf8");
     writeFileSync(join(workflows, "holder.yaml"), [
-      "version: 2",
-      "id: holder",
-      "nodes:",
-      "  hold:",
-      "    run:",
-      `      command: 'echo launch >> ${holderLaunches}; echo $$ > ${holderPidPath}; sleep 20'`,
-      "    next: null",
+      "steps:",
+      "  - hold:",
+      `      run: 'echo launch >> ${holderLaunches}; echo $$ > ${holderPidPath}; sleep 20'`,
       "",
     ].join("\n"), "utf8");
     writeFileSync(join(workflows, "scheduled.yaml"), [
-      "version: 2",
-      "id: scheduled",
       "schedule:",
       "  every: 1s",
       "  max_runs: 2",
-      "nodes:",
-      "  tick:",
-      "    run:",
-      `      command: 'printf tick >> ${scheduledLaunches}'`,
-      "    next: null",
+      "steps:",
+      "  - tick:",
+      `      run: 'printf tick >> ${scheduledLaunches}'`,
       "",
     ].join("\n"), "utf8");
 
@@ -1907,19 +1782,13 @@ describe("public service restart", () => {
 
 function frozenWorkflow(firstCommand: string, secondCommand: string): string {
   return [
-    "version: 2",
-    "id: frozen-chain",
-    "nodes:",
-    "  first:",
-    "    run:",
-    "      command: >-",
+    "steps:",
+    "  - first:",
+    "      run: >-",
     `        ${firstCommand}`,
-    "    next: second",
-    "  second:",
-    "    run:",
-    "      command: >-",
+    "  - second:",
+    "      run: >-",
     `        ${secondCommand}`,
-    "    next: null",
     "",
   ].join("\n");
 }
@@ -1984,9 +1853,11 @@ async function admitQueuedRunOffline(root: string, workflowId: string): Promise<
     const prepared = prepareRunAdmission({
       sourceText: checked.sourceText,
       sourceLabel: checked.sourcePath,
+      workflowId,
       machineConfig: installation.machine,
       projectCwd: installation.projectCwd,
       runsDirectory: installation.runsDirectory,
+      archiveDirectory: installation.archiveDirectory,
       resolvedSettings: checked.resolvedSettings,
       runtimeManifest: {
         durableVersion: "1.0.2",
@@ -2023,27 +1894,23 @@ async function startBlockedCommandRun(
   command: string,
   options: { readonly validatorCommand?: string; readonly launchMarker?: string } = {},
 ): Promise<{ runId: ReturnType<typeof runIdSchema.parse> }> {
-  const config = join(root, ".workshop", "config");
+  const config = join(root, ".workshop");
   const workflows = join(config, "workflows");
   const launchMarker = options.launchMarker ?? join(root, "worker-launches.txt");
   mkdirSync(workflows, { recursive: true });
-  writeFileSync(join(config, "workshop.yaml"), "version: 2\nshell: /bin/bash\nmax_concurrent_runs: 1\n", "utf8");
+  writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\nmax_concurrent_runs: 1\n", "utf8");
   writeFileSync(join(workflows, `${workflowId}.yaml`), [
-    "version: 2",
-    `id: ${workflowId}`,
-    "nodes:",
-    "  work:",
-    "    replay: never",
-    "    max_attempts: 1",
+    "steps:",
+    "  - work:",
+    "      replay: never",
+    "      max_attempts: 1",
     ...(options.validatorCommand === undefined ? [] : [
-      "    validator:",
-      "      command: >-",
-      `        ${options.validatorCommand}`,
+      "      check:",
+      "        run: >-",
+      `          ${options.validatorCommand}`,
     ]),
-    "    run:",
-    "      command: >-",
+    "      run: >-",
     `        ${command}`,
-    "    next: null",
     "",
   ].join("\n"), "utf8");
   const started = runCli(root, ["start", workflowId, "--detach"]);
@@ -2153,7 +2020,7 @@ async function waitForNodeStatus(
 ) {
   const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {
-    const result = runCli(root, ["node", "describe", workflowId, nodeId, "--run", runId, "--json"]);
+    const result = runCli(root, ["step", "describe", workflowId, nodeId, "--run", runId, "--json"]);
     if (result.status !== 0) throw new Error(result.stderr);
     const description = nodeDescriptionDtoSchema.parse(JSON.parse(result.stdout));
     if (description.node.status === expectedStatus) return description;
@@ -2171,7 +2038,7 @@ async function waitForAttemptStatus(
 ) {
   const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {
-    const result = runCli(root, ["node", "describe", workflowId, nodeId, "--run", runId, "--json"]);
+    const result = runCli(root, ["step", "describe", workflowId, nodeId, "--run", runId, "--json"]);
     if (result.status !== 0) throw new Error(result.stderr);
     const description = nodeDescriptionDtoSchema.parse(JSON.parse(result.stdout));
     if (description.node.attempts.at(-1)?.status === expectedStatus) return description;

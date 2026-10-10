@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { Buffer } from "node:buffer";
-import { existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, statSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import type { Context } from "@earendil-works/chord";
 import { defineTask, type ConversationId, type Task, type TaskId, type TaskRuntime, type Tx } from "@earendil-works/pi-durable";
@@ -34,10 +34,10 @@ import {
   type WorkflowRunDocumentV1,
 } from "../../run/records.js";
 import { WorkshopEventEntry, WorkshopInstallationDoc, WorkshopRunDoc } from "./define-workshop-records.js";
-import { materializeRunViews, type RunViewFailure } from "./materialize-run-views.js";
+import { writeProcessInputs } from "./write-process-inputs.js";
 import {
   buildProcessExecutionEnvironment,
-  processExecutionCapturePaths,
+  processExecutionFiles,
   processExecutionTaskInputSchema,
   processExecutionTaskResultSchema,
   type ProcessExecutionTaskEnvironmentInput,
@@ -48,7 +48,6 @@ import {
 import { utcTimestampSchema } from "../../util/schema.js";
 
 const positive = z.number().int().positive().refine(Number.isSafeInteger);
-const nonnegative = z.number().int().nonnegative().refine(Number.isSafeInteger);
 type ReadyRun = Extract<WorkflowRunDocumentV1, { state: "ready" }>;
 type PersistedNodeAttempt = z.infer<typeof persistedNodeAttemptSchema>;
 type NodeRuntime = TaskRuntime<NodeAttemptTaskInput, NodeCheckpoint, NodeAttemptOutcome, object>;
@@ -125,20 +124,6 @@ export function defineNodeAttemptTask(
           await settleAttempt(task, runtime, input, { kind: "failed", failure, candidate: null, validator: null }, "failed", context);
           return;
         }
-        const viewFailures = await refreshRunViewsBestEffort(runtime, context);
-        if (viewFailures.some((failure) => failure.view === "input" && failure.nodeId === input.nodeId)) {
-          const block = blockInfo(
-            "integrity_failed",
-            "worker input view could not be materialized from canonical state before launch",
-            input.runId,
-            input.nodeId,
-            input.attemptId,
-            timestamp(runtime.now()),
-          );
-          await settleAttempt(task, runtime, input, { kind: "blocked", block, candidate: null, validator: null }, "interrupted", context);
-          return;
-        }
-        mkdirSync(run.paths.captureDirectory, { recursive: true });
         const executionId = executionIdSchema.parse(randomUUID());
         const incarnationId = incarnationIdSchema.parse(randomUUID());
         const processInput = createProcessInput({
@@ -153,7 +138,11 @@ export function defineNodeAttemptTask(
           launchIntentAt,
           deadlineAt,
         });
-        writeAgentPrompt(processInput, run, input.attemptNumber, settings.run);
+        if (!writeLaunchFiles(processInput, run, input.attemptNumber, settings.run, null)) {
+          const block = blockInfo("integrity_failed", "worker input files could not be written before launch", input.runId, input.nodeId, input.attemptId, timestamp(runtime.now()));
+          await settleAttempt(task, runtime, input, { kind: "blocked", block, candidate: null, validator: null }, "interrupted", context);
+          return;
+        }
         await runtime.commit(async (tx) => {
           const { draft, run: current } = await runDraft(tx, runtime.conversationId);
           assertNodeIdentity(input, current, runtime.taskId);
@@ -179,7 +168,6 @@ export function defineNodeAttemptTask(
             policy: "allSettled",
           };
         }, context);
-        await refreshRunViewsBestEffort(runtime, context);
       },
       awaitWorker: async (task, runtime, context) => {
         await waitForLaunchPermission(runtime, canLaunch, context);
@@ -271,7 +259,7 @@ export function defineNodeAttemptTask(
             await settleAttempt(task, runtime, input, { kind: "blocked", block, candidate: null, validator: null }, "interrupted", context);
             return;
           }
-          const resultPath = processExecutionCapturePaths(run.paths.captureDirectory, checkpoint.executionId, checkpoint.incarnationId).resultPath;
+          const resultPath = processExecutionFiles({ role: "worker", nodeId: input.nodeId, incarnationNumber: checkpoint.incarnationNumber }, run.paths.runDirectory, input.attemptNumber).resultPath;
           const parsed = parseWorkerResultFile(resultPath);
           if (!parsed.ok) {
             const failure = failureInfo(parsed.failure.kind, parsed.failure.message, input, runtime.now());
@@ -309,20 +297,6 @@ export function defineNodeAttemptTask(
         }
         const predecessor = run.chain.predecessors[input.nodeId];
         if (predecessor === undefined) throw new Error("frozen node has no predecessor snapshot");
-        const viewFailures = await refreshRunViewsBestEffort(runtime, context);
-        if (viewFailures.some((failure) => failure.nodeId === input.nodeId && (failure.view === "input" || failure.view === "output"))) {
-          const block = blockInfo(
-            "integrity_failed",
-            "validator input views could not be materialized from canonical state before launch",
-            input.runId,
-            input.nodeId,
-            input.attemptId,
-            timestamp(runtime.now()),
-          );
-          await settleAttempt(task, runtime, input, { kind: "blocked", block, candidate, validator: null }, "interrupted", context);
-          return;
-        }
-        mkdirSync(run.paths.captureDirectory, { recursive: true });
         const launchIntentAt = timestamp(runtime.now());
         let deadlineAt: string | null;
         try {
@@ -346,7 +320,11 @@ export function defineNodeAttemptTask(
           launchIntentAt,
           deadlineAt,
         });
-        writeAgentPrompt(processInput, run, input.attemptNumber, settings.validator, candidate);
+        if (!writeLaunchFiles(processInput, run, input.attemptNumber, settings.validator, candidate)) {
+          const block = blockInfo("integrity_failed", "validator input files could not be written before launch", input.runId, input.nodeId, input.attemptId, timestamp(runtime.now()));
+          await settleAttempt(task, runtime, input, { kind: "blocked", block, candidate, validator: null }, "interrupted", context);
+          return;
+        }
         await runtime.commit(async (tx) => {
           const { draft, run: current } = await runDraft(tx, runtime.conversationId);
           assertNodeIdentity(input, current, runtime.taskId);
@@ -372,7 +350,6 @@ export function defineNodeAttemptTask(
             policy: "allSettled",
           };
         }, context);
-        await refreshRunViewsBestEffort(runtime, context);
       },
       awaitValidator: async (task, runtime, context) => {
         await waitForLaunchPermission(runtime, canLaunch, context);
@@ -446,7 +423,7 @@ export function defineNodeAttemptTask(
             await settleAttempt(task, runtime, input, { kind: "failed", failure, candidate, validator: null }, "failed", context);
             return;
           }
-          const resultPath = processExecutionCapturePaths(run.paths.captureDirectory, checkpoint.executionId, checkpoint.incarnationId).resultPath;
+          const resultPath = processExecutionFiles({ role: "validator", nodeId: input.nodeId, incarnationNumber: checkpoint.incarnationNumber }, run.paths.runDirectory, input.attemptNumber).resultPath;
           const parsed = parseValidatorVerdictFile(resultPath);
           if (!parsed.ok) {
             const failure = failureInfo(parsed.failure.kind, parsed.failure.message, input, runtime.now());
@@ -533,7 +510,6 @@ async function commitWorkerCandidate(
     });
     return { status: "running", checkpoint: { phase: hasValidator ? "launchValidator" : "finish" } };
   }, context);
-  await refreshRunViewsBestEffort(runtime, context);
 }
 
 async function commitValidatorOutcome(
@@ -572,7 +548,6 @@ async function commitValidatorOutcome(
     });
     return { status: "running", checkpoint: { phase: "finish" } };
   }, context);
-  await refreshRunViewsBestEffort(runtime, context);
 }
 
 function createProcessInput(args: {
@@ -588,6 +563,11 @@ function createProcessInput(args: {
   launchIntentAt: string;
   deadlineAt: string | null;
 }): ProcessExecutionTaskInput {
+  const files = processExecutionFiles(
+    { role: args.role, nodeId: args.input.nodeId, incarnationNumber: args.incarnationNumber ?? 1 },
+    args.run.paths.runDirectory,
+    args.input.attemptNumber,
+  );
   const base: ProcessExecutionTaskEnvironmentInput = {
     runId: args.run.runId,
     workflowId: args.run.workflowId,
@@ -610,8 +590,8 @@ function createProcessInput(args: {
     timeoutMs: args.site.timeoutMs,
     streamCapBytes: args.site.streamCapBytes,
     replay: args.site.replay,
-    stdoutPath: processExecutionCapturePaths(args.run.paths.captureDirectory, args.executionId, args.incarnationId).stdoutPath,
-    stderrPath: processExecutionCapturePaths(args.run.paths.captureDirectory, args.executionId, args.incarnationId).stderrPath,
+    stdoutPath: files.stdoutPath,
+    stderrPath: files.stderrPath,
   };
   return processExecutionTaskInputSchema.parse({
     ...base,
@@ -674,7 +654,11 @@ async function scheduleSafeProcessReplay(args: {
     launchIntentAt: replay.launchIntentAt,
     deadlineAt: replay.deadlineAt,
   });
-  writeAgentPrompt(replayInput, resumableRun, input.attemptNumber, site, currentCandidate ?? undefined);
+  if (!writeLaunchFiles(replayInput, resumableRun, input.attemptNumber, site, currentCandidate)) {
+    const block = blockInfo("integrity_failed", "replay input files could not be written before launch", input.runId, input.nodeId, input.attemptId, timestamp(runtime.now()));
+    await settleAttempt(task, runtime, input, { kind: "blocked", block, candidate, validator: null }, "interrupted", context);
+    return;
+  }
   await runtime.commit(async (tx) => {
     const { draft, run: current } = await runDraft(tx, runtime.conversationId);
     assertNodeIdentity(input, current, runtime.taskId);
@@ -699,7 +683,6 @@ async function scheduleSafeProcessReplay(args: {
       : { phase: "awaitValidator" as const, processTaskId: Number(processTaskId), executionId: replay.executionId, incarnationId: replay.incarnationId, incarnationNumber: replay.incarnationNumber };
     return { status: "waiting", checkpoint: nextCheckpoint, on: [processTaskId], policy: "allSettled" };
   }, context);
-  await refreshRunViewsBestEffort(runtime, context);
 }
 
 async function waitForNodeReplayResume(runtime: NodeRuntime, input: NodeAttemptTaskInput, context: Context): Promise<ReadyRun> {
@@ -728,7 +711,6 @@ async function waitForNodeReplayResume(runtime: NodeRuntime, input: NodeAttemptT
         });
         return undefined;
       }, context);
-      await refreshRunViewsBestEffort(runtime, context);
       continue;
     }
     if (run.desiredState === "running" && run.status === "running"
@@ -740,43 +722,41 @@ async function waitForNodeReplayResume(runtime: NodeRuntime, input: NodeAttemptT
   }
 }
 
-function writeAgentPrompt(
+/** Writes a process's input files and agent prompt; false means launch must not proceed. */
+function writeLaunchFiles(
   processInput: ProcessExecutionTaskInput,
   run: ReadyRun,
   attemptNumber: number,
   site: ResolvedExecutionSite,
-  candidate?: NodeResult,
-): void {
-  if (site.kind !== "agent") return;
+  candidate: NodeResult | null,
+): boolean {
   if (processInput.nodeId === null || processInput.attemptId === null || processInput.role === "preflight") {
-    throw new Error("agent prompt requires a node execution identity");
+    throw new Error("process input files require a node execution identity");
   }
-  const promptPath = processInput.env.WORKSHOP_PROMPT_FILE;
-  const resultPath = processInput.env.WORKSHOP_RESULT_FILE;
-  const worklogPath = processInput.env.WORKSHOP_WORKLOG_FILE;
-  const previousOutputPath = processInput.env.WORKSHOP_PREVIOUS_OUTPUT_FILE;
-  const candidatePath = processInput.env.WORKSHOP_NODE_OUTPUT_FILE;
-  if (promptPath === undefined || resultPath === undefined || worklogPath === undefined
-    || previousOutputPath === undefined || candidatePath === undefined) {
-    throw new Error("agent process environment lacks a required runtime path");
+  const files = processExecutionFiles(processInput, run.paths.runDirectory, attemptNumber);
+  try {
+    writeProcessInputs(run, processInput.nodeId, files, processInput.role === "validator" ? candidate : null);
+    if (site.kind !== "agent") return true;
+    if (existsSync(files.resultPath)) return false;
+    const identity = {
+      workflowId: run.workflowId,
+      runId: run.runId,
+      nodeId: processInput.nodeId,
+      attemptNumber,
+      instructions: site.instructions,
+      worklogPath: files.worklogPath,
+      previousOutputPath: files.previousOutputPath,
+      resultPath: files.resultPath,
+    };
+    if (processInput.role === "validator" && candidate === null) return false;
+    const prompt = processInput.role === "worker"
+      ? renderWorkerPrompt(identity)
+      : renderValidatorPrompt({ ...identity, candidatePath: files.candidateOutputPath });
+    writeFileSync(files.promptPath, prompt, "utf8");
+    return true;
+  } catch {
+    return false;
   }
-  if (existsSync(resultPath)) throw new Error("agent result path exists before process launch");
-  const identity = {
-    workflowId: run.workflowId,
-    runId: run.runId,
-    nodeId: processInput.nodeId,
-    attemptNumber,
-    instructions: site.instructions,
-    worklogPath,
-    previousOutputPath,
-    resultPath,
-  };
-  const prompt = processInput.role === "worker"
-    ? renderWorkerPrompt(identity)
-    : candidate === undefined
-      ? (() => { throw new Error("agent validator prompt lacks its committed candidate"); })()
-      : renderValidatorPrompt({ ...identity, candidatePath });
-  writeFileSync(promptPath, prompt, "utf8");
 }
 
 export function resolveWorkerArtifacts(
@@ -853,8 +833,6 @@ async function checkedOperatorStopRetirement(
   }
   const hasWorkerReceipt = attempt.workerExecutionId !== null
     && attempt.processIncarnations.some((reference) => reference.executionId === attempt.workerExecutionId);
-  const hasValidatorReceipt = attempt.validatorExecutionId === null
-    || attempt.processIncarnations.some((reference) => reference.executionId === attempt.validatorExecutionId);
   if (checkpoint.phase === "launchValidator") {
     return attempt.result.kind === "candidate_committed" && hasWorkerReceipt
       && attempt.validatorExecutionId === null;
@@ -946,7 +924,6 @@ async function finishNodeAttempt(
     });
     return { status: "terminal", outcome: { status: "completed", result: outcome } };
   }, context);
-  await refreshRunViewsBestEffort(runtime, context);
 }
 
 
@@ -1001,7 +978,6 @@ async function settleAttempt(
       ? { status: "terminal", outcome: { status: "aborted", reason: "node attempt stopped with an unresolved outcome" } }
       : { status: "terminal", outcome: { status: "completed", result: committedOutcome } };
   }, context);
-  await refreshRunViewsBestEffort(runtime, context);
 }
 
 async function pauseInstallationRun(tx: Tx, run: ReadyRun): Promise<void> {
@@ -1025,38 +1001,6 @@ async function appendEvent(tx: Tx, conversationId: ConversationId, value: unknow
   if (!checked.success) throw new Error(`workshop event failed validation: ${checked.error.message}`);
   await tx.appendEntry(WorkshopEventEntry, conversationId, { data: checked.data });
 }
-
-async function refreshRunViewsBestEffort<I, S extends { phase: string }, R, H extends object>(
-  runtime: TaskRuntime<I, S, R, H>,
-  context: Context,
-): Promise<RunViewFailure[]> {
-  const run = await snapshotRun(runtime, context);
-  const failures = materializeRunViews(run);
-  if (failures.length === 0) return failures;
-
-  try {
-    await runtime.commit(async (tx) => {
-      const occurredAt = timestamp(runtime.now());
-      for (const failure of failures) {
-        await appendEvent(tx, runtime.conversationId, {
-          version: 1,
-          eventId: randomUUID(),
-          type: "view_refresh_failed",
-          runId: run.runId,
-          view: failure.view,
-          nodeId: failure.nodeId,
-          errorCode: failure.errorCode,
-          occurredAt,
-        });
-      }
-      return undefined;
-    }, context);
-  } catch {
-    // View diagnostics cannot change a lifecycle transition that already committed.
-  }
-  return failures;
-}
-
 
 function replaceRunAttempt(run: ReadyRun, nodeId: string, attemptId: string, update: (attempt: PersistedNodeAttempt) => PersistedNodeAttempt): ReadyRun {
   return readyRun({

@@ -17,7 +17,6 @@ import {
   nodeAttemptOutcomeSchema,
   nodeResultSchema,
   runIdSchema,
-  validatorOutcomePasses,
   type BlockInfo,
   type FailureInfo,
   type JudgmentDecision,
@@ -38,7 +37,6 @@ import {
   capacityGateOutcomeSchema,
   defineCapacityGateTask,
   type CapacityGateOutcome,
-  type CapacityGateTaskInput,
   type CapacityGateTaskDefinition,
 } from "./define-capacity-gate-task.js";
 import {
@@ -48,11 +46,10 @@ import {
   failureJudgmentTaskResultSchema,
   type FailureJudgmentTaskResult,
 } from "./define-failure-judgment-task.js";
-import { materializeRunViews, type RunViewFailure } from "./materialize-run-views.js";
 import {
   defineProcessExecutionTask,
   buildProcessExecutionEnvironment,
-  processExecutionCapturePaths,
+  processExecutionFiles,
   processExecutionTaskInputSchema,
   processExecutionTaskResultSchema,
   type ProcessExecutionTaskEnvironmentInput,
@@ -62,6 +59,7 @@ import {
 } from "./define-process-execution-task.js";
 import { defineNodeAttemptTask, nodeAttemptTaskInputSchema, type NodeAttemptTaskDefinition } from "./define-node-attempt-task.js";
 import { utcTimestampSchema } from "../../util/schema.js";
+import { removeRunFiles } from "../disk/remove-run-files.js";
 import { DEFAULT_STREAM_CAP_BYTES } from "../../util/parse-units.js";
 
 const positive = z.number().int().positive().refine(Number.isSafeInteger);
@@ -171,7 +169,7 @@ export function defineWorkshopTasks(
 
   const NodeAttemptTask = defineNodeAttemptTask(ProcessExecutionTask, activeBootId, canLaunch);
 
-  const CapacityGateTask = defineCapacityGateTask(refreshRunViewsBestEffort);
+  const CapacityGateTask = defineCapacityGateTask();
 
 
   const FailureJudgmentTask = FailureJudgmentTaskDefinition;
@@ -252,7 +250,6 @@ export function defineWorkshopTasks(
             ? { status: "running", checkpoint: { phase: "admitAttempt", nodeIndex: 0 } }
             : { status: "running", checkpoint: { phase: "preflight" } };
         }, context);
-        await refreshRunViewsBestEffort(runtime, context);
       },
       awaitCapacity: async (task, runtime, context) => {
         await waitForLaunchPermission(runtime, canLaunch, context);
@@ -338,7 +335,6 @@ export function defineWorkshopTasks(
             ? { status: "running", checkpoint: { phase: "preflight" } }
             : { status: "running", checkpoint: { phase: "admitAttempt", nodeIndex } };
         }, context);
-        await refreshRunViewsBestEffort(runtime, context);
       },
 
 
@@ -437,7 +433,6 @@ export function defineWorkshopTasks(
             policy: "allSettled",
           };
         }, context);
-        await refreshRunViewsBestEffort(runtime, context);
       },
       awaitPreflight: async (task, runtime, context) => {
         await waitForLaunchPermission(runtime, canLaunch, context);
@@ -531,7 +526,6 @@ export function defineWorkshopTasks(
             });
             return { status: "terminal", outcome: { status: "completed", result: { kind: "blocked", block } } };
           }, context);
-          await refreshRunViewsBestEffort(runtime, context);
           return;
         }
         const passedAt = timestamp(runtime.now());
@@ -563,7 +557,6 @@ export function defineWorkshopTasks(
           }));
           return { status: "running", checkpoint: { phase: "admitAttempt", nodeIndex: 0 } };
         }, context);
-        await refreshRunViewsBestEffort(runtime, context);
       },
       admitAttempt: async (task, runtime, context) => {
         await waitForLaunchPermission(runtime, canLaunch, context);
@@ -661,7 +654,6 @@ export function defineWorkshopTasks(
             policy: "allSettled",
           };
         }, context);
-        await refreshRunViewsBestEffort(runtime, context);
       },
       awaitAttempt: async (task, runtime, context) => {
         const input = parseWorkflowInput(task.input);
@@ -712,7 +704,6 @@ export function defineWorkshopTasks(
               }));
               return { status: "running", checkpoint: { phase: "decide", nodeIndex: checkpoint.nodeIndex, nodeId: checkpoint.nodeId, attemptId: checkpoint.attemptId } };
             }, context);
-            await refreshRunViewsBestEffort(runtime, context);
             return;
           }
         }
@@ -753,7 +744,6 @@ export function defineWorkshopTasks(
             }));
             return { status: "running", checkpoint: { phase: "admitAttempt", nodeIndex: nextIndex } };
           }, context);
-          await refreshRunViewsBestEffort(runtime, context);
           return;
         }
         await completeRun(task, runtime, input, checkpoint, candidate, context);
@@ -831,7 +821,6 @@ export function defineWorkshopTasks(
               policy: "allSettled",
             };
           }, context);
-          await refreshRunViewsBestEffort(runtime, context);
           return;
         }
       },
@@ -921,6 +910,7 @@ function createPreflightProcessInput(args: {
   launchIntentAt: string;
   deadlineAt: string | null;
 }): ProcessExecutionTaskInput {
+  const files = processExecutionFiles({ role: "preflight", nodeId: null, incarnationNumber: args.incarnationNumber ?? 1 }, args.run.paths.runDirectory, null);
   const base: ProcessExecutionTaskEnvironmentInput = {
     runId: args.run.runId,
     workflowId: args.run.workflowId,
@@ -943,8 +933,8 @@ function createPreflightProcessInput(args: {
     timeoutMs: args.site.timeoutMs,
     streamCapBytes: DEFAULT_STREAM_CAP_BYTES,
     replay: "safe",
-    stdoutPath: processExecutionCapturePaths(args.run.paths.captureDirectory, args.executionId, args.incarnationId).stdoutPath,
-    stderrPath: processExecutionCapturePaths(args.run.paths.captureDirectory, args.executionId, args.incarnationId).stderrPath,
+    stdoutPath: files.stdoutPath,
+    stderrPath: files.stderrPath,
   };
   return processExecutionTaskInputSchema.parse({
     ...base,
@@ -1025,7 +1015,6 @@ async function schedulePreflightReplay(args: {
       policy: "allSettled",
     };
   }, context);
-  await refreshRunViewsBestEffort(runtime, context);
 }
 
 
@@ -1206,7 +1195,6 @@ async function blockRun(
     if (taskOutcome === "aborted") return { status: "terminal", outcome: { status: "aborted", reason: block.reason } };
     return { status: "terminal", outcome: { status: "completed", result: { kind: "blocked", block } } };
   }, context);
-  await refreshRunViewsBestEffort(runtime, context);
 }
 
 async function applyFailureJudgment(
@@ -1334,7 +1322,6 @@ async function applyFailureJudgment(
     });
     return { status: "terminal", outcome: { status: "completed", result: { kind: "failed", failure } } };
   }, context);
-  await refreshRunViewsBestEffort(runtime, context);
 }
 
 function failureJudgmentAllowedActions(
@@ -1472,7 +1459,6 @@ async function cancelRun(
     });
     return { status: "terminal", outcome: { status: "completed", result: { kind: "cancelled" } } };
   }, context);
-  await refreshRunViewsBestEffort(runtime, context);
 }
 
 
@@ -1527,7 +1513,6 @@ async function failRun(
     });
     return { status: "terminal", outcome: { status: "completed", result: { kind: "failed", failure } } };
   }, context);
-  await refreshRunViewsBestEffort(runtime, context);
   return !deferred;
 }
 
@@ -1539,6 +1524,7 @@ async function completeRun(
   candidate: NodeResult,
   context: Context,
 ): Promise<void> {
+  let completed: WorkflowRunDocumentV1 | undefined;
   await runtime.commit(async (tx) => {
     const { draft, run } = await runDraft(tx, runtime.conversationId);
     assertWorkflowIdentity(input, run, runtime.taskId);
@@ -1550,7 +1536,7 @@ async function completeRun(
       throw new Error("terminal child result differs from canonical attempt evidence");
     }
     const at = timestamp(runtime.now());
-    assign(draft, workflowRunDocumentV1Schema.parse({
+    completed = workflowRunDocumentV1Schema.parse({
       ...run,
       status: "completed",
       finishedAt: at,
@@ -1562,7 +1548,8 @@ async function completeRun(
       nodes: run.nodes.map((value, index) => index === checkpoint.nodeIndex
         ? { ...value, status: "succeeded", successfulAttemptId: checkpoint.attemptId }
         : value),
-    }));
+    });
+    assign(draft, completed);
     await setInstallationStatus(tx, run, "completed");
     await appendEvent(tx, runtime.conversationId, {
       version: 1,
@@ -1583,7 +1570,7 @@ async function completeRun(
     });
     return { status: "terminal", outcome: { status: "completed", result: { kind: "completed", terminalOutput: candidate.output } } };
   }, context);
-  await refreshRunViewsBestEffort(runtime, context);
+  if (completed !== undefined) removeRunFiles(completed);
 }
 
 async function setInstallationStatus(
@@ -1620,47 +1607,6 @@ async function appendEvent(tx: Tx, conversationId: ConversationId, value: unknow
   await tx.appendEntry(WorkshopEventEntry, conversationId, { data: checked.data });
 }
 
-async function refreshRunViewsBestEffort<I, S extends { phase: string }, R, H extends object>(
-  runtime: TaskRuntime<I, S, R, H>,
-  context: Context,
-): Promise<RunViewFailure[]> {
-  const run = await snapshotRun(runtime, context);
-  const failures = materializeRunViews(run);
-  if (failures.length === 0) return failures;
-
-  try {
-    await runtime.commit(async (tx) => {
-      const occurredAt = timestamp(runtime.now());
-      for (const failure of failures) {
-        await appendEvent(tx, runtime.conversationId, {
-          version: 1,
-          eventId: randomUUID(),
-          type: "view_refresh_failed",
-          runId: run.runId,
-          view: failure.view,
-          nodeId: failure.nodeId,
-          errorCode: failure.errorCode,
-          occurredAt,
-        });
-      }
-      return undefined;
-    }, context);
-  } catch {
-    // View diagnostics cannot change a lifecycle transition that already committed.
-  }
-  return failures;
-}
-
-
-function replaceRunAttempt(run: ReadyRun, nodeId: string, attemptId: string, update: (attempt: PersistedNodeAttempt) => PersistedNodeAttempt): ReadyRun {
-  return readyRun({
-    ...run,
-    nodes: run.nodes.map((node) => node.nodeId !== nodeId ? node : {
-      ...node,
-      attempts: node.attempts.map((attempt) => attempt.attemptId === attemptId ? update(attempt) : attempt),
-    }),
-  });
-}
 
 function requireAttempt(run: ReadyRun, nodeId: string, attemptId: string) {
   const attempt = run.nodes.find((node) => node.nodeId === nodeId)?.attempts.find((value) => value.attemptId === attemptId);
@@ -1668,14 +1614,6 @@ function requireAttempt(run: ReadyRun, nodeId: string, attemptId: string) {
   return attempt;
 }
 
-function successfulOutput(run: ReadyRun, nodeId: string): string {
-  const node = run.nodes.find((value) => value.nodeId === nodeId);
-  const attempt = node?.attempts.at(-1);
-  if (node?.status !== "succeeded" || attempt?.result.kind !== "settled" || attempt.result.outcome.kind !== "succeeded") {
-    throw new Error("predecessor has no successful canonical output");
-  }
-  return attempt.result.outcome.candidate.output;
-}
 
 function durableTaskId<R>(value: number): TaskId<R> {
   const checked = positive.parse(value);
@@ -1725,7 +1663,6 @@ async function waitForWorkflowResume(
         });
         return undefined;
       }, context);
-      await refreshRunViewsBestEffort(runtime, context);
       continue;
     }
     if (run.desiredState === "stopped" || (run.status === "running" && run.desiredState === "running"

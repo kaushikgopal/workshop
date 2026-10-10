@@ -1,11 +1,12 @@
 import { createHash } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { createRegistry, defineTask, Harness } from "@earendil-works/pi-durable";
+import { openNodeSqliteDatabase } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { canonicalHash } from "../src/definition/hash-canonical-json.js";
 import { checkDefinitionText } from "../src/definition/check-definition.js";
 import { resolvedNodeSettingsSchema } from "../src/definition/schema-resolved.js";
@@ -23,6 +24,7 @@ import {
   WorkshopInstallationDoc,
   WorkshopRunDoc,
 } from "../src/storage/durable/define-workshop-records.js";
+import { checkpointDurableWal } from "../src/storage/durable/checkpoint-durable-wal.js";
 import { openDurableStorage } from "../src/storage/durable/open-durable-storage.js";
 import { sha256Schema } from "../src/util/schema.js";
 
@@ -53,15 +55,11 @@ const StorageReceiptTask = defineTask<Record<string, never>, ReceiptCheckpoint, 
 
 function fixtureRun(conversationId: number, workflowTaskId: number, baseDir: string) {
   const sourceText = [
-    "version: 2",
-    "id: release",
-    "nodes:",
-    "  prepare-report:",
-    "    run: { command: echo prepare }",
-    "    next: null",
+    "steps:",
+    "  - prepare-report: echo prepare",
     "",
   ].join("\n");
-  const checked = checkDefinitionText(sourceText, "release.yaml");
+  const checked = checkDefinitionText(sourceText, "release.yaml", "release");
   const resolvedSettings = {
     nodes: {
       "prepare-report": resolvedNodeSettingsSchema.parse({
@@ -79,6 +77,7 @@ function fixtureRun(conversationId: number, workflowTaskId: number, baseDir: str
       }),
     },
     preflight: null,
+    keepFiles: "failed",
     orchestrator: { model: null, timeoutMs: null },
   };
   const sourceHash = `sha256:${createHash("sha256").update(sourceText, "utf8").digest("hex")}`;
@@ -104,11 +103,7 @@ function fixtureRun(conversationId: number, workflowTaskId: number, baseDir: str
     paths: {
       projectCwd: baseDir,
       runDirectory: join(baseDir, "runs", "run-storage-contract"),
-      definitionSnapshot: join(baseDir, "runs", "run-storage-contract", "definition.yaml"),
-      worklog: join(baseDir, "runs", "run-storage-contract", "WORKLOG.md"),
-      inputDirectory: join(baseDir, "runs", "run-storage-contract", "input"),
-      outputDirectory: join(baseDir, "runs", "run-storage-contract", "output"),
-      captureDirectory: join(baseDir, "runs", "run-storage-contract", "captures"),
+      archiveDirectory: join(baseDir, "archive", "release"),
     },
     runtimeManifest: {
       durableVersion: "1.0.2",
@@ -376,6 +371,31 @@ describe("Durable storage records", () => {
       expect(entries.items.some((entry) => WorkshopEventEntry.is(entry))).toBe(true);
     } finally {
       if (harness !== undefined) await harness.close(BACKGROUND_CONTEXT);
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("truncates an idle WAL without losing committed rows", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "workshop-wal-checkpoint-"));
+    const databasePath = join(directory, "durable.db");
+    const database = await openNodeSqliteDatabase(databasePath, { walAutoCheckpointPages: 0 });
+    try {
+      await database.exec("PRAGMA synchronous = FULL; CREATE TABLE wal_fixture (value BLOB NOT NULL);");
+      const value = new Uint8Array(256 * 1024).fill(0x5a);
+      await database.transaction(async (transaction) => {
+        for (let index = 0; index < 32; index++) {
+          await transaction.run("INSERT INTO wal_fixture (value) VALUES (?)", value);
+        }
+      });
+
+      const walPath = `${databasePath}-wal`;
+      expect(statSync(walPath).size).toBeGreaterThan(0);
+      expect(await checkpointDurableWal(databasePath)).toBe(true);
+      expect(statSync(walPath).size).toBe(0);
+      expect(await database.get<{ rowCount: number }>("SELECT COUNT(*) AS rowCount FROM wal_fixture"))
+        .toEqual({ rowCount: 32 });
+    } finally {
+      await database.close();
       rmSync(directory, { recursive: true, force: true });
     }
   });

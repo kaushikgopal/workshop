@@ -1,7 +1,7 @@
 import { existsSync, lstatSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { canonicalHash } from "../definition/hash-canonical-json.js";
-import { checkDefinitionText } from "../definition/check-definition.js";
+import { checkDefinitionText, checkFormatVersion } from "../definition/check-definition.js";
 import { resolveWorkflowSettings } from "../definition/resolve-workflow-settings.js";
 import { machineConfigSchema, workflowIdSchema, type MachineConfig } from "../definition/schema.js";
 import { parseStrictYaml } from "../definition/parse-yaml.js";
@@ -9,8 +9,8 @@ import { parseStrictYaml } from "../definition/parse-yaml.js";
 export interface Installation {
   readonly root: string;
   readonly workshopDirectory: string;
-  readonly configDirectory: string;
   readonly workflowsDirectory: string;
+  readonly archiveDirectory: string;
   readonly stateDirectory: string;
   readonly runsDirectory: string;
   readonly databasePath: string;
@@ -51,18 +51,17 @@ export function loadInstallation(root: string): Installation {
     throw new Error(`installation path must be a real .workshop directory: ${workshopDirectory}`);
   }
 
-  const configDirectory = join(workshopDirectory, "config");
-  const workflowsDirectory = join(configDirectory, "workflows");
+  const workflowsDirectory = join(workshopDirectory, "workflows");
   const stateDirectory = join(workshopDirectory, "state");
-  const configPath = join(configDirectory, "workshop.yaml");
+  const configPath = join(workshopDirectory, "workshop.yaml");
   const machine = loadMachineConfig(configPath);
-  const projectCwd = machine.project_dir === undefined ? absoluteRoot : resolve(configDirectory, machine.project_dir);
+  const projectCwd = machine.project_dir === undefined ? absoluteRoot : resolve(workshopDirectory, machine.project_dir);
 
   return {
     root: absoluteRoot,
     workshopDirectory,
-    configDirectory,
     workflowsDirectory,
+    archiveDirectory: join(workshopDirectory, "archive"),
     stateDirectory,
     runsDirectory: join(stateDirectory, "runs"),
     databasePath: join(stateDirectory, "durable.db"),
@@ -71,20 +70,11 @@ export function loadInstallation(root: string): Installation {
   };
 }
 
-/**
- * A missing machine config means built-in defaults. A present one must declare
- * `version: 2`, so an unversioned file fails with a schema error that names the
- * fix instead of a list of unrecognized keys.
- */
+/** A missing machine config means built-in defaults; an empty file means the same. */
 function loadMachineConfig(configPath: string): MachineConfig {
-  if (!existsSync(configPath)) return machineConfigSchema.parse({ version: 2 });
-  const raw = parseStrictYaml(readFileSync(configPath, "utf8"), configPath);
-  const version = typeof raw === "object" && raw !== null && !Array.isArray(raw) && "version" in raw ? raw.version : undefined;
-  if (version !== 2) {
-    throw new Error(version === undefined
-      ? `${configPath}: machine config does not declare a version; add version: 2`
-      : `${configPath}: unsupported machine config version ${JSON.stringify(version)}; expected version: 2`);
-  }
+  if (!existsSync(configPath)) return machineConfigSchema.parse({});
+  const raw = parseStrictYaml(readFileSync(configPath, "utf8"), configPath) ?? {};
+  checkFormatVersion(raw, configPath, "machine config");
   return machineConfigSchema.parse(raw);
 }
 
@@ -93,10 +83,7 @@ export function loadCheckedWorkflow(installation: Installation, workflowId: stri
   const checkedId = workflowIdSchema.parse(workflowId);
   const sourcePath = join(installation.workflowsDirectory, `${checkedId}.yaml`);
   const sourceText = readFileSync(sourcePath, "utf8");
-  const checked = checkDefinitionText(sourceText, sourcePath);
-  if (checked.def.id !== checkedId) {
-    throw new Error(`workflow id in ${sourcePath} is ${JSON.stringify(checked.def.id)}, expected ${JSON.stringify(checkedId)}`);
-  }
+  const checked = checkDefinitionText(sourceText, sourcePath, checkedId);
   const resolvedSettings = resolveWorkflowSettings({
     definition: checked.def,
     machine: installation.machine,

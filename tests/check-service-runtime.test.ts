@@ -11,7 +11,7 @@ import { installationDocumentV1Schema } from "../src/installation/schema.js";
 import { workshopProcessV1Schema } from "../src/run/records.js";
 import { serviceLogSectionPageV1Schema, serviceRunsPageV1Schema, serviceStartResultV1Schema } from "../src/service/schema.js";
 import { probeServiceHealth } from "../src/service/probe-service-health.js";
-import { readServiceWorklog, sendServiceRequest, streamServiceLogChunks, streamServiceLogSections } from "../src/service/send-service-request.js";
+import { readServiceWorklog, sendServiceRequest, streamServiceLogChunks } from "../src/service/send-service-request.js";
 import { acquireServiceLock } from "../src/service/acquire-service-lock.js";
 import { WorkshopInstallationDoc, WorkshopProcessEntry } from "../src/storage/durable/define-workshop-records.js";
 import { openDurableStorage } from "../src/storage/durable/open-durable-storage.js";
@@ -38,19 +38,15 @@ async function waitForCompletedRun(socketPath: string, workflowId: string, runId
 describe("Durable service runtime", () => {
   test("serves start, status, runs, and logs for one canonical run through real SQLite and Harness resources", async () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-service-runtime-"));
-    const config = join(root, ".workshop", "config");
+    const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
     mkdirSync(workflows, { recursive: true });
-    writeFileSync(join(config, "workshop.yaml"), "version: 2\nshell: /bin/bash\n", "utf8");
+    writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\nkeep_files: always\n", "utf8");
     writeFileSync(join(workflows, "clock.yaml"), [
-      "version: 2",
-      "id: clock",
       "description: Durable service fixture",
-      "nodes:",
-      "  tick:",
-      "    run:",
-      "      command: sleep 0.3; printf 'fixture-output'",
-      "    next: null",
+      "steps:",
+      "  - tick:",
+      "      run: sleep 0.3; printf 'fixture-output'",
       "",
     ].join("\n"), "utf8");
 
@@ -98,8 +94,11 @@ describe("Durable service runtime", () => {
       expect(page?.highWaterMark).toBe(1);
 
       const logSections: LogsDto["sections"] = [];
-      const logStream = await streamServiceLogSections(socketPath, "clock", started.runId, (section) => { logSections.push(section); });
-      const logs = logsDtoSchema.parse({ version: 2, runId: logStream.runId, sections: logSections, projection: logStream.projection });
+      const logStream = await streamServiceLogChunks(socketPath, "clock", started.runId, (section, _runId, chunk) => {
+        expect(chunk.complete).toBe(true);
+        logSections.push(section);
+      });
+      const logs = logsDtoSchema.parse({ version: 2, runId: logStream.runId, sections: logSections });
       expect(logs.runId).toBe(started.runId);
       expect(logs.sections.some((section) => section.kind === "capture" && section.content === "fixture-output")).toBe(true);
 
@@ -187,26 +186,24 @@ describe("Durable service runtime", () => {
 
   test("repairs an unavailable judge and retries only the judgment before authorizing a new attempt", async () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-judgment-repair-"));
-    const config = join(root, ".workshop", "config");
+    const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
     const workerLaunches = join(root, "worker-launches.txt");
     const validatorLaunches = join(root, "validator-launches.txt");
     const validatorFirstFailure = join(root, "validator-first-failure.txt");
     mkdirSync(workflows, { recursive: true });
-    writeFileSync(join(config, "workshop.yaml"), "version: 2\nshell: /bin/bash\n", "utf8");
+    writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\n", "utf8");
     writeFileSync(join(workflows, "judgment-repair.yaml"), [
-      "version: 2",
-      "id: judgment-repair",
-      "nodes:",
-      "  verify:",
-      "    replay: safe",
-      "    max_attempts: 2",
-      "    run:",
-      `      command: >-\n        printf w >> '${workerLaunches}'; printf candidate`,
-      "    validator:",
+      "steps:",
+      "  - verify:",
       "      replay: safe",
-      `      command: >-\n        printf v >> '${validatorLaunches}'; if [ ! -e '${validatorFirstFailure}' ]; then touch '${validatorFirstFailure}'; exit 7; fi; exit 0`,
-      "    next: null",
+      "      max_attempts: 2",
+      "      run: >-",
+      `        printf w >> '${workerLaunches}'; printf candidate`,
+      "      check:",
+      "        replay: safe",
+      "        run: >-",
+      `          printf v >> '${validatorLaunches}'; if [ ! -e '${validatorFirstFailure}' ]; then touch '${validatorFirstFailure}'; exit 7; fi; exit 0`,
       "orchestrator:",
       "  model: faux/failure-judge:low",
       "  timeout: 20s",
@@ -292,37 +289,29 @@ describe("Durable service runtime", () => {
       rmSync(root, { recursive: true, force: true });
     }
   }, 30_000);
-  test("preserves BOMs, isolates invalid UTF-8, and reports a missing capture locally", async () => {
+  test("renders committed capture text, marks unavailable content, and skips empty captures", async () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-log-text-integrity-"));
-    const config = join(root, ".workshop", "config");
+    const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
     mkdirSync(workflows, { recursive: true });
     const harnessCommand = String.raw`printf '%s' '{"version":1,"output":"candidate","summary":"fixture result","artifacts":[]}' > "$WORKSHOP_RESULT_FILE"
-case "$WORKSHOP_NODE_ID" in
+case "$WORKSHOP_STEP_ID" in
   bom) printf '\357\273\277raw-bom' ;;
   invalid) printf '\377raw-invalid' ;;
   readable) printf 'other sections remain readable' ;;
+  empty) : ;;
 esac`;
-    writeFileSync(join(config, "workshop.yaml"), `version: 2\nshell: /bin/bash\nagent:\n  model: fixture/mock-model:medium\n  harness:\n    command: |\n${harnessCommand.split("\n").map((line) => `      ${line}`).join("\n")}\n`, "utf8");
+    writeFileSync(join(config, "workshop.yaml"), `shell: /bin/bash\nkeep_files: always\nagent:\n  model: fixture/mock-model:medium\n  harness:\n    command: |\n${harnessCommand.split("\n").map((line) => `      ${line}`).join("\n")}\n`, "utf8");
     writeFileSync(join(workflows, "capture-text.yaml"), [
-      "version: 2",
-      "id: capture-text",
-      "nodes:",
-      "  bom:",
-      "    run:",
-      "      agent:",
-      "        instructions: Return the fixture result.",
-      "    next: invalid",
-      "  invalid:",
-      "    run:",
-      "      agent:",
-      "        instructions: Return the fixture result.",
-      "    next: readable",
-      "  readable:",
-      "    run:",
-      "      agent:",
-      "        instructions: Return the fixture result.",
-      "    next: null",
+      "steps:",
+      "  - bom:",
+      "      agent: Return the fixture result.",
+      "  - invalid:",
+      "      agent: Return the fixture result.",
+      "  - readable:",
+      "      agent: Return the fixture result.",
+      "  - empty:",
+      "      agent: Return the fixture result.",
       "",
     ].join("\n"), "utf8");
     const installation = loadInstallation(root);
@@ -338,21 +327,24 @@ esac`;
       const started = serviceStartResultV1Schema.parse(startedResponse.result);
       await waitForCompletedRun(health.metadata.socketPath, "capture-text", started.runId);
       const logSections: LogsDto["sections"] = [];
-      const logStream = await streamServiceLogSections(health.metadata.socketPath, "capture-text", started.runId, (section) => { logSections.push(section); });
-      const logs = logsDtoSchema.parse({ version: 2, runId: logStream.runId, sections: logSections, projection: logStream.projection });
+      const logStream = await streamServiceLogChunks(health.metadata.socketPath, "capture-text", started.runId, (section, _runId, chunk) => {
+        expect(chunk.complete).toBe(true);
+        logSections.push(section);
+      });
+      const logs = logsDtoSchema.parse({ version: 2, runId: logStream.runId, sections: logSections });
       const bom = logs.sections.find((section) => section.kind === "capture" && section.label === "bom worker stdout");
-      const invalid = logs.sections.find((section) => section.kind === "capture" && section.label === "invalid worker stdout");
+      const unavailable = logs.sections.find((section) => section.kind === "capture" && section.label === "invalid worker stdout");
       const readable = logs.sections.find((section) => section.kind === "capture" && section.label === "readable worker stdout");
       expect(bom?.kind).toBe("capture");
       if (bom?.kind !== "capture") throw new Error("BOM capture section is missing");
       expect(bom.content).toBe("\uFEFFraw-bom");
-      expect(invalid?.kind).toBe("capture");
-      if (invalid?.kind !== "capture") throw new Error("invalid UTF-8 capture section is missing");
-      expect(invalid.content).toBeNull();
-      expect(invalid.unavailableReason).toBe("capture contains invalid UTF-8");
+      expect(unavailable?.kind).toBe("capture");
+      if (unavailable?.kind !== "capture") throw new Error("unavailable capture section is missing");
+      expect(unavailable.content).toBeNull();
       expect(readable?.kind).toBe("capture");
       if (readable?.kind !== "capture") throw new Error("readable capture section is missing");
       expect(readable.content).toBe("other sections remain readable");
+      expect(logs.sections.some((section) => section.kind === "capture" && section.label === "empty worker stdout")).toBe(false);
       const worklog = logs.sections.find((section) => section.kind === "worklog");
       expect(worklog?.kind).toBe("worklog");
       if (worklog?.kind !== "worklog") throw new Error("worklog section is missing");
@@ -372,18 +364,6 @@ esac`;
       } while (cursor !== undefined);
       expect(pages.map((section) => section.sectionId)).toEqual(logs.sections.map((section) => section.sectionId));
       expect(pages.find((section) => section.kind === "capture" && section.label === "invalid worker stdout")?.content).toBeNull();
-
-      rmSync(readable.capture.path);
-      const missingSections: LogsDto["sections"] = [];
-      const missingStream = await streamServiceLogSections(health.metadata.socketPath, "capture-text", started.runId, (section) => { missingSections.push(section); });
-      const missingLogs = logsDtoSchema.parse({ version: 2, runId: missingStream.runId, sections: missingSections, projection: missingStream.projection });
-      const missing = missingLogs.sections.find((section) => section.kind === "capture" && section.label === "readable worker stdout");
-      expect(missing?.kind).toBe("capture");
-      if (missing?.kind !== "capture") throw new Error("missing capture section is missing");
-      expect(missing.content).toBeNull();
-      expect(missing.unavailableReason).toBe("capture file is missing");
-      if (missing.unavailableReason === null) throw new Error("missing capture section has no diagnostic");
-      expect(missing.unavailableReason.length).toBeLessThanOrEqual(64 * 1024);
     } finally {
       if (owner !== undefined) await owner.shutdown();
       rmSync(root, { recursive: true, force: true });
@@ -392,7 +372,7 @@ esac`;
 
   test("bounds artifact_missing diagnostics without truncating worker artifact metadata", async () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-long-artifact-path-"));
-    const config = join(root, ".workshop", "config");
+    const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
     const validatorLaunch = join(root, "validator-launched");
     const successorLaunch = join(root, "successor-launched");
@@ -401,7 +381,6 @@ esac`;
     mkdirSync(workflows, { recursive: true });
     writeFileSync(harnessScript, `printf '%s' '${JSON.stringify({ version: 1, output: "candidate", summary: "long-path fixture", artifacts: [{ kind: "report", path: artifactPath }] })}' > "$WORKSHOP_RESULT_FILE"\n`, "utf8");
     writeFileSync(join(config, "workshop.yaml"), [
-      "version: 2",
       "shell: /bin/bash",
       "agent:",
       "  model: fixture/mock-model:medium",
@@ -411,20 +390,13 @@ esac`;
       "",
     ].join("\n"), "utf8");
     writeFileSync(join(workflows, "long-artifact.yaml"), [
-      "version: 2",
-      "id: long-artifact",
-      "nodes:",
-      "  worker:",
-      "    run:",
-      "      agent:",
-      "        instructions: Return the fixture result.",
-      "    validator:",
-      `      command: 'printf launched > ${validatorLaunch}'`,
-      "    next: successor",
-      "  successor:",
-      "    run:",
-      `      command: 'printf launched > ${successorLaunch}'`,
-      "    next: null",
+      "steps:",
+      "  - worker:",
+      "      agent: Return the fixture result.",
+      "      check:",
+      "        run: 'printf launched > ${validatorLaunch}'",
+      "  - successor:",
+      "      run: 'printf launched > ${successorLaunch}'",
       "",
     ].join("\n"), "utf8");
     const installation = loadInstallation(root);
@@ -468,7 +440,7 @@ esac`;
       });
       if (!successorResponse.ok) throw new Error(successorResponse.error.message);
       expect(nodeDescriptionDtoSchema.parse(successorResponse.result).node.status).toBe("pending");
-      const worklog = await readServiceWorklog(health.metadata.socketPath, "long-artifact", started.runId);
+      const worklog = await readServiceWorklog(health.metadata.socketPath, "long-artifact", started.runId, 10_000, true);
       expect(worklog).toContain(`> ${artifactPath}`);
     } finally {
       if (owner !== undefined) await owner.shutdown();
@@ -479,7 +451,7 @@ esac`;
 
   test("streams a valid 18 MiB capture through bounded, UTF-8-safe fragments", async () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-large-log-section-"));
-    const config = join(root, ".workshop", "config");
+    const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
     const outputBytes = 18 * 1024 * 1024;
     const exactPrefix = "\uFEFFλ\r\n\u0001";
@@ -490,16 +462,11 @@ printf '\357\273\277\316\273\r\n\001'
 head -c ${beforeBoundaryCodePoint} /dev/zero | tr '\000' x
 printf '\342\202\254'
 head -c 18874368 /dev/zero | tr '\000' x`;
-    writeFileSync(join(config, "workshop.yaml"), `version: 2\nshell: /bin/bash\nstream_cap: unlimited\nagent:\n  model: fixture/mock-model:medium\n  harness:\n    command: |\n${harnessCommand.split("\n").map((line) => `      ${line}`).join("\n")}\n`, "utf8");
+    writeFileSync(join(config, "workshop.yaml"), `shell: /bin/bash\nkeep_files: always\nstream_cap: unlimited\nagent:\n  model: fixture/mock-model:medium\n  harness:\n    command: |\n${harnessCommand.split("\n").map((line) => `      ${line}`).join("\n")}\n`, "utf8");
     writeFileSync(join(workflows, "large-capture.yaml"), [
-      "version: 2",
-      "id: large-capture",
-      "nodes:",
-      "  large:",
-      "    run:",
-      "      agent:",
-      "        instructions: Return the fixture result.",
-      "    next: null",
+      "steps:",
+      "  - large:",
+      "      agent: Return the fixture result.",
       "",
     ].join("\n"), "utf8");
     const installation = loadInstallation(root);
@@ -535,24 +502,21 @@ head -c 18874368 /dev/zero | tr '\000' x`;
     }
   }, 60_000);
 
-  test("streams an unbounded worklog in bounded chunks and rejects missing or tampered snapshots", async () => {
+  test("streams compact and verbose worklogs through bounded pages", async () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-large-worklog-"));
-    const config = join(root, ".workshop", "config");
+    const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
     const summaryBytes = 60_000;
     const nodeIds = Array.from({ length: 18 }, (_, index) => `node-${String(index).padStart(2, "0")}`);
     mkdirSync(workflows, { recursive: true });
     const harnessCommand = String.raw`summary=$(head -c 60000 /dev/zero | tr '\000' y)
 printf '{"version":1,"output":"candidate","summary":"%s","artifacts":[]}' "$summary" > "$WORKSHOP_RESULT_FILE"`;
-    writeFileSync(join(config, "workshop.yaml"), `version: 2\nshell: /bin/bash\nagent:\n  model: fixture/mock-model:medium\n  harness:\n    command: |\n${harnessCommand.split("\n").map((line) => `      ${line}`).join("\n")}\n`, "utf8");
-    const nodeLines = nodeIds.flatMap((nodeId, index) => [
-      `  ${nodeId}:`,
-      "    run:",
-      "      agent:",
-      "        instructions: Return the fixture result.",
-      `    next: ${nodeIds[index + 1] ?? "null"}`,
+    writeFileSync(join(config, "workshop.yaml"), `shell: /bin/bash\nagent:\n  model: fixture/mock-model:medium\n  harness:\n    command: |\n${harnessCommand.split("\n").map((line) => `      ${line}`).join("\n")}\n`, "utf8");
+    const stepLines = nodeIds.flatMap((nodeId) => [
+      `  - ${nodeId}:`,
+      "      agent: Return the fixture result.",
     ]);
-    writeFileSync(join(workflows, "large-worklog.yaml"), ["version: 2", "id: large-worklog", "nodes:", ...nodeLines, ""].join("\n"), "utf8");
+    writeFileSync(join(workflows, "large-worklog.yaml"), ["steps:", ...stepLines, ""].join("\n"), "utf8");
     const installation = loadInstallation(root);
     let owner: Awaited<ReturnType<typeof startWorkshopService>> | undefined;
     try {
@@ -565,12 +529,16 @@ printf '{"version":1,"output":"candidate","summary":"%s","artifacts":[]}' "$summ
       if (!startedResponse.ok) throw new Error(startedResponse.error.message);
       const started = serviceStartResultV1Schema.parse(startedResponse.result);
       await waitForCompletedRun(health.metadata.socketPath, "large-worklog", started.runId);
-      const worklog = await readServiceWorklog(health.metadata.socketPath, "large-worklog", started.runId, 30_000);
-      expect(new TextEncoder().encode(worklog).byteLength).toBeGreaterThan(1024 * 1024);
-      expect(worklog).toContain(`> ${"y".repeat(summaryBytes)}`);
+
+      const compact = await readServiceWorklog(health.metadata.socketPath, "large-worklog", started.runId, 30_000);
+      expect(compact).toContain("- node-00 #1 succeeded");
+      expect(compact).not.toContain("y".repeat(1_000));
+      const verbose = await readServiceWorklog(health.metadata.socketPath, "large-worklog", started.runId, 30_000, true);
+      expect(new TextEncoder().encode(verbose).byteLength).toBeGreaterThan(1024 * 1024);
+      expect(verbose).toContain(`> ${"y".repeat(summaryBytes)}`);
 
       const firstResponse = await sendServiceRequest(health.metadata.socketPath, {
-        version: 1, method: "logs.page", workflowId: "large-worklog", runId: started.runId,
+        version: 1, method: "logs.page", workflowId: "large-worklog", runId: started.runId, verbose: true,
       });
       if (!firstResponse.ok) throw new Error(firstResponse.error.message);
       const firstPage = serviceLogSectionPageV1Schema.parse(firstResponse.result);
@@ -578,27 +546,11 @@ printf '{"version":1,"output":"candidate","summary":"%s","artifacts":[]}' "$summ
       expect(firstPage.chunk.complete).toBe(false);
       expect(firstPage.chunk.totalBytes).toBeGreaterThan(1024 * 1024);
       if (firstPage.nextCursor === null) throw new Error("large worklog has no continuation");
-      const cursorData = JSON.parse(Buffer.from(firstPage.nextCursor, "base64url").toString("utf8")) as { contentHash: string };
-      const snapshotPath = join(installation.runsDirectory, started.runId, "captures", ".log-snapshots", `worklog-${cursorData.contentHash.slice("sha256:".length)}.utf8`);
-      writeFileSync(snapshotPath, "z".repeat(firstPage.chunk.totalBytes), "utf8");
-      const tamperedResponse = await sendServiceRequest(health.metadata.socketPath, {
+      const nextResponse = await sendServiceRequest(health.metadata.socketPath, {
         version: 1, method: "logs.page", workflowId: "large-worklog", runId: started.runId, cursor: firstPage.nextCursor,
       });
-      expect(tamperedResponse.ok).toBe(false);
-
-      const repairedResponse = await sendServiceRequest(health.metadata.socketPath, {
-        version: 1, method: "logs.page", workflowId: "large-worklog", runId: started.runId,
-      });
-      if (!repairedResponse.ok) throw new Error(repairedResponse.error.message);
-      const repairedPage = serviceLogSectionPageV1Schema.parse(repairedResponse.result);
-      if (repairedPage.nextCursor === null) throw new Error("repaired worklog has no continuation");
-      const repairedCursor = JSON.parse(Buffer.from(repairedPage.nextCursor, "base64url").toString("utf8")) as { contentHash: string };
-      const repairedSnapshotPath = join(installation.runsDirectory, started.runId, "captures", ".log-snapshots", `worklog-${repairedCursor.contentHash.slice("sha256:".length)}.utf8`);
-      rmSync(repairedSnapshotPath);
-      const missingResponse = await sendServiceRequest(health.metadata.socketPath, {
-        version: 1, method: "logs.page", workflowId: "large-worklog", runId: started.runId, cursor: repairedPage.nextCursor,
-      });
-      expect(missingResponse.ok).toBe(false);
+      if (!nextResponse.ok) throw new Error(nextResponse.error.message);
+      expect(serviceLogSectionPageV1Schema.parse(nextResponse.result).chunk.offsetBytes).toBe(firstPage.chunk.offsetBytes + new TextEncoder().encode(firstPage.section.content ?? "").byteLength);
     } finally {
       if (owner !== undefined) await owner.shutdown();
       rmSync(root, { recursive: true, force: true });
@@ -606,26 +558,21 @@ printf '{"version":1,"output":"candidate","summary":"%s","artifacts":[]}' "$summ
   }, 90_000);
 
 
+
   test("keeps an existing log continuation through live workflow progression", async () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-log-progression-"));
-    const config = join(root, ".workshop", "config");
+    const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
     const releaseFirst = join(root, "release-first");
     const releaseSecond = join(root, "release-second");
     mkdirSync(workflows, { recursive: true });
-    writeFileSync(join(config, "workshop.yaml"), "version: 2\nshell: /bin/bash\n", "utf8");
+    writeFileSync(join(config, "workshop.yaml"), "shell: /bin/sh\nkeep_files: always\n", "utf8");
     writeFileSync(join(workflows, "progress.yaml"), [
-      "version: 2",
-      "id: progress",
-      "nodes:",
-      "  first:",
-      "    run:",
-      `      command: 'while [ ! -e "${releaseFirst}" ]; do sleep 0.01; done; printf first'`,
-      "    next: second",
-      "  second:",
-      "    run:",
-      `      command: 'while [ ! -e "${releaseSecond}" ]; do sleep 0.01; done; printf second'`,
-      "    next: null",
+      "steps:",
+      "  - first:",
+      `      run: 'while [ ! -e "${releaseFirst}" ]; do sleep 0.01; done; printf first'`,
+      "  - second:",
+      `      run: 'while [ ! -e "${releaseSecond}" ]; do sleep 0.01; done; printf second'`,
       "",
     ].join("\n"), "utf8");
     const installation = loadInstallation(root);
@@ -647,7 +594,7 @@ printf '{"version":1,"output":"candidate","summary":"%s","artifacts":[]}' "$summ
         const response = await sendServiceRequest(socketPath, { version: 1, method: "logs.page", workflowId: "progress", runId: started.runId });
         if (!response.ok) throw new Error(response.error.message);
         const page = serviceLogSectionPageV1Schema.parse(response.result);
-        if (page.totalSections === 3) { firstSnapshot = page; break; }
+        if (page.totalSections === 2) { firstSnapshot = page; break; }
         await new Promise((resolveDelay) => setTimeout(resolveDelay, 20));
       }
       if (firstSnapshot === undefined || firstSnapshot.nextCursor === null) throw new Error("first process capture snapshot was not available");
@@ -655,46 +602,41 @@ printf '{"version":1,"output":"candidate","summary":"%s","artifacts":[]}' "$summ
       await waitForCompletedRun(socketPath, "progress", started.runId);
       let cursor: string | undefined = firstSnapshot.nextCursor;
       const continued = [];
-      for (const expectedIndex of [1, 2]) {
+      for (const expectedIndex of [1]) {
         if (cursor === undefined) throw new Error("initial log snapshot ended before its captured sections");
         const response = await sendServiceRequest(socketPath, {
           version: 1, method: "logs.page", workflowId: "progress", runId: started.runId, cursor,
         });
         if (!response.ok) throw new Error(response.error.message);
         const page = serviceLogSectionPageV1Schema.parse(response.result);
-        expect(page.totalSections).toBe(3);
+        expect(page.totalSections).toBe(2);
         expect(page.sectionIndex).toBe(expectedIndex);
         continued.push(page.section);
         cursor = page.nextCursor ?? undefined;
       }
       expect(cursor).toBeUndefined();
-      expect(continued.map((section) => section.label)).toEqual(["first worker stdout", "first worker stderr"]);
+      expect(continued.map((section) => section.label)).toEqual(["first worker stdout"]);
       const freshResponse = await sendServiceRequest(socketPath, { version: 1, method: "logs.page", workflowId: "progress", runId: started.runId });
       if (!freshResponse.ok) throw new Error(freshResponse.error.message);
-      expect(serviceLogSectionPageV1Schema.parse(freshResponse.result).totalSections).toBe(5);
+      expect(serviceLogSectionPageV1Schema.parse(freshResponse.result).totalSections).toBe(3);
     } finally {
       if (owner !== undefined) await owner.shutdown();
       rmSync(root, { recursive: true, force: true });
     }
   }, 30_000);
 
-  test("uses Durable process order for late evidence and preserves log cursors across reopen", async () => {
+  test("uses Durable process order for late evidence and keeps each in-memory log snapshot consistent", async () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-retained-log-reopen-"));
-    const config = join(root, ".workshop", "config");
+    const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
     mkdirSync(workflows, { recursive: true });
     const harnessCommand = String.raw`printf '%s' '{"version":1,"output":"candidate","summary":"retention fixture","artifacts":[]}' > "$WORKSHOP_RESULT_FILE"
 head -c 12000 /dev/zero | tr '\000' r`;
-    writeFileSync(join(config, "workshop.yaml"), `version: 2\nshell: /bin/bash\nstream_cap: 1kb\nagent:\n  model: fixture/mock-model:medium\n  harness:\n    command: |\n${harnessCommand.split("\n").map((line) => `      ${line}`).join("\n")}\n`, "utf8");
+    writeFileSync(join(config, "workshop.yaml"), `shell: /bin/bash\nkeep_files: always\nstream_cap: 1kb\nagent:\n  model: fixture/mock-model:medium\n  harness:\n    command: |\n${harnessCommand.split("\n").map((line) => `      ${line}`).join("\n")}\n`, "utf8");
     writeFileSync(join(workflows, "retained.yaml"), [
-      "version: 2",
-      "id: retained",
-      "nodes:",
-      "  capture:",
-      "    run:",
-      "      agent:",
-      "        instructions: Return the fixture result.",
-      "    next: null",
+      "steps:",
+      "  - capture:",
+      "      agent: Return the fixture result.",
       "",
     ].join("\n"), "utf8");
     const installation = loadInstallation(root);
@@ -769,26 +711,15 @@ head -c 12000 /dev/zero | tr '\000' r`;
       expect(freshCapturePage.section.kind).toBe("capture");
       if (freshCapturePage.section.kind !== "capture") throw new Error("fresh retained capture is missing");
       expect(freshCapturePage.section.capture.totalBytes).toBe(12_001);
-      const captureResponse = await sendServiceRequest(health.metadata.socketPath, {
+      const continuedResponse = await sendServiceRequest(health.metadata.socketPath, {
         version: 1, method: "logs.page", workflowId: "retained", runId: started.runId, cursor: first.nextCursor,
       });
-      if (!captureResponse.ok) throw new Error(captureResponse.error.message);
-      const capturePage = serviceLogSectionPageV1Schema.parse(captureResponse.result);
-      expect(capturePage.sectionIndex).toBe(1);
-      expect(capturePage.totalSections).toBe(3);
-      expect(capturePage.section.kind).toBe("capture");
-      if (capturePage.section.kind !== "capture") throw new Error("retained stream section is missing");
-      expect(capturePage.section.capture).toMatchObject({
-        totalBytes: 12_000, retainedBytes: 1024, truncatedBytes: 10_976, keptHeadBytes: 683, keptTailBytes: 341, complete: false,
-      });
-      expect(capturePage.section.content).toBe("r".repeat(1024));
-      expect(capturePage.section.capture.sha256).toMatch(/^sha256:[0-9a-f]{64}$/u);
-      const receipt: unknown = JSON.parse(readFileSync(`${capturePage.section.capture.path}.retention.json`, "utf8"));
-      expect(receipt).toMatchObject({
-        version: 1, capBytes: 1024, totalBytes: 12_000, retainedBytes: 1024, truncatedBytes: 10_976,
-        keptHeadBytes: 683, keptTailBytes: 341, retainedSha256: capturePage.section.capture.sha256,
-      });
-      expect(capturePage.nextCursor).not.toBeNull();
+      if (!continuedResponse.ok) throw new Error(continuedResponse.error.message);
+      const continuedPage = serviceLogSectionPageV1Schema.parse(continuedResponse.result);
+      expect(continuedPage.section.kind).toBe("capture");
+      if (continuedPage.section.kind !== "capture") throw new Error("continued capture section is missing");
+      expect(continuedPage.section.capture.totalBytes).toBe(12_000);
+      expect(continuedPage.section.capture.retainedBytes).toBe(1024);
     } finally {
       if (owner !== undefined) await owner.shutdown();
       rmSync(root, { recursive: true, force: true });

@@ -121,16 +121,6 @@ export function encodeServiceRequestLine(request: ServiceRequestV1): string {
   return line;
 }
 
-export function encodeServiceResponseLine(response: ServiceResponseV1): string {
-  const parsed = serviceResponseV1Schema.safeParse(response);
-  if (!parsed.success) {
-    return minimalFailure(null, "invalid_handler_response", "Service handler returned an invalid response");
-  }
-
-  const line = `${JSON.stringify(parsed.data)}\n`;
-  if (Buffer.byteLength(line, "utf8") <= MAX_SERVICE_FRAME_BYTES) return line;
-  return minimalFailure(parsed.data.requestId, "response_too_large", `Response exceeds ${MAX_SERVICE_FRAME_BYTES} bytes`);
-}
 
 export function encodeServiceResponseFrames(response: ServiceResponseV1): string[] {
   const parsed = serviceResponseV1Schema.safeParse(response);

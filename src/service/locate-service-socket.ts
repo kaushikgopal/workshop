@@ -25,8 +25,7 @@ export function locateServiceSocket(stateDirectory: string): ServiceSocketLocati
 
   const uid = typeof process.getuid === "function" ? process.getuid() : "user";
   const identity = createHash("sha256").update(canonicalStateDirectory).digest("hex").slice(0, 24);
-  // The v4 prefix predates the rename; a running service and its CLI must agree on this path across upgrades.
-  const runtimeDirectory = join("/tmp", `workshop-v4-${uid}-${identity}`);
+  const runtimeDirectory = join("/tmp", `workshop-${uid}-${identity}`);
   const socketPath = join(runtimeDirectory, "service.sock");
   if (Buffer.byteLength(socketPath) > unixSocketPathLimit()) {
     throw new Error(`cannot fit a private Workshop service socket path on ${process.platform}`);

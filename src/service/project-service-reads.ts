@@ -1,22 +1,20 @@
 import { Buffer } from "node:buffer";
-import { createHash } from "node:crypto";
-import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, readSync, rmSync, utimesSync, type Stats } from "node:fs";
-import { dirname, join, relative, resolve, sep } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import type { ConversationId, Cursor, EntryRecord, Harness } from "@earendil-works/pi-durable";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { z } from "zod";
-import { nodeIdSchema, workflowIdSchema } from "../definition/schema.js";
+import { workflowIdSchema } from "../definition/schema.js";
 import {
   installationDocumentV1Schema,
   type RunReference,
 } from "../installation/schema.js";
 import { loadCheckedWorkflow, type Installation } from "../installation/load-installation.js";
 import { runIdSchema } from "../run/schema.js";
-import { processCaptureSchema } from "../process/schema.js";
+import type { ProcessCapture } from "../process/schema.js";
 import { workshopEventV1Schema, workshopProcessV1Schema, workflowRunDocumentV1Schema } from "../run/records.js";
 import type { PersistedNodeAttempt, PersistedNode, WorkflowRunDocumentV1, WorkshopEventV1 } from "../run/records.js";
 import { renderWorklog } from "../storage/durable/render-worklog.js";
-import { atomicWriteFileSync } from "../storage/disk/write-crash-safe.js";
 import { WorkshopEventEntry, WorkshopInstallationDoc, WorkshopProcessEntry, WorkshopRunDoc } from "../storage/durable/define-workshop-records.js";
 import {
   diagramDtoSchema,
@@ -40,19 +38,8 @@ import {
 } from "./schema.js";
 
 const MAX_RUN_PAGE_BYTES = 12 * 1024 * 1024;
-const LOG_SNAPSHOT_TTL_MS = 24 * 60 * 60 * 1000;
-const LOG_SNAPSHOT_DIRECTORY = ".log-snapshots";
-// Eviction forces a fresh digest scan; the cache never limits section length.
-const MAX_VERIFIED_LOG_FILE_CACHE_ENTRIES = 256;
-type VerifiedLogFile = {
-  readonly device: number;
-  readonly inode: number;
-  readonly size: number;
-  readonly mtimeMs: number;
-  readonly ctimeMs: number;
-  readonly contentHash: string;
-};
-const verifiedLogFiles = new Map<string, VerifiedLogFile>();
+const LOG_SNAPSHOT_TTL_MS = 10 * 60 * 1000;
+const MAX_LOG_SNAPSHOTS = 32;
 const runCursorV1Schema = z.strictObject({
   version: z.literal(1),
   workflowId: workflowIdSchema,
@@ -64,16 +51,12 @@ const runCursorV1Schema = z.strictObject({
 });
 type RunCursorV1 = z.infer<typeof runCursorV1Schema>;
 const logsCursorSchema = z.strictObject({
-  version: z.literal(2),
+  version: z.literal(1),
   workflowId: workflowIdSchema,
   runId: runIdSchema,
-  manifestHash: z.string().regex(/^[0-9a-f]{64}$/),
+  snapshotId: z.string().uuid(),
   sectionIndex: z.number().int().nonnegative().safe(),
   sectionOffsetBytes: z.number().int().nonnegative().safe(),
-  totalSections: z.number().int().positive().safe(),
-  contentHash: z.string().regex(/^sha256:[0-9a-f]{64}$/).nullable(),
-  contentBytes: z.number().int().nonnegative().safe().nullable(),
-  expiresAt: z.number().int().positive().safe(),
 });
 type LogsCursor = z.infer<typeof logsCursorSchema>;
 type ReadyInstallation = Extract<z.infer<typeof installationDocumentV1Schema>, { state: "ready" }>;
@@ -83,60 +66,37 @@ type RunEvidenceSnapshot = {
   readonly run: ReadyRun;
   readonly processEvidence: readonly ProcessEvidenceRecord[];
   readonly events: readonly WorkshopEventV1[];
-  readonly asOfEntryId: number | null;
 };
-type LogSection = ServiceLogSectionPageV1["section"];
-type LogSnapshotManifestV1 = z.infer<typeof logSnapshotManifestV1Schema>;
-const logSnapshotManifestV1Schema = z.strictObject({
-  version: z.literal(1),
-  workflowId: workflowIdSchema,
-  runId: runIdSchema,
-  sourceHash: z.string().regex(/^sha256:[0-9a-f]{64}$/),
-  canonicalHash: z.string().regex(/^sha256:[0-9a-f]{64}$/),
-  conversationId: z.number().int().positive().safe(),
-  asOfEntryId: z.number().int().positive().safe().nullable().optional(),
-  sections: z.array(z.discriminatedUnion("kind", [
-    z.strictObject({
-      kind: z.literal("worklog"),
-      sectionId: z.literal("worklog"),
-      order: z.literal(0),
-      label: z.literal("WORKLOG.md"),
-      contentHash: z.string().regex(/^sha256:[0-9a-f]{64}$/),
-      contentBytes: z.number().int().nonnegative().safe(),
-    }),
-    z.strictObject({
-      kind: z.literal("capture"),
-      sectionId: z.string().min(1),
-      order: z.number().int().positive().safe(),
-      label: z.string().min(1),
-      executionId: z.string().min(1),
-      incarnationNumber: z.number().int().positive().safe(),
-      capture: processCaptureSchema,
-      contentPath: z.string().min(1),
-      contentHash: z.string().regex(/^sha256:[0-9a-f]{64}$/).nullable(),
-      contentBytes: z.number().int().nonnegative().safe(),
-      unavailableReason: z.enum(["capture file is missing", "capture contains invalid UTF-8"]).nullable(),
-    }),
-  ])),
-}).superRefine((manifest, context) => {
-  if (manifest.sections.length === 0 || manifest.sections[0]?.kind !== "worklog") {
-    context.addIssue({ code: "custom", path: ["sections", 0], message: "log snapshot starts with its worklog" });
-  }
-  const sectionIds = new Set<string>();
-  for (const [index, section] of manifest.sections.entries()) {
-    if (section.order !== index) context.addIssue({ code: "custom", path: ["sections", index, "order"], message: "log snapshot sections are contiguous and ordered" });
-    if (sectionIds.has(section.sectionId)) context.addIssue({ code: "custom", path: ["sections", index, "sectionId"], message: "log snapshot section IDs are unique" });
-    sectionIds.add(section.sectionId);
-    if (section.kind === "capture") {
-      if (section.contentHash === null && section.unavailableReason !== "capture file is missing") {
-        context.addIssue({ code: "custom", path: ["sections", index, "contentHash"], message: "available captures require a content digest" });
-      }
-      if (section.unavailableReason === null && section.contentHash === null) {
-        context.addIssue({ code: "custom", path: ["sections", index, "unavailableReason"], message: "missing capture digests require an unavailable reason" });
-      }
+type ProcessCaptureLogMetadata = Omit<ProcessCapture, "content">;
+type LogSnapshotSection =
+  | {
+      readonly kind: "worklog";
+      readonly sectionId: "worklog";
+      readonly order: 0;
+      readonly label: "worklog";
+      readonly content: string;
+      readonly contentBytes: number;
     }
-  }
-});
+  | {
+      readonly kind: "capture";
+      readonly sectionId: string;
+      readonly order: number;
+      readonly label: string;
+      readonly executionId: string;
+      readonly incarnationNumber: number;
+      readonly capture: ProcessCaptureLogMetadata;
+      readonly content: string | null;
+      readonly contentBytes: number;
+    };
+type LogSnapshot = {
+  readonly snapshotId: string;
+  readonly workflowId: string;
+  readonly runId: z.infer<typeof runIdSchema>;
+  readonly expiresAt: number;
+  readonly sections: readonly LogSnapshotSection[];
+};
+// Keep one committed projection in memory while its bounded log pages are read.
+const logSnapshots = new Map<string, LogSnapshot>();
 
 export async function projectServiceRead(
   harness: Harness,
@@ -147,7 +107,7 @@ export async function projectServiceRead(
   switch (request.method) {
     case "status": return await buildStatusDto(harness, installation, metadata, request.workflowId);
     case "runs": return await buildRunsPage(harness, request.workflowId, request.cursor, request.limit);
-    case "logs.page": return await buildLogsSectionPage(harness, request.workflowId, request.runId, request.cursor);
+    case "logs.page": return await buildLogsSectionPage(harness, request.workflowId, request.runId, request.cursor, request.verbose === true);
     case "node.describe": return await buildNodeDescriptionDto(harness, installation, request.workflowId, request.nodeId, request.runId);
     case "diagram": return await buildDiagramDto(harness, installation, request.workflowId, request.runId);
   }
@@ -253,9 +213,9 @@ async function buildNodeDescriptionDto(
     if (selectedRunId !== undefined) throw new Error(`run ${selectedRunId} was not found`);
     const checked = loadCheckedWorkflow(installation, workflowId);
     const position = checked.chain.order.indexOf(nodeId);
-    if (position < 0) throw new Error(`node ${nodeId} is not configured in workflow ${workflowId}`);
+    if (position < 0) throw new Error(`step ${nodeId} is not configured in workflow ${workflowId}`);
     const resolvedSettings = checked.resolvedSettings.nodes[nodeId];
-    if (resolvedSettings === undefined) throw new Error(`resolved settings for node ${nodeId} are unavailable`);
+    if (resolvedSettings === undefined) throw new Error(`resolved settings for step ${nodeId} are unavailable`);
     return nodeDescriptionDtoSchema.parse({
       version: 2,
       workflowId,
@@ -279,9 +239,9 @@ async function buildNodeDescriptionDto(
   const snapshot = await readRunEvidenceSnapshot(harness, reference, workflowId);
   const { run, processEvidence: processes, events } = snapshot;
   const position = run.chain.order.indexOf(nodeId);
-  if (position < 0) throw new Error(`node ${nodeId} is not part of run ${run.runId}`);
+  if (position < 0) throw new Error(`step ${nodeId} is not part of run ${run.runId}`);
   const persistedNode = run.nodes[position];
-  if (persistedNode === undefined || persistedNode.nodeId !== nodeId) throw new Error(`node ${nodeId} is absent from run ${run.runId}`);
+  if (persistedNode === undefined || persistedNode.nodeId !== nodeId) throw new Error(`step ${nodeId} is absent from run ${run.runId}`);
   const resolvedSettings = run.resolvedSettings.nodes[nodeId];
   if (resolvedSettings === undefined) throw new Error(`frozen settings for node ${nodeId} are unavailable`);
   const lastAttempt = persistedNode.attempts.at(-1);
@@ -373,7 +333,7 @@ async function readRunEvidenceSnapshot(
 ): Promise<RunEvidenceSnapshot> {
   // SAFETY: the installation document schema checks this as a positive safe Durable conversation ID.
   const conversationId = reference.conversationId as ConversationId;
-  // Pin the run document and newest-first entry high-water to one Durable state.
+  // Read the run document and its evidence in one Durable transaction.
   return harness.commit(async (tx) => {
     const parsedRun = workflowRunDocumentV1Schema.safeParse(await tx.doc(WorkshopRunDoc, conversationId));
     if (!parsedRun.success || parsedRun.data.state !== "ready") {
@@ -386,14 +346,8 @@ async function readRunEvidenceSnapshot(
     const latestProcesses = new Map<string, { record: ProcessEvidenceRecord; firstEntryId: number }>();
     const events: WorkshopEventV1[] = [];
     let cursor: Cursor | undefined;
-    let asOfEntryId: number | null = null;
-    let firstPage = true;
     do {
       const page = await tx.scanEntries({ conversationId }, 256, cursor);
-      if (firstPage) {
-        asOfEntryId = page.items[0]?.id ?? null;
-        firstPage = false;
-      }
       for (const entry of page.items) {
         if (WorkshopProcessEntry.is(entry)) {
           const parsed = workshopProcessV1Schema.safeParse(entry.data);
@@ -422,7 +376,7 @@ async function readRunEvidenceSnapshot(
     const processEvidence = [...latestProcesses.values()]
       .sort((left, right) => left.firstEntryId - right.firstEntryId)
       .map(({ record }) => record);
-    return { run, processEvidence, events, asOfEntryId };
+    return { run, processEvidence, events };
   }, BACKGROUND_CONTEXT);
 }
 
@@ -659,148 +613,98 @@ async function buildLogsSectionPage(
   workflowId: string,
   selectedRunId: string | undefined,
   encodedCursor: string | undefined,
+  verbose: boolean,
 ): Promise<ServiceLogSectionPageV1> {
   const cursor = encodedCursor === undefined ? undefined : decodeLogsCursor(encodedCursor, workflowId);
   if (selectedRunId !== undefined && cursor !== undefined && cursor.runId !== selectedRunId) {
     throw new Error("logs cursor belongs to a different selected run");
   }
-  const installation = await readInstallation(harness);
-  const workflow = installation.workflows[workflowId];
-  const runId = selectedRunId ?? cursor?.runId;
-  const reference = runId === undefined
-    ? workflow?.runs.slice().sort(compareRunReferences)[0]
-    : workflow?.runs.find((run) => run.runId === runId);
-  if (reference === undefined) throw new Error(runId === undefined ? `workflow ${workflowId} has no runs` : `run ${runId} was not found`);
-  let evidenceSnapshot: RunEvidenceSnapshot | undefined;
-  const run = cursor === undefined
-    ? (evidenceSnapshot = await readRunEvidenceSnapshot(harness, reference, workflowId)).run
-    : await readRun(harness, reference);
-  if (run.workflowId !== workflowId || (cursor !== undefined && cursor.runId !== run.runId)) {
-    throw new Error("logs cursor does not match its checked workflow/run identity");
-  }
-  let manifest: LogSnapshotManifestV1;
-  let manifestHash: string;
-  let expiresAt: number;
+
+  let snapshot: LogSnapshot;
   if (cursor === undefined) {
-    if (evidenceSnapshot === undefined) throw new Error("new log snapshots require a Durable evidence boundary");
-    const snapshot = createLogSnapshotManifest(evidenceSnapshot);
-    manifest = snapshot.manifest;
-    manifestHash = snapshot.manifestHash;
-    expiresAt = Date.now() + LOG_SNAPSHOT_TTL_MS;
+    const installation = await readInstallation(harness);
+    const workflow = installation.workflows[workflowId];
+    const reference = selectedRunId === undefined
+      ? workflow?.runs.slice().sort(compareRunReferences)[0]
+      : workflow?.runs.find((run) => run.runId === selectedRunId);
+    if (reference === undefined) {
+      throw new Error(selectedRunId === undefined ? `workflow ${workflowId} has no runs` : `run ${selectedRunId} was not found`);
+    }
+    const evidence = await readRunEvidenceSnapshot(harness, reference, workflowId);
+    snapshot = createLogSnapshot(evidence, verbose);
+    rememberLogSnapshot(snapshot);
   } else {
-    const now = Date.now();
-    if (cursor.expiresAt < now) throw new Error("logs snapshot continuation expired; request logs again");
-    if (cursor.expiresAt > now + LOG_SNAPSHOT_TTL_MS + 5_000) throw new Error("logs cursor expiry exceeds its snapshot lifetime");
-    manifestHash = cursor.manifestHash;
-    expiresAt = cursor.expiresAt;
-    manifest = readLogSnapshotManifest(run.paths.captureDirectory, manifestHash, workflowId, run.runId, run.sourceHash, run.canonicalHash, run.durable.conversationId);
-    if (manifest.sections.length !== cursor.totalSections) throw new Error("logs cursor section count does not match its frozen manifest");
+    const storedSnapshot = logSnapshots.get(cursor.snapshotId);
+    if (storedSnapshot === undefined || storedSnapshot.expiresAt <= Date.now()) {
+      logSnapshots.delete(cursor.snapshotId);
+      throw new Error("logs cursor expired or its in-memory snapshot is unavailable; request logs again");
+    }
+    snapshot = storedSnapshot;
+    if (snapshot.workflowId !== workflowId || snapshot.runId !== cursor.runId || (selectedRunId !== undefined && snapshot.runId !== selectedRunId)) {
+      throw new Error("logs cursor does not match its checked workflow/run identity");
+    }
+    logSnapshots.delete(snapshot.snapshotId);
+    logSnapshots.set(snapshot.snapshotId, snapshot);
   }
+
   const sectionIndex = cursor?.sectionIndex ?? 0;
   const sectionOffsetBytes = cursor?.sectionOffsetBytes ?? 0;
-  const section = manifest.sections[sectionIndex];
-  if (section === undefined) throw new Error("logs cursor section is outside its frozen manifest");
-  if (cursor !== undefined) {
-    if (cursor.contentHash !== section.contentHash || cursor.contentBytes !== section.contentBytes) {
-      throw new Error("logs cursor content reference does not match its frozen section");
-    }
-    if (sectionOffsetBytes > section.contentBytes
-      || (sectionOffsetBytes > 0 && sectionOffsetBytes === section.contentBytes)) {
-      throw new Error("logs cursor offset is outside its frozen section");
-    }
+  const section = snapshot.sections[sectionIndex];
+  if (section === undefined) throw new Error("logs cursor is outside its in-memory snapshot");
+  if (sectionOffsetBytes > section.contentBytes || (sectionOffsetBytes > 0 && sectionOffsetBytes === section.contentBytes)) {
+    throw new Error("logs cursor offset is outside its committed section");
   }
-  let projected: unknown;
-  let chunkText: string | null;
-  let totalBytes: number;
-  let offsetBytes: number;
+
+  let content: string | null;
   if (section.kind === "worklog") {
-    const snapshotPath = worklogSnapshotPath(run.paths.captureDirectory, section.contentHash);
-    chunkText = readVerifiedUtf8Chunk(snapshotPath, section.contentBytes, section.contentHash, sectionOffsetBytes);
-    totalBytes = section.contentBytes;
-    offsetBytes = sectionOffsetBytes;
-    projected = { kind: "worklog", sectionId: section.sectionId, order: section.order, label: section.label, content: chunkText, omittedBytes: 0 };
-  } else if (section.unavailableReason !== null) {
-    chunkText = null;
-    totalBytes = 0;
-    offsetBytes = 0;
-    projected = {
-      kind: "capture", sectionId: section.sectionId, order: section.order, label: section.label,
-      executionId: section.executionId, incarnationNumber: section.incarnationNumber, capture: section.capture,
-      content: null, unavailableReason: section.unavailableReason, omittedBytes: 0,
-    };
+    content = readUtf8StringChunk(section.content, sectionOffsetBytes);
+  } else if (section.content === null) {
+    content = null;
   } else {
-    const absolute = resolveCapturePath(run.paths.captureDirectory, section.contentPath);
-    chunkText = readVerifiedUtf8Chunk(absolute, section.contentBytes, section.contentHash!, sectionOffsetBytes);
-    totalBytes = section.contentBytes;
-    offsetBytes = sectionOffsetBytes;
-    projected = {
-      kind: "capture", sectionId: section.sectionId, order: section.order, label: section.label,
-      executionId: section.executionId, incarnationNumber: section.incarnationNumber, capture: section.capture,
-      content: chunkText, unavailableReason: null, omittedBytes: 0,
-    };
+    content = readUtf8StringChunk(section.content, sectionOffsetBytes);
   }
+  const totalBytes = section.contentBytes;
+  const offsetBytes = content === null ? 0 : sectionOffsetBytes;
+
+  const projected = section.kind === "worklog"
+    ? { kind: "worklog" as const, sectionId: section.sectionId, order: section.order, label: section.label, content: content! }
+    : {
+        kind: "capture" as const, sectionId: section.sectionId, order: section.order, label: section.label,
+        executionId: section.executionId, incarnationNumber: section.incarnationNumber, capture: section.capture, content,
+      };
   const parsedSection = logSectionDtoSchema.parse(projected);
-  const chunkBytes = chunkText === null ? 0 : Buffer.byteLength(chunkText, "utf8");
-  const complete = chunkText === null || offsetBytes + chunkBytes === totalBytes;
+  const chunkBytes = content === null ? 0 : Buffer.byteLength(content, "utf8");
+  const complete = content === null || offsetBytes + chunkBytes === totalBytes;
   let nextCursor: string | null = null;
   if (!complete) {
     nextCursor = encodeLogsCursor({
-      version: 2, workflowId, runId: run.runId, manifestHash, sectionIndex,
-      sectionOffsetBytes: offsetBytes + chunkBytes, totalSections: manifest.sections.length,
-      contentHash: section.contentHash, contentBytes: section.contentBytes, expiresAt,
+      version: 1, workflowId, runId: snapshot.runId, snapshotId: snapshot.snapshotId, sectionIndex,
+      sectionOffsetBytes: offsetBytes + chunkBytes,
     });
-  } else if (sectionIndex + 1 < manifest.sections.length) {
-    const nextSection = manifest.sections[sectionIndex + 1];
-    if (nextSection === undefined) throw new Error("next log section is outside its frozen manifest");
+  } else if (sectionIndex + 1 < snapshot.sections.length) {
     nextCursor = encodeLogsCursor({
-      version: 2, workflowId, runId: run.runId, manifestHash, sectionIndex: sectionIndex + 1,
-      sectionOffsetBytes: 0, totalSections: manifest.sections.length,
-      contentHash: nextSection.contentHash, contentBytes: nextSection.contentBytes, expiresAt,
+      version: 1, workflowId, runId: snapshot.runId, snapshotId: snapshot.snapshotId, sectionIndex: sectionIndex + 1,
+      sectionOffsetBytes: 0,
     });
   }
   return serviceLogSectionPageV1Schema.parse({
-    version: 1, runId: run.runId, sectionIndex, totalSections: manifest.sections.length, nextCursor,
+    version: 1, runId: snapshot.runId, sectionIndex, totalSections: snapshot.sections.length, nextCursor,
     section: parsedSection, chunk: { offsetBytes, totalBytes, complete },
-    projection: { truncated: false, omittedSections: 0, omittedBytes: 0 },
   });
 }
 
-function createLogSnapshotManifest(
-  snapshot: RunEvidenceSnapshot,
-): { manifest: LogSnapshotManifestV1; manifestHash: string } {
-  const { run, processEvidence, asOfEntryId } = snapshot;
-  const root = run.paths.captureDirectory;
-  const snapshotsDirectory = logSnapshotsDirectory(root);
-  mkdirSync(snapshotsDirectory, { recursive: true });
-  pruneLogSnapshots(snapshotsDirectory, Date.now());
-  const worklog = readWorklog(run);
-  const worklogBytes = Buffer.byteLength(worklog, "utf8");
-  const worklogHash = `sha256:${createHash("sha256").update(worklog, "utf8").digest("hex")}`;
-  ensureLogSnapshotTextFile(worklogSnapshotPath(root, worklogHash), worklog, worklogHash, worklogBytes);
-  const sections: LogSnapshotManifestV1["sections"][number][] = [{
-    kind: "worklog", sectionId: "worklog", order: 0, label: "WORKLOG.md",
-    contentHash: worklogHash, contentBytes: worklogBytes,
+function createLogSnapshot(snapshot: RunEvidenceSnapshot, verbose: boolean): LogSnapshot {
+  const { run, processEvidence } = snapshot;
+  const worklog = renderWorklog(run, { verbose });
+  const sections: LogSnapshotSection[] = [{
+    kind: "worklog", sectionId: "worklog", order: 0, label: "worklog",
+    content: worklog, contentBytes: Buffer.byteLength(worklog, "utf8"),
   }];
   for (const record of processEvidence) {
     for (const capture of record.process.captures) {
-      const absolute = resolveCaptureAbsolutePath(root, capture.path);
-      const contentPath = relative(resolve(root), absolute);
-      let contentHash: string | null = null;
-      let contentBytes = 0;
-      let unavailableReason: "capture file is missing" | "capture contains invalid UTF-8" | null = null;
-      try {
-        const inspected = inspectUtf8File(absolute, capture.retainedBytes);
-        if (capture.sha256 !== null && inspected.contentHash !== capture.sha256) {
-          throw new Error("process capture digest does not match its committed metadata");
-        }
-        contentHash = inspected.contentHash;
-        if (inspected.validUtf8) contentBytes = capture.retainedBytes;
-        else unavailableReason = "capture contains invalid UTF-8";
-      } catch (error) {
-        if (!isNodeErrorCode(error, "ENOENT")) throw error;
-        if (capture.retainedBytes === 0) contentHash = `sha256:${createHash("sha256").digest("hex")}`;
-        else unavailableReason = "capture file is missing";
-      }
+      // Completed runs delete their folder by default; their captures have nothing left to show.
+      if (capture.totalBytes === 0 || !existsSync(capture.path)) continue;
+      const content = readVerifiedCapture(capture);
       sections.push({
         kind: "capture",
         sectionId: `${record.process.executionId}-${record.process.incarnationId}-${capture.stream}`,
@@ -808,245 +712,68 @@ function createLogSnapshotManifest(
         label: `${record.nodeId ?? "preflight"} ${record.process.role} ${capture.stream}`,
         executionId: record.process.executionId,
         incarnationNumber: record.process.incarnationNumber,
-        capture, contentPath, contentHash, contentBytes, unavailableReason,
+        capture,
+        content,
+        contentBytes: content === null ? 0 : Buffer.byteLength(content, "utf8"),
       });
     }
   }
-  const manifest = logSnapshotManifestV1Schema.parse({
-    version: 1, workflowId: run.workflowId, runId: run.runId,
-    sourceHash: run.sourceHash, canonicalHash: run.canonicalHash,
-    conversationId: run.durable.conversationId, asOfEntryId, sections,
-  });
-  const manifestJson = JSON.stringify(manifest);
-  const manifestHash = createHash("sha256").update(manifestJson, "utf8").digest("hex");
-  ensureLogSnapshotTextFile(logManifestPath(root, manifestHash), manifestJson, `sha256:${manifestHash}`, Buffer.byteLength(manifestJson, "utf8"));
-  return { manifest, manifestHash };
+  return {
+    snapshotId: randomUUID(), workflowId: run.workflowId, runId: run.runId,
+    expiresAt: Date.now() + LOG_SNAPSHOT_TTL_MS, sections,
+  };
 }
 
-function readLogSnapshotManifest(
-  captureDirectory: string, manifestHash: string, workflowId: string, runId: string,
-  sourceHash: string, canonicalHash: string, conversationId: number,
-): LogSnapshotManifestV1 {
-  const path = logManifestPath(captureDirectory, manifestHash);
-  const fd = openRegularFile(path);
-  let bytes: Buffer;
-  try { bytes = readFileSync(fd); } finally { closeSync(fd); }
-  if (`sha256:${createHash("sha256").update(bytes).digest("hex")}` !== `sha256:${manifestHash}`) {
-    throw new Error("logs snapshot manifest digest does not match its cursor");
-  }
-  let value: unknown;
-  try { value = JSON.parse(bytes.toString("utf8")); }
-  catch { throw new Error("logs snapshot manifest is not valid JSON"); }
-  const manifest = logSnapshotManifestV1Schema.parse(value);
-  if (manifest.workflowId !== workflowId || manifest.runId !== runId || manifest.conversationId !== conversationId
-    || manifest.sourceHash !== sourceHash || manifest.canonicalHash !== canonicalHash) {
-    throw new Error("logs snapshot manifest belongs to a different checked workflow source or run");
-  }
-  return manifest;
-}
-
-function logSnapshotsDirectory(captureDirectory: string): string {
-  return join(resolve(captureDirectory), LOG_SNAPSHOT_DIRECTORY);
-}
-
-function worklogSnapshotPath(captureDirectory: string, contentHash: string): string {
-  const digest = contentHash.slice("sha256:".length);
-  return join(logSnapshotsDirectory(captureDirectory), `worklog-${digest}.utf8`);
-}
-
-function logManifestPath(captureDirectory: string, manifestHash: string): string {
-  return join(logSnapshotsDirectory(captureDirectory), `manifest-${manifestHash}.json`);
-}
-
-function resolveCaptureAbsolutePath(captureDirectory: string, capturePath: string): string {
-  const absolute = resolve(capturePath);
-  const root = resolve(captureDirectory);
-  const pathFromRoot = relative(root, absolute);
-  if (pathFromRoot === ".." || pathFromRoot.startsWith(`..${sep}`) || pathFromRoot === "" || resolve(root, pathFromRoot) !== absolute) {
-    throw new Error("process capture path escapes its run capture directory");
-  }
-  return absolute;
-}
-
-function resolveCapturePath(captureDirectory: string, contentPath: string): string {
-  const root = resolve(captureDirectory);
-  const absolute = resolve(root, contentPath);
-  const pathFromRoot = relative(root, absolute);
-  if (pathFromRoot === ".." || pathFromRoot.startsWith(`..${sep}`) || pathFromRoot === "" || resolve(root, pathFromRoot) !== absolute) {
-    throw new Error("logs snapshot capture reference escapes its run capture directory");
-  }
-  return absolute;
-}
-
-function ensureLogSnapshotTextFile(path: string, content: string, expectedHash: string, expectedBytes: number): void {
-  mkdirSync(dirname(path), { recursive: true });
+/** Reads a kept capture file; deleted, changed, or non-UTF-8 files show as unavailable content. */
+function readVerifiedCapture(capture: ProcessCapture): string | null {
+  if (capture.sha256 === null) return null;
   try {
-    const existing = hashRegularFile(path);
-    if (existing.size === expectedBytes && `sha256:${existing.hash}` === expectedHash) {
-      const now = new Date();
-      utimesSync(path, now, now);
-      return;
-    }
-  } catch { /* replace missing, malformed, or tampered derived snapshots */ }
-  atomicWriteFileSync(path, content);
-}
-
-function pruneLogSnapshots(directory: string, nowMs: number): void {
-  let entries;
-  try { entries = readdirSync(directory, { withFileTypes: true }); }
-  catch (error) { if (isNodeErrorCode(error, "ENOENT")) return; throw error; }
-  const cutoff = nowMs - LOG_SNAPSHOT_TTL_MS;
-  for (const entry of entries) {
-    if (!entry.isFile() || (!entry.name.startsWith("manifest-") && !entry.name.startsWith("worklog-"))) continue;
-    const path = join(directory, entry.name);
-    if (lstatSync(path).mtimeMs < cutoff) rmSync(path, { force: true });
+    const bytes = readFileSync(capture.path);
+    if (bytes.byteLength !== capture.retainedBytes) return null;
+    if (`sha256:${createHash("sha256").update(bytes).digest("hex")}` !== capture.sha256) return null;
+    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+  } catch {
+    return null;
   }
 }
 
-function hashRegularFile(path: string): { size: number; hash: string } {
-  const fd = openRegularFile(path);
-  try {
-    const before = fstatSync(fd);
-    const hash = createHash("sha256");
-    let offset = 0;
-    while (offset < before.size) {
-      const buffer = Buffer.allocUnsafe(Math.min(64 * 1024, before.size - offset));
-      const count = readSync(fd, buffer, 0, buffer.byteLength, offset);
-      if (count === 0) throw new Error("log snapshot file changed while hashing");
-      hash.update(buffer.subarray(0, count));
-      offset += count;
-    }
-    assertFileUnchanged(fd, before);
-    return { size: offset, hash: hash.digest("hex") };
-  } finally { closeSync(fd); }
-}
-
-function inspectUtf8File(path: string, expectedBytes: number): { contentHash: string; validUtf8: boolean } {
-  const fd = openRegularFile(path);
-  try {
-    const before = fstatSync(fd);
-    if (before.size !== expectedBytes) throw new Error("process capture size does not match its committed metadata");
-    const hash = createHash("sha256");
-    const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
-    let validUtf8 = true;
-    let offset = 0;
-    while (offset < before.size) {
-      const buffer = Buffer.allocUnsafe(Math.min(64 * 1024, before.size - offset));
-      const count = readSync(fd, buffer, 0, buffer.byteLength, offset);
-      if (count === 0) throw new Error("process capture changed while reading");
-      const chunk = buffer.subarray(0, count);
-      hash.update(chunk);
-      if (validUtf8) { try { decoder.decode(chunk, { stream: true }); } catch { validUtf8 = false; } }
-      offset += count;
-    }
-    if (validUtf8) { try { decoder.decode(); } catch { validUtf8 = false; } }
-    assertFileUnchanged(fd, before);
-    const contentHash = `sha256:${hash.digest("hex")}`;
-    if (validUtf8) rememberVerifiedLogFile(path, before, contentHash);
-    return { contentHash, validUtf8 };
-  } finally { closeSync(fd); }
-}
-
-function readVerifiedUtf8Chunk(path: string, expectedBytes: number, expectedHash: string, offset: number): string {
-  if (!Number.isSafeInteger(offset) || offset < 0 || offset > expectedBytes) throw new Error("logs cursor offset is outside its verified content");
-  if (expectedBytes === 0) return "";
-  const fd = openRegularFile(path);
-  try {
-    const before = fstatSync(fd);
-    if (before.size !== expectedBytes) throw new Error("logs snapshot content size changed");
-    const cached = verifiedLogFiles.get(path);
-    if (cached !== undefined && matchesVerifiedLogFile(cached, before)) {
-      if (cached.contentHash !== expectedHash) throw new Error("logs snapshot content digest does not match its frozen reference");
-      verifiedLogFiles.delete(path);
-      verifiedLogFiles.set(path, cached);
-    } else {
-      const hash = createHash("sha256");
-      const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
-      let validUtf8 = true;
-      let position = 0;
-      while (position < before.size) {
-        const buffer = Buffer.allocUnsafe(Math.min(64 * 1024, before.size - position));
-        const count = readSync(fd, buffer, 0, buffer.byteLength, position);
-        if (count === 0) throw new Error("logs snapshot content changed while verifying");
-        const bytes = buffer.subarray(0, count);
-        hash.update(bytes);
-        if (validUtf8) { try { decoder.decode(bytes, { stream: true }); } catch { validUtf8 = false; } }
-        position += count;
-      }
-      if (validUtf8) { try { decoder.decode(); } catch { validUtf8 = false; } }
-      assertFileUnchanged(fd, before);
-      const actualHash = `sha256:${hash.digest("hex")}`;
-      if (actualHash !== expectedHash) throw new Error("logs snapshot content digest changed");
-      if (!validUtf8) throw new Error("logs snapshot content is no longer valid UTF-8");
-      rememberVerifiedLogFile(path, before, actualHash);
-    }
-    const maxRead = Math.min(MAX_LOG_CONTENT_CHUNK_BYTES_V1 + 4, expectedBytes - offset);
-    const window = Buffer.allocUnsafe(maxRead);
-    let windowBytes = 0;
-    while (windowBytes < maxRead) {
-      const count = readSync(fd, window, windowBytes, maxRead - windowBytes, offset + windowBytes);
-      if (count === 0) throw new Error("logs snapshot ended inside a UTF-8 chunk");
-      windowBytes += count;
-    }
-    assertFileUnchanged(fd, before);
-    let chunkBytes = Math.min(MAX_LOG_CONTENT_CHUNK_BYTES_V1, expectedBytes - offset);
-    if (offset + chunkBytes < expectedBytes) {
-      while (chunkBytes > 0 && ((window[chunkBytes] ?? 0) & 0xc0) === 0x80) chunkBytes -= 1;
-      if (chunkBytes === 0) throw new Error("log chunk limit cannot contain the next UTF-8 code point");
-    }
-    const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(window.subarray(0, chunkBytes));
-    if (Buffer.byteLength(text, "utf8") !== chunkBytes) throw new Error("log chunk boundary does not match its UTF-8 byte range");
-    return text;
-  } finally { closeSync(fd); }
-}
-
-function rememberVerifiedLogFile(path: string, stat: Stats, contentHash: string): void {
-  const current = verifiedLogFiles.get(path);
-  if (current === undefined && verifiedLogFiles.size >= MAX_VERIFIED_LOG_FILE_CACHE_ENTRIES) {
-    const oldestPath = verifiedLogFiles.keys().next().value;
-    if (oldestPath !== undefined) verifiedLogFiles.delete(oldestPath);
+function rememberLogSnapshot(snapshot: LogSnapshot): void {
+  const now = Date.now();
+  for (const [snapshotId, current] of logSnapshots) {
+    if (current.expiresAt <= now) logSnapshots.delete(snapshotId);
   }
-  verifiedLogFiles.delete(path);
-  verifiedLogFiles.set(path, {
-    device: stat.dev, inode: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs, contentHash,
-  });
-}
-
-function matchesVerifiedLogFile(cached: VerifiedLogFile, stat: Stats): boolean {
-  return cached.device === stat.dev && cached.inode === stat.ino && cached.size === stat.size
-    && cached.mtimeMs === stat.mtimeMs && cached.ctimeMs === stat.ctimeMs;
-}
-
-function openRegularFile(path: string): number {
-  const linkStat = lstatSync(path);
-  if (!linkStat.isFile() || linkStat.isSymbolicLink()) throw new Error("log snapshot reference is not a regular file");
-  const fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
-  try {
-    if (!fstatSync(fd).isFile()) throw new Error("log snapshot reference is not a regular file");
-    return fd;
-  } catch (error) {
-    closeSync(fd);
-    throw error;
+  while (logSnapshots.size >= MAX_LOG_SNAPSHOTS) {
+    const oldestId = logSnapshots.keys().next().value;
+    if (oldestId === undefined) break;
+    logSnapshots.delete(oldestId);
   }
+  logSnapshots.set(snapshot.snapshotId, snapshot);
 }
 
-function assertFileUnchanged(fd: number, before: ReturnType<typeof fstatSync>): void {
-  const after = fstatSync(fd);
-  if (before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size
-    || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs) {
-    throw new Error("log snapshot file changed while reading");
+function readUtf8StringChunk(value: string, offset: number): string {
+  const bytes = Buffer.from(value, "utf8");
+  if (!Number.isSafeInteger(offset) || offset < 0 || offset > bytes.byteLength) throw new Error("logs cursor offset is outside its committed section");
+  return decodeUtf8Chunk(bytes, offset);
+}
+
+function decodeUtf8Chunk(bytes: Buffer, offset: number): string {
+  const maxRead = Math.min(MAX_LOG_CONTENT_CHUNK_BYTES_V1 + 4, bytes.byteLength - offset);
+  const window = bytes.subarray(offset, offset + maxRead);
+  const chunkBytes = utf8ChunkLength(window, bytes.byteLength - offset);
+  return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(window.subarray(0, chunkBytes));
+}
+
+function utf8ChunkLength(window: Buffer, remainingBytes: number): number {
+  let chunkBytes = Math.min(MAX_LOG_CONTENT_CHUNK_BYTES_V1, remainingBytes);
+  if (chunkBytes < remainingBytes) {
+    while (chunkBytes > 0 && ((window[chunkBytes] ?? 0) & 0xc0) === 0x80) chunkBytes -= 1;
+    if (chunkBytes === 0) throw new Error("log chunk limit cannot contain the next UTF-8 code point");
   }
-}
-
-function isNodeErrorCode(error: unknown, code: string): boolean {
-  return error !== null && typeof error === "object" && "code" in error
-    && (error as NodeJS.ErrnoException).code === code;
+  return chunkBytes;
 }
 
 
-function readWorklog(run: ReadyRun): string {
-  return renderWorklog(run);
-}
+
 
 function summarizeRun(run: ReadyRun): RunSummaryDto {
   const currentNode = run.currentNodeId === null ? undefined : run.nodes.find((node) => node.nodeId === run.currentNodeId);

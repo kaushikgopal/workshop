@@ -197,6 +197,4 @@ export type ServiceMutationReceiptV1 = z.infer<typeof serviceMutationReceiptV1Sc
 export type ServiceMutationReceiptsDocumentV1 = z.infer<typeof serviceMutationReceiptsDocumentV1Schema>;
 export type ActivationIndex = z.infer<typeof activationIndexSchema>;
 export type RunReference = z.infer<typeof runReferenceSchema>;
-export type PreflightCacheEntry = z.infer<typeof preflightCacheEntrySchema>;
-export type WorkflowInstallationIndex = z.infer<typeof workflowInstallationIndexSchema>;
 export type InstallationDocumentV1 = z.infer<typeof installationDocumentV1Schema>;

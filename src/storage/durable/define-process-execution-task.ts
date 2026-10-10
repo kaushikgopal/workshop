@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { createReadStream, existsSync, mkdirSync, statSync } from "node:fs";
-import { dirname, isAbsolute, join } from "node:path";
+import { createReadStream, existsSync, mkdirSync, rmSync, statSync } from "node:fs";
+import { dirname, isAbsolute } from "node:path";
 import type { Context } from "@earendil-works/chord";
 import { defineTask, type ConversationId, type Task, type TaskRuntime, type Tx } from "@earendil-works/pi-durable";
 import { z } from "zod";
@@ -33,6 +33,7 @@ import {
 import { WorkshopProcessEntry, WorkshopRunDoc } from "./define-workshop-records.js";
 import { sha256Schema, utcTimestampSchema } from "../../util/schema.js";
 import { DEFAULT_STREAM_CAP_BYTES } from "../../util/parse-units.js";
+import { locateProcessFiles, type ProcessFiles } from "../../run/locate-run-files.js";
 import { readVerifiedRetentionWindow, retainStreamWindow } from "../disk/cap-streams.js";
 
 const positive = z.number().int().positive().refine(Number.isSafeInteger);
@@ -71,14 +72,13 @@ export const processExecutionTaskInputSchema = z.strictObject({
 export type ProcessExecutionTaskInput = z.infer<typeof processExecutionTaskInputSchema>;
 export type ProcessExecutionTaskEnvironmentInput = Omit<ProcessExecutionTaskInput, "env">;
 
-export function processExecutionCapturePaths(captureDirectory: string, executionId: string, incarnationId: string) {
-  const prefix = join(captureDirectory, `${executionId}-${incarnationId}`);
-  return {
-    stdoutPath: `${prefix}.stdout`,
-    stderrPath: `${prefix}.stderr`,
-    promptPath: `${prefix}.prompt.md`,
-    resultPath: `${prefix}.result.json`,
-  };
+/** Locates the files of one process from its task input. */
+export function processExecutionFiles(
+  input: Pick<ProcessExecutionTaskInput, "role" | "nodeId" | "incarnationNumber">,
+  runDirectory: string,
+  attemptNumber: number | null,
+): ProcessFiles {
+  return locateProcessFiles(runDirectory, { role: input.role, nodeId: input.nodeId, attemptNumber, incarnationNumber: input.incarnationNumber });
 }
 
 export function buildProcessExecutionEnvironment(
@@ -87,7 +87,7 @@ export function buildProcessExecutionEnvironment(
   attemptNumber: number | null,
 ): Record<string, string> {
   const run = readyRun(runDocument);
-  const paths = processExecutionCapturePaths(run.paths.captureDirectory, input.executionId, input.incarnationId);
+  const paths = processExecutionFiles(input, run.paths.runDirectory, attemptNumber);
   if (input.role === "preflight") {
     if (input.nodeId !== null || input.attemptId !== null || attemptNumber !== null || run.resolvedSettings.preflight === null) {
       throw new Error("preflight process identity differs from frozen workflow settings");
@@ -96,6 +96,7 @@ export function buildProcessExecutionEnvironment(
       WORKSHOP_RUN_ID: run.runId,
       WORKSHOP_WORKFLOW_ID: run.workflowId,
       WORKSHOP_EXECUTION_ID: input.executionId,
+      WORKSHOP_ARCHIVE: run.paths.archiveDirectory,
       WORKSHOP_STDOUT_FILE: paths.stdoutPath,
       WORKSHOP_STDERR_FILE: paths.stderrPath,
     };
@@ -109,12 +110,13 @@ export function buildProcessExecutionEnvironment(
   const env: Record<string, string> = {
     WORKSHOP_RUN_ID: run.runId,
     WORKSHOP_WORKFLOW_ID: run.workflowId,
-    WORKSHOP_NODE_ID: input.nodeId,
+    WORKSHOP_STEP_ID: input.nodeId,
     WORKSHOP_ATTEMPT: String(attemptNumber),
     WORKSHOP_EXECUTION_ID: input.executionId,
-    WORKSHOP_NODE_OUTPUT_FILE: join(run.paths.outputDirectory, `${input.nodeId}.output.txt`),
-    WORKSHOP_PREVIOUS_OUTPUT_FILE: join(run.paths.inputDirectory, `${input.nodeId}.previous.txt`),
-    WORKSHOP_WORKLOG_FILE: run.paths.worklog,
+    WORKSHOP_ARCHIVE: run.paths.archiveDirectory,
+    WORKSHOP_STEP_OUTPUT_FILE: paths.candidateOutputPath,
+    WORKSHOP_PREVIOUS_OUTPUT_FILE: paths.previousOutputPath,
+    WORKSHOP_WORKLOG_FILE: paths.worklogPath,
     WORKSHOP_STDOUT_FILE: paths.stdoutPath,
     WORKSHOP_STDERR_FILE: paths.stderrPath,
   };
@@ -318,9 +320,7 @@ export function defineProcessExecutionTask(
           return;
         }
         mkdirSync(dirname(input.stdoutPath), { recursive: true });
-        const siteSettings = input.nodeId === null ? undefined : run.resolvedSettings.nodes[input.nodeId];
-        const site = input.role === "preflight" ? run.resolvedSettings.preflight
-          : input.role === "worker" ? siteSettings?.run : siteSettings?.validator;
+        mkdirSync(run.paths.archiveDirectory, { recursive: true });
         const semanticStdoutLimitBytes = input.role === "worker" && input.nodeId !== null
           && run.resolvedSettings.nodes[input.nodeId]?.run.kind === "command"
           ? MAX_SEMANTIC_OUTPUT_BYTES
@@ -485,6 +485,7 @@ export function defineProcessExecutionTask(
           await appendProcess(tx, runtime.conversationId, input, Number(runtime.taskId), exited, finishedAt);
           return { status: "terminal", outcome: { status: "completed", result } };
         }, context);
+        removeEmptyCaptures(captures);
         trackedProcesses.delete(input.executionId);
       },
     },
@@ -566,6 +567,7 @@ export function defineProcessExecutionTask(
             await appendProcess(tx, runtime.conversationId, input, Number(runtime.taskId), retired, completedAt);
             return { status: "terminal", outcome: { status: "completed", result } };
           }, context);
+          removeEmptyCaptures(captures);
           trackedProcesses.delete(input.executionId);
           return;
         }
@@ -590,6 +592,7 @@ export function defineProcessExecutionTask(
         await appendProcess(tx, runtime.conversationId, input, Number(runtime.taskId), blocked, timestamp(runtime.now()));
         return { status: "terminal", outcome: { status: "aborted", reason: dead ? "process stopped without a checked operator-stop receipt" : block.reason } };
       }, context);
+      if (dead && confirmedIdentity) removeEmptyCaptures(captures);
       trackedProcesses.delete(input.executionId);
     },
   });
@@ -638,6 +641,7 @@ async function blockProcess(
     await appendProcess(tx, runtime.conversationId, input, Number(runtime.taskId), blocked, timestamp(runtime.now()));
     return { status: "terminal", outcome: { status: "completed", result: { kind: "blocked", block } } };
   }, context);
+  if (cleanup === "confirmed_dead") removeEmptyCaptures(captures);
 }
 
 async function settleRecoveredProcess(
@@ -781,7 +785,7 @@ function assertProcessIdentity(
   if (input.role === "preflight") {
     const site = run.resolvedSettings.preflight;
     const expectedEnv = buildProcessExecutionEnvironment(input, run, null);
-    const paths = processExecutionCapturePaths(run.paths.captureDirectory, input.executionId, input.incarnationId);
+    const paths = processExecutionFiles(input, run.paths.runDirectory, null);
     const validDeadline = site !== null && site !== undefined
       && validProcessDeadline(input, site.timeoutMs);
     const authorized = run.preflight.kind === "pending"
@@ -814,7 +818,7 @@ function assertProcessIdentity(
   const hasReference = recordedIncarnationIndex >= 0;
   const expectedIncarnationNumber = hasReference ? recordedIncarnationIndex + 1 : executionIncarnations.length + 1;
   const expectedEnv = buildProcessExecutionEnvironment(input, run, attempt.number);
-  const paths = processExecutionCapturePaths(run.paths.captureDirectory, input.executionId, input.incarnationId);
+  const paths = processExecutionFiles(input, run.paths.runDirectory, attempt.number);
   const validDeadline = site !== undefined && site !== null
     && validProcessDeadline(input, site.timeoutMs);
   if (input.runId !== run.runId || input.workflowId !== run.workflowId
@@ -1020,6 +1024,14 @@ export async function recoverRetainedProcessCaptureRecords(input: ProcessCapture
     }));
   }
   return captures;
+}
+
+/** Empty streams carry no evidence beyond their committed zero-byte record. */
+function removeEmptyCaptures(captures: readonly z.infer<typeof processCaptureSchema>[]): void {
+  for (const capture of captures) {
+    if (capture.totalBytes !== 0) continue;
+    try { rmSync(capture.path, { force: true }); } catch { /* The committed record stays authoritative. */ }
+  }
 }
 
 function captureFileSize(path: string): number {

@@ -22,7 +22,7 @@ import { WorkshopInstallationDoc, WorkshopRunDoc } from "../src/storage/durable/
 import {
   buildProcessExecutionEnvironment,
   decideProcessReplay,
-  processExecutionCapturePaths,
+  processExecutionFiles,
   processExecutionTaskInputSchema,
   processExecutionTaskResultSchema,
   type ProcessExecutionTaskEnvironmentInput,
@@ -31,54 +31,37 @@ import { parseWorkerResultBytes } from "../src/attempt/parse-result.js";
 import { createWorkflowRunTaskInput, defineWorkshopTasks, parseWorkflowRunTaskInput } from "../src/storage/durable/define-workshop-tasks.js";
 import { FAILURE_JUDGMENT_DECISION_TOOL_NAME, FailureJudgmentExtension, failureJudgmentTaskInputSchema, failureJudgmentTaskResultSchema } from "../src/storage/durable/define-failure-judgment-task.js";
 import { openDurableStorage } from "../src/storage/durable/open-durable-storage.js";
-import { materializeRunViews } from "../src/storage/durable/materialize-run-views.js";
 
 const sourceText = [
-  "version: 2",
-  "id: command-chain",
-  "nodes:",
-  "  first:",
-  "    run: { command: \"printf 'alpha'\" }",
-  "    next: second",
-  "  second:",
-  "    run:",
-  "      command: >-",
+  "steps:",
+  "  - first:",
+  "      run: \"printf 'alpha'\"",
+  "  - second:",
+  "      run: >-",
   "        printf '%s-beta' \"$(cat \"$WORKSHOP_PREVIOUS_OUTPUT_FILE\")\"",
-  "    next: null",
   "",
 ].join("\n");
 const timeoutSourceText = [
-  "version: 2",
-  "id: command-chain",
-  "nodes:",
-  "  first:",
-  "    timeout: 1s",
-  "    run:",
-  "      command: exec sleep 30",
-  "    next: null",
+  "steps:",
+  "  - first:",
+  "      timeout: 1s",
+  "      run: exec sleep 30",
   "",
 ].join("\n");
 const failureSourceText = [
-  "version: 2",
-  "id: command-chain",
-  "nodes:",
-  "  first:",
-  "    run:",
-  "      command: printf 'expected failure'; exit 7",
-  "    next: null",
+  "steps:",
+  "  - first:",
+  "      run: >-",
+  "        printf 'expected failure'; exit 7",
   "",
 ].join("\n");
 const abortSourceText = [
-  "version: 2",
-  "id: command-chain",
-  "nodes:",
-  "  first:",
-  "    run:",
-  "      command: exec sleep 30",
-  "    next: null",
+  "steps:",
+  "  - first:",
+  "      run: exec sleep 30",
   "",
 ].join("\n");
-const machineConfig = { version: 2, shell: "/bin/bash" } as const;
+const machineConfig = { shell: "/bin/bash" } as const;
 const iso = (milliseconds: number) => new Date(milliseconds).toISOString();
 const hash = (value: string) => `sha256:${createHash("sha256").update(value).digest("hex")}`;
 
@@ -114,8 +97,10 @@ function prepare(
   runId: string,
   source = sourceText,
   machine: Parameters<typeof resolveWorkflowSettings>[0]["machine"] = machineConfig,
+  workflowId = runId.startsWith("command-chain-") ? "command-chain" : runId.split("-run-")[0] ?? "command-chain",
 ) {
-  const checked = checkDefinitionText(source, "command-chain.yaml");
+  const sourceLabel = `${workflowId}.yaml`;
+  const checked = checkDefinitionText(source, sourceLabel, workflowId);
   const resolvedSettings = resolveWorkflowSettings({
     definition: checked.def,
     machine,
@@ -123,10 +108,12 @@ function prepare(
   });
   const prepared = prepareRunAdmission({
     sourceText: source,
-    sourceLabel: "command-chain.yaml",
+    sourceLabel,
+    workflowId,
     machineConfig: machine,
     projectCwd: directory,
     runsDirectory: join(directory, "state", "runs"),
+    archiveDirectory: join(directory, ".workshop", "archive"),
     resolvedSettings,
     runtimeManifest: {
       durableVersion: "1.0.2",
@@ -135,8 +122,8 @@ function prepare(
     },
     runId,
     eventId: `admission-${runId}`,
-    activationId: "activation-command-chain",
-    occurrenceId: "occurrence-command-chain-001",
+    activationId: `activation-${workflowId}`,
+    occurrenceId: `occurrence-${workflowId}-001`,
     requestId,
     admittedAt: iso(Date.now()),
   });
@@ -194,7 +181,7 @@ describe("Durable workflow lifecycle", () => {
     const requestId = "command-chain-request-001";
     let opened: CommandHarness | undefined;
     try {
-      const prepared = prepare(directory, requestId, "command-chain-run-001", sourceText, { ...machineConfig, stream_cap: "3" });
+      const prepared = prepare(directory, requestId, "command-chain-run-001", sourceText, { ...machineConfig, stream_cap: "3", keep_files: "always" });
       opened = await openCommandHarness(databasePath);
       await initializeInstallation(opened.harness, prepared.canonicalHash);
       const admission = await admit(opened.harness, opened.tasks, prepared);
@@ -266,7 +253,7 @@ describe("Durable workflow lifecycle", () => {
       expect(reopenedRun.status).toBe("completed");
       expect(reopenedRun.terminalOutput).toBe("alpha-beta");
 
-      const retry = await admit(opened.harness, opened.tasks, prepare(directory, requestId, "command-chain-run-retry", sourceText, { ...machineConfig, stream_cap: "3" }));
+      const retry = await admit(opened.harness, opened.tasks, prepare(directory, requestId, "command-chain-run-retry", sourceText, { ...machineConfig, stream_cap: "3", keep_files: "always" }));
       expect(retry).toEqual({
         ok: true,
         value: {
@@ -395,6 +382,26 @@ describe("Durable workflow lifecycle", () => {
     }
   });
 
+  test("deletes a completed run's folder unless keep_files is always", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "workshop-command-cleanup-"));
+    let opened: CommandHarness | undefined;
+    try {
+      const prepared = prepare(directory, "command-cleanup-request-001", "command-chain-cleanup-001", sourceText);
+      opened = await openCommandHarness(join(directory, "durable.db"));
+      await initializeInstallation(opened.harness, prepared.canonicalHash);
+      const admission = await admit(opened.harness, opened.tasks, prepared);
+      if (!admission.ok) throw new Error(`${admission.failure.kind}: ${admission.failure.message}`);
+      await opened.harness.waitForIdle(BACKGROUND_CONTEXT);
+      const task = await opened.harness.waitForTask(admission.value.workflowTaskId as TaskId<ReturnType<typeof runOutcomeSchema.parse>>, BACKGROUND_CONTEXT);
+      if (task.state.outcome.status !== "completed") throw new Error("WorkflowRun task did not complete");
+      expect(runOutcomeSchema.parse(task.state.outcome.result)).toEqual({ kind: "completed", terminalOutput: "alpha-beta" });
+      expect(existsSync(prepared.paths.runDirectory)).toBe(false);
+    } finally {
+      if (opened !== undefined) await opened.harness.close(BACKGROUND_CONTEXT);
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   test("settles an expected command failure as a typed domain outcome", async () => {
     const directory = mkdtempSync(join(tmpdir(), "workshop-command-failure-"));
     let opened: CommandHarness | undefined;
@@ -442,18 +449,15 @@ describe("Durable workflow lifecycle", () => {
 
 function judgedWorkflowSource(workflowId: string, replay: "safe" | "never", maxAttempts = 2): string {
   return [
-    "version: 2",
-    `id: ${workflowId}`,
-    "nodes:",
-    "  verify:",
-    `    replay: ${replay}`,
-    `    max_attempts: ${maxAttempts}`,
-    "    run: { command: \"printf 'candidate'\" }",
-    "    validator:",
-    "      replay: safe",
-    "      command: >-",
-    "        if [ -f .validator-failed-once ]; then exit 0; else touch .validator-failed-once; exit 7; fi",
-    "    next: null",
+    "steps:",
+    "  - verify:",
+    `      replay: ${replay}`,
+    `      max_attempts: ${maxAttempts}`,
+    "      run: \"printf 'candidate'\"",
+    "      check:",
+    "        replay: safe",
+    "        run: >-",
+    "          if [ -f .validator-failed-once ]; then exit 0; else touch .validator-failed-once; exit 7; fi",
     "",
   ].join("\n");
 }
@@ -621,27 +625,23 @@ describe("native Durable failure judgment", () => {
     ]);
     const workflowId = "multiple-judgments";
     const source = [
-      "version: 2",
-      `id: ${workflowId}`,
-      "nodes:",
-      "  first:",
-      "    replay: safe",
-      "    max_attempts: 2",
-      "    run: { command: \"printf 'first'\" }",
-      "    validator:",
+      "steps:",
+      "  - first:",
       "      replay: safe",
-      "      command: >-",
-      "        if [ -f .first-validator-passed-once ]; then exit 0; else touch .first-validator-passed-once; exit 7; fi",
-      "    next: second",
-      "  second:",
-      "    replay: safe",
-      "    max_attempts: 2",
-      "    run: { command: \"printf 'second'\" }",
-      "    validator:",
+      "      max_attempts: 2",
+      "      run: \"printf 'first'\"",
+      "      check:",
+      "        replay: safe",
+      "        run: >-",
+      "          if [ -f .first-validator-passed-once ]; then exit 0; else touch .first-validator-passed-once; exit 7; fi",
+      "  - second:",
       "      replay: safe",
-      "      command: >-",
-      "        if [ -f .second-validator-passed-once ]; then exit 0; else touch .second-validator-passed-once; exit 7; fi",
-      "    next: null",
+      "      max_attempts: 2",
+      "      run: \"printf 'second'\"",
+      "      check:",
+      "        replay: safe",
+      "        run: >-",
+      "          if [ -f .second-validator-passed-once ]; then exit 0; else touch .second-validator-passed-once; exit 7; fi",
       "",
     ].join("\n");
     try {
@@ -768,7 +768,7 @@ describe("native Durable failure judgment", () => {
       },
       orchestrator: { model: "faux/failure-judge:low", timeout: "10s" },
     };
-    const source = headlessChainSourceText.replace("id: command-chain", `id: ${workflowId}`);
+    const source = headlessChainSourceText;
     try {
       const prepared = prepare(directory, "judgment-excerpts-request-001", "judgment-excerpts-run-001", source, machineWithExcerpts);
       opened = await openCommandHarness(join(directory, "durable.db"), undefined, {}, models);
@@ -1389,14 +1389,13 @@ describe("native Durable failure judgment", () => {
 });
 
 describe("canonical worker output views", () => {
-  test("regenerates successor input from stored output after reopen and ignores edited output files", async () => {
+  test("writes successor input from stored output over stale files", async () => {
     const directory = mkdtempSync(join(tmpdir(), "workshop-canonical-output-"));
     const databasePath = join(directory, "durable.db");
     let opened: CommandHarness | undefined;
     let conversationId: ConversationId | undefined;
     const prepared = prepare(directory, "canonical-output-request-001", "command-chain-run-001");
-    const previousOutputPath = join(prepared.paths.inputDirectory, "second.previous.txt");
-    const outputPath = join(prepared.paths.outputDirectory, "second.output.txt");
+    const previousOutputPath = join(prepared.paths.runDirectory, "second.1", "previous-output.txt");
     try {
       const candidate = nodeResultSchema.parse({
         version: 1,
@@ -1491,10 +1490,8 @@ describe("canonical worker output views", () => {
       await opened.harness.close(BACKGROUND_CONTEXT);
       opened = undefined;
 
-      mkdirSync(prepared.paths.inputDirectory, { recursive: true });
-      mkdirSync(prepared.paths.outputDirectory, { recursive: true });
+      mkdirSync(join(prepared.paths.runDirectory, "second.1"), { recursive: true });
       writeFileSync(previousOutputPath, "stale input from disk", "utf8");
-      writeFileSync(outputPath, "unverified output from disk", "utf8");
 
       opened = await openCommandHarness(databasePath);
       const reopened = opened;
@@ -1541,31 +1538,6 @@ describe("canonical worker output views", () => {
       }
       expect(result.outcome.candidate.output).toBe("alpha-beta");
       expect(readFileSync(previousOutputPath, "utf8")).toBe("alpha");
-      expect(readFileSync(outputPath, "utf8")).toBe("alpha-beta");
-
-      const definitionPath = prepared.paths.definitionSnapshot;
-      const worklogPath = prepared.paths.worklog;
-      writeFileSync(definitionPath, "tampered definition", "utf8");
-      rmSync(previousOutputPath, { force: true });
-      writeFileSync(outputPath, "tampered after commit", "utf8");
-      writeFileSync(worklogPath, "tampered worklog", "utf8");
-      await reopened.harness.close(BACKGROUND_CONTEXT);
-      opened = undefined;
-      opened = await openCommandHarness(databasePath);
-      const afterTamper = workflowRunDocumentV1Schema.parse(
-        await opened.harness.snapshot(WorkshopRunDoc, conversationId, BACKGROUND_CONTEXT),
-      );
-      if (afterTamper.state !== "ready") throw new Error("canonical-output run failed to reopen");
-      const storedResult = afterTamper.nodes.find((node) => node.nodeId === "second")?.attempts[0]?.result;
-      if (storedResult?.kind !== "settled" || storedResult.outcome.kind !== "succeeded") {
-        throw new Error("reopened successor lacks canonical output");
-      }
-      expect(storedResult.outcome.candidate.output).toBe("alpha-beta");
-      expect(materializeRunViews(afterTamper)).toEqual([]);
-      expect(readFileSync(definitionPath, "utf8")).toBe(sourceText);
-      expect(readFileSync(previousOutputPath, "utf8")).toBe("alpha");
-      expect(readFileSync(outputPath, "utf8")).toBe("alpha-beta");
-      expect(readFileSync(worklogPath, "utf8")).toContain("## Run outcome");
     } finally {
       if (opened !== undefined) await opened.harness.close(BACKGROUND_CONTEXT);
       rmSync(directory, { recursive: true, force: true });
@@ -1573,83 +1545,8 @@ describe("canonical worker output views", () => {
   });
 });
 
-describe("run view write failures", () => {
-  test("records projection errors without failing execution and repairs the views without replay", async () => {
-    const directory = mkdtempSync(join(tmpdir(), "workshop-view-failure-"));
-    const restoreEnvironment = preserveEnvironment(["WORKSHOP_TEST_WORKERS"]);
-    const workerMarker = join(directory, "workers.txt");
-    process.env.WORKSHOP_TEST_WORKERS = workerMarker;
-    let opened: CommandHarness | undefined;
-    try {
-      const source = [
-        "version: 2",
-        "id: command-chain",
-        "nodes:",
-        "  first:",
-        "    run:",
-        "      command: >-",
-        "        printf w >> $WORKSHOP_TEST_WORKERS; printf alpha",
-        "    next: second",
-        "  second:",
-        "    run:",
-        "      command: >-",
-        "        printf '%s-beta' $(cat $WORKSHOP_PREVIOUS_OUTPUT_FILE)",
-        "    next: null",
-        "",
-      ].join("\n");
-      const prepared = prepare(directory, "view-failure-request-001", "command-chain-view-failure-run-001", source);
-      const blockedOutput = join(prepared.paths.outputDirectory, "first.output.txt");
-      mkdirSync(blockedOutput, { recursive: true });
-      opened = await openCommandHarness(join(directory, "durable.db"));
-      await initializeInstallation(opened.harness, prepared.canonicalHash);
-      const admission = await admit(opened.harness, opened.tasks, prepared);
-      expect(admission.ok).toBe(true);
-      if (!admission.ok) throw new Error(`${admission.failure.kind}: ${admission.failure.message}`);
-
-      await opened.harness.waitForIdle(BACKGROUND_CONTEXT);
-      const task = await opened.harness.waitForTask(
-        admission.value.workflowTaskId as TaskId<ReturnType<typeof runOutcomeSchema.parse>>,
-        BACKGROUND_CONTEXT,
-      );
-      expect(task.state.outcome.status).toBe("completed");
-      if (task.state.outcome.status !== "completed") throw new Error("view failure changed the workflow task outcome");
-      const outcome = runOutcomeSchema.parse(task.state.outcome.result);
-      expect(outcome).toEqual({ kind: "completed", terminalOutput: "alpha-beta" });
-
-      const conversationId = admission.value.conversationId as ConversationId;
-      const stored = workflowRunDocumentV1Schema.parse(
-        await opened.harness.snapshot(WorkshopRunDoc, conversationId, BACKGROUND_CONTEXT),
-      );
-      if (stored.state !== "ready") throw new Error("view failure run disappeared");
-      expect(stored.status).toBe("completed");
-      expect(stored.nodes.map((node) => node.attempts.length)).toEqual([1, 1]);
-      expect(readFileSync(workerMarker, "utf8")).toBe("w");
-
-      const conversation = await opened.harness.conversation(conversationId, BACKGROUND_CONTEXT);
-      if (conversation === undefined) throw new Error("view failure conversation is missing");
-      const entries = await conversation.entries({}, 1000, undefined, BACKGROUND_CONTEXT);
-      const projectionFailures = entries.items
-        .filter((entry) => entry.kind === "workshop.event")
-        .map((entry) => workshopEventV1Schema.parse(entry.data))
-        .filter((event) => event.type === "view_refresh_failed");
-      expect(projectionFailures.some((event) => event.view === "output" && event.nodeId === "first")).toBe(true);
-
-      rmSync(blockedOutput, { recursive: true, force: true });
-      expect(materializeRunViews(stored)).toEqual([]);
-      expect(readFileSync(blockedOutput, "utf8")).toBe("alpha");
-      expect(readFileSync(join(prepared.paths.inputDirectory, "second.previous.txt"), "utf8")).toBe("alpha");
-      expect(readFileSync(join(prepared.paths.outputDirectory, "second.output.txt"), "utf8")).toBe("alpha-beta");
-      expect(readFileSync(workerMarker, "utf8")).toBe("w");
-    } finally {
-      if (opened !== undefined) await opened.harness.close(BACKGROUND_CONTEXT);
-      restoreEnvironment();
-      rmSync(directory, { recursive: true, force: true });
-    }
-  });
-});
-
-describe("required execution view failures", () => {
-  test("blocks a successor before dispatch when its predecessor input view cannot be written", async () => {
+describe("required process input file failures", () => {
+  test("blocks a successor before dispatch when its previous output file cannot be written", async () => {
     const directory = mkdtempSync(join(tmpdir(), "workshop-input-view-failure-"));
     const restoreEnvironment = preserveEnvironment(["WORKSHOP_TEST_WORKERS", "WORKSHOP_TEST_SUCCESSORS"]);
     const workerMarker = join(directory, "workers.txt");
@@ -1659,23 +1556,17 @@ describe("required execution view failures", () => {
     let opened: CommandHarness | undefined;
     try {
       const source = [
-        "version: 2",
-        "id: command-chain",
-        "nodes:",
-        "  first:",
-        "    run:",
-        "      command: >-",
+        "steps:",
+        "  - first:",
+        "      run: >-",
         "        printf w >> $WORKSHOP_TEST_WORKERS; printf alpha",
-        "    next: second",
-        "  second:",
-        "    run:",
-        "      command: >-",
+        "  - second:",
+        "      run: >-",
         "        printf s >> $WORKSHOP_TEST_SUCCESSORS; printf '%s-beta' $(cat $WORKSHOP_PREVIOUS_OUTPUT_FILE)",
-        "    next: null",
         "",
       ].join("\n");
       const prepared = prepare(directory, "input-view-failure-request", "command-chain-input-view-failure-run", source);
-      const inputPath = join(prepared.paths.inputDirectory, "second.previous.txt");
+      const inputPath = join(prepared.paths.runDirectory, "second.1", "previous-output.txt");
       mkdirSync(inputPath, { recursive: true });
       opened = await openCommandHarness(join(directory, "durable.db"));
       await initializeInstallation(opened.harness, prepared.canonicalHash);
@@ -1707,24 +1598,10 @@ describe("required execution view failures", () => {
       if (secondResult?.kind !== "settled" || secondResult.outcome.kind !== "blocked") {
         throw new Error("blocked successor lacks durable preparation evidence");
       }
-      expect(secondResult.outcome.block.reason).toContain("input view");
+      expect(secondResult.outcome.block.reason).toContain("input files");
       expect(readFileSync(workerMarker, "utf8")).toBe("w");
       expect(existsSync(successorMarker)).toBe(false);
 
-      const conversation = await opened.harness.conversation(conversationId, BACKGROUND_CONTEXT);
-      if (conversation === undefined) throw new Error("input-view failure conversation is missing");
-      const entries = await conversation.entries({}, 1000, undefined, BACKGROUND_CONTEXT);
-      const projectionFailures = entries.items
-        .filter((entry) => entry.kind === "workshop.event")
-        .map((entry) => workshopEventV1Schema.parse(entry.data))
-        .filter((event) => event.type === "view_refresh_failed");
-      expect(projectionFailures.some((event) => event.view === "input" && event.nodeId === "second")).toBe(true);
-
-      rmSync(inputPath, { recursive: true, force: true });
-      expect(materializeRunViews(stored)).toEqual([]);
-      expect(readFileSync(inputPath, "utf8")).toBe("alpha");
-      expect(readFileSync(workerMarker, "utf8")).toBe("w");
-      expect(existsSync(successorMarker)).toBe(false);
     } finally {
       if (opened !== undefined) await opened.harness.close(BACKGROUND_CONTEXT);
       restoreEnvironment();
@@ -1732,7 +1609,7 @@ describe("required execution view failures", () => {
     }
   });
 
-  test("blocks validation when the committed candidate output view cannot be written", async () => {
+  test("blocks validation when the candidate output file cannot be written", async () => {
     const directory = mkdtempSync(join(tmpdir(), "workshop-validator-view-failure-"));
     const envNames = ["WORKSHOP_TEST_WORKERS", "WORKSHOP_TEST_VALIDATORS"];
     const restoreEnvironment = preserveEnvironment(envNames);
@@ -1744,21 +1621,17 @@ describe("required execution view failures", () => {
     let opened: CommandHarness | undefined;
     try {
       const source = [
-        "version: 2",
-        "id: command-chain",
-        "nodes:",
-        "  first:",
-        "    run:",
-        "      command: >-",
+        "steps:",
+        "  - first:",
+        "      run: >-",
         "        printf w >> $WORKSHOP_TEST_WORKERS; printf candidate",
-        "    validator:",
-        "      command: >-",
-        "        printf v >> $WORKSHOP_TEST_VALIDATORS; exit 0",
-        "    next: null",
+        "      check:",
+        "        run: >-",
+        "          printf v >> $WORKSHOP_TEST_VALIDATORS; exit 0",
         "",
       ].join("\n");
       const prepared = prepare(directory, "validator-view-failure-request", "command-chain-validator-view-failure-run", source);
-      const blockedOutput = join(prepared.paths.outputDirectory, "first.output.txt");
+      const blockedOutput = join(prepared.paths.runDirectory, "first.1", "candidate-output.txt");
       mkdirSync(blockedOutput, { recursive: true });
       opened = await openCommandHarness(databasePath);
       await initializeInstallation(opened.harness, prepared.canonicalHash);
@@ -1797,15 +1670,6 @@ describe("required execution view failures", () => {
       expect(readFileSync(workerMarker, "utf8")).toBe("w");
       expect(existsSync(validatorMarker)).toBe(false);
 
-      const conversation = await opened.harness.conversation(conversationId, BACKGROUND_CONTEXT);
-      if (conversation === undefined) throw new Error("validator-view failure conversation is missing");
-      const entries = await conversation.entries({}, 1000, undefined, BACKGROUND_CONTEXT);
-      const projectionFailures = entries.items
-        .filter((entry) => entry.kind === "workshop.event")
-        .map((entry) => workshopEventV1Schema.parse(entry.data))
-        .filter((event) => event.type === "view_refresh_failed");
-      expect(projectionFailures.some((event) => event.view === "output" && event.nodeId === "first")).toBe(true);
-
       await opened.harness.close(BACKGROUND_CONTEXT);
       opened = undefined;
       rmSync(blockedOutput, { recursive: true, force: true });
@@ -1817,8 +1681,6 @@ describe("required execution view failures", () => {
       if (reopened.state !== "ready") throw new Error("validator-view failure run did not survive reopen");
       expect(reopened.status).toBe("blocked");
       expect(reopened.nodes[0]?.attempts).toHaveLength(1);
-      expect(materializeRunViews(reopened)).toEqual([]);
-      expect(readFileSync(blockedOutput, "utf8")).toBe("candidate");
       expect(readFileSync(workerMarker, "utf8")).toBe("w");
       expect(existsSync(validatorMarker)).toBe(false);
     } finally {
@@ -1937,7 +1799,7 @@ async function verifyDurableRestartAfterProcessLaunch(mode: "worker" | "validato
     }
     if (validatorMode) {
       expect(attemptResult?.kind === "settled" && attemptResult.outcome.kind === "blocked" ? attemptResult.outcome.candidate?.output : "candidate").toBe("candidate");
-      expect(readFileSync(join(stored.paths.outputDirectory, "first.output.txt"), "utf8")).toBe("candidate");
+      if (!replayedProcess) expect(readFileSync(join(stored.paths.runDirectory, "first.1", "candidate-output.txt"), "utf8")).toBe("candidate");
     } else if (!replayedProcess) {
       if (attemptResult?.kind !== "settled" || attemptResult.outcome.kind !== "blocked") throw new Error("worker replay candidate state is missing");
       expect(attemptResult.outcome.candidate).toBeNull();
@@ -2030,13 +1892,9 @@ describe("Durable process launch startup gate", () => {
     const databasePath = join(directory, "durable.db");
     const markerPath = join(directory, "process-launched.txt");
     const source = [
-      "version: 2",
-      "id: command-chain",
-      "nodes:",
-      "  first:",
-      "    run:",
-      `      command: 'echo $$ > ${markerPath}; sleep 0.05; printf gate-opened'`,
-      "    next: null",
+      "steps:",
+      "  - first:",
+      `      run: 'echo $$ > ${markerPath}; sleep 0.05; printf gate-opened'`,
       "",
     ].join("\n");
     const oldBootId = randomUUID();
@@ -2131,24 +1989,18 @@ describe("Durable launch intent without process identity", () => {
 
 
 const headlessChainSourceText = [
-  "version: 2",
-  "id: command-chain",
-  "nodes:",
-  "  first:",
-  "    stream_cap: \"32\"",
-  "    run:",
+  "steps:",
+  "  - first:",
+  "      stream_cap: \"32\"",
   "      agent:",
   "        instructions: produce a checked candidate",
-  "    validator:",
-  "      agent:",
-  "        instructions: check the candidate",
-  "    next: second",
-  "  second:",
-  "    stream_cap: \"32\"",
-  "    run:",
-  "      command: >-",
+  "      check:",
+  "        agent:",
+  "          instructions: check the candidate",
+  "  - second:",
+  "      stream_cap: \"32\"",
+  "      run: >-",
   "        printf 's' >> \"$WORKSHOP_TEST_SUCCESSORS\"; printf '%s-next' \"$(cat \"$WORKSHOP_PREVIOUS_OUTPUT_FILE\")\"",
-  "    next: null",
   "",
 ].join("\n");
 
@@ -2162,19 +2014,19 @@ function headlessChainMachineConfig(validatorJson: string) {
   const validatorCommand = validatorJson === "__sleep__"
     ? [
       "printf 'v' >> \"$WORKSHOP_TEST_VALIDATORS\"",
-      "cat \"$WORKSHOP_NODE_OUTPUT_FILE\" > \"$WORKSHOP_TEST_VALIDATOR_INPUT\"",
+      "cat \"$WORKSHOP_STEP_OUTPUT_FILE\" > \"$WORKSHOP_TEST_VALIDATOR_INPUT\"",
       "sleep 3",
     ].join("; ")
     : [
       "printf 'v' >> \"$WORKSHOP_TEST_VALIDATORS\"",
-      "cat \"$WORKSHOP_NODE_OUTPUT_FILE\" > \"$WORKSHOP_TEST_VALIDATOR_INPUT\"",
+      "cat \"$WORKSHOP_STEP_OUTPUT_FILE\" > \"$WORKSHOP_TEST_VALIDATOR_INPUT\"",
       "echo \"$WORKSHOP_RESULT_FILE\" >> \"$WORKSHOP_TEST_RESULT_PATHS\"",
       "printf '%s' '" + validatorJson + "' > \"$WORKSHOP_RESULT_FILE\"",
       "yes v | head -c 1100000",
     ].join("; ");
   return {
-    version: 2,
     shell: "/bin/bash",
+    keep_files: "always",
     agent: {
       model: "provider/model:low",
       harness: {
@@ -2271,8 +2123,8 @@ describe("Durable headless validation chain", () => {
       const validatorRef = firstAttempt.processIncarnations.find((ref) => ref.executionId === firstAttempt.validatorExecutionId);
       if (firstAttempt.workerExecutionId === null || firstAttempt.validatorExecutionId === null
         || workerRef === undefined || validatorRef === undefined) throw new Error("agent process identities were not committed");
-      const workerPaths = processExecutionCapturePaths(stored.paths.captureDirectory, firstAttempt.workerExecutionId, workerRef.incarnationId);
-      const validatorPaths = processExecutionCapturePaths(stored.paths.captureDirectory, firstAttempt.validatorExecutionId, validatorRef.incarnationId);
+      const workerPaths = processExecutionFiles({ role: "worker", nodeId: "first", incarnationNumber: 1 }, stored.paths.runDirectory, 1);
+      const validatorPaths = processExecutionFiles({ role: "validator", nodeId: "first", incarnationNumber: 1 }, stored.paths.runDirectory, 1);
       expect(readFileSync(workerPaths.promptPath, "utf8")).toContain("produce a checked candidate");
       expect(readFileSync(validatorPaths.promptPath, "utf8")).toContain("immutable evidence");
       expect(workerPaths.resultPath).not.toBe(validatorPaths.resultPath);
@@ -2437,7 +2289,7 @@ describe("Durable headless validation chain", () => {
       if (firstResult?.kind !== "settled" || firstResult.outcome.kind !== "failed") throw new Error("invalid result did not preserve checked failure evidence");
       expect(firstResult.outcome.failure.kind).toBe("result_invalid");
       expect(firstResult.outcome.candidate).toBeNull();
-      expect(existsSync(join(stored.paths.outputDirectory, "first.output.txt"))).toBe(false);
+      expect(existsSync(join(stored.paths.runDirectory, "first.1", "candidate-output.txt"))).toBe(false);
       expect(readFileSync(markers.workers, "utf8")).toBe("w");
       expect(existsSync(markers.validators)).toBe(false);
       expect(existsSync(markers.successors)).toBe(false);
@@ -2472,8 +2324,8 @@ describe("Durable headless validation chain", () => {
     let opened: CommandHarness | undefined;
     try {
       const timeoutSource = headlessChainSourceText.replace(
-        ["    validator:", "      agent:"].join("\n"),
-        ["    validator:", "      timeout: 1s", "      agent:"].join("\n"),
+        ["      check:", "        agent:"].join("\n"),
+        ["      check:", "        timeout: 1s", "        agent:"].join("\n"),
       );
       const prepared = prepare(
         directory,
@@ -2523,21 +2375,16 @@ describe("Durable headless validation chain", () => {
 
 function commandValidatorChainSource(validatorCommand: string): string {
   return [
-    "version: 2",
-    "id: command-chain",
-    "nodes:",
-    "  first:",
-    "    stream_cap: \"32\"",
-    "    run: { command: \"printf 'command-candidate'\" }",
-    "    validator:",
-    "      command: >-",
-    "        " + validatorCommand,
-    "    next: second",
-    "  second:",
-    "    run:",
-    "      command: >-",
+    "steps:",
+    "  - first:",
+    "      stream_cap: \"32\"",
+    "      run: \"printf 'command-candidate'\"",
+    "      check:",
+    "        run: >-",
+    "          " + validatorCommand,
+    "  - second:",
+    "      run: >-",
     "        printf '%s-next' \"$(cat \"$WORKSHOP_PREVIOUS_OUTPUT_FILE\")\"",
-    "    next: null",
     "",
   ].join("\n");
 }
@@ -2549,7 +2396,7 @@ describe("Durable command validator chain", () => {
       let opened: CommandHarness | undefined;
       try {
         const command = mode === "pass"
-          ? "grep -qx command-candidate \"$WORKSHOP_NODE_OUTPUT_FILE\""
+          ? "grep -qx command-candidate \"$WORKSHOP_STEP_OUTPUT_FILE\""
           : "exit 7";
         const prepared = prepare(
           directory,
@@ -2576,7 +2423,6 @@ describe("Durable command validator chain", () => {
         if (stored.state !== "ready") throw new Error("command validator run disappeared");
         const firstResult = stored.nodes[0]?.attempts[0]?.result;
         if (firstResult?.kind !== "settled") throw new Error("command worker candidate did not settle");
-        expect(readFileSync(join(prepared.paths.outputDirectory, "first.output.txt"), "utf8")).toBe("command-candidate");
         if (mode === "pass") {
           expect(outcome).toEqual({ kind: "completed", terminalOutput: "command-candidate-next" });
           expect(firstResult.outcome.kind).toBe("succeeded");
@@ -2604,23 +2450,18 @@ describe("Durable command validator chain", () => {
 });
 
 const agentProcessSourceText = [
-  "version: 2",
-  "id: agent-process-adapter",
-  "nodes:",
-  "  first:",
-  "    timeout: 5s",
-  "    stream_cap: \"4\"",
-  "    run:",
+  "steps:",
+  "  - first:",
+  "      timeout: 5s",
+  "      stream_cap: \"4\"",
   "      agent:",
   "        instructions: worker instructions",
-  "    validator:",
-  "      agent:",
-  "        instructions: validator instructions",
-  "    next: null",
+  "      check:",
+  "        agent:",
+  "          instructions: validator instructions",
   "",
 ].join("\n");
 const agentProcessMachineConfig = {
-  version: 2,
   shell: "/bin/bash",
   agent: {
     harness: { command: "(sleep 30) & printf '%s' \"$WORKSHOP_TEST_AT_LAUNCH\"; yes x | head -c 1100000; printf '%s' '{\"version\":1,\"output\":\"agent-result\",\"summary\":\"checked\",\"artifacts\":[]}' > \"$WORKSHOP_RESULT_FILE\"" },
@@ -2638,9 +2479,9 @@ const agentProcessMachineConfig = {
         "agent-process-adapter-paused-run-001",
         agentProcessSourceText,
         agentProcessMachineConfig,
+        "agent-process-adapter",
       );
       opened = await openCommandHarness(join(directory, "durable.db"));
-      mkdirSync(prepared.paths.outputDirectory, { recursive: true });
       const seeded = await seedAgentProcessTasks(opened.harness, opened.tasks, prepared, { pauseBeforeValidator: true });
       const validatorTaskId = seeded.taskIds[1];
       if (validatorTaskId === undefined) throw new Error("paused validator task was not created");
@@ -2717,9 +2558,9 @@ describe("Durable process execution adapter", () => {
         "agent-process-adapter-run-001",
         agentProcessSourceText,
         agentProcessMachineConfig,
+        "agent-process-adapter",
       );
       opened = await openCommandHarness(join(directory, "durable.db"));
-      mkdirSync(prepared.paths.outputDirectory, { recursive: true });
       const seeded = await seedAgentProcessTasks(opened.harness, opened.tasks, prepared);
       expect(seeded.inputs.map((input) => input.role)).toEqual(["worker", "validator"]);
       expect(seeded.inputs.every((input) => input.env.WORKSHOP_TEST_AT_LAUNCH === undefined)).toBe(true);
@@ -2783,13 +2624,10 @@ describe("Durable process execution adapter", () => {
   test("rejects unsafe absolute-deadline arithmetic before dispatch", async () => {
     const directory = mkdtempSync(join(tmpdir(), "workshop-unsafe-deadline-"));
     const unsafeDeadlineSource = [
-      "version: 2",
-      "id: unsafe-deadline",
-      "nodes:",
-      "  first:",
-      "    timeout: 9007199254740991ms",
-      "    run: { command: \"printf 'must-not-launch'\" }",
-      "    next: null",
+      "steps:",
+      "  - first:",
+      "      timeout: 9007199254740991ms",
+      "      run: \"printf 'must-not-launch'\"",
       "",
     ].join("\n");
     let opened: CommandHarness | undefined;
@@ -3010,7 +2848,7 @@ function createAdapterAgentProcessInput(args: {
   const deadlineAt = args.site.timeoutMs === null
     ? null
     : iso(Date.parse(args.launchIntentAt) + args.site.timeoutMs);
-  const paths = processExecutionCapturePaths(args.run.paths.captureDirectory, args.executionId, args.incarnationId);
+  const paths = processExecutionFiles({ role: args.role, nodeId: args.nodeId, incarnationNumber: 1 }, args.run.paths.runDirectory, 1);
   const base: ProcessExecutionTaskEnvironmentInput = {
     runId: args.run.runId,
     workflowId: args.run.workflowId,

@@ -40,12 +40,12 @@ export async function streamServiceLogChunks(
   runId: ServiceLogSectionPageV1["runId"] | undefined,
   onChunk: (section: ServiceLogSectionPageV1["section"], runId: string, chunk: ServiceLogSectionPageV1["chunk"]) => void | Promise<void>,
   timeoutMs = 10_000,
-): Promise<{ readonly runId: string; readonly projection: ServiceLogSectionPageV1["projection"] }> {
+  verbose = false,
+): Promise<{ readonly runId: string }> {
   let cursor: string | undefined;
   let selectedRunId = runId;
   let expectedIndex = 0;
   let totalSections: number | undefined;
-  let projection: ServiceLogSectionPageV1["projection"] | undefined;
   let sectionId: string | undefined;
   let sectionMetadata: string | undefined;
   let sectionOffsetBytes = 0;
@@ -56,15 +56,13 @@ export async function streamServiceLogChunks(
       version: 1, method: "logs.page", workflowId,
       ...(selectedRunId === undefined ? {} : { runId: selectedRunId }),
       ...(cursor === undefined ? {} : { cursor }),
+      ...(cursor === undefined && verbose ? { verbose: true } : {}),
     }, timeoutMs);
     if (!response.ok) throw new ServiceConnectionError(`${response.error.code}: ${response.error.message}`);
     const page = serviceLogSectionPageV1Schema.parse(response.result);
     if (selectedRunId !== undefined && page.runId !== selectedRunId) throw new ServiceConnectionError("service changed the selected log run between chunks");
     if ((totalSections !== undefined && page.totalSections !== totalSections)
       || page.sectionIndex !== expectedIndex) throw new ServiceConnectionError("service returned an out-of-order log section chunk");
-    if (projection !== undefined && JSON.stringify(page.projection) !== JSON.stringify(projection)) {
-      throw new ServiceConnectionError("service changed log projection metadata between chunks");
-    }
     const metadata = JSON.stringify({ ...page.section, content: null });
     if (sectionId === undefined) {
       if (sectionIds.has(page.section.sectionId)) throw new ServiceConnectionError("service repeated a log section ID");
@@ -83,7 +81,6 @@ export async function streamServiceLogChunks(
     await onChunk(page.section, page.runId, page.chunk);
     selectedRunId = page.runId;
     totalSections = page.totalSections;
-    projection = page.projection;
     if (page.chunk.complete) {
       sectionIds.add(page.section.sectionId);
       expectedIndex += 1;
@@ -96,51 +93,26 @@ export async function streamServiceLogChunks(
     }
     cursor = page.nextCursor ?? undefined;
   } while (cursor !== undefined);
-  if (selectedRunId === undefined || totalSections === undefined || projection === undefined || expectedIndex !== totalSections) {
+  if (selectedRunId === undefined || totalSections === undefined || expectedIndex !== totalSections) {
     throw new ServiceConnectionError("service ended the log section stream before its snapshot was complete");
   }
-  return { runId: selectedRunId, projection };
-}
-
-/** Reassemble one bounded transport stream into complete logical sections. */
-export async function streamServiceLogSections(
-  socketPath: string,
-  workflowId: string,
-  runId: ServiceLogSectionPageV1["runId"] | undefined,
-  onSection: (section: ServiceLogSectionPageV1["section"], selectedRunId: string) => void | Promise<void>,
-  timeoutMs = 10_000,
-): Promise<{ readonly runId: string; readonly projection: ServiceLogSectionPageV1["projection"] }> {
-  let sectionTemplate: ServiceLogSectionPageV1["section"] | undefined;
-  let content: string[] = [];
-  return streamServiceLogChunks(socketPath, workflowId, runId, async (section, selectedRunId, chunk) => {
-    if (chunk.offsetBytes === 0) { sectionTemplate = section; content = []; }
-    if (section.content !== null) content.push(section.content);
-    if (!chunk.complete) return;
-    if (sectionTemplate === undefined) throw new ServiceConnectionError("service ended a log section without its initial chunk");
-    const completeSection = {
-      ...sectionTemplate,
-      content: sectionTemplate.content === null ? null : content.join(""),
-    } as ServiceLogSectionPageV1["section"];
-    await onSection(completeSection, selectedRunId);
-    sectionTemplate = undefined;
-    content = [];
-  }, timeoutMs);
+  return { runId: selectedRunId };
 }
 
 export async function readServiceWorklog(
-  socketPath: string, workflowId: string, runId: ServiceLogSectionPageV1["runId"], timeoutMs = 10_000,
+  socketPath: string, workflowId: string, runId: ServiceLogSectionPageV1["runId"], timeoutMs = 10_000, verbose = false,
 ): Promise<string> {
   let cursor: string | undefined;
   let offsetBytes = 0;
   let totalBytes: number | undefined;
   let sectionMetadata: string | undefined;
   let totalSections: number | undefined;
-  let projection: string | undefined;
   const chunks: string[] = [];
   for (;;) {
     const response = await sendServiceRequest(socketPath, {
       version: 1, method: "logs.page", workflowId, runId,
       ...(cursor === undefined ? {} : { cursor }),
+      ...(cursor === undefined && verbose ? { verbose: true } : {}),
     }, timeoutMs);
     if (!response.ok) throw new ServiceConnectionError(`${response.error.code}: ${response.error.message}`);
     const page = serviceLogSectionPageV1Schema.parse(response.result);
@@ -148,15 +120,12 @@ export async function readServiceWorklog(
       throw new ServiceConnectionError("service returned no worklog section");
     }
     const currentMetadata = JSON.stringify({ ...page.section, content: null });
-    const currentProjection = JSON.stringify(page.projection);
     if ((sectionMetadata !== undefined && sectionMetadata !== currentMetadata)
-      || (totalSections !== undefined && totalSections !== page.totalSections)
-      || (projection !== undefined && projection !== currentProjection)) {
+      || (totalSections !== undefined && totalSections !== page.totalSections)) {
       throw new ServiceConnectionError("service changed worklog snapshot metadata between chunks");
     }
     sectionMetadata = currentMetadata;
     totalSections = page.totalSections;
-    projection = currentProjection;
     if (page.chunk.offsetBytes !== offsetBytes || (totalBytes !== undefined && page.chunk.totalBytes !== totalBytes)) {
       throw new ServiceConnectionError("service returned a discontinuous worklog byte range");
     }

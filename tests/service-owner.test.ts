@@ -136,9 +136,9 @@ describe("Durable service ownership", () => {
   test("keeps service ownership after partial-open cleanup fails until the failed owner exits", async () => {
     const directory = mkdtempSync(join(tmpdir(), "workshop-service-open-failure-"));
     const root = join(directory, "installation");
-    const configDirectory = join(root, ".workshop", "config");
+    const configDirectory = join(root, ".workshop");
     mkdirSync(configDirectory, { recursive: true });
-    writeFileSync(join(configDirectory, "workshop.yaml"), "version: 2\n", "utf8");
+    writeFileSync(join(configDirectory, "workshop.yaml"), "\n", "utf8");
     const stateDirectory = join(root, ".workshop", "state");
     const markerPath = join(directory, "partial-open-failed.txt");
     let stderr = "";

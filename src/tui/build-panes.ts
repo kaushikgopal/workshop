@@ -92,7 +92,7 @@ export function relativeAge(iso: string, now: Date): string {
  */
 export function nodeLines(nodes: NodeStatusDto[] | undefined, width?: number): string[] {
   if (!nodes) return ["(no run selected)"];
-  if (nodes.length === 0) return ["(this run has no node attempts yet)"];
+  if (nodes.length === 0) return ["(this run has no step attempts yet)"];
   return nodes.map((node, i) => {
     const last = i === nodes.length - 1;
     const attempts = node.attempts;
@@ -287,18 +287,4 @@ export function pickerModel(input: {
     runs: { title: `detail · ${current?.id ?? "none"}`, lines: detail },
     stream: { title: "hint", lines: ["Choose a workflow to", "follow it live."] },
   };
-}
-
-/** Keys change state and nothing else; the reducer is pure so bindings are testable. */
-export interface PickerKey {
-  name: string;
-  ctrl?: boolean;
-}
-
-/** Returns the chosen workflow id, or "quit", or null while still picking. */
-export function reducePickerKey(key: PickerKey, workflowIds: string[], cursor: number): string | null {
-  const name = key.name.toLowerCase();
-  if (name === "q" || (key.ctrl && name === "c")) return "quit";
-  if (name === "enter" || name === "return") return workflowIds[cursor] ?? null;
-  return null;
 }

@@ -46,6 +46,7 @@ export const byteSizeValue = z.union([
 ]);
 
 export const replayValue = replayPolicySchema;
+export const keepFilesValue = z.enum(["failed", "always"]);
 
 export const workflowIdSchema = z
   .string()
@@ -54,13 +55,15 @@ export const workflowIdSchema = z
 
 export const nodeIdSchema = z
   .string()
-  .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/, "node ids must be lowercase slugs separated by single hyphens");
+  .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/, "step ids must be lowercase slugs separated by single hyphens");
 
 const nonemptyCommand = z.string().refine((value) => value.trim().length > 0, "command must be nonempty");
 
-export const harnessSchema = z.strictObject({
-  command: nonemptyCommand,
-});
+/** `pi` names the built-in Pi preset; an object supplies a custom command. */
+export const harnessSchema = z.union([
+  z.literal("pi"),
+  z.strictObject({ command: nonemptyCommand }),
+]);
 
 export const agentDefaultsSchema = z.strictObject({
   harness: harnessSchema.optional(),
@@ -73,6 +76,7 @@ export const agentSettingsSchema = z.strictObject({
   instructions: z.string(),
 });
 
+// The frozen, normalized chain stored with every run. Authors write `workflowFileSchema` below.
 const runSchema = z.union([
   z.strictObject({ agent: agentSettingsSchema }),
   z.strictObject({ command: nonemptyCommand }),
@@ -116,9 +120,7 @@ const orchestratorSchema = z.strictObject({
   timeout: timeoutValue.optional(),
 });
 
-export const workflowSchema = z.strictObject({
-  version: z.literal(2),
-  id: workflowIdSchema,
+const workflowSettings = {
   description: z.string().refine(
     (value) => new TextEncoder().encode(value).byteLength <= 4 * 1024,
     "description must be at most 4 KiB in UTF-8",
@@ -129,16 +131,62 @@ export const workflowSchema = z.strictObject({
     timeout: timeoutValue.optional(),
     stream_cap: byteSizeValue.optional(),
     replay: replayValue.optional(),
+    keep_files: keepFilesValue.optional(),
     agent: agentDefaultsSchema.optional(),
   }).optional(),
   environment: z.strictObject({
     preflight: preflightSchema,
   }).optional(),
   orchestrator: orchestratorSchema.optional(),
+};
+
+export const workflowSchema = z.strictObject({
+  id: workflowIdSchema,
+  ...workflowSettings,
   nodes: z.record(nodeIdSchema, nodeSchema).refine(
     (nodes) => Object.keys(nodes).length > 0,
-    "workflow must contain at least one node",
+    "workflow must contain at least one step",
   ),
+});
+
+/** The current authored format; files may declare it or omit `version`. */
+export const CURRENT_FORMAT_VERSION = 3;
+const formatVersion = z.literal(CURRENT_FORMAT_VERSION).optional();
+
+const authoredAgentSchema = z.union([
+  z.string(),
+  agentSettingsSchema,
+]);
+
+const authoredCheckSchema = z.union([
+  z.string(),
+  z.strictObject({ run: nonemptyCommand, timeout: timeoutValue.optional(), replay: replayValue.optional() }),
+  z.strictObject({ agent: authoredAgentSchema, timeout: timeoutValue.optional(), replay: replayValue.optional() }),
+]);
+
+const authoredStepOptions = {
+  check: authoredCheckSchema.optional(),
+  max_attempts: positiveSafeInteger.optional(),
+  timeout: timeoutValue.optional(),
+  stream_cap: byteSizeValue.optional(),
+  replay: replayValue.optional(),
+};
+
+export const authoredStepSchema = z.union([
+  nonemptyCommand,
+  z.strictObject({ run: nonemptyCommand, ...authoredStepOptions }),
+  z.strictObject({ agent: authoredAgentSchema, ...authoredStepOptions }),
+]);
+
+export const workflowFileSchema = z.strictObject({
+  version: formatVersion,
+  ...workflowSettings,
+  steps: z.array(
+    z.record(nodeIdSchema, authoredStepSchema).refine(
+      (entry) => Object.keys(entry).length === 1,
+      "each step is one `- <step-id>: ...` entry",
+    ),
+  ).min(1, "workflow must contain at least one step"),
 });
 
 const absoluteShell = z.string().refine(
@@ -147,17 +195,20 @@ const absoluteShell = z.string().refine(
 );
 
 export const machineConfigSchema = z.strictObject({
-  version: z.literal(2),
+  version: formatVersion,
   project_dir: z.string().optional(),
   shell: absoluteShell.optional(),
   max_concurrent_runs: positiveSafeInteger.optional(),
   default_timeout: timeoutValue.optional(),
   stream_cap: byteSizeValue.optional(),
+  keep_files: keepFilesValue.optional(),
   agent: agentDefaultsSchema.optional(),
   orchestrator: orchestratorSchema.optional(),
 });
 
 export type WorkflowDefinition = z.infer<typeof workflowSchema>;
+export type WorkflowFile = z.infer<typeof workflowFileSchema>;
+export type AuthoredStep = z.infer<typeof authoredStepSchema>;
 export type NodeDefinition = z.infer<typeof nodeSchema>;
 export type AgentDefaults = z.infer<typeof agentDefaultsSchema>;
 export type AgentSettings = z.infer<typeof agentSettingsSchema>;

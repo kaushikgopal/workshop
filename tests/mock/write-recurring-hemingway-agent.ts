@@ -76,7 +76,7 @@ function overlapsArchive(candidate: string, quotes: readonly string[]): boolean 
 record("start", {
   executionId,
   resultPath,
-  ...(role === "generator" ? {} : { candidatePath: env.WORKSHOP_NODE_OUTPUT_FILE ?? null }),
+  ...(role === "generator" ? {} : { candidatePath: env.WORKSHOP_STEP_OUTPUT_FILE ?? null }),
 });
 
 try {
@@ -96,7 +96,7 @@ try {
     writeFileSync(resultPath, `${payload}\n`, "utf8");
     record("result", { executionId, resultPath, malformed: mode === "malformed", output });
   } else {
-    const candidatePath = env.WORKSHOP_NODE_OUTPUT_FILE;
+    const candidatePath = env.WORKSHOP_STEP_OUTPUT_FILE;
     if (candidatePath === undefined) throw new Error("validator candidate path is missing");
     const candidate = readFileSync(candidatePath, "utf8").trim();
     const quotes = archivedQuotes();

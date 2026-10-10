@@ -60,11 +60,7 @@ export const runChainSnapshotSchema = z.strictObject({
 export const runSnapshotPathsSchema = z.strictObject({
   projectCwd: absolutePath,
   runDirectory: absolutePath,
-  definitionSnapshot: absolutePath,
-  worklog: absolutePath,
-  inputDirectory: absolutePath,
-  outputDirectory: absolutePath,
-  captureDirectory: absolutePath,
+  archiveDirectory: absolutePath,
 });
 
 export const runtimeManifestSchema = z.strictObject({
@@ -505,17 +501,6 @@ const scheduleSlotsSkippedEventV1Schema = z.strictObject({
   occurredAt: utcTimestampSchema,
 });
 
-const viewRefreshFailedEventV1Schema = z.strictObject({
-  version: z.literal(1),
-  eventId: evidenceIdSchema,
-  type: z.literal("view_refresh_failed"),
-  runId: runIdSchema,
-  view: z.enum(["definition", "input", "output", "worklog"]),
-  nodeId: nodeIdSchema.nullable(),
-  errorCode: z.string().min(1).max(128).nullable(),
-  occurredAt: utcTimestampSchema,
-});
-
 export const workshopEventV1Schema = z.discriminatedUnion("type", [
   runAdmittedEventV1Schema,
   runStateChangedEventV1Schema,
@@ -528,7 +513,6 @@ export const workshopEventV1Schema = z.discriminatedUnion("type", [
   judgmentAppliedEventV1Schema,
   runSettledEventV1Schema,
   scheduleSlotsSkippedEventV1Schema,
-  viewRefreshFailedEventV1Schema,
  ]);
 
 export const workshopProcessV1Schema = z.strictObject({
@@ -577,7 +561,6 @@ export const workshopJudgmentV1Schema = z.discriminatedUnion("phase", [
   z.strictObject({ ...workshopJudgmentFieldsV1, phase: z.literal("cancelled") }),
 ]);
 
-export type ProcessEvidenceReference = z.infer<typeof processEvidenceReferenceSchema>;
 export type PersistedJudgment = z.infer<typeof persistedJudgmentSchema>;
 export type PersistedNodeAttempt = z.infer<typeof persistedNodeAttemptSchema>;
 export type PersistedNode = z.infer<typeof persistedNodeSchema>;

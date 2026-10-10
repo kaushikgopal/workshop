@@ -15,43 +15,30 @@ const cliPath = join(REPO_ROOT, "src/cli/main.ts");
 describe("public inspection parity", () => {
   test("status text, validator streams, node text, and a failed selected chain follow canonical state", async () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-parity-gaps-"));
-    const config = join(root, ".workshop", "config");
+    const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
     const firstStarted = join(root, "first-started.txt");
     const releaseFirst = join(root, "release-first.txt");
     const thirdStarted = join(root, "third-started.txt");
     mkdirSync(workflows, { recursive: true });
-    writeFileSync(join(config, "workshop.yaml"), "version: 2\nshell: /bin/bash\n", "utf8");
+    writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\n", "utf8");
     writeFileSync(join(workflows, "chain.yaml"), [
-      "version: 2",
-      "id: chain",
-      "nodes:",
-      "  first:",
-      "    run:",
-      "      command: >-",
+      "steps:",
+      "  - first:",
+      "      run: >-",
       `        printf started > '${firstStarted}'; while [ ! -e '${releaseFirst}' ]; do sleep 0.05; done; printf worker-err >&2; printf first-output`,
-      "    validator:",
-      "      command: >-",
-      "        printf validator-out; printf validator-err >&2",
-      "    next: second",
-      "  second:",
-      "    run:",
-      "      command: 'printf second-err >&2; exit 7'",
-      "    next: third",
-      "  third:",
-      "    run:",
-      `      command: 'printf started > ${thirdStarted}'`,
-      "    next: null",
+      "      check:",
+      "        run: >-",
+      "          printf validator-out; printf validator-err >&2",
+      "  - second:",
+      "      run: 'printf second-err >&2; exit 7'",
+      "  - third:",
+      `      run: 'printf started > ${thirdStarted}'`,
       "",
     ].join("\n"), "utf8");
     writeFileSync(join(workflows, "idle.yaml"), [
-      "version: 2",
-      "id: idle",
-      "nodes:",
-      "  only:",
-      "    run:",
-      "      command: printf idle",
-      "    next: null",
+      "steps:",
+      "  - only: printf idle",
       "",
     ].join("\n"), "utf8");
 
@@ -100,21 +87,21 @@ describe("public inspection parity", () => {
         expect(logsText.stdout).toContain(text);
       }
 
-      const failedNodeJson = runCli(root, ["node", "describe", "chain", "second", "--run", runId, "--json"]);
+      const failedNodeJson = runCli(root, ["step", "describe", "chain", "second", "--run", runId, "--json"]);
       expect(failedNodeJson.status).toBe(0);
       const failedNode = nodeDescriptionDtoSchema.parse(JSON.parse(failedNodeJson.stdout));
       expect(failedNode.runStatus).toBe("failed");
       expect(failedNode.node.status).toBe("failed");
       expect(failedNode.node.successfulOutput).toBeNull();
       expect(failedNode.node.resolvedSettings.run).toMatchObject({ kind: "command", command: "printf second-err >&2; exit 7" });
-      const failedNodeText = runCli(root, ["node", "describe", "chain", "second", "--run", runId]);
+      const failedNodeText = runCli(root, ["step", "describe", "chain", "second", "--run", runId]);
       expect(failedNodeText.status).toBe(0);
       expect(failedNodeText.stdout).toContain(`chain/second  failed  ${runId}`);
-      const firstNodeText = runCli(root, ["node", "describe", "chain", "first", "--run", runId]);
+      const firstNodeText = runCli(root, ["step", "describe", "chain", "first", "--run", runId]);
       expect(firstNodeText.stdout).toContain(`chain/first  succeeded  ${runId}`);
       expect(firstNodeText.stdout).toContain("first-output");
       const pendingNode = nodeDescriptionDtoSchema.parse(JSON.parse(
-        runCli(root, ["node", "describe", "chain", "third", "--run", runId, "--json"]).stdout,
+        runCli(root, ["step", "describe", "chain", "third", "--run", runId, "--json"]).stdout,
       ));
       expect(pendingNode.node.status).toBe("pending");
       expect(pendingNode.node.attempts).toHaveLength(0);
@@ -140,25 +127,18 @@ describe("public inspection parity", () => {
 describe("retention limits", () => {
   test("resolves stream caps from node override, workflow default, machine default, then the built-in limit", () => {
     const definition = (defaults: string) => checkDefinitionText([
-      "version: 2",
-      "id: caps",
       ...defaults === "" ? [] : ["defaults:", `  stream_cap: ${defaults}`],
-      "nodes:",
-      "  inherited:",
-      "    run:",
-      "      command: printf inherited",
-      "    validator:",
-      "      command: printf ok",
-      "    next: overridden",
-      "  overridden:",
-      "    run:",
-      "      command: printf overridden",
-      "    stream_cap: unlimited",
-      "    next: null",
+      "steps:",
+      "  - inherited:",
+      "      run: printf inherited",
+      "      check: printf ok",
+      "  - overridden:",
+      "      run: printf overridden",
+      "      stream_cap: unlimited",
       "",
-    ].join("\n"), "caps.yaml").def;
+    ].join("\n"), "caps.yaml", "caps").def;
     const caps = (defaults: string, machineCap: string | undefined) => {
-      const machine = machineConfigSchema.parse({ version: 2, ...machineCap === undefined ? {} : { stream_cap: machineCap } });
+      const machine = machineConfigSchema.parse({ ...machineCap === undefined ? {} : { stream_cap: machineCap } });
       const settings = resolveWorkflowSettings({ definition: definition(defaults), machine, projectCwd: "/tmp" });
       return {
         inherited: settings.nodes.inherited?.run.streamCapBytes,

@@ -52,11 +52,10 @@ export const validatorVerdictSchema = z.strictObject({
   ),
 });
 
-export type ArtifactInput = z.infer<typeof artifactInputSchema>;
-export type WorkerResult = z.infer<typeof workerResultSchema>;
-export type ValidatorVerdict = z.infer<typeof validatorVerdictSchema>;
+type WorkerResult = z.infer<typeof workerResultSchema>;
+type ValidatorVerdict = z.infer<typeof validatorVerdictSchema>;
 
-export type ResultEnvelopeParse<T> =
+type ResultEnvelopeParse<T> =
   | { ok: true; value: T; sourceBytesHash: string }
   | { ok: false; failure: { kind: "result_invalid" | "result_too_large"; message: string } };
 

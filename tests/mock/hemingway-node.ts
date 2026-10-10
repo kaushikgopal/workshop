@@ -13,7 +13,7 @@ import { appendFileSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 
 const env = process.env;
-const nodeId = env.WORKSHOP_NODE_ID ?? "unknown";
+const nodeId = env.WORKSHOP_STEP_ID ?? "unknown";
 const sleepMs = Number(env.WORKSHOP_MOCK_SLEEP_MS ?? "0");
 
 const launchLog = env.WORKSHOP_LAUNCH_LOG;

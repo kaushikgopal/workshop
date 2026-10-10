@@ -66,7 +66,12 @@ export function resolveWorkflowSettings(input: {
       : parseTimeout(definition.orchestrator?.timeout ?? machine.orchestrator?.timeout ?? "5m"),
   };
 
-  return resolvedWorkflowSettingsSchema.parse({ nodes, preflight, orchestrator });
+  return resolvedWorkflowSettingsSchema.parse({
+    keepFiles: definition.defaults?.keep_files ?? machine.keep_files ?? "failed",
+    nodes,
+    preflight,
+    orchestrator,
+  });
 }
 
 function resolveExecutionSite(input: {
@@ -95,8 +100,8 @@ function resolveExecutionSite(input: {
     workflowDefault: input.workflowDefault,
     machine: input.machineDefault,
   });
-  if (resolved.harnessCommand === null || resolved.model === null) {
-    throw new Error("agent execution settings remain unresolved");
+  if (resolved.model === null) {
+    throw new Error("agent model is unresolved; set agent.model on the step, workflow defaults, or machine config");
   }
   return {
     kind: "agent",
