@@ -6,6 +6,25 @@ import { describe, expect, test } from "bun:test";
 import { raceDeadline, spawnTracked, type TrackedProcess } from "../src/process/launch-process.js";
 import { captureProcessRecords, recoverProcessCaptureRecords } from "../src/storage/durable/define-process-execution-task.js";
 import { retainStreamWindow } from "../src/storage/disk/cap-streams.js";
+import { processStdioWriteSchema } from "../src/process/schema.js";
+
+function spawnInputProcess(
+  directory: string,
+  command: string,
+  inputBytes: Uint8Array,
+  signal?: AbortSignal,
+): TrackedProcess {
+  return spawnTracked({
+    shell: "/bin/bash",
+    command,
+    cwd: directory,
+    env: { BASH_ENV: "/dev/null", HOME: directory },
+    stdoutFile: join(directory, "stdout"),
+    stderrFile: join(directory, "stderr"),
+    inputBytes,
+    ...(signal === undefined ? {} : { signal }),
+  });
+}
 
 async function settle(process: TrackedProcess) {
   const raced = await raceDeadline(process, 5_000);
@@ -220,6 +239,149 @@ describe("bounded subprocess capture", () => {
       expect(result.groupDead).toBe(true);
       expect(readFileSync(stdoutPath, "utf8")).toBe("stdout");
       expect(readFileSync(stderrPath, "utf8")).toBe("stderr");
+    } finally {
+      if (child !== undefined) await child.kill();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("subprocess stdin transport", () => {
+  test("delivers input through EOF and reports a schema-valid outcome", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "workshop-process-stdin-eof-"));
+    let child: TrackedProcess | undefined;
+    try {
+      const inputBytes = Buffer.from("input through eof");
+      child = spawnInputProcess(directory, "data=$(cat); printf '<%s>' \"$data\"", inputBytes);
+      const result = await settle(child);
+      expect(result.exit.code).toBe(0);
+      expect(readFileSync(join(directory, "stdout"), "utf8")).toBe("<input through eof>");
+      expect(processStdioWriteSchema.parse(child.writeOutcome())).toEqual({ kind: "finished", queuedBytes: inputBytes.byteLength });
+    } finally {
+      if (child !== undefined) await child.kill();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("exits promptly when the command ignores a large input", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "workshop-process-stdin-ignored-"));
+    let child: TrackedProcess | undefined;
+    try {
+      child = spawnInputProcess(directory, "printf ignored", Buffer.alloc(8 * 1024 * 1024));
+      const startedAt = Date.now();
+      const result = await settle(child);
+      expect(Date.now() - startedAt).toBeLessThan(2_000);
+      expect(result.exit.code).toBe(0);
+      expect(readFileSync(join(directory, "stdout"), "utf8")).toBe("ignored");
+      expect(child.writeOutcome().kind).toBe("early_closed");
+    } finally {
+      if (child !== undefined) await child.kill();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("records an early stdin close while the process stays alive", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "workshop-process-stdin-close-"));
+    let child: TrackedProcess | undefined;
+    try {
+      child = spawnInputProcess(directory, "exec 0<&-; sleep 0.15; printf alive", Buffer.alloc(1024 * 1024));
+      const result = await settle(child);
+      expect(result.exit.code).toBe(0);
+      expect(readFileSync(join(directory, "stdout"), "utf8")).toBe("alive");
+      expect(child.writeOutcome()).toMatchObject({ kind: "early_closed" });
+    } finally {
+      if (child !== undefined) await child.kill();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("treats EPIPE as evidence without an unhandled rejection", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "workshop-process-stdin-epipe-"));
+    let child: TrackedProcess | undefined;
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      child = spawnInputProcess(directory, "exec 0<&-; sleep 0.15; printf alive", Buffer.alloc(1024 * 1024));
+      const result = await settle(child);
+      expect(result.exit.code).toBe(0);
+      const outcome = child.writeOutcome();
+      expect(outcome.kind).toBe("early_closed");
+      if (outcome.kind === "early_closed") {
+        expect(outcome.queuedBytes).toBeGreaterThan(0);
+        expect(outcome.diagnosticCode).toBe("EPIPE");
+      }
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+      if (child !== undefined) await child.kill();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("waits for a slow reader under backpressure", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "workshop-process-stdin-slow-"));
+    let child: TrackedProcess | undefined;
+    try {
+      const inputBytes = Buffer.alloc(512 * 1024, 0x61);
+      child = spawnInputProcess(directory, "sleep 0.1; wc -c", inputBytes);
+      const result = await settle(child);
+      expect(result.exit.code).toBe(0);
+      expect(Number(readFileSync(join(directory, "stdout"), "utf8").trim())).toBe(inputBytes.byteLength);
+      expect(child.writeOutcome()).toEqual({ kind: "finished", queuedBytes: inputBytes.byteLength });
+    } finally {
+      if (child !== undefined) await child.kill();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("streams input larger than pipe capacity", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "workshop-process-stdin-large-"));
+    let child: TrackedProcess | undefined;
+    try {
+      const inputBytes = Buffer.alloc(8 * 1024 * 1024, 0x62);
+      child = spawnInputProcess(directory, "wc -c", inputBytes);
+      const result = await settle(child);
+      expect(result.exit.code).toBe(0);
+      expect(Number(readFileSync(join(directory, "stdout"), "utf8").trim())).toBe(inputBytes.byteLength);
+      expect(child.writeOutcome()).toEqual({ kind: "finished", queuedBytes: inputBytes.byteLength });
+    } finally {
+      if (child !== undefined) await child.kill();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("cancels a blocked writer when its deadline expires", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "workshop-process-stdin-timeout-"));
+    let child: TrackedProcess | undefined;
+    try {
+      child = spawnInputProcess(directory, "sleep 10", Buffer.alloc(8 * 1024 * 1024));
+      expect(await raceDeadline(child, 50)).toEqual({ kind: "timeout" });
+      expect(child.writeOutcome().kind).toBe("cancelled");
+      expect(await child.kill()).toBe(true);
+      await child.streamsClosed;
+    } finally {
+      if (child !== undefined) await child.kill();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("cancels a blocked writer when its abort signal fires", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "workshop-process-stdin-abort-"));
+    let child: TrackedProcess | undefined;
+    const controller = new AbortController();
+    try {
+      child = spawnInputProcess(directory, "sleep 10", Buffer.alloc(8 * 1024 * 1024), controller.signal);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      controller.abort();
+      const outcome = child.writeOutcome();
+      expect(outcome.kind).toBe("cancelled");
+      if (outcome.kind === "cancelled") {
+        expect(outcome.queuedBytes).toBeGreaterThan(0);
+        expect(outcome.diagnosticCode).toBe("ABORTED");
+      }
+      expect(await child.kill()).toBe(true);
+      await child.streamsClosed;
     } finally {
       if (child !== undefined) await child.kill();
       rmSync(directory, { recursive: true, force: true });

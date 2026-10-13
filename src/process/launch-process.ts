@@ -1,11 +1,14 @@
 import { createHash } from "node:crypto";
 import { closeSync, openSync, writeSync } from "node:fs";
 import { spawn } from "node:child_process";
-import type { Readable } from "node:stream";
+import type { Readable, Writable } from "node:stream";
+import type { z } from "zod";
+import type { processStdioWriteSchema } from "./schema.js";
 import { terminateProcessGroup } from "./kill-process-tree.js";
 import { processStartId } from "./identify-process.js";
 
 type ExitInfo = { code: number | null; signal: NodeJS.Signals | null };
+type StdioWriteOutcome = z.infer<typeof processStdioWriteSchema>;
 export interface TrackedCaptureStats {
   totalBytes: number;
   retainedBytes: number;
@@ -35,6 +38,8 @@ export interface TrackedProcess {
   streamsClosed: Promise<void>;
   captures: () => { stdout: Readonly<TrackedCaptureStats>; stderr: Readonly<TrackedCaptureStats> };
   semanticStdout: () => SemanticStdoutCapture | null;
+  writeOutcome: () => Readonly<StdioWriteOutcome>;
+  cancelInput: () => void;
   /**
    * Terminate the whole process group and confirm every member is gone.
    * Returns true only when the whole group was observed dead — a dead leader
@@ -53,6 +58,8 @@ export function spawnTracked(input: {
   stdoutLogCapBytes?: number;
   stderrLogCapBytes?: number;
   semanticStdoutLimitBytes?: number;
+  inputBytes?: Uint8Array;
+  signal?: AbortSignal;
 }): TrackedProcess {
   for (const [name, limit] of [
     ["stdout log", input.stdoutLogCapBytes],
@@ -70,11 +77,15 @@ export function spawnTracked(input: {
     const child = spawn(input.shell, ["-lc", input.command], {
       cwd: input.cwd,
       env: { ...process.env, ...input.env },
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "pipe"],
       detached: true, // child becomes its own process-group leader
     });
+    const stdinWriter = createStdinWriter(child.stdin, child, input.inputBytes ?? new Uint8Array(), input.signal);
     const pid = child.pid;
-    if (pid === undefined) throw new Error("could not capture spawned process ID");
+    if (pid === undefined) {
+      stdinWriter.cancel();
+      throw new Error("could not capture spawned process ID");
+    }
     const semantic = input.semanticStdoutLimitBytes === undefined
       ? null
       : createSemanticStdoutCapture(input.semanticStdoutLimitBytes, () => { void terminateProcessGroup(pid, 0); });
@@ -90,6 +101,7 @@ export function spawnTracked(input: {
     try {
       identity = captureIdentity(pid);
     } catch (e) {
+      stdinWriter.cancel();
       try { process.kill(-pid, "SIGKILL"); } catch { /* already gone */ }
       throw e;
     }
@@ -105,7 +117,12 @@ export function spawnTracked(input: {
       streamsClosed,
       captures: () => ({ stdout: { ...stdoutStats }, stderr: { ...stderrStats } }),
       semanticStdout: () => semantic?.result() ?? null,
-      kill: async (graceMs?: number) => terminateProcessGroup(identity.pgid, graceMs ?? 2000),
+      writeOutcome: stdinWriter.snapshot,
+      cancelInput: stdinWriter.cancel,
+      kill: async (graceMs?: number) => {
+        stdinWriter.cancel();
+        return terminateProcessGroup(identity.pgid, graceMs ?? 2000);
+      },
     };
   } finally {
     if (!closeAfterStreams) {
@@ -113,6 +130,124 @@ export function spawnTracked(input: {
       closeSync(stderr);
     }
   }
+}
+
+function createStdinWriter(
+  stdin: Writable | null,
+  child: ReturnType<typeof spawn>,
+  inputBytes: Uint8Array,
+  signal?: AbortSignal,
+): { snapshot: () => Readonly<StdioWriteOutcome>; cancel: () => void } {
+  let outcome: StdioWriteOutcome = { kind: "pending", queuedBytes: 0 };
+  let stopped = false;
+  let endRequested = false;
+  let resumeWait: ((continueWriting: boolean) => void) | undefined;
+  let removeAbortListener = () => {};
+  const bytes = Buffer.from(inputBytes);
+
+  const stop = (next: StdioWriteOutcome, destroy: boolean) => {
+    if (outcome.kind === "pending") outcome = next;
+    stopped = true;
+    removeAbortListener();
+    removeAbortListener = () => {};
+    resumeWait?.(false);
+    if (destroy && stdin !== null && !stdin.destroyed) stdin.destroy();
+  };
+  const earlyClose = (diagnosticCode: string) => {
+    if (outcome.kind === "pending" && endRequested && outcome.queuedBytes === bytes.byteLength) {
+      stop({ kind: "finished", queuedBytes: outcome.queuedBytes }, true);
+    } else {
+      stop({ kind: "early_closed", queuedBytes: outcome.queuedBytes, diagnosticCode }, true);
+    }
+  };
+  const onInputError = (error: Error) => {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "EPIPE") {
+      earlyClose(code);
+    } else {
+      const diagnosticCode = typeof code === "string" && /^[A-Za-z0-9_.-]{1,64}$/u.test(code)
+        ? code
+        : "WRITE_FAILED";
+      stop({ kind: "write_error", queuedBytes: outcome.queuedBytes, diagnosticCode }, true);
+    }
+  };
+
+  child.on("error", () => stop({
+    kind: "cancelled", queuedBytes: outcome.queuedBytes, diagnosticCode: "SPAWN_ERROR",
+  }, true));
+  child.on("exit", () => earlyClose("PROCESS_EXIT"));
+  child.on("close", () => earlyClose("PROCESS_CLOSED"));
+  stdin?.on("error", onInputError);
+  stdin?.on("close", () => earlyClose("STDIN_CLOSED"));
+
+  function waitFor(event: "drain" | "finish"): Promise<boolean> {
+    if (stopped || stdin === null) return Promise.resolve(false);
+    return new Promise((resolve) => {
+      const finish = (continueWriting: boolean) => {
+        stdin.off(event, onEvent);
+        if (resumeWait === onStop) resumeWait = undefined;
+        resolve(continueWriting);
+      };
+      const onEvent = () => finish(true);
+      const onStop = () => finish(false);
+      resumeWait = onStop;
+      stdin.once(event, onEvent);
+      if (stopped) onStop();
+    });
+  }
+
+  async function writeInput(): Promise<void> {
+    if (stdin === null) {
+      stop({ kind: "write_error", queuedBytes: 0, diagnosticCode: "STDIN_UNAVAILABLE" }, false);
+      return;
+    }
+    const chunkBytes = 64 * 1024;
+    let offset = 0;
+    try {
+      while (!stopped && offset < bytes.byteLength) {
+        const chunk = bytes.subarray(offset, Math.min(bytes.byteLength, offset + chunkBytes));
+        const canContinue = stdin.write(chunk);
+        offset += chunk.byteLength;
+        if (outcome.kind === "pending") {
+          outcome = { kind: "pending", queuedBytes: outcome.queuedBytes + chunk.byteLength };
+        }
+        if (!canContinue && !await waitFor("drain")) return;
+      }
+      if (stopped) return;
+      const flushed = waitFor("finish");
+      endRequested = true;
+      stdin.end();
+      if (!await flushed || stopped) return;
+      if (outcome.kind === "pending") {
+        stop({ kind: "finished", queuedBytes: outcome.queuedBytes }, false);
+      } else {
+        stopped = true;
+        removeAbortListener();
+        removeAbortListener = () => {};
+      }
+    } catch (error) {
+      onInputError(error instanceof Error ? error : new Error("stdin write failed"));
+    }
+  }
+
+  const cancel = (diagnosticCode?: string) => stop({
+    kind: "cancelled",
+    queuedBytes: outcome.queuedBytes,
+    ...(diagnosticCode === undefined ? {} : { diagnosticCode }),
+  }, true);
+  if (signal !== undefined) {
+    const onAbort = () => cancel("ABORTED");
+    if (signal.aborted) onAbort();
+    else {
+      signal.addEventListener("abort", onAbort, { once: true });
+      removeAbortListener = () => signal.removeEventListener("abort", onAbort);
+    }
+  }
+  queueMicrotask(() => { void writeInput(); });
+  return {
+    snapshot: () => ({ ...outcome }),
+    cancel: () => cancel(),
+  };
 }
 
 /**
@@ -210,7 +345,11 @@ export async function raceDeadline(
   });
   try {
     const exit = await Promise.race([proc.exit.then((e) => ({ kind: "exit" as const, exit: e })), timer]);
-    return exit === "timeout" ? { kind: "timeout" } : exit;
+    if (exit === "timeout") {
+      proc.cancelInput();
+      return { kind: "timeout" };
+    }
+    return exit;
   } finally {
     clearTimeout(timerId);
   }
