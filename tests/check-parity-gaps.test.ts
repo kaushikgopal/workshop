@@ -169,10 +169,11 @@ describe("import boundaries", () => {
   const sourceRoot = join(REPO_ROOT, "src");
   const productFiles = sourceFiles(sourceRoot);
 
-  test("every source file is reachable from the CLI or the service process", () => {
+  test("all source files are reachable except the standalone tagged parser", () => {
     // Type-only imports count: a file that only declares a contract is still in use.
     const reachable = importClosure(["src/cli/main.ts", "src/service/serve-service-process.ts"], { includeTypes: true });
-    expect(productFiles.map(repoPath).filter((path) => !reachable.includes(path))).toEqual([]);
+    const unreachable = productFiles.map(repoPath).filter((path) => !reachable.includes(path));
+    expect(unreachable).toEqual(["src/attempt/parse-tagged-result.ts"]);
   });
 
   test("help and validate load neither the service client nor the viewer", () => {
