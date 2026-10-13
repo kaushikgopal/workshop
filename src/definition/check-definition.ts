@@ -3,6 +3,7 @@ import { checkChain, type ChainInfo } from "./check-chain.js";
 import {
   CURRENT_FORMAT_VERSION,
   MACHINE_FORMAT_VERSION,
+  MAX_AUTHORED_INSTRUCTION_BYTES,
   workflowFileSchema,
   workflowIdSchema,
   workflowSchema,
@@ -31,6 +32,7 @@ export function checkDefinitionText(text: string, label: string, workflowId: str
   checkFormatVersion(value, label, "workflow");
   const file = workflowFileSchema.parse(value);
   const def = workflowSchema.parse(toChainDefinition(id, file, label));
+  checkAuthoredInstructionBounds(def, label);
   checkStepPolicies(def, label);
   return { def, chain: checkChain(def) };
 }
@@ -128,6 +130,22 @@ function toNode(step: AuthoredStep, next: string | null): NodeDefinition {
 function toValidator(verify: AuthoredVerify): NonNullable<NodeDefinition["validator"]> {
   if (typeof verify === "string") return { command: verify };
   return "agent" in verify ? { agent: toAgent(verify.agent) } : { command: verify.run };
+}
+
+/** Check normalized agent sites while keeping the internal historical schema permissive. */
+function checkAuthoredInstructionBounds(def: WorkflowDefinition, label: string): void {
+  for (const [stepId, node] of Object.entries(def.nodes)) {
+    const sites: { role: string; settings: AgentSettings }[] = [];
+    if ("agent" in node.run) sites.push({ role: "worker", settings: node.run.agent });
+    if (node.validator !== undefined && "agent" in node.validator) {
+      sites.push({ role: "verifier", settings: node.validator.agent });
+    }
+    for (const { role, settings } of sites) {
+      if (new TextEncoder().encode(settings.instructions).byteLength > MAX_AUTHORED_INSTRUCTION_BYTES) {
+        throw new DefinitionError(label + ': step "' + stepId + '" ' + role + ' instructions must be at most 64 KiB in UTF-8');
+      }
+    }
+  }
 }
 
 /** Every step must resolve retry and replay policy from the file itself; the engine supplies no default. */

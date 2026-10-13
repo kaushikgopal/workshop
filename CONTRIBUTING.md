@@ -241,7 +241,8 @@ src/
 ├─ attempt/                       result parsing and agent prompts
 │  ├─ parse-result.ts             historical JSON result contracts
 │  ├─ parse-tagged-result.ts      text and tagged stdout result parsing
-│  └─ render-agent-prompt.ts      agent prompts
+│  ├─ build-process-stdin.ts      pure role-specific stdin bytes and hashes
+│  └─ render-agent-prompt.ts      legacy and format 4 agent prompts
 ├─ model/                         models.json → pi-ai providers for the judge
 ├─ process/                       launch, identify, and kill process groups
 ├─ storage/disk/                  crash-safe writes, stream caps, run folder removal

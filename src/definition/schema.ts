@@ -54,7 +54,9 @@ export const replayValue = replayPolicySchema;
 /** Retries after the first attempt; `unlimited` never stops on count alone. */
 export const retriesValue = z.union([nonnegativeSafeInteger, z.literal("unlimited")]);
 export const resultModeValue = z.enum(["text", "tagged"]);
-const workflowInstructionsValue = maxUtf8Bytes(64 * 1024, "instructions");
+export const MAX_AUTHORED_INSTRUCTION_BYTES = 64 * 1024;
+const workflowInstructionsValue = maxUtf8Bytes(MAX_AUTHORED_INSTRUCTION_BYTES, "instructions");
+const authoredAgentInstructionsValue = maxUtf8Bytes(MAX_AUTHORED_INSTRUCTION_BYTES, "agent instructions");
 export const keepFilesValue = z.enum(["failed", "always"]);
 
 export const workflowIdSchema = z
@@ -168,9 +170,15 @@ export const CURRENT_FORMAT_VERSION = 4;
 /** The machine config format; unchanged by workflow format 4 and still optional. */
 export const MACHINE_FORMAT_VERSION = 3;
 
+const authoredAgentSettingsSchema = z.strictObject({
+  harness: harnessSchema.optional(),
+  model: modelString.optional(),
+  instructions: authoredAgentInstructionsValue,
+});
+
 const authoredAgentSchema = z.union([
-  z.string(),
-  agentSettingsSchema,
+  authoredAgentInstructionsValue,
+  authoredAgentSettingsSchema,
 ]);
 
 /** A verifier has the same shapes as a step body and no other fields. */

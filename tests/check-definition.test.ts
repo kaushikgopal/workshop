@@ -176,6 +176,14 @@ describe("workflow and machine schemas", () => {
     })).toThrow();
   });
 
+  test("keeps internal historical agent instructions outside the authoring bound", () => {
+    const instructions = "x".repeat(64 * 1024 + 1);
+    const checked = workflowSchema.parse(baseDefinition({
+      nodes: { "node-a": { run: { agent: { instructions } }, next: null } },
+    }));
+    expect("agent" in checked.nodes["node-a"]!.run).toBe(true);
+  });
+
   test("requires an absolute shell path and a nonempty command template", () => {
     expect(() => machineConfigSchema.parse({ shell: "bash" })).toThrow(/absolute executable path/);
     expect(() => workflowSchema.parse(baseDefinition({
@@ -386,6 +394,34 @@ describe("authored workflow text", () => {
       "duplicate-key.yaml",
       "clock",
     )).toThrow(/duplicate|unique/i);
+  });
+
+  test("bounds authored worker and verifier instructions by UTF-8 bytes", () => {
+    const definition = (role: "worker" | "verifier", instructions: string) => {
+      const lines = [
+        "version: 4",
+        "defaults: { retries: 0, replay: never }",
+        "steps:",
+        "  - one:",
+      ];
+      if (role === "worker") {
+        lines.push("      agent:", "        instructions: " + JSON.stringify(instructions));
+      } else {
+        lines.push(
+          "      run: echo candidate",
+          "      verify:",
+          "        agent:",
+          "          instructions: " + JSON.stringify(instructions),
+        );
+      }
+      return lines.join("\n");
+    };
+
+    for (const role of ["worker", "verifier"] as const) {
+      expect(() => checkDefinitionText(definition(role, "é".repeat(32_769)), "instructions.yaml", "clock"))
+        .toThrow(/64 KiB in UTF-8/);
+      expect(() => checkDefinitionText(definition(role, "é".repeat(32_768)), "instructions.yaml", "clock")).not.toThrow();
+    }
   });
 
   test("bounds workflow instructions at 64 KiB and freezes them with the resolved settings", () => {

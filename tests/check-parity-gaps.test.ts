@@ -169,11 +169,12 @@ describe("import boundaries", () => {
   const sourceRoot = join(REPO_ROOT, "src");
   const productFiles = sourceFiles(sourceRoot);
 
-  test("all source files are reachable except the standalone tagged parser", () => {
+  test("all source files are reachable except the tagged parser and deferred stdin preparation", () => {
     // Type-only imports count: a file that only declares a contract is still in use.
     const reachable = importClosure(["src/cli/main.ts", "src/service/serve-service-process.ts"], { includeTypes: true });
     const unreachable = productFiles.map(repoPath).filter((path) => !reachable.includes(path));
-    expect(unreachable).toEqual(["src/attempt/parse-tagged-result.ts"]);
+    // Runtime wiring imports the stdin builder in sub-step 4.
+    expect(unreachable).toEqual(["src/attempt/parse-tagged-result.ts", "src/attempt/build-process-stdin.ts"]);
   });
 
   test("help and validate load neither the service client nor the viewer", () => {
