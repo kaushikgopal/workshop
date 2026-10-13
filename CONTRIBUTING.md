@@ -122,7 +122,7 @@ flowchart TD
   PE --> P[pi / command process]
   WR -->|on failure| FJ[FailureJudgment]
   FJ -->|retry / block / fail| WR
-  PE --> V[run folder: inputs + captures]
+  PE --> V[run folder: captures]
 ```
 
 ### One run
@@ -134,9 +134,9 @@ WorkflowRun                                define-workshop-tasks.ts
   preflight → ProcessExecution
   for each step (node) in the frozen chain:
     NodeAttempt                            define-node-attempt-task.ts
-      write process inputs                 write-process-inputs.ts
+      build process stdin                  attempt/build-process-stdin.ts
       worker    → ProcessExecution         define-process-execution-task.ts
-      check result.json (strict envelope)
+      parse stdout by frozen result mode
       validator → ProcessExecution
     if the attempt failed:
       FailureJudgment                      define-failure-judgment-task.ts
@@ -226,7 +226,6 @@ src/
 │  ├─ define-workshop-records.ts  versioned documents and immutable entries
 │  ├─ commit-service-mutation.ts  receipts that make controls idempotent
 │  ├─ render-worklog.ts           compact or verbose worklog from the committed run
-│  ├─ write-process-inputs.ts     previous output, candidate, worklog before launch
 │  ├─ checkpoint-durable-wal.ts   truncates the WAL when the service is idle
 │  └─ open-durable-storage.ts     SQLite with FULL synchronization
 ├─ definition/                    YAML → checked, resolved definition
@@ -241,11 +240,11 @@ src/
 ├─ attempt/                       result parsing and agent prompts
 │  ├─ parse-result.ts             historical JSON result contracts
 │  ├─ parse-tagged-result.ts      text and tagged stdout result parsing
-│  ├─ build-process-stdin.ts      pure role-specific stdin bytes and hashes
-│  └─ render-agent-prompt.ts      legacy and format 4 agent prompts
+│  ├─ build-process-stdin.ts      committed role inputs, UTF-8 bytes, and hashes
+│  └─ render-agent-prompt.ts      format 4 worker and verifier prompts
 ├─ model/                         models.json → pi-ai providers for the judge
 ├─ process/                       launch, identify, and kill process groups
-├─ storage/disk/                  crash-safe writes, stream caps, run folder removal
+├─ storage/disk/                  stream caps and run folder removal
 ├─ views/                         versioned JSON contracts and terminal text
 ├─ tui/                           the `watch` viewer (OpenTUI), loaded lazily;
 │                                 data-source.ts is the contract it renders

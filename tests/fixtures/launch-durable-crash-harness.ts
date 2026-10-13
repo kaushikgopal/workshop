@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
@@ -22,6 +22,8 @@ if (directory === undefined || databasePath === undefined || readyPath === undef
   throw new Error("crash harness requires directory, database, ready, and metadata paths");
 }
 
+const restarting = existsSync(metadataPath);
+const hangLaunches = process.env.WORKSHOP_CRASH_HANG_LAUNCHES === "2" ? 2 : 1;
 const safeReplay = mode === "safe-worker" || mode === "safe-validator";
 const preflightMode = mode === "preflight";
 // Verifiers always replay after a crash, so only the replaying validator mode remains.
@@ -32,12 +34,12 @@ const processGroupMarker = `'${join(directory, "process-group.txt")}'`;
 const successorMarker = `'${join(directory, "successors.txt")}'`;
 const preflightMarker = `'${join(directory, "preflight.txt")}'`;
 const workerCommand = safeReplay && !validatorMode
-  ? `printf w >> ${workerMarker}; if [ "$(wc -c < ${workerMarker})" -eq 1 ]; then printf '%s' "$$" > ${processGroupMarker}; (/bin/sleep 60) & wait; else printf replayed; fi`
+  ? `printf w >> ${workerMarker}; if [ "$(wc -c < ${workerMarker})" -le ${hangLaunches} ]; then printf '%s' "$$" > ${processGroupMarker}; (/bin/sleep 60) & wait; else printf replayed; fi`
   : `printf w >> ${workerMarker}; printf '%s' "$$" > ${processGroupMarker}; (/bin/sleep 60) & wait`;
 const validatorCommand = safeReplay && validatorMode
-  ? `printf v >> ${validatorMarker}; if [ "$(wc -c < ${validatorMarker})" -eq 1 ]; then printf '%s' "$$" > ${processGroupMarker}; (/bin/sleep 60) & wait; else printf validator-passed; fi`
+  ? `printf v >> ${validatorMarker}; if [ "$(wc -c < ${validatorMarker})" -le ${hangLaunches} ]; then printf '%s' "$$" > ${processGroupMarker}; (/bin/sleep 60) & wait; else printf validator-passed; fi`
   : `printf v >> ${validatorMarker}; printf '%s' "$$" > ${processGroupMarker}; (/bin/sleep 60) & wait`;
-const preflightCommand = `printf p >> ${preflightMarker}; if [ "$(wc -c < ${preflightMarker})" -eq 1 ]; then printf '%s' "$$" > ${processGroupMarker}; (/bin/sleep 60) & wait; else printf preflight-ready; fi`;
+const preflightCommand = `printf p >> ${preflightMarker}; if [ "$(wc -c < ${preflightMarker})" -le ${hangLaunches} ]; then printf '%s' "$$" > ${processGroupMarker}; (/bin/sleep 60) & wait; else printf preflight-ready; fi`;
 const header = ["version: 4", "defaults:", "  retries: 0", "  replay: never"];
 const source = [...header, ...(preflightMode ? [
   "environment:",
@@ -59,7 +61,7 @@ const source = [...header, ...(preflightMode ? [
   `        ${workerCommand}`,
   "  - second:",
   "      run: >-",
-  `        printf s >> ${successorMarker}; printf '%s-next' \"$(cat \"$WORKSHOP_PREVIOUS_OUTPUT_FILE\")\"`,
+  `        printf s >> ${successorMarker}; printf '%s-next' \"$(cat)\"`,
   "",
 ] : [
   "steps:",
@@ -71,7 +73,7 @@ const source = [...header, ...(preflightMode ? [
   `          ${validatorCommand}`,
   "  - second:",
   "      run: >-",
-  `        printf s >> ${successorMarker}; printf '%s-next' \"$(cat \"$WORKSHOP_PREVIOUS_OUTPUT_FILE\")\"`,
+  `        printf s >> ${successorMarker}; printf '%s-next' \"$(cat)\"`,
   "",
 ])].join("\n");
 
@@ -139,10 +141,14 @@ const installation = installationDocumentV1Schema.parse({
     },
   },
 });
-await harness.commit(async (tx) => {
-  Object.assign(await tx.doc(WorkshopInstallationDoc), installation);
-}, BACKGROUND_CONTEXT);
-const admission = await admitPreparedRun({
+if (!restarting) {
+  await harness.commit(async (tx) => {
+    Object.assign(await tx.doc(WorkshopInstallationDoc), installation);
+  }, BACKGROUND_CONTEXT);
+}
+const admission = restarting
+  ? { ok: true as const, value: JSON.parse(readFileSync(metadataPath, "utf8")) as { conversationId: number; workflowTaskId: number } }
+  : await admitPreparedRun({
   harness,
   prepared: preparedResult.value,
   workflowRunTask: tasks.WorkflowRunTask,
@@ -163,7 +169,8 @@ for (let attempt = 0; attempt < 2_000; attempt += 1) {
   const processStarted = entries.items
     .filter((entry) => entry.kind === "workshop.process")
     .map((entry) => workshopProcessV1Schema.parse(entry.data))
-    .some((entry) => entry.process.role === targetRole && entry.process.status === targetStatus
+    .some((entry) => entry.process.incarnationNumber === (restarting ? 2 : 1)
+      && entry.process.role === targetRole && entry.process.status === targetStatus
       && (mode !== "identity" || entry.process.identity === null));
   if (processStarted) {
     writeFileSync(readyPath, "running");

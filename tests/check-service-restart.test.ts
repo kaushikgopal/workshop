@@ -39,7 +39,7 @@ describe("public service restart", () => {
     const launches = join(state, "mock-launches.jsonl");
     mkdirSync(workflows, { recursive: true });
     writeFileSync(join(config, "workshop.yaml"), [
-      "shell: /bin/bash",
+      "shell: /bin/sh",
       "keep_files: always",
       "agent:",
       "  harness:",
@@ -58,9 +58,9 @@ describe("public service restart", () => {
       "steps:",
       "  - generate:",
       "      agent:",
-      "        instructions: Write one original sentence to the supplied result path.",
+      "        instructions: Write one original sentence in the tagged stdout format.",
       "      verify:",
-      "        run: 'printf mock-validator-passed; test -s \"$WORKSHOP_STEP_OUTPUT_FILE\"'",
+      "        run: 'printf mock-validator-passed >&2; test -n \"$(cat)\"'",
       "",
     ].join("\n"), "utf8");
 
@@ -94,7 +94,7 @@ describe("public service restart", () => {
       expect(detailedWorklog.content).toContain("Candidate SHA-256");
       const compactLogs = runCli(root, ["logs", "hemingway", "--run", runId]);
       expect(compactLogs.status).toBe(0);
-      expect(compactLogs.stdout).toMatch(/- generate #1 succeeded · \d+ms · One Hemingway sentence/u);
+      expect(compactLogs.stdout).toMatch(/- generate #1 succeeded · \d+ms · tagged succeeded · One Hemingway sentence/u);
       expect(compactLogs.stdout).not.toContain("Candidate SHA-256");
       expect(compactLogs.stdout).not.toContain("## Global decision log");
       const firstLaunchCount = readLaunches(launches);
@@ -144,10 +144,10 @@ describe("public service restart", () => {
       "        model: mock-alpha/poet:high",
       "        harness:",
       "          command: >-",
-      `            WORKSHOP_HARNESS_TRACE='${traceFile}' bun '${argvHarnessPath}' --model "$WORKSHOP_MODEL_WITH_THINKING" --prompt-file "$WORKSHOP_PROMPT_FILE" --result-file "$WORKSHOP_RESULT_FILE"`,
+      `            WORKSHOP_HARNESS_TRACE='${traceFile}' bun '${argvHarnessPath}' --model "$WORKSHOP_MODEL_WITH_THINKING"`,
       "        instructions: |",
       "          MOCK_ALPHA_PROMPT_SENTINEL",
-      "          Write checked result JSON to the supplied result path.",
+      "          Read the prompt from stdin and write a tagged result to stdout.",
       "  - env-harness:",
       "      agent:",
       "        model: mock-beta/editor:low",
@@ -156,7 +156,7 @@ describe("public service restart", () => {
       `            WORKSHOP_HARNESS_TRACE='${traceFile}' bun '${envHarnessPath}'`,
       "        instructions: |",
       "          MOCK_BETA_PROMPT_SENTINEL",
-      "          Write checked result JSON to the supplied result path.",
+      "          Read the prompt from stdin and write a tagged result to stdout.",
       "",
     ].join("\n"), "utf8");
 
@@ -180,9 +180,8 @@ describe("public service restart", () => {
       const traceEntrySchema = z.strictObject({
         harness: z.enum(["argv", "environment"]),
         model: z.string(),
-        promptFile: z.string(),
+        promptLength: z.number(),
         promptMarker: z.string(),
-        resultFile: z.string(),
         previousOutput: z.string().optional(),
       });
       const trace = readFileSync(traceFile, "utf8").trim().split("\n")
@@ -198,11 +197,8 @@ describe("public service restart", () => {
         harness: "environment", model: "mock-beta/editor:low", promptMarker: "MOCK_BETA_PROMPT_SENTINEL",
         previousOutput: alphaOutput,
       });
-      expect(argvTrace.resultFile).not.toBe(envTrace.resultFile);
-      expect(existsSync(argvTrace.resultFile)).toBe(true);
-      expect(existsSync(envTrace.resultFile)).toBe(true);
-      expect(readFileSync(argvTrace.promptFile, "utf8")).toContain("MOCK_ALPHA_PROMPT_SENTINEL");
-      expect(readFileSync(envTrace.promptFile, "utf8")).toContain("MOCK_BETA_PROMPT_SENTINEL");
+      expect(argvTrace.promptLength).toBeGreaterThan("MOCK_ALPHA_PROMPT_SENTINEL".length);
+      expect(envTrace.promptLength).toBeGreaterThan("MOCK_BETA_PROMPT_SENTINEL".length);
     } finally {
       await stopService(root);
       rmSync(root, { recursive: true, force: true });
@@ -306,10 +302,8 @@ describe("public service restart", () => {
       const started = runCli(root, ["start", "preflight-stop", "--detach"]);
       expect(started.status).toBe(0);
       const runId = runIdSchema.parse(started.stdout.match(/Started run (\S+)/)?.[1]);
-      await waitForFile(preflightGroupPath);
-      await waitForFile(preflightChildPath);
-      const groupId = Number(readFileSync(preflightGroupPath, "utf8").trim());
-      const childId = Number(readFileSync(preflightChildPath, "utf8").trim());
+      const groupId = await waitForPositiveIntegerFile(preflightGroupPath);
+      const childId = await waitForPositiveIntegerFile(preflightChildPath);
       expect(isProcessGroupAlive(groupId)).toBe(true);
       expect(Number.isSafeInteger(childId) && childId > 0).toBe(true);
       const stopping = spawnCli(root, ["stop", "preflight-stop"]);
@@ -384,7 +378,7 @@ describe("public service restart", () => {
       `        printf started > '${workerStarted}'; sleep 1; printf first-result`,
       "      verify:",
       "        run: >-",
-      `          sleep 0.2; test -s \"$WORKSHOP_STEP_OUTPUT_FILE\" && printf done > '${validatorFinished}'`,
+      `          sleep 0.2; test -n \"$(cat)\" && printf done > '${validatorFinished}'`,
       "  - second:",
       "      run: >-",
       `        printf started >> '${successorStarted}'; sleep 0.5; printf second-result`,
@@ -521,8 +515,7 @@ describe("public service restart", () => {
       const started = runCli(root, ["start", "safe-replay", "--detach"]);
       expect(started.status).toBe(0);
       const runId = runIdSchema.parse(started.stdout.match(/Started run (\S+)/)?.[1]);
-      await waitForFile(validatorPgidPath);
-      const oldPgid = Number(readFileSync(validatorPgidPath, "utf8").trim());
+      const oldPgid = await waitForPositiveIntegerFile(validatorPgidPath);
       if (!Number.isSafeInteger(oldPgid) || oldPgid <= 0) throw new Error("validator fixture did not record its process group");
       const beforePause = runCli(root, ["step", "describe", "safe-replay", "work", "--run", runId, "--json"]);
       expect(beforePause.status).toBe(0);
@@ -603,7 +596,7 @@ describe("public service restart", () => {
   }, 30_000);
 
 
-  test("operator retry, acceptance, and fail resolution require evidence and preserve their audit", async () => {
+  test("operator retry and fail resolution require evidence; format 4 rejects human acceptance files", async () => {
     const retryRoot = mkdtempSync(join(tmpdir(), "workshop-resolve-retry-"));
     const retryMarker = join(retryRoot, "worker-launches.txt");
     try {
@@ -650,13 +643,36 @@ describe("public service restart", () => {
     const acceptedValidatorMarker = join(acceptRoot, "validator-launches.txt");
     const acceptedValidatorStarted = join(acceptRoot, "accepted-validator-started.txt");
     try {
-      const blocked = await startBlockedCommandRun(acceptRoot, "acceptable", `printf w >> '${acceptMarker}'; sleep 60`, { validatorCommand: `printf v >> '${acceptedValidatorMarker}'; touch '${acceptedValidatorStarted}'; sleep 3; test -s "$WORKSHOP_STEP_OUTPUT_FILE"` });
+      const blocked = await startBlockedCommandRun(
+        acceptRoot,
+        "acceptable",
+        "printf w >> '" + acceptMarker + "'; sleep 60",
+        { validatorCommand: "printf v >> '" + acceptedValidatorMarker + "'; touch '" + acceptedValidatorStarted + "'; sleep 3; test -n \"$(cat)\"" },
+      );
       const resultFile = join(acceptRoot, "accepted-result.json");
-      const unpairedSurrogate = String.fromCharCode(0xd800);
-      writeFileSync(resultFile, JSON.stringify({ version: 1, output: unpairedSurrogate, summary: "checked by the operator", artifacts: [] }), "utf8");
-      const malformedAcceptance = runCli(acceptRoot, ["resolve", "acceptable", "--action", "accept", "--reason", "the recorded worker effect was checked", "--result-file", resultFile, "--acknowledge-effects"]);
-      expect(malformedAcceptance.status).not.toBe(0);
-      expect(malformedAcceptance.stderr).toContain("accept_result_invalid");
+      writeFileSync(resultFile, JSON.stringify({ version: 1, output: "operator-accepted", summary: "checked by the operator", artifacts: [] }), "utf8");
+      const cliAcceptance = runCli(acceptRoot, [
+        "resolve", "acceptable", "--action", "accept", "--reason", "the recorded worker effect was checked",
+        "--result-file", resultFile, "--acknowledge-effects",
+      ]);
+      expect(cliAcceptance.status).not.toBe(0);
+      expect(cliAcceptance.stderr).toMatch(/format.?4/i);
+
+      const acceptService = JSON.parse(readFileSync(join(acceptRoot, ".workshop", "state", "service.json"), "utf8")) as { socketPath: string };
+      const acceptRequest = {
+        version: 1 as const,
+        requestId: randomUUID(),
+        method: "resolve" as const,
+        workflowId: "acceptable",
+        action: "accept" as const,
+        reason: "the recorded worker effect was checked",
+        resultFile,
+        acknowledgeEffects: true,
+      };
+      const directAcceptance = await sendServiceRequest(acceptService.socketPath, acceptRequest);
+      expect(directAcceptance.ok).toBe(false);
+      if (directAcceptance.ok) throw new Error("format 4 accepted a human result file");
+      expect(directAcceptance.error.message).toMatch(/format.?4/i);
       const stillBlocked = await waitForRunStatus(acceptRoot, "acceptable", blocked.runId, "blocked");
       expect(stillBlocked.status).toBe("blocked");
       expect(stillBlocked.terminalOutput).toBeNull();
@@ -667,38 +683,6 @@ describe("public service restart", () => {
       const blockedDescription = nodeDescriptionDtoSchema.parse(JSON.parse(blockedNode.stdout));
       expect(blockedDescription.node.successfulOutput).toBeNull();
       expect(blockedDescription.node.attempts[0]?.candidate).toBeNull();
-
-      writeFileSync(resultFile, JSON.stringify({ version: 1, output: "operator-accepted", summary: "checked by the operator", artifacts: [] }), "utf8");
-      const missingAcknowledgement = runCli(acceptRoot, ["resolve", "acceptable", "--action", "accept", "--reason", "the recorded worker effect was checked", "--result-file", resultFile]);
-      expect(missingAcknowledgement.status).not.toBe(0);
-      const acceptService = JSON.parse(readFileSync(join(acceptRoot, ".workshop", "state", "service.json"), "utf8")) as { socketPath: string };
-      const acceptRequest = { version: 1 as const, requestId: randomUUID(), method: "resolve" as const, workflowId: "acceptable", action: "accept" as const, reason: "the recorded worker effect was checked", resultFile, acknowledgeEffects: true };
-      await dropFirstServiceReply(acceptService.socketPath, acceptRequest);
-      rmSync(resultFile);
-      await waitForFile(acceptedValidatorStarted);
-      const accepted = await sendServiceRequest(acceptService.socketPath, acceptRequest);
-      expect(accepted.ok).toBe(true);
-      if (!accepted.ok) throw new Error("acceptance receipt was not replayed while the new validator was live");
-      const acceptedResult = serviceResolveResultV1Schema.parse(accepted.result);
-      expect(acceptedResult).toMatchObject({ workflowId: "acceptable", runId: blocked.runId, status: "queued" });
-      const acceptedReplay = await sendServiceRequest(acceptService.socketPath, acceptRequest);
-      expect(acceptedReplay).toEqual(accepted);
-      const acceptedRun = await waitForRun(acceptRoot, "acceptable", blocked.runId);
-      expect(acceptedRun.status).toBe("completed");
-      expect(acceptedRun.terminalOutput).toBe("operator-accepted");
-      expect(readFileSync(acceptMarker, "utf8")).toBe("w");
-      expect(readFileSync(acceptedValidatorMarker, "utf8")).toBe("v");
-      const acceptedNodeResult = runCli(acceptRoot, ["step", "describe", "acceptable", "work", "--run", blocked.runId, "--json"]);
-      expect(acceptedNodeResult.status).toBe(0);
-      const acceptedAttempt = nodeDescriptionDtoSchema.parse(JSON.parse(acceptedNodeResult.stdout)).node.attempts[0];
-      expect(acceptedAttempt?.candidate?.kind).toBe("candidate");
-      expect(acceptedAttempt?.operatorAcceptances).toHaveLength(1);
-      const acceptance = acceptedAttempt?.operatorAcceptances[0];
-      if (acceptance === undefined) throw new Error("operator acceptance audit was not retained");
-      expect(acceptance.target).toBe("worker");
-      expect(acceptance.acknowledgedEffects).toBe(true);
-      expect(acceptance.processGroupsConfirmedDead).toBe(true);
-      expect(acceptance.resultBytesHash).toMatch(/^sha256:[0-9a-f]{64}$/);
     } finally {
       await stopService(acceptRoot);
       rmSync(acceptRoot, { recursive: true, force: true });
@@ -942,8 +926,7 @@ describe("public service restart", () => {
       const activeStart = runCli(root, ["start", "active-stop", "--detach"]);
       expect(activeStart.status).toBe(0);
       const activeRunId = runIdSchema.parse(activeStart.stdout.match(/Started run (\S+)/)?.[1]);
-      await waitForFile(activePidPath);
-      const processGroupId = Number(readFileSync(activePidPath, "utf8").trim());
+      const processGroupId = await waitForPositiveIntegerFile(activePidPath);
       expect(Number.isSafeInteger(processGroupId)).toBe(true);
       if (!Number.isSafeInteger(processGroupId) || processGroupId <= 0) throw new Error("active stop fixture did not record a process-group ID");
 
@@ -1011,10 +994,8 @@ describe("public service restart", () => {
       const started = runCli(root, ["start", "validator-stop", "--detach"]);
       expect(started.status).toBe(0);
       const runId = runIdSchema.parse(started.stdout.match(/Started run (\S+)/)?.[1]);
-      await waitForFile(validatorGroupPath);
-      await waitForFile(validatorChildPath);
-      const validatorGroupId = Number(readFileSync(validatorGroupPath, "utf8").trim());
-      const validatorChildId = Number(readFileSync(validatorChildPath, "utf8").trim());
+      const validatorGroupId = await waitForPositiveIntegerFile(validatorGroupPath);
+      const validatorChildId = await waitForPositiveIntegerFile(validatorChildPath);
       expect(Number.isSafeInteger(validatorGroupId) && validatorGroupId > 0).toBe(true);
       expect(Number.isSafeInteger(validatorChildId) && validatorChildId > 0).toBe(true);
       expect(isProcessGroupAlive(validatorGroupId)).toBe(true);
@@ -1066,9 +1047,7 @@ describe("public service restart", () => {
       const started = runCli(root, ["start", "long-process", "--detach"]);
       expect(started.status).toBe(0);
       const runId = runIdSchema.parse(started.stdout.match(/Started run (\S+)/)?.[1]);
-      await waitForFile(pidPath);
-      const workerPidText = readFileSync(pidPath, "utf8").trim();
-      const workerPid = Number(workerPidText);
+      const workerPid = await waitForPositiveIntegerFile(pidPath);
       expect(Number.isSafeInteger(workerPid)).toBe(true);
       if (!Number.isSafeInteger(workerPid) || workerPid <= 0) throw new Error("worker pid fixture did not record a positive process id");
       const serviceMetadataPath = join(root, ".workshop", "state", "service.json");
@@ -1089,7 +1068,7 @@ describe("public service restart", () => {
       const logsResult = runCli(root, ["logs", "long-process", "--run", runId, "--json"]);
       expect(logsResult.status).toBe(0);
       expect(logsDtoSchema.parse(JSON.parse(logsResult.stdout)).runId).toBe(runId);
-      expect(readFileSync(pidPath, "utf8").trim()).toBe(workerPidText);
+      expect(Number(readFileSync(pidPath, "utf8").trim())).toBe(workerPid);
       await waitForProcessGroupGone(workerPid);
     } finally {
       await stopService(root);
@@ -1110,7 +1089,7 @@ describe("public service restart", () => {
     mkdirSync(workflows, { recursive: true });
     mkdirSync(state, { recursive: true });
     writeFileSync(join(config, "workshop.yaml"), [
-      "shell: /bin/bash",
+      "shell: /bin/sh",
       "stream_cap: 32mb",
       "agent:",
       "  harness:",
@@ -1128,12 +1107,12 @@ describe("public service restart", () => {
       "steps:",
       "  - capture:",
       "      agent:",
-      "        instructions: Write one original sentence to the supplied result path.",
+      "        instructions: Write one original sentence in the tagged stdout format.",
       "      verify:",
       "        run: |",
       `          printf validator >> '${validatorLaunches}'`,
-      `          head -c ${totalBytes} /dev/zero | tr '\\000' x`,
-      "          test -s \"$WORKSHOP_STEP_OUTPUT_FILE\"",
+      `          head -c ${totalBytes} /dev/zero | tr '\\000' x >&2`,
+      "          test -n \"$(cat)\"",
       "  - finish:",
       "      run: |",
       `        printf successor >> '${successorLaunches}'`,
@@ -1247,8 +1226,7 @@ describe("public service restart", () => {
       const started = runCli(root, ["start", "long-process", "--detach"]);
       expect(started.status).toBe(0);
       const oldRunId = runIdSchema.parse(started.stdout.match(/Started run (\S+)/)?.[1]);
-      await waitForFile(oldPidPath);
-      const oldWorkerPid = Number(readFileSync(oldPidPath, "utf8").trim());
+      const oldWorkerPid = await waitForPositiveIntegerFile(oldPidPath);
       if (!Number.isSafeInteger(oldWorkerPid) || oldWorkerPid <= 0) throw new Error("old worker did not write a positive process-group ID");
       const metadataPath = join(state, "service.json");
       const oldService = JSON.parse(readFileSync(metadataPath, "utf8")) as { pid: number; bootId: string };
@@ -1287,7 +1265,7 @@ describe("public service restart", () => {
     const workflowPath = join(workflows, "frozen-chain.yaml");
     mkdirSync(workflows, { recursive: true });
     writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\n", "utf8");
-    writeFileSync(workflowPath, frozenWorkflow("sleep 3; printf frozen-first", 'cat "$WORKSHOP_PREVIOUS_OUTPUT_FILE"'), "utf8");
+    writeFileSync(workflowPath, frozenWorkflow("sleep 3; printf frozen-first", "cat"), "utf8");
 
     try {
       const started = runCli(root, ["start", "frozen-chain", "--detach"]);
@@ -1324,7 +1302,7 @@ describe("public service restart", () => {
       expect(secondNodeResult.status).toBe(0);
       const secondNode = nodeDescriptionDtoSchema.parse(JSON.parse(secondNodeResult.stdout));
       expect(secondNode.runId).toBe(runId);
-      expect(secondNode.node.resolvedSettings.run).toMatchObject({ kind: "command", command: 'cat "$WORKSHOP_PREVIOUS_OUTPUT_FILE"' });
+      expect(secondNode.node.resolvedSettings.run).toMatchObject({ kind: "command", command: "cat" });
       expect(secondNode.node.successfulOutput).toBe("frozen-first");
 
       writeFileSync(workflowPath, [
@@ -1619,7 +1597,7 @@ describe("public service restart", () => {
       "  retries: 0",
       "  replay: never",
       "schedule:",
-      "  every: 1s",
+      "  every: 10s",
       "  max_runs: 2",
       "steps:",
       "  - tick:",
@@ -1635,11 +1613,14 @@ describe("public service restart", () => {
       const firstStatus = runCli(root, ["status", "scheduled", "--json"]);
       expect(firstStatus.status).toBe(0);
       const firstActivation = statusDtoSchema.parse(JSON.parse(firstStatus.stdout)).workflows[0]?.activation;
-      if (firstActivation === null || firstActivation === undefined) throw new Error("scheduled activation is missing");
+      if (firstActivation === null || firstActivation === undefined || firstActivation.nextDueAt === null) throw new Error("scheduled activation deadline is missing");
       const firstBootId = statusDtoSchema.parse(JSON.parse(firstStatus.stdout)).service.bootId;
 
       await stopService(root);
-      await new Promise((resolveDelay) => setTimeout(resolveDelay, 2_200));
+      // Restart after two slots become due, before the third slot.
+      const restartAt = Date.parse(firstActivation.nextDueAt) + 15_000;
+      const downtime = restartAt - Date.now();
+      if (downtime > 0) await new Promise((resolveDelay) => setTimeout(resolveDelay, downtime));
       const restartedStatus = runCli(root, ["status", "scheduled", "--json"]);
       expect(restartedStatus.status).toBe(0);
       expect(statusDtoSchema.parse(JSON.parse(restartedStatus.stdout)).service.bootId).not.toBe(firstBootId);
@@ -1661,12 +1642,12 @@ describe("public service restart", () => {
       const activation = statusDtoSchema.parse(JSON.parse(finalStatus.stdout)).workflows[0]?.activation;
       expect(activation).toMatchObject({ state: "exhausted", admittedCount: 2, skippedSlots: 1, maxRuns: 2 });
       if (activation === null || activation === undefined) throw new Error("final scheduled activation is missing");
-      expect(activation.lastSkippedSlotAt).toBe(new Date(Date.parse(firstActivation.activatedAt) + 1_000).toISOString());
+      expect(activation.lastSkippedSlotAt).toBe(firstActivation.nextDueAt);
     } finally {
       await stopService(root);
       rmSync(root, { recursive: true, force: true });
     }
-  }, 20_000);
+  }, 45_000);
 
   test("pause, resume, and stop preserve recurrence activation semantics", async () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-schedule-controls-"));
@@ -1806,8 +1787,7 @@ describe("public service restart", () => {
       const holderStart = runCli(root, ["start", "holder", "--detach"]);
       expect(holderStart.status).toBe(0);
       const holderRunId = runIdSchema.parse(holderStart.stdout.match(/Started run (\S+)/)?.[1]);
-      await waitForFile(holderPidPath);
-      const holderPid = Number(readFileSync(holderPidPath, "utf8").trim());
+      const holderPid = await waitForPositiveIntegerFile(holderPidPath);
       expect(Number.isSafeInteger(holderPid)).toBe(true);
       if (!Number.isSafeInteger(holderPid) || holderPid <= 0) throw new Error("holder process fixture did not record a positive PID");
 
@@ -2161,6 +2141,24 @@ async function waitForFileLength(path: string, minimumBytes: number): Promise<vo
   throw new Error(`worker did not append ${minimumBytes} bytes to ${path}`);
 }
 
+async function waitForPositiveIntegerFile(path: string): Promise<number> {
+  const deadline = Date.now() + 10_000;
+  let previous: number | undefined;
+  while (Date.now() < deadline) {
+    if (existsSync(path)) {
+      const value = Number(readFileSync(path, "utf8").trim());
+      if (Number.isSafeInteger(value) && value > 0) {
+        if (value === previous) return value;
+        previous = value;
+      } else {
+        previous = undefined;
+      }
+    }
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
+  }
+  throw new Error("fixture did not write a stable positive integer to " + path);
+}
+
 function dropFirstServiceReply(
   socketPath: string,
   request: Extract<ServiceRequestV1, { method: "resolve" }>,
@@ -2192,14 +2190,14 @@ async function waitForRetainedCapture(directory: string, retainedBytes: number):
   while (Date.now() < deadline) {
     if (existsSync(directory)) {
       for (const name of readdirSync(directory)) {
-        if (!name.endsWith(".stdout")) continue;
+        if (!name.endsWith(".stderr")) continue;
         const path = join(directory, name);
         if (existsSync(`${path}.retention.json`) && statSync(path).size === retainedBytes) return path;
       }
     }
     await new Promise((resolveDelay) => setTimeout(resolveDelay, 1));
   }
-  throw new Error(`no retained stdout window of ${retainedBytes} bytes appeared in ${directory}`);
+  throw new Error(`no retained stderr window of ${retainedBytes} bytes appeared in ${directory}`);
 }
 
 

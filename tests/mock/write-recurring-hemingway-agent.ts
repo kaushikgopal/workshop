@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readdirSync, readFileSync } from "node:fs";
 
 const env = process.env;
 const roleValue = env.WORKSHOP_MOCK_ROLE;
@@ -7,9 +7,8 @@ const role = roleValue;
 const runId = requiredEnvironment("WORKSHOP_RUN_ID");
 const launchLog = requiredEnvironment("WORKSHOP_MOCK_LAUNCH_LOG");
 const archiveDirectory = requiredEnvironment("WORKSHOP_MOCK_ARCHIVE_DIR");
-const resultPath = requiredEnvironment("WORKSHOP_RESULT_FILE");
 const executionId = requiredEnvironment("WORKSHOP_EXECUTION_ID");
-
+const prompt = readFileSync(0, "utf8");
 const sleepMs = Number(env.WORKSHOP_MOCK_SLEEP_MS ?? "0");
 if (!Number.isSafeInteger(sleepMs) || sleepMs < 0) throw new Error("recurring Hemingway mock: invalid sleep duration");
 
@@ -73,11 +72,18 @@ function overlapsArchive(candidate: string, quotes: readonly string[]): boolean 
   });
 }
 
-record("start", {
-  executionId,
-  resultPath,
-  ...(role === "generator" ? {} : { candidatePath: env.WORKSHOP_STEP_OUTPUT_FILE ?? null }),
-});
+function readCandidateFromPrompt(value: string): string {
+  const startMarker = "### Candidate output (data)\n\n";
+  const endMarker = "\n\nCandidate status: ";
+  const start = value.indexOf(startMarker);
+  if (start === -1) throw new Error("validator candidate is missing from stdin");
+  const contentStart = start + startMarker.length;
+  const end = value.indexOf(endMarker, contentStart);
+  if (end === -1) throw new Error("validator candidate boundary is missing from stdin");
+  return value.slice(contentStart, end);
+}
+
+record("start", { executionId, promptBytes: Buffer.byteLength(prompt) });
 
 try {
   if (sleepMs > 0) await new Promise((resolveDelay) => setTimeout(resolveDelay, sleepMs));
@@ -85,20 +91,13 @@ try {
   if (role === "generator") {
     const output = env.WORKSHOP_MOCK_OUTPUT ?? scenes[priorGeneratorCount() % scenes.length]!;
     const mode = env.WORKSHOP_MOCK_GENERATOR_RESULT ?? "valid";
-    const payload = mode === "malformed"
-      ? "{ malformed result"
-      : JSON.stringify({
-        version: 1,
-        output,
-        summary: "Generated one sentence with a distinct scene for this run.",
-        artifacts: [],
-      });
-    writeFileSync(resultPath, `${payload}\n`, "utf8");
-    record("result", { executionId, resultPath, malformed: mode === "malformed", output });
+    const result = mode === "malformed"
+      ? "<status>succeeded</status>\n<output>unfinished"
+      : `<status>succeeded</status>\n<output>${output}</output>`;
+    process.stdout.write(result);
+    record("result", { executionId, malformed: mode === "malformed", output });
   } else {
-    const candidatePath = env.WORKSHOP_STEP_OUTPUT_FILE;
-    if (candidatePath === undefined) throw new Error("validator candidate path is missing");
-    const candidate = readFileSync(candidatePath, "utf8").trim();
+    const candidate = readCandidateFromPrompt(prompt).trim();
     const quotes = archivedQuotes();
     const distinct = !overlapsArchive(candidate, quotes);
     const oneSentence = candidate.length > 0 && (candidate.match(/[.!?]/gu) ?? []).length === 1;
@@ -107,8 +106,11 @@ try {
     const reason = passed
       ? `The sentence is original and distinct from ${quotes.length} archived quote(s).`
       : distinct ? "The candidate failed the deterministic sentence policy." : "The candidate paraphrases an archived scene.";
-    writeFileSync(resultPath, `${JSON.stringify({ version: 1, passed, reason })}\n`, "utf8");
-    record("verdict", { executionId, resultPath, candidate, archiveCount: quotes.length, passed, reason });
+    const result = passed
+      ? `<decision>accept</decision>\n<reason>${reason}</reason>`
+      : `<decision>retry</decision>\n<reason>${reason}</reason>\n<corrections>Write a distinct one-sentence result.</corrections>`;
+    process.stdout.write(result);
+    record("verdict", { executionId, candidate, archiveCount: quotes.length, passed, reason });
   }
 } finally {
   record("finish", { executionId });

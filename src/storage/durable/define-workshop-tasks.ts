@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import type { Context } from "@earendil-works/chord";
-import { defineTask, type ConversationId, type Task, type TaskId, type TaskRuntime, type Tx } from "@earendil-works/pi-durable";
+import { defineTask, type ConversationId, type Cursor, type Task, type TaskId, type TaskRuntime, type Tx } from "@earendil-works/pi-durable";
 import { z } from "zod";
+import { reconstructProcessStdin } from "../../attempt/build-process-stdin.js";
 import { canonicalHash } from "../../definition/hash-canonical-json.js";
 import { resolveRetryLimit } from "../../definition/resolve-retry-limit.js";
 import type { ResolvedPreflightSettings } from "../../definition/schema-resolved.js";
@@ -32,9 +33,10 @@ import {
   workflowRunDocumentV1Schema,
   workshopEventV1Schema,
   workshopJudgmentV1Schema,
+  workshopProcessV1Schema,
   type WorkflowRunDocumentV1,
 } from "../../run/records.js";
-import { WorkshopEventEntry, WorkshopInstallationDoc, WorkshopJudgmentEntry, WorkshopRunDoc } from "./define-workshop-records.js";
+import { WorkshopEventEntry, WorkshopInstallationDoc, WorkshopJudgmentEntry, WorkshopProcessEntry, WorkshopRunDoc } from "./define-workshop-records.js";
 import {
   capacityGateOutcomeSchema,
   defineCapacityGateTask,
@@ -198,13 +200,8 @@ export function defineWorkshopTasks(
         }
         const taskVersions = run.runtimeManifest.taskVersions;
         const schedulerCompatible = taskVersions.scheduleWakeup === undefined || taskVersions.scheduleWakeup === 1;
-        const currentWorkflowVersion = taskVersions.workflowRun === 10 && taskVersions.failureJudgment === 1;
-        const previousWorkflowVersion = taskVersions.workflowRun === 9 && taskVersions.failureJudgment === 1;
-        const oldestWorkflowVersion = taskVersions.workflowRun === 8 && taskVersions.failureJudgment === undefined;
-        const compatible = schedulerCompatible && (currentWorkflowVersion || previousWorkflowVersion || oldestWorkflowVersion)
-          && taskVersions.nodeAttempt === 4
-          && taskVersions.processExecution === 4
-          && taskVersions.capacityGate === 1;
+        const compatible = schedulerCompatible && taskVersions.workflowRun === 10 && taskVersions.failureJudgment === 1
+          && taskVersions.nodeAttempt === 4 && taskVersions.processExecution === 4 && taskVersions.capacityGate === 1;
         if (!compatible) {
           const block = blockInfo("runtime_incompatible", "runtime manifest does not match the registered task versions", input.runId, null, null, timestamp(runtime.now()));
           await blockRun(task, runtime, input, block, context, { markNode: false });
@@ -377,16 +374,7 @@ export function defineWorkshopTasks(
         const executionId = executionIdSchema.parse(randomUUID());
         const incarnationId = incarnationIdSchema.parse(randomUUID());
         const launchedAt = timestamp(runtime.now());
-        const processInput = createPreflightProcessInput({
-          run,
-          taskId: Number(runtime.taskId),
-          site,
-          executionId,
-          incarnationId,
-          serviceBootId: activeBootId,
-          launchIntentAt: launchedAt,
-          deadlineAt: deadline(launchedAt, site.timeoutMs),
-        });
+        const deadlineAt = deadline(launchedAt, site.timeoutMs);
         await runtime.commit(async (tx) => {
           const { draft, run: current } = await runDraft(tx, runtime.conversationId);
           assertWorkflowIdentity(input, current, runtime.taskId);
@@ -417,6 +405,18 @@ export function defineWorkshopTasks(
             return { status: "running", checkpoint: { phase: "admitAttempt", nodeIndex: 0 } };
           }
           if (current.preflight.processExecutionIds.includes(executionId)) throw new Error("preflight execution ID collision");
+          const currentSite = current.resolvedSettings.preflight;
+          if (currentSite === null) throw new Error("canonical run lost its frozen preflight settings");
+          const processInput = createPreflightProcessInput({
+            run: current,
+            taskId: Number(runtime.taskId),
+            site: currentSite,
+            executionId,
+            incarnationId,
+            serviceBootId: activeBootId,
+            launchIntentAt: launchedAt,
+            deadlineAt,
+          });
           const childId = await tx.createTask(ProcessExecutionTask, processInput, {
             ownership: { kind: "task", taskId: runtime.taskId },
             conversationId: runtime.conversationId,
@@ -913,7 +913,11 @@ function createPreflightProcessInput(args: {
   deadlineAt: string | null;
 }): ProcessExecutionTaskInput {
   const files = processExecutionFiles({ role: "preflight", nodeId: null, incarnationNumber: args.incarnationNumber ?? 1 }, args.run.paths.runDirectory, null);
+  const stdin = reconstructProcessStdin({ role: "preflight", nodeId: null, attemptId: null, executionId: args.executionId }, args.run);
   const base: ProcessExecutionTaskEnvironmentInput = {
+    ioVersion: 1,
+    stdinSha256: stdin.sha256,
+    stdinByteCount: stdin.byteCount,
     runId: args.run.runId,
     workflowId: args.run.workflowId,
     activationId: args.run.activationId,
@@ -942,6 +946,52 @@ function createPreflightProcessInput(args: {
     ...base,
     env: buildProcessExecutionEnvironment(base, args.run, null),
   });
+}
+
+async function processInputMatchesCommittedStdin(
+  tx: Tx,
+  conversationId: ConversationId,
+  input: ProcessExecutionTaskInput,
+  previousIncarnationId: string,
+): Promise<boolean> {
+  const records: z.infer<typeof workshopProcessV1Schema>[] = [];
+  let cursor: Cursor | undefined;
+  do {
+    const page = await tx.scanEntries({ conversationId }, 256, cursor);
+    for (const entry of page.items) {
+      if (!WorkshopProcessEntry.is(entry)) continue;
+      const parsed = workshopProcessV1Schema.safeParse(entry.data);
+      if (!parsed.success) return false;
+      if (parsed.data.process.executionId === input.executionId) records.push(parsed.data);
+    }
+    cursor = page.next;
+  } while (cursor !== undefined);
+
+  const first = records.filter((record) => record.process.incarnationNumber === 1);
+  if (first.length === 0) return false;
+  const original = first[0]!.process;
+  const originalStdio = original.stdio;
+  if (originalStdio === undefined || originalStdio.version !== 1
+    || originalStdio.stdinSha256 !== input.stdinSha256 || originalStdio.stdinByteCount !== input.stdinByteCount) return false;
+  if (first.some((record) => record.process.incarnationId !== original.incarnationId)) return false;
+
+  const incarnationIds = new Map<number, string>();
+  for (const record of records) {
+    const process = record.process;
+    const knownIncarnationId = incarnationIds.get(process.incarnationNumber);
+    if (knownIncarnationId !== undefined && knownIncarnationId !== process.incarnationId) return false;
+    incarnationIds.set(process.incarnationNumber, process.incarnationId);
+    if (record.runId !== input.runId || record.nodeId !== input.nodeId || record.attemptId !== input.attemptId
+      || process.executionId !== input.executionId || process.role !== input.role || process.incarnationNumber >= input.incarnationNumber
+      || process.stdio?.version !== 1
+      || process.stdio.stdinSha256 !== originalStdio.stdinSha256
+      || process.stdio.stdinByteCount !== originalStdio.stdinByteCount) return false;
+  }
+  if (incarnationIds.get(input.incarnationNumber - 1) !== previousIncarnationId) return false;
+  for (let number = 1; number < input.incarnationNumber; number += 1) {
+    if (!incarnationIds.has(number)) return false;
+  }
+  return true;
 }
 
 async function schedulePreflightReplay(args: {
@@ -979,17 +1029,6 @@ async function schedulePreflightReplay(args: {
     await blockRun(task, runtime, input, block, context, { markNode: false, retainCapacity: true, stopped: resumableRun.desiredState === "stopped" });
     return;
   }
-  const replayInput = createPreflightProcessInput({
-    run: resumableRun,
-    taskId: Number(runtime.taskId),
-    site,
-    executionId: replay.executionId,
-    incarnationId: replay.incarnationId,
-    incarnationNumber: replay.incarnationNumber,
-    serviceBootId: activeBootId,
-    launchIntentAt: replay.launchIntentAt,
-    deadlineAt: replay.deadlineAt,
-  });
   await runtime.commit(async (tx) => {
     const { draft, run: current } = await runDraft(tx, runtime.conversationId);
     assertWorkflowIdentity(input, current, runtime.taskId);
@@ -998,6 +1037,27 @@ async function schedulePreflightReplay(args: {
     }
     if (current.desiredState !== "running" || current.status !== "running") {
       return { status: "running", checkpoint };
+    }
+    const currentSite = current.resolvedSettings.preflight;
+    let replayInput: ProcessExecutionTaskInput;
+    try {
+      if (currentSite === null) throw new Error("frozen preflight settings are missing");
+      replayInput = createPreflightProcessInput({
+        run: current,
+        taskId: Number(runtime.taskId),
+        site: currentSite,
+        executionId: replay.executionId,
+        incarnationId: replay.incarnationId,
+        incarnationNumber: replay.incarnationNumber,
+        serviceBootId: activeBootId,
+        launchIntentAt: replay.launchIntentAt,
+        deadlineAt: replay.deadlineAt,
+      });
+    } catch {
+      return await blockPreflightReplayIntegrityFailure(tx, runtime, input, current, draft);
+    }
+    if (!await processInputMatchesCommittedStdin(tx, runtime.conversationId, replayInput, checkpoint.incarnationId)) {
+      return await blockPreflightReplayIntegrityFailure(tx, runtime, input, current, draft);
     }
     assign(draft, current);
     const childId = await tx.createTask(ProcessExecutionTask, replayInput, {
@@ -1021,6 +1081,48 @@ async function schedulePreflightReplay(args: {
 
 
 
+
+async function blockPreflightReplayIntegrityFailure(
+  tx: Tx,
+  runtime: WorkflowRuntime,
+  input: WorkflowRunTaskInput,
+  run: ReadyRun,
+  draft: object,
+): Promise<{ status: "terminal"; outcome: { status: "completed"; result: RunOutcome } }> {
+  if (run.block !== null) {
+    return { status: "terminal", outcome: { status: "completed", result: { kind: "blocked", block: run.block } } };
+  }
+  const at = timestamp(runtime.now());
+  const block = blockInfo("integrity_failed", "preflight replay input differs from its original execution identity", input.runId, null, null, at);
+  assign(draft, workflowRunDocumentV1Schema.parse({
+    ...run,
+    status: "blocked",
+    finishedAt: null,
+    block,
+    failure: null,
+    terminalOutput: null,
+    durable: { ...run.durable, capacityGateTaskId: null },
+  }));
+  await setInstallationStatus(tx, run, "blocked", { retainCapacity: true });
+  await appendEvent(tx, runtime.conversationId, {
+    version: 1,
+    eventId: randomUUID(),
+    type: "run_state_changed",
+    runId: input.runId,
+    from: run.status,
+    to: "blocked",
+    occurredAt: at,
+  });
+  await appendEvent(tx, runtime.conversationId, {
+    version: 1,
+    eventId: randomUUID(),
+    type: "run_settled",
+    runId: input.runId,
+    outcome: { kind: "blocked", block },
+    occurredAt: at,
+  });
+  return { status: "terminal", outcome: { status: "completed", result: { kind: "blocked", block } } };
+}
 
 function stoppedAttemptWasChecked(run: ReadyRun): boolean {
   if (run.currentNodeId === null || run.currentAttemptId === null) return false;

@@ -18,7 +18,7 @@ type ActivityRecord = {
   readonly runId: string;
   readonly pid: number;
   readonly executionId?: string;
-  readonly resultPath?: string;
+  readonly promptBytes?: number;
   readonly output?: string;
   readonly archiveCount?: number;
   readonly passed?: boolean;
@@ -81,12 +81,9 @@ describe("recurring Hemingway acceptance", () => {
         expect(validator).toBeDefined();
         expect(generator?.pid).not.toBe(validator?.pid);
         expect(generator?.executionId).not.toBe(validator?.executionId);
-        expect(generator?.resultPath).not.toBe(validator?.resultPath);
+        expect(generator?.promptBytes).toBeGreaterThan(0);
+        expect(validator?.promptBytes).toBeGreaterThan(0);
       }
-      const resultPaths = activity
-        .filter((record) => record.event === "start" && (record.role === "generator" || record.role === "validator"))
-        .map((record) => record.resultPath);
-      expect(new Set(resultPaths).size).toBe(12);
       const verdicts = activity.filter((record) => record.role === "validator" && record.event === "verdict");
       expect(verdicts).toHaveLength(6);
       expect(verdicts.every((record) => record.passed === true)).toBe(true);
@@ -215,11 +212,11 @@ function createFixture(options: {
     "steps:",
     "  - generate:",
     "      agent:",
-    "        instructions: Write one distinct original sentence to the supplied result path.",
+    "        instructions: Write one distinct original sentence in the tagged stdout format.",
     "      verify:",
     "        agent:",
     `          harness:\n            command: ${JSON.stringify(validatorCommand)}`,
-    "          instructions: Compare the candidate with archived quotes and write a checked verdict.",
+    "          instructions: Compare the candidate with archived quotes and write a tagged decision to stdout.",
     "  - publish:",
     "      run: |",
     ...publication.split("\n").map((line) => `        ${line}`),
@@ -254,9 +251,9 @@ function publicationCommand(activityLog: string): string {
     `mkdir -p "$archive_directory"`,
     `target="$archive_directory/$WORKSHOP_RUN_ID.md"`,
     `if [ -f "$target" ]; then`,
-    `  cmp -s "$target" "$WORKSHOP_PREVIOUS_OUTPUT_FILE" || exit 1`,
+    `  cmp -s - "$target" || exit 1`,
     `else`,
-    `  cp "$WORKSHOP_PREVIOUS_OUTPUT_FILE" "$target"`,
+    `  cat > "$target"`,
     `fi`,
     `printf '{"event":"finish","role":"publisher","runId":"%s","pid":%s}\\n' "$WORKSHOP_RUN_ID" "$$" >> "$activity_log"`,
     `printf '%s\\n' "$target"`,

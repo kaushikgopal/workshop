@@ -8,23 +8,16 @@ export interface ProcessFileIdentity {
   readonly incarnationNumber: number;
 }
 
-/** Files one process reads or writes. Paths are computed; nothing touches disk. */
+/** Capture paths are process-scoped; readable projections are run-scoped. */
 export interface ProcessFiles {
   readonly directory: string;
   readonly stdoutPath: string;
   readonly stderrPath: string;
-  readonly promptPath: string;
-  readonly resultPath: string;
-  readonly previousOutputPath: string;
-  readonly candidateOutputPath: string;
-  readonly worklogPath: string;
+  readonly resultsPath: string;
+  readonly logPath: string;
 }
 
-/**
- * Locates `runs/<run>/<step>.<attempt>/` or `runs/<run>/preflight/`.
- * A safe replay numbers its files (`worker.2.stdout`) so it never overwrites
- * the committed captures of an earlier incarnation.
- */
+/** Locate capture paths without creating files. */
 export function locateProcessFiles(runDirectory: string, identity: ProcessFileIdentity): ProcessFiles {
   const directory = identity.role === "preflight"
     ? join(runDirectory, "preflight")
@@ -34,11 +27,8 @@ export function locateProcessFiles(runDirectory: string, identity: ProcessFileId
     directory,
     stdoutPath: join(directory, `${stem}.stdout`),
     stderrPath: join(directory, `${stem}.stderr`),
-    promptPath: join(directory, `${stem}.prompt.md`),
-    resultPath: join(directory, `${stem}.result.json`),
-    previousOutputPath: join(directory, "previous-output.txt"),
-    candidateOutputPath: join(directory, "candidate-output.txt"),
-    worklogPath: join(directory, "worklog.md"),
+    resultsPath: join(runDirectory, "results.md"),
+    logPath: join(runDirectory, "execution.log"),
   };
 }
 

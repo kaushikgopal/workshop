@@ -86,12 +86,12 @@ describe("workflow and machine schemas", () => {
     }
   });
 
-  test("checks the documented Pi, OpenCode, and Claude Code command templates as workflow sites", () => {
+  test("rejects legacy README harness templates with stdin/stdout/stderr migration guidance", () => {
     const readme = readFileSync(join(import.meta.dir, "..", "README.md"), "utf8");
     const heading = "### Headless-agent command templates";
     const start = readme.indexOf(heading);
     if (start < 0) throw new Error("README is missing the harness-template section");
-    const yaml = /```yaml\n([\s\S]*?)\n```/u.exec(readme.slice(start))?.[1];
+    const yaml = /\x60{3}yaml\n([\s\S]*?)\n\x60{3}/u.exec(readme.slice(start))?.[1];
     if (yaml === undefined) throw new Error("README harness templates are missing their YAML mapping");
 
     const templateSchema = z.strictObject({
@@ -115,24 +115,30 @@ describe("workflow and machine schemas", () => {
     expect(templates.pi.model_env).toEqual(["WORKSHOP_MODEL_WITH_THINKING"]);
     expect(templates.opencode.model_env).toEqual(["WORKSHOP_MODEL", "WORKSHOP_THINKING"]);
     expect(templates["claude-code"].model_env).toEqual(["WORKSHOP_MODEL_ID", "WORKSHOP_THINKING"]);
-    const entries = Object.entries(templates);
-    const nodes: Record<string, unknown> = {};
-    for (const [index, [name, template]] of entries.entries()) {
-      const id = `node-${name}`;
-      const next = entries[index + 1]?.[0];
-      nodes[id] = {
-        run: { agent: { model: template.model, harness: { command: template.command }, instructions: "Write the checked result JSON to the supplied result path." } },
-        next: next === undefined ? null : `node-${next}`,
-      };
-      expect(template.command).toContain(`"$${template.prompt_env}"`);
-      for (const modelEnv of template.model_env) expect(template.command).toContain(`"$${modelEnv}"`);
-      expect(template.result_env).toBe("WORKSHOP_RESULT_FILE");
-      expect(resolveAgent({ site: { model: template.model, harness: { command: template.command } } }))
-        .toMatchObject({ harnessCommand: template.command, model: { full: template.model } });
-    }
 
-    const checked = workflowSchema.parse({ id: "harness-templates", nodes });
-    expect(Object.keys(checked.nodes)).toEqual(["node-pi", "node-opencode", "node-claude-code"]);
+    for (const [name, template] of Object.entries(templates)) {
+      const stepId = "node-" + name;
+      const definition = workflowSchema.parse({
+        id: "harness-templates",
+        defaults: { retries: 0, replay: "never" },
+        nodes: {
+          [stepId]: {
+            run: {
+              agent: {
+                model: template.model,
+                harness: { command: template.command },
+                instructions: "Write the declared result.",
+              },
+            },
+            next: null,
+          },
+        },
+      });
+      expect(template.command).toContain("\"$" + template.prompt_env + "\"");
+      for (const modelEnv of template.model_env) expect(template.command).toContain("\"$" + modelEnv + "\"");
+      expect(() => resolveWorkflowSettings({ definition, machine: {}, projectCwd: "/tmp" }))
+        .toThrow(new RegExp("step \"" + stepId + "\" worker harness command references removed variable WORKSHOP_PROMPT_FILE; migrate the harness to read input from stdin, write the declared result to stdout, and send diagnostics to stderr"));
+    }
     expect(readme.slice(start)).toContain("Claude Code flags have not been checked against installed binaries");
   });
 
@@ -499,6 +505,93 @@ describe("field-by-field agent resolution", () => {
   const machine = { harness: { command: "machine-harness" }, model: "machine/model:low" };
   const workflowDefault = { harness: { command: "workflow-harness" }, model: "workflow/model:medium" };
 
+  test("rejects removed variables from the selected site, workflow, and machine harness", () => {
+    const customCommand = "custom-agent $WORKSHOP_PROMPT_FILE";
+    const agentRun = { agent: { instructions: "Write the result." } };
+    const definition = (run: Record<string, unknown>, defaults: Record<string, unknown> = {}) => workflowSchema.parse({
+      id: "clock",
+      defaults: { retries: 0, replay: "never", ...defaults },
+      nodes: { "node-a": { run, next: null } },
+    });
+    const machineModel = { agent: { model: "provider/model:low" } };
+    const layers = [
+      {
+        name: "site",
+        definition: definition({
+          agent: { ...agentRun.agent, harness: { command: customCommand } },
+        }),
+        machine: machineModel,
+      },
+      {
+        name: "workflow",
+        definition: definition(agentRun, { agent: { harness: { command: customCommand } } }),
+        machine: machineModel,
+      },
+      {
+        name: "machine",
+        definition: definition(agentRun),
+        machine: { agent: { ...machineModel.agent, harness: { command: customCommand } } },
+      },
+    ];
+
+    for (const layer of layers) {
+      expect(() => resolveWorkflowSettings({
+        definition: layer.definition,
+        machine: layer.machine,
+        projectCwd: "/tmp",
+      }), layer.name).toThrow(/step "node-a" worker harness command references removed variable WORKSHOP_PROMPT_FILE; migrate the harness to read input from stdin, write the declared result to stdout, and send diagnostics to stderr/);
+    }
+  });
+
+  test("rejects WORKSHOP_BIN for a verifier and checks names case-sensitively", () => {
+    const definition = workflowSchema.parse({
+      id: "clock",
+      defaults: { retries: 0, replay: "never" },
+      nodes: {
+        "node-a": {
+          run: { command: "echo candidate" },
+          validator: {
+            agent: {
+              instructions: "Judge the result.",
+              model: "provider/model:low",
+              harness: { command: "custom-verifier $WORKSHOP_BIN" },
+            },
+          },
+          next: null,
+        },
+      },
+    });
+    expect(() => resolveWorkflowSettings({ definition, machine: {}, projectCwd: "/tmp" }))
+      .toThrow(/step "node-a" verifier harness command references removed variable WORKSHOP_BIN; migrate the harness to read input from stdin, write the declared result to stdout, and send diagnostics to stderr/);
+
+    const lowercase = resolveAgent({
+      site: {
+        model: "provider/model:low",
+        harness: { command: "custom-agent $workshop_prompt_file" },
+      },
+    });
+    expect(lowercase.harnessCommand).toBe("custom-agent $workshop_prompt_file");
+
+    for (const variable of [
+      "WORKSHOP_PROMPT_FILE",
+      "WORKSHOP_RESULT_FILE",
+      "WORKSHOP_PREVIOUS_OUTPUT_FILE",
+      "WORKSHOP_STEP_OUTPUT_FILE",
+      "WORKSHOP_WORKLOG_FILE",
+      "WORKSHOP_STDOUT_FILE",
+      "WORKSHOP_STDERR_FILE",
+      "WORKSHOP_BIN",
+    ]) {
+      expect(() => resolveAgent({
+        site: {
+          model: "provider/model:low",
+          harness: { command: "custom-agent $" + variable },
+        },
+        context: { role: "worker", stepId: "node-a" },
+      })).toThrow(new RegExp("step \"node-a\" worker harness command references removed variable " + variable));
+    }
+  });
+
   test("a site can override one field while inheriting the other", () => {
     const modelOnly = resolveAgent({
       site: { model: "site/model:high" },
@@ -523,11 +616,13 @@ describe("field-by-field agent resolution", () => {
     expect(resolved.model?.full).toBe("workflow/model:low");
   });
 
-  test("the Pi preset is used for an explicit or unset harness", () => {
+  test("the Pi preset is the exact stdin command for an explicit or unset harness", () => {
+    const expected = 'pi --print --approve --no-session --no-extensions --no-skills --no-context-files --no-mcp --model "$WORKSHOP_MODEL_WITH_THINKING"';
     const explicit = resolveAgent({ site: { harness: "pi", model: "provider/model:low" } });
     const unset = resolveAgent({ site: { model: "provider/model:low" } });
-    expect(explicit.harnessCommand).toBe(PI_HARNESS_COMMAND);
-    expect(unset.harnessCommand).toBe(PI_HARNESS_COMMAND);
+    expect(PI_HARNESS_COMMAND).toBe(expected);
+    expect(explicit.harnessCommand).toBe(expected);
+    expect(unset.harnessCommand).toBe(expected);
     expect(explicit.model?.full).toBe("provider/model:low");
     expect(unset.model?.full).toBe("provider/model:low");
   });

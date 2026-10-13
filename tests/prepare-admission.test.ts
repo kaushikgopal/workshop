@@ -170,6 +170,34 @@ describe("prepareRunAdmission", () => {
     expect(result.failure.kind).toBe("resolved_settings_mismatch");
   });
 
+  test("rejects removed harness variables before admission with migration guidance", () => {
+    const legacyHarnessSource = [
+      "version: 4",
+      "defaults: { retries: 0, replay: never }",
+      "steps:",
+      "  - legacy-worker:",
+      "      agent:",
+      "        instructions: Write the result.",
+      "        model: provider/model:low",
+      "        harness:",
+      "          command: 'custom-agent $WORKSHOP_RESULT_FILE'",
+      "",
+    ].join("\n");
+    const result = prepareRunAdmission({
+      ...preparedRequest(),
+      sourceText: legacyHarnessSource,
+    });
+
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("legacy harness command passed admission");
+    expect(result.failure.kind).toBe("machine_settings_invalid");
+    expect(result.failure.message).toContain("step \"legacy-worker\" worker harness");
+    expect(result.failure.message).toContain("WORKSHOP_RESULT_FILE");
+    expect(result.failure.message).toContain("read input from stdin");
+    expect(result.failure.message).toContain("write the declared result to stdout");
+    expect(result.failure.message).toContain("send diagnostics to stderr");
+  });
+
   test("rejects malformed definitions and unsafe run paths before storage access", () => {
     const invalidSource = prepareRunAdmission({ ...preparedRequest(), sourceText: "version: 1\nid: old\n" });
     expect(invalidSource.ok).toBe(false);

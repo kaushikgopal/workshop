@@ -1,15 +1,15 @@
 import { createHash, randomUUID } from "node:crypto";
 import { Buffer } from "node:buffer";
-import { existsSync, statSync, writeFileSync } from "node:fs";
+import { statSync } from "node:fs";
 import { resolve } from "node:path";
 import type { Context } from "@earendil-works/chord";
-import { defineTask, type ConversationId, type Task, type TaskId, type TaskRuntime, type Tx } from "@earendil-works/pi-durable";
+import { defineTask, type ConversationId, type Cursor, type Task, type TaskId, type TaskRuntime, type Tx } from "@earendil-works/pi-durable";
 import { z } from "zod";
 import { canonicalHash } from "../../definition/hash-canonical-json.js";
 import type { ResolvedExecutionSite } from "../../definition/schema-resolved.js";
 import { nodeIdSchema, workflowIdSchema } from "../../definition/schema.js";
-import { parseValidatorVerdictFile, parseWorkerResultFile } from "../../attempt/parse-result.js";
-import { renderValidatorPrompt, renderWorkerPrompt } from "../../attempt/render-agent-prompt.js";
+import { parseTextResult, parseTaggedWorkerResult, parseTaggedVerifierDecision } from "../../attempt/parse-tagged-result.js";
+import { reconstructProcessStdin } from "../../attempt/build-process-stdin.js";
 import { installationDocumentV1Schema } from "../../installation/schema.js";
 import { executionIdSchema, incarnationIdSchema } from "../../process/schema.js";
 import {
@@ -31,10 +31,10 @@ import {
   persistedNodeAttemptSchema,
   workflowRunDocumentV1Schema,
   workshopEventV1Schema,
+  workshopProcessV1Schema,
   type WorkflowRunDocumentV1,
 } from "../../run/records.js";
-import { WorkshopEventEntry, WorkshopInstallationDoc, WorkshopRunDoc } from "./define-workshop-records.js";
-import { writeProcessInputs } from "./write-process-inputs.js";
+import { WorkshopEventEntry, WorkshopInstallationDoc, WorkshopProcessEntry, WorkshopRunDoc } from "./define-workshop-records.js";
 import {
   buildProcessExecutionEnvironment,
   processExecutionFiles,
@@ -126,23 +126,6 @@ export function defineNodeAttemptTask(
         }
         const executionId = executionIdSchema.parse(randomUUID());
         const incarnationId = incarnationIdSchema.parse(randomUUID());
-        const processInput = createProcessInput({
-          run,
-          taskId: Number(runtime.taskId),
-          input,
-          role: "worker",
-          site: settings.run,
-          executionId,
-          incarnationId,
-          serviceBootId: activeBootId,
-          launchIntentAt,
-          deadlineAt,
-        });
-        if (!writeLaunchFiles(processInput, run, input.attemptNumber, settings.run, null)) {
-          const block = blockInfo("integrity_failed", "worker input files could not be written before launch", input.runId, input.nodeId, input.attemptId, timestamp(runtime.now()));
-          await settleAttempt(task, runtime, input, { kind: "blocked", block, candidate: null, validator: null }, "interrupted", context);
-          return;
-        }
         await runtime.commit(async (tx) => {
           const { draft, run: current } = await runDraft(tx, runtime.conversationId);
           assertNodeIdentity(input, current, runtime.taskId);
@@ -150,6 +133,20 @@ export function defineNodeAttemptTask(
           if (attempt.status !== "prepared" || attempt.workerExecutionId !== null || attempt.result.kind !== "pending") {
             throw new Error("node attempt is not ready to admit its first worker process");
           }
+          const currentSettings = current.resolvedSettings.nodes[input.nodeId];
+          if (currentSettings === undefined) throw new Error("canonical node lost its frozen execution settings");
+          const processInput = createProcessInput({
+            run: current,
+            taskId: Number(runtime.taskId),
+            input,
+            role: "worker",
+            site: currentSettings.run,
+            executionId,
+            incarnationId,
+            serviceBootId: activeBootId,
+            launchIntentAt,
+            deadlineAt,
+          });
           const processTaskId = await tx.createTask(ProcessExecutionTask, processInput, {
             ownership: { kind: "task", taskId: runtime.taskId },
             conversationId: runtime.conversationId,
@@ -225,57 +222,38 @@ export function defineNodeAttemptTask(
         }
         const settings = run.resolvedSettings.nodes[input.nodeId];
         if (settings === undefined) throw new Error("frozen node settings disappeared");
-        let candidate: NodeResult;
-        if (settings.run.kind === "command") {
-          const stdout = process.semanticStdout;
-          if (stdout.kind === "not_captured") {
-            const block = blockInfo("integrity_failed", "command worker omitted semantic stdout capture", input.runId, input.nodeId, input.attemptId, timestamp(runtime.now()));
-            await settleAttempt(task, runtime, input, { kind: "blocked", block, candidate: null, validator: null }, "interrupted", context);
-            return;
-          }
-          if (stdout.kind === "too_large") {
-            const failure = failureInfo("result_too_large", "command stdout exceeded the 1 MiB output limit", input, runtime.now());
-            await settleAttempt(task, runtime, input, { kind: "failed", failure, candidate: null, validator: null }, "failed", context);
-            return;
-          }
-          if (stdout.kind === "invalid_utf8") {
-            const failure = failureInfo("result_invalid", "command stdout is not valid UTF-8", input, runtime.now());
-            await settleAttempt(task, runtime, input, { kind: "failed", failure, candidate: null, validator: null }, "failed", context);
-            return;
-          }
-          if (stdout.kind !== "captured") throw new Error("command stdout passed checks without checked text");
-          candidate = nodeResultSchema.parse({
-            version: 1,
-            source: "command",
-            output: stdout.text,
-            summary: "command completed with exit code 0",
-            artifacts: [],
-            sourceBytesHash: stdout.sha256,
-            exit: process.exit,
-          });
-        } else {
-          if (process.semanticStdout.kind !== "not_captured") {
-            const block = blockInfo("integrity_failed", "agent worker stdout was treated as semantic output", input.runId, input.nodeId, input.attemptId, timestamp(runtime.now()));
-            await settleAttempt(task, runtime, input, { kind: "blocked", block, candidate: null, validator: null }, "interrupted", context);
-            return;
-          }
-          const resultPath = processExecutionFiles({ role: "worker", nodeId: input.nodeId, incarnationNumber: checkpoint.incarnationNumber }, run.paths.runDirectory, input.attemptNumber).resultPath;
-          const parsed = parseWorkerResultFile(resultPath);
-          if (!parsed.ok) {
-            const failure = failureInfo(parsed.failure.kind, parsed.failure.message, input, runtime.now());
-            await settleAttempt(task, runtime, input, { kind: "failed", failure, candidate: null, validator: null }, "failed", context);
-            return;
-          }
-          candidate = nodeResultSchema.parse({
-            version: 1,
-            source: "agent",
-            output: parsed.value.output,
-            summary: parsed.value.summary,
-            artifacts: resolveWorkerArtifacts(settings.run.cwd, parsed.value.artifacts),
-            sourceBytesHash: parsed.sourceBytesHash,
-            exit: process.exit,
-          });
+        const stdout = process.semanticStdout;
+        if (stdout.kind === "not_captured") {
+          const block = blockInfo("integrity_failed", "worker omitted stdout evidence", input.runId, input.nodeId, input.attemptId, timestamp(runtime.now()));
+          await settleAttempt(task, runtime, input, { kind: "blocked", block, candidate: null, validator: null }, "interrupted", context);
+          return;
         }
+        if (stdout.kind !== "captured") {
+          const failure = failureInfo(stdout.kind === "too_large" ? "result_too_large" : "result_invalid",
+            stdout.kind === "too_large" ? "worker stdout exceeded the 1 MiB result limit" : "worker stdout is not valid UTF-8", input, runtime.now());
+          await settleAttempt(task, runtime, input, { kind: "failed", failure, candidate: null, validator: null }, "failed", context);
+          return;
+        }
+        if (!("formatVersion" in run.resolvedSettings) || run.resolvedSettings.formatVersion !== 4) throw new Error("format 3 execution is unsupported");
+        const mode = run.resolvedSettings.nodes[input.nodeId]!.result;
+        const parsed = mode === "text" ? parseTextResult(Buffer.from(stdout.text, "utf8")) : parseTaggedWorkerResult(Buffer.from(stdout.text, "utf8"));
+        if (!parsed.ok) {
+          const failure = failureInfo(parsed.failure.kind, parsed.failure.message, input, runtime.now());
+          await settleAttempt(task, runtime, input, { kind: "failed", failure, candidate: null, validator: null }, "failed", context);
+          return;
+        }
+        const candidate = nodeResultSchema.parse({
+          version: 2,
+          source: settings.run.kind,
+          output: parsed.value.output,
+          summary: "reason" in parsed.value ? parsed.value.reason ?? "" : "",
+          artifacts: [],
+          sourceBytesHash: parsed.sourceBytesHash,
+          exit: process.exit,
+          stdioResult: { version: 1, mode, status: parsed.value.status,
+            reason: "reason" in parsed.value ? parsed.value.reason : null,
+            question: "question" in parsed.value ? parsed.value.question : null },
+        });
         await commitWorkerCandidate(runtime, input, candidate, settings.validator !== null, context);
       },
       launchValidator: async (task, runtime, context) => {
@@ -308,23 +286,6 @@ export function defineNodeAttemptTask(
         }
         const executionId = executionIdSchema.parse(randomUUID());
         const incarnationId = incarnationIdSchema.parse(randomUUID());
-        const processInput = createProcessInput({
-          run,
-          taskId: Number(runtime.taskId),
-          input,
-          role: "validator",
-          site: settings.validator,
-          executionId,
-          incarnationId,
-          serviceBootId: activeBootId,
-          launchIntentAt,
-          deadlineAt,
-        });
-        if (!writeLaunchFiles(processInput, run, input.attemptNumber, settings.validator, candidate)) {
-          const block = blockInfo("integrity_failed", "validator input files could not be written before launch", input.runId, input.nodeId, input.attemptId, timestamp(runtime.now()));
-          await settleAttempt(task, runtime, input, { kind: "blocked", block, candidate, validator: null }, "interrupted", context);
-          return;
-        }
         await runtime.commit(async (tx) => {
           const { draft, run: current } = await runDraft(tx, runtime.conversationId);
           assertNodeIdentity(input, current, runtime.taskId);
@@ -332,6 +293,22 @@ export function defineNodeAttemptTask(
           if (currentAttempt.result.kind !== "candidate_committed" || currentAttempt.validatorExecutionId !== null) {
             throw new Error("node attempt is not ready to admit its validator");
           }
+          const currentSettings = current.resolvedSettings.nodes[input.nodeId];
+          if (currentSettings === undefined || currentSettings.validator === null) {
+            throw new Error("canonical node no longer has a frozen validator");
+          }
+          const processInput = createProcessInput({
+            run: current,
+            taskId: Number(runtime.taskId),
+            input,
+            role: "validator",
+            site: currentSettings.validator,
+            executionId,
+            incarnationId,
+            serviceBootId: activeBootId,
+            launchIntentAt,
+            deadlineAt,
+          });
           const processTaskId = await tx.createTask(ProcessExecutionTask, processInput, {
             ownership: { kind: "task", taskId: runtime.taskId },
             conversationId: runtime.conversationId,
@@ -397,11 +374,6 @@ export function defineNodeAttemptTask(
           return;
         }
         const process = checked.data;
-        if (process.semanticStdout.kind !== "not_captured") {
-          const block = blockInfo("integrity_failed", "validator stdout was treated as semantic output", input.runId, input.nodeId, input.attemptId, timestamp(runtime.now()));
-          await settleAttempt(task, runtime, input, { kind: "blocked", block, candidate, validator: null }, "interrupted", context);
-          return;
-        }
         if (process.timedOut) {
           const failure = failureInfo("timeout", "validator exceeded its absolute deadline", input, runtime.now());
           await settleAttempt(task, runtime, input, { kind: "failed", failure, candidate, validator: null }, "failed", context);
@@ -423,8 +395,13 @@ export function defineNodeAttemptTask(
             await settleAttempt(task, runtime, input, { kind: "failed", failure, candidate, validator: null }, "failed", context);
             return;
           }
-          const resultPath = processExecutionFiles({ role: "validator", nodeId: input.nodeId, incarnationNumber: checkpoint.incarnationNumber }, run.paths.runDirectory, input.attemptNumber).resultPath;
-          const parsed = parseValidatorVerdictFile(resultPath);
+          const stdout = process.semanticStdout;
+          if (stdout.kind !== "captured") {
+            const failure = failureInfo(stdout.kind === "too_large" ? "result_too_large" : "result_invalid", "agent verifier stdout is unavailable, oversized, or invalid UTF-8", input, runtime.now());
+            await settleAttempt(task, runtime, input, { kind: "failed", failure, candidate, validator: null }, "failed", context);
+            return;
+          }
+          const parsed = parseTaggedVerifierDecision(Buffer.from(stdout.text, "utf8"));
           if (!parsed.ok) {
             const failure = failureInfo(parsed.failure.kind, parsed.failure.message, input, runtime.now());
             await settleAttempt(task, runtime, input, { kind: "failed", failure, candidate, validator: null }, "failed", context);
@@ -433,7 +410,7 @@ export function defineNodeAttemptTask(
           validator = validatorOutcomeSchema.parse({
             kind: "agent",
             exit: process.exit,
-            verdict: parsed.value,
+            verdict: { version: 2, decision: parsed.value.decision, reason: parsed.value.reason, corrections: parsed.value.corrections },
             resultBytesHash: parsed.sourceBytesHash,
           });
         }
@@ -508,7 +485,8 @@ async function commitWorkerCandidate(
       candidate: checkedCandidate,
       occurredAt: timestamp(runtime.now()),
     });
-    return { status: "running", checkpoint: { phase: hasValidator ? "launchValidator" : "finish" } };
+    const gatedWorkerResult = workerResultRequiresRuntimeGate(checkedCandidate);
+    return { status: "running", checkpoint: { phase: gatedWorkerResult ? "finish" : hasValidator ? "launchValidator" : "finish" } };
   }, context);
 }
 
@@ -568,7 +546,11 @@ function createProcessInput(args: {
     args.run.paths.runDirectory,
     args.input.attemptNumber,
   );
+  const stdin = reconstructProcessStdin({ role: args.role, nodeId: args.input.nodeId, attemptId: args.input.attemptId, executionId: args.executionId }, args.run);
   const base: ProcessExecutionTaskEnvironmentInput = {
+    ioVersion: 1,
+    stdinSha256: stdin.sha256,
+    stdinByteCount: stdin.byteCount,
     runId: args.run.runId,
     workflowId: args.run.workflowId,
     activationId: args.run.activationId,
@@ -641,24 +623,6 @@ async function scheduleSafeProcessReplay(args: {
   const currentCandidate = role === "validator" && currentAttempt.result.kind === "candidate_committed"
     ? currentAttempt.result.candidate
     : null;
-  const replayInput = createProcessInput({
-    run: resumableRun,
-    taskId: Number(runtime.taskId),
-    input,
-    role,
-    site,
-    executionId: replay.executionId,
-    incarnationId: replay.incarnationId,
-    incarnationNumber: replay.incarnationNumber,
-    serviceBootId: activeBootId,
-    launchIntentAt: replay.launchIntentAt,
-    deadlineAt: replay.deadlineAt,
-  });
-  if (!writeLaunchFiles(replayInput, resumableRun, input.attemptNumber, site, currentCandidate)) {
-    const block = blockInfo("integrity_failed", "replay input files could not be written before launch", input.runId, input.nodeId, input.attemptId, timestamp(runtime.now()));
-    await settleAttempt(task, runtime, input, { kind: "blocked", block, candidate, validator: null }, "interrupted", context);
-    return;
-  }
   await runtime.commit(async (tx) => {
     const { draft, run: current } = await runDraft(tx, runtime.conversationId);
     assertNodeIdentity(input, current, runtime.taskId);
@@ -673,6 +637,30 @@ async function scheduleSafeProcessReplay(args: {
     if (current.desiredState !== "running" || current.status !== "running") {
       return { status: "running", checkpoint };
     }
+    const currentSettings = current.resolvedSettings.nodes[input.nodeId];
+    const currentSite = role === "worker" ? currentSettings?.run : currentSettings?.validator;
+    let replayInput: ProcessExecutionTaskInput;
+    try {
+      if (currentSite === undefined || currentSite === null) throw new Error("frozen replay execution site is missing");
+      replayInput = createProcessInput({
+        run: current,
+        taskId: Number(runtime.taskId),
+        input,
+        role,
+        site: currentSite,
+        executionId: replay.executionId,
+        incarnationId: replay.incarnationId,
+        incarnationNumber: replay.incarnationNumber,
+        serviceBootId: activeBootId,
+        launchIntentAt: replay.launchIntentAt,
+        deadlineAt: replay.deadlineAt,
+      });
+    } catch {
+      return await blockReplayIntegrityFailure(tx, runtime.conversationId, draft, current, input, latestAttempt, runtime.now());
+    }
+    if (!await processInputMatchesCommittedStdin(tx, runtime.conversationId, replayInput, checkpoint.incarnationId)) {
+      return await blockReplayIntegrityFailure(tx, runtime.conversationId, draft, current, input, latestAttempt, runtime.now());
+    }
     assign(draft, current);
     const processTaskId = await tx.createTask(ProcessExecutionTask, replayInput, {
       ownership: { kind: "task", taskId: runtime.taskId },
@@ -683,6 +671,91 @@ async function scheduleSafeProcessReplay(args: {
       : { phase: "awaitValidator" as const, processTaskId: Number(processTaskId), executionId: replay.executionId, incarnationId: replay.incarnationId, incarnationNumber: replay.incarnationNumber };
     return { status: "waiting", checkpoint: nextCheckpoint, on: [processTaskId], policy: "allSettled" };
   }, context);
+}
+
+async function blockReplayIntegrityFailure(
+  tx: Tx,
+  conversationId: ConversationId,
+  draft: object,
+  run: ReadyRun,
+  input: NodeAttemptTaskInput,
+  attempt: PersistedNodeAttempt,
+  now: number,
+): Promise<{ status: "terminal"; outcome: { status: "completed"; result: NodeAttemptOutcome } }> {
+  const at = timestamp(now);
+  const block = blockInfo("integrity_failed", "replay input differs from the original execution identity", input.runId, input.nodeId, input.attemptId, at);
+  const outcome = nodeAttemptOutcomeSchema.parse({
+    kind: "blocked",
+    block,
+    candidate: attempt.result.kind === "candidate_committed" || attempt.result.kind === "validation_committed" ? attempt.result.candidate : null,
+    validator: attempt.result.kind === "validation_committed" ? attempt.result.validator : null,
+  });
+  assign(draft, replaceRunAttempt(run, input.nodeId, input.attemptId, (value) => ({
+    ...value,
+    status: "interrupted",
+    phase: null,
+    finishedAt: at,
+    elapsedMs: value.startedAt === null ? null : Date.parse(at) - Date.parse(value.startedAt),
+    result: { kind: "settled", outcome },
+    blockIds: [...value.blockIds, block.blockId],
+  })));
+  await appendEvent(tx, conversationId, {
+    version: 1,
+    eventId: randomUUID(),
+    type: "attempt_settled",
+    runId: input.runId,
+    nodeId: input.nodeId,
+    attemptId: input.attemptId,
+    outcome,
+    occurredAt: at,
+  });
+  return { status: "terminal", outcome: { status: "completed", result: outcome } };
+}
+
+async function processInputMatchesCommittedStdin(
+  tx: Tx,
+  conversationId: ConversationId,
+  input: ProcessExecutionTaskInput,
+  previousIncarnationId: string,
+): Promise<boolean> {
+  const records: z.infer<typeof workshopProcessV1Schema>[] = [];
+  let cursor: Cursor | undefined;
+  do {
+    const page = await tx.scanEntries({ conversationId }, 256, cursor);
+    for (const entry of page.items) {
+      if (!WorkshopProcessEntry.is(entry)) continue;
+      const parsed = workshopProcessV1Schema.safeParse(entry.data);
+      if (!parsed.success) return false;
+      if (parsed.data.process.executionId === input.executionId) records.push(parsed.data);
+    }
+    cursor = page.next;
+  } while (cursor !== undefined);
+
+  const first = records.filter((record) => record.process.incarnationNumber === 1);
+  if (first.length === 0) return false;
+  const original = first[0]!.process;
+  const originalStdio = original.stdio;
+  if (originalStdio === undefined || originalStdio.version !== 1
+    || originalStdio.stdinSha256 !== input.stdinSha256 || originalStdio.stdinByteCount !== input.stdinByteCount) return false;
+  if (first.some((record) => record.process.incarnationId !== original.incarnationId)) return false;
+
+  const incarnationIds = new Map<number, string>();
+  for (const record of records) {
+    const process = record.process;
+    const knownIncarnationId = incarnationIds.get(process.incarnationNumber);
+    if (knownIncarnationId !== undefined && knownIncarnationId !== process.incarnationId) return false;
+    incarnationIds.set(process.incarnationNumber, process.incarnationId);
+    if (record.runId !== input.runId || record.nodeId !== input.nodeId || record.attemptId !== input.attemptId
+      || process.executionId !== input.executionId || process.role !== input.role || process.incarnationNumber >= input.incarnationNumber
+      || process.stdio?.version !== 1
+      || process.stdio.stdinSha256 !== originalStdio.stdinSha256
+      || process.stdio.stdinByteCount !== originalStdio.stdinByteCount) return false;
+  }
+  if (incarnationIds.get(input.incarnationNumber - 1) !== previousIncarnationId) return false;
+  for (let number = 1; number < input.incarnationNumber; number += 1) {
+    if (!incarnationIds.has(number)) return false;
+  }
+  return true;
 }
 
 async function waitForNodeReplayResume(runtime: NodeRuntime, input: NodeAttemptTaskInput, context: Context): Promise<ReadyRun> {
@@ -722,44 +795,6 @@ async function waitForNodeReplayResume(runtime: NodeRuntime, input: NodeAttemptT
   }
 }
 
-/** Writes a process's input files and agent prompt; false means launch must not proceed. */
-function writeLaunchFiles(
-  processInput: ProcessExecutionTaskInput,
-  run: ReadyRun,
-  attemptNumber: number,
-  site: ResolvedExecutionSite,
-  candidate: NodeResult | null,
-): boolean {
-  if (processInput.nodeId === null || processInput.attemptId === null || processInput.role === "preflight") {
-    throw new Error("process input files require a node execution identity");
-  }
-  const files = processExecutionFiles(processInput, run.paths.runDirectory, attemptNumber);
-  try {
-    writeProcessInputs(run, processInput.nodeId, files, processInput.role === "validator" ? candidate : null);
-    if (site.kind !== "agent") return true;
-    if (existsSync(files.resultPath)) return false;
-    const identity = {
-      workflowId: run.workflowId,
-      runId: run.runId,
-      nodeId: processInput.nodeId,
-      attemptNumber,
-      instructions: site.instructions,
-      workflowInstructions: "instructions" in run.resolvedSettings ? run.resolvedSettings.instructions : null,
-      worklogPath: files.worklogPath,
-      previousOutputPath: files.previousOutputPath,
-      resultPath: files.resultPath,
-    };
-    if (processInput.role === "validator" && candidate === null) return false;
-    const prompt = processInput.role === "worker"
-      ? renderWorkerPrompt(identity)
-      : renderValidatorPrompt({ ...identity, candidatePath: files.candidateOutputPath });
-    writeFileSync(files.promptPath, prompt, "utf8");
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 export function resolveWorkerArtifacts(
   cwd: string,
   artifacts: readonly { kind: string; path: string }[],
@@ -785,13 +820,20 @@ export function resolveWorkerArtifacts(
   });
 }
 
+function workerResultRequiresRuntimeGate(candidate: NodeResult): boolean {
+  return candidate.version === 2
+    && (candidate.stdioResult.status === "needs_input" || candidate.stdioResult.status === "success_and_complete");
+}
+
 function validatorFailureReason(validator: ValidatorOutcome): string {
   if (validator.kind === "command") {
     return validator.exit.kind === "code"
       ? `command validator exited with code ${validator.exit.code}`
       : `command validator exited by ${validator.exit.kind}`;
   }
-  return validator.verdict.reason;
+  return validator.verdict.version === 2 && validator.verdict.corrections !== null
+    ? validator.verdict.reason + "\n\nCorrections:\n" + validator.verdict.corrections
+    : validator.verdict.reason;
 }
 
 function cancelledAttemptOutcome(attempt: PersistedNodeAttempt): NodeAttemptOutcome {
@@ -884,6 +926,14 @@ async function finishNodeAttempt(
     : null;
   if (candidate === null) throw new Error("attempt has no committed candidate to settle");
   const validator = attempt.result.kind === "validation_committed" ? attempt.result.validator : null;
+  const gatedStatus = workerResultRequiresRuntimeGate(candidate);
+  const gatedVerdict = validator?.kind === "agent" && validator.verdict.version === 2 && validator.verdict.decision === "block";
+  if (gatedStatus || gatedVerdict) {
+    const reason = gatedStatus ? "worker status requires a later runtime package" : "verifier block requires a later runtime package";
+    const block = blockInfo("runtime_incompatible", reason, input.runId, input.nodeId, input.attemptId, timestamp(runtime.now()));
+    await settleAttempt(null, runtime, input, { kind: "blocked", block, candidate, validator }, "interrupted", context);
+    return;
+  }
   const missingArtifact = candidate.artifacts.find((artifact) => artifact.availability === "missing");
   const outcome = missingArtifact !== undefined
     ? nodeAttemptOutcomeSchema.parse({

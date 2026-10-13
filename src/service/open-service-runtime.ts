@@ -591,6 +591,31 @@ async function controlWorkflow(
   return result.response;
 }
 
+type ResolutionBlockKind = NonNullable<ReadyRunForResolution["block"]>["kind"];
+
+export function format4ResolutionRejection(input: {
+  readonly formatVersion: number | undefined;
+  readonly blockKind: ResolutionBlockKind | undefined;
+  readonly action: Extract<ServiceRequestV1, { method: "resolve" }>["action"];
+}): string | null {
+  if (input.formatVersion !== 4) return null;
+  if (input.action === "accept") {
+    return "format 4 accept --result-file is not supported yet; WP6 must define human text/tagged acceptance. Fail this run or use the previous build";
+  }
+  if ((input.blockKind === "runtime_incompatible" || input.blockKind === "integrity_failed") && input.action !== "fail") {
+    return "format 4 runtime_incompatible and integrity_failed blocks permit only fail; retry, including judgment retry, cannot bypass the runtime gate";
+  }
+  return null;
+}
+
+function checkFormat4Resolution(run: ReadyRunForResolution, request: Extract<ServiceRequestV1, { method: "resolve" }>): void {
+  const formatVersion = "formatVersion" in run.resolvedSettings && typeof run.resolvedSettings.formatVersion === "number"
+    ? run.resolvedSettings.formatVersion
+    : undefined;
+  const rejection = format4ResolutionRejection({ formatVersion, blockKind: run.block?.kind, action: request.action });
+  if (rejection !== null) throw new ServiceRequestError("resolution_rejected", rejection);
+}
+
 async function resolveBlockedWorkflow(
   harness: Harness,
   tasks: ReturnType<typeof defineWorkshopTasks>,
@@ -651,6 +676,7 @@ async function resolveBlockedWorkflow(
     const selectedRun = await readRun(harness, reference);
     if (selectedRun.status !== "blocked" || selectedRun.block === null) throw new ServiceRequestError("resolution_rejected", "run_blocked: only the current blocked run can be resolved");
     const source = selectedRun.block;
+    checkFormat4Resolution(selectedRun, request);
     const attemptLocation = source.attemptId === null ? null : findRunAttempt(selectedRun, source.nodeId, source.attemptId);
     if (source.attemptId !== null && attemptLocation === null) throw new ServiceRequestError("resolution_rejected", "resolution source attempt is missing");
     if (selectedRun.resolutions.some((resolution) => resolution.sourceBlock.blockId === source.blockId)
@@ -751,6 +777,7 @@ async function resolveBlockedWorkflow(
       const currentProcesses = processRecords;
       assertRunProcessGroupsConfirmedDead(currentRun, currentProcesses);
       const currentBlock = currentRun.block;
+      checkFormat4Resolution(currentRun, request);
       if (currentBlock.blockId !== sourceBlock.blockId) throw new ServiceRequestError("resolution_rejected", "resolution source block changed before commit");
       const currentLocation = currentBlock.attemptId === null ? null : findRunAttempt(currentRun, currentBlock.nodeId, currentBlock.attemptId);
       if (currentBlock.attemptId !== null && currentLocation === null) throw new ServiceRequestError("resolution_rejected", "resolution source attempt is missing");

@@ -1,4 +1,5 @@
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -15,7 +16,7 @@ import { readServiceWorklog, sendServiceRequest, streamServiceLogChunks } from "
 import { acquireServiceLock } from "../src/service/acquire-service-lock.js";
 import { WorkshopInstallationDoc, WorkshopProcessEntry } from "../src/storage/durable/define-workshop-records.js";
 import { openDurableStorage } from "../src/storage/durable/open-durable-storage.js";
-import { startWorkshopService } from "../src/service/open-service-runtime.js";
+import { format4ResolutionRejection, startWorkshopService } from "../src/service/open-service-runtime.js";
 import { logsDtoSchema, nodeDescriptionDtoSchema, statusDtoSchema, type LogsDto } from "../src/views/schema.js";
 
 async function waitForCompletedRun(socketPath: string, workflowId: string, runId: string): Promise<void> {
@@ -36,12 +37,24 @@ async function waitForCompletedRun(socketPath: string, workflowId: string, runId
 
 
 describe("Durable service runtime", () => {
+  test("limits format 4 runtime and integrity blocks to fail", () => {
+    expect(format4ResolutionRejection({ formatVersion: 4, blockKind: "runtime_incompatible", action: "retry" }))
+      .toContain("permit only fail");
+    expect(format4ResolutionRejection({ formatVersion: 4, blockKind: "integrity_failed", action: "retry" }))
+      .toContain("permit only fail");
+    expect(format4ResolutionRejection({ formatVersion: 4, blockKind: "integrity_failed", action: "accept" }))
+      .toContain("WP6 must define human text/tagged acceptance");
+    expect(format4ResolutionRejection({ formatVersion: 4, blockKind: "runtime_incompatible", action: "fail" })).toBeNull();
+    expect(format4ResolutionRejection({ formatVersion: 4, blockKind: "integrity_failed", action: "fail" })).toBeNull();
+    expect(format4ResolutionRejection({ formatVersion: 4, blockKind: "orchestrator_unavailable", action: "retry" })).toBeNull();
+    expect(format4ResolutionRejection({ formatVersion: 3, blockKind: "runtime_incompatible", action: "retry" })).toBeNull();
+  });
   test("serves start, status, runs, and logs for one canonical run through real SQLite and Harness resources", async () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-service-runtime-"));
     const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
     mkdirSync(workflows, { recursive: true });
-    writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\nkeep_files: always\n", "utf8");
+    writeFileSync(join(config, "workshop.yaml"), "shell: /bin/sh\nkeep_files: always\n", "utf8");
     writeFileSync(join(workflows, "clock.yaml"), [
       "version: 4",
       "defaults:",
@@ -196,7 +209,7 @@ describe("Durable service runtime", () => {
     const validatorLaunches = join(root, "validator-launches.txt");
     const validatorFirstFailure = join(root, "validator-first-failure.txt");
     mkdirSync(workflows, { recursive: true });
-    writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\norchestrator:\n  model: faux/failure-judge:low\n  timeout: 20s\n", "utf8");
+    writeFileSync(join(config, "workshop.yaml"), "shell: /bin/sh\norchestrator:\n  model: faux/failure-judge:low\n  timeout: 20s\n", "utf8");
     writeFileSync(join(workflows, "judgment-repair.yaml"), [
       "version: 4",
       "defaults:",
@@ -247,6 +260,16 @@ describe("Durable service runtime", () => {
       expect(blocked.workflows[0]?.unresolvedRun?.block?.kind).toBe("orchestrator_unavailable");
       expect(count(workerLaunches)).toBe(1);
       expect(count(validatorLaunches)).toBe(1);
+      const unsupportedAcceptance = await sendServiceRequest(socketPath, {
+        version: 1, method: "resolve", requestId: "judgment-repair-accept", workflowId: "judgment-repair",
+        runId: startResult.runId, action: "accept", reason: "Test the temporary format 4 acceptance guard.",
+        resultFile: "candidate.json", acknowledgeEffects: true,
+      });
+      expect(unsupportedAcceptance.ok).toBe(false);
+      if (unsupportedAcceptance.ok) throw new Error("format 4 file acceptance unexpectedly succeeded");
+      expect(unsupportedAcceptance.error.code).toBe("resolution_rejected");
+      expect(unsupportedAcceptance.error.message).toContain("format 4 accept --result-file is not supported yet");
+      expect(unsupportedAcceptance.error.message).toContain("WP6 must define human text/tagged acceptance");
       models.setProvider(faux.provider);
       const resolved = await sendServiceRequest(socketPath, {
         version: 1, method: "resolve", requestId: "judgment-repair-rejudge", workflowId: "judgment-repair",
@@ -298,14 +321,14 @@ describe("Durable service runtime", () => {
     const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
     mkdirSync(workflows, { recursive: true });
-    const harnessCommand = String.raw`printf '%s' '{"version":1,"output":"candidate","summary":"fixture result","artifacts":[]}' > "$WORKSHOP_RESULT_FILE"
+    const harnessCommand = String.raw`printf '<status>succeeded</status>\n<output>candidate</output>'
 case "$WORKSHOP_STEP_ID" in
-  bom) printf '\357\273\277raw-bom' ;;
-  invalid) printf '\377raw-invalid' ;;
-  readable) printf 'other sections remain readable' ;;
+  bom) printf '\357\273\277raw-bom' >&2 ;;
+  invalid) printf '\377raw-invalid' >&2 ;;
+  readable) printf 'other sections remain readable' >&2 ;;
   empty) : ;;
 esac`;
-    writeFileSync(join(config, "workshop.yaml"), `shell: /bin/bash\nkeep_files: always\nagent:\n  model: fixture/mock-model:medium\n  harness:\n    command: |\n${harnessCommand.split("\n").map((line) => `      ${line}`).join("\n")}\n`, "utf8");
+    writeFileSync(join(config, "workshop.yaml"), `shell: /bin/sh\nkeep_files: always\nagent:\n  model: fixture/mock-model:medium\n  harness:\n    command: |\n${harnessCommand.split("\n").map((line) => `      ${line}`).join("\n")}\n`, "utf8");
     writeFileSync(join(workflows, "capture-text.yaml"), [
       "version: 4",
       "defaults:",
@@ -340,9 +363,9 @@ esac`;
         logSections.push(section);
       });
       const logs = logsDtoSchema.parse({ version: 2, runId: logStream.runId, sections: logSections });
-      const bom = logs.sections.find((section) => section.kind === "capture" && section.label === "bom worker stdout");
-      const unavailable = logs.sections.find((section) => section.kind === "capture" && section.label === "invalid worker stdout");
-      const readable = logs.sections.find((section) => section.kind === "capture" && section.label === "readable worker stdout");
+      const bom = logs.sections.find((section) => section.kind === "capture" && section.label === "bom worker stderr");
+      const unavailable = logs.sections.find((section) => section.kind === "capture" && section.label === "invalid worker stderr");
+      const readable = logs.sections.find((section) => section.kind === "capture" && section.label === "readable worker stderr");
       expect(bom?.kind).toBe("capture");
       if (bom?.kind !== "capture") throw new Error("BOM capture section is missing");
       expect(bom.content).toBe("\uFEFFraw-bom");
@@ -352,7 +375,7 @@ esac`;
       expect(readable?.kind).toBe("capture");
       if (readable?.kind !== "capture") throw new Error("readable capture section is missing");
       expect(readable.content).toBe("other sections remain readable");
-      expect(logs.sections.some((section) => section.kind === "capture" && section.label === "empty worker stdout")).toBe(false);
+      expect(logs.sections.some((section) => section.kind === "capture" && section.label === "empty worker stderr")).toBe(false);
       const worklog = logs.sections.find((section) => section.kind === "worklog");
       expect(worklog?.kind).toBe("worklog");
       if (worklog?.kind !== "worklog") throw new Error("worklog section is missing");
@@ -371,44 +394,45 @@ esac`;
         cursor = page.nextCursor ?? undefined;
       } while (cursor !== undefined);
       expect(pages.map((section) => section.sectionId)).toEqual(logs.sections.map((section) => section.sectionId));
-      expect(pages.find((section) => section.kind === "capture" && section.label === "invalid worker stdout")?.content).toBeNull();
+      expect(pages.find((section) => section.kind === "capture" && section.label === "invalid worker stderr")?.content).toBeNull();
     } finally {
       if (owner !== undefined) await owner.shutdown();
       rmSync(root, { recursive: true, force: true });
     }
   }, 30_000);
 
-  test("bounds artifact_missing diagnostics without truncating worker artifact metadata", async () => {
-    const root = mkdtempSync(join(tmpdir(), "workshop-long-artifact-path-"));
+  test("keeps large stderr diagnostics separate from tagged worker output", async () => {
+    const root = mkdtempSync(join(tmpdir(), "workshop-large-stderr-diagnostic-"));
     const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
     const validatorLaunch = join(root, "validator-launched");
     const successorLaunch = join(root, "successor-launched");
-    const artifactPath = `/${"a".repeat(70_000)}`;
-    const harnessScript = join(root, "write-result.sh");
     mkdirSync(workflows, { recursive: true });
-    writeFileSync(harnessScript, `printf '%s' '${JSON.stringify({ version: 1, output: "candidate", summary: "long-path fixture", artifacts: [{ kind: "report", path: artifactPath }] })}' > "$WORKSHOP_RESULT_FILE"\n`, "utf8");
+    const harnessCommand = [
+      "printf '<status>succeeded</status>\\n<output>candidate</output>'",
+      "head -c 70000 /dev/zero | tr '\\000' x >&2",
+    ].join("\n");
     writeFileSync(join(config, "workshop.yaml"), [
-      "shell: /bin/bash",
+      "shell: /bin/sh",
+      "keep_files: always",
+      "stream_cap: 1kb",
       "agent:",
       "  model: fixture/mock-model:medium",
       "  harness:",
-      "    command: >-",
-      `      bash ${JSON.stringify(harnessScript)}`,
+      "    command: |",
+      ...harnessCommand.split("\n").map((line) => "      " + line),
       "",
     ].join("\n"), "utf8");
-    writeFileSync(join(workflows, "long-artifact.yaml"), [
+    writeFileSync(join(workflows, "large-stderr.yaml"), [
       "version: 4",
-      "defaults:",
-      "  retries: 0",
-      "  replay: never",
+      "defaults: { retries: 0, replay: never }",
       "steps:",
       "  - worker:",
       "      agent: Return the fixture result.",
       "      verify:",
-      "        run: 'printf launched > ${validatorLaunch}'",
+      "        run: 'test \"$(cat)\" = candidate; printf launched > " + validatorLaunch + "'",
       "  - successor:",
-      "      run: 'printf launched > ${successorLaunch}'",
+      "      run: 'test \"$(cat)\" = candidate; printf launched > " + successorLaunch + "; printf completed'",
       "",
     ].join("\n"), "utf8");
     const installation = loadInstallation(root);
@@ -418,48 +442,35 @@ esac`;
       const health = await probeServiceHealth(installation.stateDirectory);
       if (health.kind !== "ready") throw new Error(health.reason);
       const startedResponse = await sendServiceRequest(health.metadata.socketPath, {
-        version: 1, method: "start", requestId: "long-artifact-start", workflowId: "long-artifact",
+        version: 1, method: "start", requestId: "large-stderr-start", workflowId: "large-stderr",
       });
       if (!startedResponse.ok) throw new Error(startedResponse.error.message);
       const started = serviceStartResultV1Schema.parse(startedResponse.result);
-      const deadline = Date.now() + 15_000;
-      let run: ReturnType<typeof serviceRunsPageV1Schema.parse>["runs"][number] | undefined;
-      while (Date.now() < deadline) {
-        const response = await sendServiceRequest(health.metadata.socketPath, { version: 1, method: "runs", workflowId: "long-artifact", limit: 10 });
-        if (!response.ok) throw new Error(response.error.message);
-        const page = serviceRunsPageV1Schema.parse(response.result);
-        run = page.runs.find((candidate) => candidate.runId === started.runId);
-        if (run !== undefined && ["failed", "completed", "blocked", "cancelled"].includes(run.status)) break;
-        await new Promise((resolveDelay) => setTimeout(resolveDelay, 20));
-      }
-      if (run?.status !== "failed") throw new Error(`long-path run did not fail as expected: ${run?.status ?? "missing"}`);
-      expect(run.failure?.kind).toBe("artifact_missing");
-      if (run.failure?.kind !== "artifact_missing") throw new Error("run failure is not the missing-artifact diagnostic");
-      expect(run.failure.message.length).toBeLessThanOrEqual(64 * 1024);
-      expect(run.failure.message).toContain("sha256:");
-      expect(existsSync(validatorLaunch)).toBe(false);
-      expect(existsSync(successorLaunch)).toBe(false);
-
+      await waitForCompletedRun(health.metadata.socketPath, "large-stderr", started.runId);
       const descriptionResponse = await sendServiceRequest(health.metadata.socketPath, {
-        version: 1, method: "node.describe", workflowId: "long-artifact", nodeId: "worker", runId: started.runId,
+        version: 1, method: "node.describe", workflowId: "large-stderr", nodeId: "worker", runId: started.runId,
       });
       if (!descriptionResponse.ok) throw new Error(descriptionResponse.error.message);
-      const description = nodeDescriptionDtoSchema.parse(descriptionResponse.result);
-      expect(description.node.status).toBe("failed");
-      expect(description.node.successfulOutput).toBeNull();
-      const successorResponse = await sendServiceRequest(health.metadata.socketPath, {
-        version: 1, method: "node.describe", workflowId: "long-artifact", nodeId: "successor", runId: started.runId,
-      });
-      if (!successorResponse.ok) throw new Error(successorResponse.error.message);
-      expect(nodeDescriptionDtoSchema.parse(successorResponse.result).node.status).toBe("pending");
-      const worklog = await readServiceWorklog(health.metadata.socketPath, "long-artifact", started.runId, 10_000, true);
-      expect(worklog).toContain(`> ${artifactPath}`);
+      expect(nodeDescriptionDtoSchema.parse(descriptionResponse.result).node.successfulOutput).toBe("candidate");
+      expect(existsSync(validatorLaunch)).toBe(true);
+      expect(existsSync(successorLaunch)).toBe(true);
+      const sections: LogsDto["sections"] = [];
+      await streamServiceLogChunks(health.metadata.socketPath, "large-stderr", started.runId, (section) => { sections.push(section); });
+      const diagnostic = sections.find((section) => section.kind === "capture" && section.label === "worker worker stderr");
+      expect(diagnostic?.kind).toBe("capture");
+      if (diagnostic?.kind !== "capture") throw new Error("worker stderr capture is missing");
+      expect(diagnostic.capture.totalBytes).toBe(70_000);
+      expect(diagnostic.capture.retainedBytes).toBe(1024);
+      expect(diagnostic.capture.complete).toBe(false);
+      const stdout = sections.find((section) => section.kind === "capture" && section.label === "worker worker stdout");
+      expect(stdout?.kind).toBe("capture");
+      if (stdout?.kind !== "capture") throw new Error("worker stdout capture is missing");
+      expect(stdout.content).toContain("<status>succeeded</status>");
     } finally {
       if (owner !== undefined) await owner.shutdown();
       rmSync(root, { recursive: true, force: true });
     }
   }, 30_000);
-
 
   test("streams a valid 18 MiB capture through bounded, UTF-8-safe fragments", async () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-large-log-section-"));
@@ -469,12 +480,14 @@ esac`;
     const exactPrefix = "\uFEFFλ\r\n\u0001";
     const beforeBoundaryCodePoint = 512 * 1024 - new TextEncoder().encode(exactPrefix).byteLength - 1;
     mkdirSync(workflows, { recursive: true });
-    const harnessCommand = String.raw`printf '%s' '{"version":1,"output":"candidate","summary":"large capture fixture","artifacts":[]}' > "$WORKSHOP_RESULT_FILE"
-printf '\357\273\277\316\273\r\n\001'
-head -c ${beforeBoundaryCodePoint} /dev/zero | tr '\000' x
-printf '\342\202\254'
-head -c 18874368 /dev/zero | tr '\000' x`;
-    writeFileSync(join(config, "workshop.yaml"), `shell: /bin/bash\nkeep_files: always\nstream_cap: unlimited\nagent:\n  model: fixture/mock-model:medium\n  harness:\n    command: |\n${harnessCommand.split("\n").map((line) => `      ${line}`).join("\n")}\n`, "utf8");
+    const harnessCommand = String.raw`printf '<status>succeeded</status>\n<output>candidate</output>'
+{
+  printf '\357\273\277\316\273\r\n\001'
+  head -c ${beforeBoundaryCodePoint} /dev/zero | tr '\000' x
+  printf '\342\202\254'
+  head -c 18874368 /dev/zero | tr '\000' x
+} >&2`;
+    writeFileSync(join(config, "workshop.yaml"), `shell: /bin/sh\nkeep_files: always\nstream_cap: unlimited\nagent:\n  model: fixture/mock-model:medium\n  harness:\n    command: |\n${harnessCommand.split("\n").map((line) => `      ${line}`).join("\n")}\n`, "utf8");
     writeFileSync(join(workflows, "large-capture.yaml"), [
       "version: 4",
       "defaults:",
@@ -500,7 +513,7 @@ head -c 18874368 /dev/zero | tr '\000' x`;
       const chunks: string[] = [];
       const chunkBytes: number[] = [];
       await streamServiceLogChunks(health.metadata.socketPath, "large-capture", started.runId, (section) => {
-        if (section.kind === "capture" && section.label === "large worker stdout" && section.content !== null) {
+        if (section.kind === "capture" && section.label === "large worker stderr" && section.content !== null) {
           chunks.push(section.content);
           chunkBytes.push(new TextEncoder().encode(section.content).byteLength);
         }
@@ -526,8 +539,8 @@ head -c 18874368 /dev/zero | tr '\000' x`;
     const nodeIds = Array.from({ length: 18 }, (_, index) => `node-${String(index).padStart(2, "0")}`);
     mkdirSync(workflows, { recursive: true });
     const harnessCommand = String.raw`summary=$(head -c 60000 /dev/zero | tr '\000' y)
-printf '{"version":1,"output":"candidate","summary":"%s","artifacts":[]}' "$summary" > "$WORKSHOP_RESULT_FILE"`;
-    writeFileSync(join(config, "workshop.yaml"), `shell: /bin/bash\nagent:\n  model: fixture/mock-model:medium\n  harness:\n    command: |\n${harnessCommand.split("\n").map((line) => `      ${line}`).join("\n")}\n`, "utf8");
+printf '<status>succeeded</status>\n<reason>%s</reason>\n<output>candidate</output>' "$summary"`;
+    writeFileSync(join(config, "workshop.yaml"), `shell: /bin/sh\nagent:\n  model: fixture/mock-model:medium\n  harness:\n    command: |\n${harnessCommand.split("\n").map((line) => `      ${line}`).join("\n")}\n`, "utf8");
     const stepLines = nodeIds.flatMap((nodeId) => [
       `  - ${nodeId}:`,
       "      agent: Return the fixture result.",
@@ -650,9 +663,9 @@ printf '{"version":1,"output":"candidate","summary":"%s","artifacts":[]}' "$summ
     const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
     mkdirSync(workflows, { recursive: true });
-    const harnessCommand = String.raw`printf '%s' '{"version":1,"output":"candidate","summary":"retention fixture","artifacts":[]}' > "$WORKSHOP_RESULT_FILE"
-head -c 12000 /dev/zero | tr '\000' r`;
-    writeFileSync(join(config, "workshop.yaml"), `shell: /bin/bash\nkeep_files: always\nstream_cap: 1kb\nagent:\n  model: fixture/mock-model:medium\n  harness:\n    command: |\n${harnessCommand.split("\n").map((line) => `      ${line}`).join("\n")}\n`, "utf8");
+    const harnessCommand = String.raw`printf '<status>succeeded</status>\n<output>candidate</output>'
+head -c 12000 /dev/zero | tr '\000' r >&2`;
+    writeFileSync(join(config, "workshop.yaml"), `shell: /bin/sh\nkeep_files: always\nstream_cap: 1kb\nagent:\n  model: fixture/mock-model:medium\n  harness:\n    command: |\n${harnessCommand.split("\n").map((line) => `      ${line}`).join("\n")}\n`, "utf8");
     writeFileSync(join(workflows, "retained.yaml"), [
       "version: 4",
       "defaults:",
@@ -727,23 +740,24 @@ head -c 12000 /dev/zero | tr '\000' r`;
       if (!freshResponse.ok) throw new Error(freshResponse.error.message);
       const freshPage = serviceLogSectionPageV1Schema.parse(freshResponse.result);
       if (freshPage.nextCursor === null) throw new Error("fresh retained log snapshot has no capture continuation");
-      const freshCaptureResponse = await sendServiceRequest(health.metadata.socketPath, {
-        version: 1, method: "logs.page", workflowId: "retained", runId: started.runId, cursor: freshPage.nextCursor,
-      });
-      if (!freshCaptureResponse.ok) throw new Error(freshCaptureResponse.error.message);
-      const freshCapturePage = serviceLogSectionPageV1Schema.parse(freshCaptureResponse.result);
-      expect(freshCapturePage.section.kind).toBe("capture");
-      if (freshCapturePage.section.kind !== "capture") throw new Error("fresh retained capture is missing");
-      expect(freshCapturePage.section.capture.totalBytes).toBe(12_001);
-      const continuedResponse = await sendServiceRequest(health.metadata.socketPath, {
-        version: 1, method: "logs.page", workflowId: "retained", runId: started.runId, cursor: first.nextCursor,
-      });
-      if (!continuedResponse.ok) throw new Error(continuedResponse.error.message);
-      const continuedPage = serviceLogSectionPageV1Schema.parse(continuedResponse.result);
-      expect(continuedPage.section.kind).toBe("capture");
-      if (continuedPage.section.kind !== "capture") throw new Error("continued capture section is missing");
-      expect(continuedPage.section.capture.totalBytes).toBe(12_000);
-      expect(continuedPage.section.capture.retainedBytes).toBe(1024);
+      const captureAfter = async (cursor: string) => {
+        let currentCursor: string | null = cursor;
+        while (currentCursor !== null) {
+          const response = await sendServiceRequest(health.metadata.socketPath, {
+            version: 1, method: "logs.page", workflowId: "retained", runId: started.runId, cursor: currentCursor,
+          });
+          if (!response.ok) throw new Error(response.error.message);
+          const page = serviceLogSectionPageV1Schema.parse(response.result);
+          if (page.section.kind === "capture" && page.section.label === "capture worker stderr") return page.section;
+          currentCursor = page.nextCursor;
+        }
+        throw new Error("worker stderr capture is missing from the log snapshot");
+      };
+      const freshCapture = await captureAfter(freshPage.nextCursor);
+      expect(freshCapture.capture.totalBytes).toBe(12_001);
+      const continuedCapture = await captureAfter(first.nextCursor);
+      expect(continuedCapture.capture.totalBytes).toBe(12_000);
+      expect(continuedCapture.capture.retainedBytes).toBe(1024);
     } finally {
       if (owner !== undefined) await owner.shutdown();
       rmSync(root, { recursive: true, force: true });

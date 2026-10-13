@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { createReadStream, existsSync, mkdirSync, rmSync, statSync } from "node:fs";
+import { createReadStream, existsSync, mkdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { dirname, isAbsolute } from "node:path";
 import type { Context } from "@earendil-works/chord";
 import { defineTask, type ConversationId, type Task, type TaskRuntime, type Tx } from "@earendil-works/pi-durable";
@@ -35,6 +35,7 @@ import { sha256Schema, utcTimestampSchema } from "../../util/schema.js";
 import { DEFAULT_STREAM_CAP_BYTES } from "../../util/parse-units.js";
 import { locateProcessFiles, type ProcessFiles } from "../../run/locate-run-files.js";
 import { readVerifiedRetentionWindow, retainStreamWindow } from "../disk/cap-streams.js";
+import { reconstructProcessStdin } from "../../attempt/build-process-stdin.js";
 
 const positive = z.number().int().positive().refine(Number.isSafeInteger);
 const nonnegative = z.number().int().nonnegative().refine(Number.isSafeInteger);
@@ -57,6 +58,9 @@ export const processExecutionTaskInputSchema = z.strictObject({
   incarnationNumber: positive,
   serviceBootId: z.string().uuid(),
   role: z.enum(["worker", "validator", "preflight"]),
+  ioVersion: z.literal(1),
+  stdinSha256: sha256Schema,
+  stdinByteCount: nonnegative,
   launchIntentAt: utcTimestampSchema,
   deadlineAt: utcTimestampSchema.nullable(),
   shell: absolutePath,
@@ -87,52 +91,54 @@ export function buildProcessExecutionEnvironment(
   attemptNumber: number | null,
 ): Record<string, string> {
   const run = readyRun(runDocument);
+  const settings = format4Settings(run);
   const paths = processExecutionFiles(input, run.paths.runDirectory, attemptNumber);
+  const common = {
+    WORKSHOP_RUN_ID: run.runId,
+    WORKSHOP_WORKFLOW_ID: run.workflowId,
+    WORKSHOP_EXECUTION_ID: input.executionId,
+    WORKSHOP_ARCHIVE: run.paths.archiveDirectory,
+    WORKSHOP_RESULTS_PATH: paths.resultsPath,
+    WORKSHOP_LOG_PATH: paths.logPath,
+  };
   if (input.role === "preflight") {
     if (input.nodeId !== null || input.attemptId !== null || attemptNumber !== null || run.resolvedSettings.preflight === null) {
       throw new Error("preflight process identity differs from frozen workflow settings");
     }
-    return {
-      WORKSHOP_RUN_ID: run.runId,
-      WORKSHOP_WORKFLOW_ID: run.workflowId,
-      WORKSHOP_EXECUTION_ID: input.executionId,
-      WORKSHOP_ARCHIVE: run.paths.archiveDirectory,
-      WORKSHOP_STDOUT_FILE: paths.stdoutPath,
-      WORKSHOP_STDERR_FILE: paths.stderrPath,
-    };
+    return { ...common, WORKSHOP_STEP_ID: "", WORKSHOP_ATTEMPT: "0" };
   }
   if (input.nodeId === null || input.attemptId === null || attemptNumber === null) {
     throw new Error("node process identity is missing its node or attempt");
   }
-  const nodeSettings = run.resolvedSettings.nodes[input.nodeId];
+  const nodeSettings = settings.nodes[input.nodeId];
   const site = input.role === "worker" ? nodeSettings?.run : nodeSettings?.validator;
   if (site === undefined || site === null) throw new Error("process role has no resolved execution site");
   const env: Record<string, string> = {
-    WORKSHOP_RUN_ID: run.runId,
-    WORKSHOP_WORKFLOW_ID: run.workflowId,
+    ...common,
     WORKSHOP_STEP_ID: input.nodeId,
     WORKSHOP_ATTEMPT: String(attemptNumber),
-    WORKSHOP_EXECUTION_ID: input.executionId,
-    WORKSHOP_ARCHIVE: run.paths.archiveDirectory,
-    WORKSHOP_STEP_OUTPUT_FILE: paths.candidateOutputPath,
-    WORKSHOP_PREVIOUS_OUTPUT_FILE: paths.previousOutputPath,
-    WORKSHOP_WORKLOG_FILE: paths.worklogPath,
-    WORKSHOP_STDOUT_FILE: paths.stdoutPath,
-    WORKSHOP_STDERR_FILE: paths.stderrPath,
   };
+  if (input.role === "validator" && site.kind === "command") {
+    const attempt = requireAttempt(run, input.nodeId, input.attemptId);
+    if (attempt.result.kind !== "candidate_committed" && attempt.result.kind !== "validation_committed") {
+      throw new Error("command validator environment requires a committed candidate");
+    }
+    const candidate = attempt.result.candidate;
+    const retries = nodeSettings?.retries;
+    if (retries === undefined) throw new Error("command validator environment lacks frozen retry settings");
+    env.WORKSHOP_CANDIDATE_STATUS = candidate.version === 2 ? candidate.stdioResult.status : "succeeded";
+    env.WORKSHOP_RETRIES_LEFT = retries === "unlimited" ? "unlimited" : String(Math.max(0, retries + 1 - attempt.number));
+  }
   if (site.kind === "agent") {
     const model = parseModel(site.model);
-    env.WORKSHOP_PROMPT_FILE = paths.promptPath;
-    env.WORKSHOP_RESULT_FILE = paths.resultPath;
     env.WORKSHOP_PROVIDER = model.provider;
     env.WORKSHOP_MODEL_ID = model.modelId;
-    env.WORKSHOP_MODEL = `${model.provider}/${model.modelId}`;
+    env.WORKSHOP_MODEL = model.provider + "/" + model.modelId;
     env.WORKSHOP_THINKING = model.thinking;
     env.WORKSHOP_MODEL_WITH_THINKING = model.full;
   }
   return env;
 }
-
 const processCheckpointSchema = z.discriminatedUnion("phase", [
   z.strictObject({ phase: z.literal("intent") }),
   z.strictObject({ phase: z.literal("launch"), process: processIncarnationSchema }),
@@ -196,6 +202,7 @@ export const processExecutionTaskResultSchema = z.discriminatedUnion("kind", [
 export type ProcessExecutionTaskResult = z.infer<typeof processExecutionTaskResultSchema>;
 
 type ReadyRun = Extract<WorkflowRunDocumentV1, { state: "ready" }>;
+type Format4Settings = Extract<ReadyRun["resolvedSettings"], { formatVersion: 4 }>;
 type PersistedNodeAttempt = z.infer<typeof persistedNodeAttemptSchema>;
 type ProcessRuntime = TaskRuntime<ProcessExecutionTaskInput, ProcessCheckpoint, ProcessExecutionTaskResult, object>;
 export type ProcessExecutionTaskDefinition = Task<ProcessExecutionTaskInput, ProcessCheckpoint, ProcessExecutionTaskResult, object>;
@@ -233,7 +240,7 @@ export function defineProcessExecutionTask(
         await waitForStartupLaunchGate(startupLaunchGate, runtime.signal);
         const input = parseProcessInput(task.input);
         const run = await snapshotRun(runtime, context);
-        assertProcessIdentity(input, run);
+
         const at = timestamp(runtime.now());
         const process = processIncarnationSchema.parse({
           executionId: input.executionId,
@@ -252,9 +259,21 @@ export function defineProcessExecutionTask(
           exit: null,
           cleanupState: "pending",
           captures: [],
+          stdio: { version: 1, stdinSha256: input.stdinSha256, stdinByteCount: input.stdinByteCount, write: { kind: "pending", queuedBytes: 0 } },
         });
+        if (!matchesProcessStdin(input, run)) {
+          await blockProcess(task, runtime, input, process, "integrity_failed", "reconstructed stdin differs from its committed identity", context);
+          return;
+        }
+        assertProcessIdentity(input, run);
         await runtime.commit(async (tx) => {
           const { draft, run: current } = await runDraft(tx, runtime.conversationId);
+          if (!matchesProcessStdin(input, current)) {
+            const block = blockInfo("integrity_failed", "stdin source changed before launch intent", input.runId, input.nodeId, input.attemptId, timestamp(runtime.now()));
+            const blocked = processIncarnationSchema.parse({ ...process, status: "blocked", cleanupState: "unconfirmed" });
+            await appendProcess(tx, runtime.conversationId, input, Number(runtime.taskId), blocked, timestamp(runtime.now()));
+            return { status: "terminal", outcome: { status: "completed", result: { kind: "blocked", block } } };
+          }
           assertProcessIdentity(input, current);
           if (input.role === "preflight") {
             assign(draft, current);
@@ -282,6 +301,12 @@ export function defineProcessExecutionTask(
         if (checkpoint.phase !== "launch") throw new Error("launch checkpoint lacks process intent");
         const process = checkpoint.process;
         const run = await snapshotRun(runtime, context);
+
+        if (!matchesRecordedProcessStdin(input, process, run)) {
+          await blockProcess(task, runtime, input, process, "integrity_failed", "reconstructed stdin differs from its committed identity", context);
+          return;
+        }
+
         assertProcessIdentity(input, run, { requireReference: true, requireExecuting: false });
         const authorized = input.role === "preflight"
           ? run.preflight.kind === "pending" && run.preflight.processExecutionIds.includes(input.executionId)
@@ -321,20 +346,17 @@ export function defineProcessExecutionTask(
         }
         mkdirSync(dirname(input.stdoutPath), { recursive: true });
         mkdirSync(run.paths.archiveDirectory, { recursive: true });
-        const semanticStdoutLimitBytes = input.role === "worker" && input.nodeId !== null
-          && run.resolvedSettings.nodes[input.nodeId]?.run.kind === "command"
-          ? MAX_SEMANTIC_OUTPUT_BYTES
-          : undefined;
+        const stdin = reconstructProcessStdin(input, run);
         let child: TrackedProcess;
         try {
           child = spawnTracked({
             shell: input.shell,
             command: input.command,
             cwd: input.cwd,
-            env: input.env,
+            env: processSpawnEnvironment(input, run),
+            inputBytes: stdin.bytes,
             stdoutFile: input.stdoutPath,
             stderrFile: input.stderrPath,
-            ...(semanticStdoutLimitBytes === undefined ? {} : { semanticStdoutLimitBytes }),
           });
         } catch {
           await blockProcess(task, runtime, input, process, "external_outcome_unknown", "process launch did not produce a durable identity", context);
@@ -345,6 +367,7 @@ export function defineProcessExecutionTask(
           ...process,
           status: "running",
           startedAt: timestamp(runtime.now()),
+          stdio: { ...process.stdio, write: child.writeOutcome() },
           identity: processIdentitySchema.parse({
             pid: child.pid,
             pgid: child.pgid,
@@ -375,8 +398,33 @@ export function defineProcessExecutionTask(
         const identity = process.identity;
         if (identity === null) throw new Error("running process checkpoint has no identity");
         const run = await snapshotRun(runtime, context);
-        assertProcessIdentity(input, run, { requireReference: true, requireExecuting: false });
         const child = trackedProcesses.get(input.executionId);
+        const stdinMatches = matchesRecordedProcessStdin(input, process, run);
+        if (!stdinMatches && child !== undefined) {
+          const dead = await child.kill();
+          if (dead) await child.streamsClosed;
+          const captures = dead
+            ? await captureProcessRecords(input, child.captures(), { bestEffort: true })
+            : process.captures;
+          const checkedProcess = process.stdio === undefined ? process : {
+            ...process,
+            stdio: { ...process.stdio, write: child.writeOutcome() },
+          };
+          await blockProcess(
+            task,
+            runtime,
+            input,
+            checkedProcess,
+            "integrity_failed",
+            "reconstructed stdin differs from its committed identity",
+            context,
+            dead ? "confirmed_dead" : "unconfirmed",
+            captures,
+          );
+          trackedProcesses.delete(input.executionId);
+          return;
+        }
+        if (stdinMatches) assertProcessIdentity(input, run, { requireReference: true, requireExecuting: false });
         const launchServiceBootId = process.launchServiceBootId ?? input.serviceBootId;
         if (identity.serviceBootId !== launchServiceBootId) {
           await blockProcess(task, runtime, input, process, "process_death_unconfirmed", "process identity does not match its launch intent", context);
@@ -427,7 +475,7 @@ export function defineProcessExecutionTask(
         await child.streamsClosed;
         const stats = child.captures();
         const finishedAt = timestamp(runtime.now());
-        const semantic = child.semanticStdout();
+        const semantic = readSemanticStdout(input.stdoutPath);
         const captures = await captureProcessRecords(input, stats);
         const stdoutCapture = captures.find((capture) => capture.stream === "stdout");
         const stderrCapture = captures.find((capture) => capture.stream === "stderr");
@@ -449,27 +497,13 @@ export function defineProcessExecutionTask(
         const exited = processIncarnationSchema.parse({
           ...process,
           status: "exited",
+          stdio: { ...process.stdio, write: child.writeOutcome() },
           finishedAt,
           exit: normalizedExit,
           cleanupState: "confirmed_dead",
           captures,
         });
-        let semanticStdout: z.infer<typeof semanticStdoutSchema>;
-        if (semantic === null) semanticStdout = { kind: "not_captured" };
-        else if (semantic.tooLarge) semanticStdout = { kind: "too_large", byteCount: semantic.totalBytes };
-        else {
-          if (semantic.sha256 === null) throw new Error("complete semantic stdout lacks its digest");
-          try {
-            semanticStdout = {
-              kind: "captured",
-              text: new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(semantic.bytes),
-              byteCount: semantic.totalBytes,
-              sha256: semantic.sha256,
-            };
-          } catch {
-            semanticStdout = { kind: "invalid_utf8", byteCount: semantic.totalBytes, sha256: semantic.sha256 };
-          }
-        }
+        const semanticStdout = semantic ?? { kind: "not_captured" as const };
         const result = processExecutionTaskResultSchema.parse({
           kind: "exited",
           exit: normalizedExit,
@@ -534,6 +568,7 @@ export function defineProcessExecutionTask(
           const retired = processIncarnationSchema.parse({
             ...process,
             status: "exited",
+            stdio: { ...process.stdio, write: child.writeOutcome() },
             finishedAt: completedAt,
             exit: observedExit,
             cleanupState: "confirmed_dead",
@@ -650,17 +685,20 @@ async function settleRecoveredProcess(
   process: z.infer<typeof processIncarnationSchema>,
   context: Context,
 ): Promise<void> {
-  if (process.executionId !== input.executionId || process.incarnationId !== input.incarnationId
-    || process.incarnationNumber !== input.incarnationNumber || process.replay !== input.replay
-    || process.launchIntentAt !== input.launchIntentAt || process.deadlineAt !== input.deadlineAt) {
-    throw new Error("recovered process identity differs from its durable task input");
-  }
+  const recordedIdentityMatches = process.executionId === input.executionId
+    && process.incarnationId === input.incarnationId
+    && process.incarnationNumber === input.incarnationNumber
+    && process.role === input.role
+    && process.replay === input.replay
+    && process.launchIntentAt === input.launchIntentAt
+    && process.deadlineAt === input.deadlineAt;
   const now = runtime.now();
   const recoveredAt = timestamp(now);
   const captures = await recoverProcessCaptureRecords(input);
   const blocked = processIncarnationSchema.parse({
     ...process,
     status: "blocked",
+    stdio: process.stdio === undefined ? undefined : { ...process.stdio, write: { kind: "unknown_after_restart", queuedBytes: process.stdio.write.queuedBytes } },
     finishedAt: recoveredAt,
     cleanupState: "confirmed_dead",
     captures,
@@ -668,9 +706,14 @@ async function settleRecoveredProcess(
   const nextIncarnationId = incarnationIdSchema.parse(randomUUID());
   await runtime.commit(async (tx) => {
     const { draft, run } = await runDraft(tx, runtime.conversationId);
-    assertProcessIdentity(input, run, { requireReference: true, requireExecuting: false });
+
     assign(draft, run);
     await appendProcess(tx, runtime.conversationId, input, Number(runtime.taskId), blocked, timestamp(now));
+    if (!recordedIdentityMatches || !matchesRecordedProcessStdin(input, process, run)) {
+      const block = blockInfo("integrity_failed", "reconstructed stdin differs from its committed identity", input.runId, input.nodeId, input.attemptId, timestamp(now));
+      return { status: "terminal", outcome: { status: "completed", result: { kind: "blocked", block } } };
+    }
+    assertProcessIdentity(input, run, { requireReference: true, requireExecuting: false });
     const reason = decideProcessReplay({
       replayPolicy: input.replay,
       recordedReplayPolicy: process.replay,
@@ -735,23 +778,102 @@ function validProcessDeadline(input: ProcessExecutionTaskInput, timeoutMs: numbe
     && (input.incarnationNumber === 1 ? remaining === timeoutMs : remaining <= timeoutMs);
 }
 
+function format4Settings(run: ReadyRun): Format4Settings {
+  const settings = run.resolvedSettings;
+  if (!("formatVersion" in settings) || settings.formatVersion !== 4) {
+    throw new Error("format 3 runs cannot launch or replay processes");
+  }
+  return settings;
+}
+
+function matchesProcessStdin(input: ProcessExecutionTaskInput, run: ReadyRun): boolean {
+  try {
+    const rebuilt = reconstructProcessStdin(input, run);
+    return input.ioVersion === 1 && rebuilt.sha256 === input.stdinSha256 && rebuilt.byteCount === input.stdinByteCount;
+  } catch {
+    return false;
+  }
+}
+
+function matchesRecordedProcessStdin(
+  input: ProcessExecutionTaskInput,
+  process: z.infer<typeof processIncarnationSchema>,
+  run: ReadyRun,
+): boolean {
+  return process.executionId === input.executionId
+    && process.incarnationId === input.incarnationId
+    && process.incarnationNumber === input.incarnationNumber
+    && process.role === input.role
+    && process.replay === input.replay
+    && process.launchIntentAt === input.launchIntentAt
+    && process.deadlineAt === input.deadlineAt
+    && process.commandHash === processCommandHash(input)
+    && process.stdio?.version === 1
+    && process.stdio.stdinSha256 === input.stdinSha256
+    && process.stdio.stdinByteCount === input.stdinByteCount
+    && matchesProcessStdin(input, run);
+}
+
+function processSpawnEnvironment(input: ProcessExecutionTaskInput, run: ReadyRun): Record<string, string> {
+  const settings = format4Settings(run);
+  const site = input.role === "preflight" || input.nodeId === null
+    ? null
+    : input.role === "worker"
+      ? settings.nodes[input.nodeId]?.run ?? null
+      : settings.nodes[input.nodeId]?.validator ?? null;
+  const environment: NodeJS.ProcessEnv = { ...input.env };
+  const removed = [
+    "WORKSHOP_PROMPT_FILE", "WORKSHOP_RESULT_FILE", "WORKSHOP_PREVIOUS_OUTPUT_FILE",
+    "WORKSHOP_STEP_OUTPUT_FILE", "WORKSHOP_WORKLOG_FILE", "WORKSHOP_STDOUT_FILE",
+    "WORKSHOP_STDERR_FILE", "WORKSHOP_BIN", "WORKSHOP_ANSWER",
+  ];
+  if (input.role !== "validator" || site?.kind !== "command") {
+    removed.push("WORKSHOP_CANDIDATE_STATUS", "WORKSHOP_RETRIES_LEFT");
+  }
+  if (site?.kind !== "agent") {
+    removed.push("WORKSHOP_PROVIDER", "WORKSHOP_MODEL_ID", "WORKSHOP_MODEL", "WORKSHOP_THINKING", "WORKSHOP_MODEL_WITH_THINKING");
+  }
+  // Node drops undefined values from the child environment, which clears inherited Workshop channels.
+  for (const name of removed) environment[name] = undefined;
+  return environment as Record<string, string>;
+}
+
+function readSemanticStdout(path: string): z.infer<typeof semanticStdoutSchema> | null {
+  try {
+    if (!existsSync(path)) return null;
+    const byteCount = statSync(path).size;
+    if (byteCount > MAX_SEMANTIC_OUTPUT_BYTES) return { kind: "too_large", byteCount };
+    const bytes = readFileSync(path);
+    if (bytes.byteLength > MAX_SEMANTIC_OUTPUT_BYTES) return { kind: "too_large", byteCount: bytes.byteLength };
+    const digest = sha256(bytes);
+    try {
+      return {
+        kind: "captured",
+        text: new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes),
+        byteCount: bytes.byteLength,
+        sha256: digest,
+      };
+    } catch {
+      return { kind: "invalid_utf8", byteCount: bytes.byteLength, sha256: digest };
+    }
+  } catch {
+    return null;
+  }
+}
+
 function processCommandHash(input: ProcessExecutionTaskInput): string {
-  const {
-    WORKSHOP_STDOUT_FILE: _stdoutPath,
-    WORKSHOP_STDERR_FILE: _stderrPath,
-    WORKSHOP_PROMPT_FILE: _promptPath,
-    WORKSHOP_RESULT_FILE: _resultPath,
-    ...stableEnvironment
-  } = input.env;
+  const stableEnvironment = input.env;
   return canonicalHash({
     role: input.role,
+    ioVersion: input.ioVersion,
+    stdinSha256: input.stdinSha256,
+    stdinByteCount: input.stdinByteCount,
     command: input.command,
     shell: input.shell,
     cwd: input.cwd,
     env: stableEnvironment,
   });
 }
-
 
 function replaceRunAttempt(
   run: ReadyRun,
@@ -782,8 +904,9 @@ function assertProcessIdentity(
   options: { requireReference?: boolean; requireExecuting?: boolean } = {},
 ): void {
   const { requireReference = false, requireExecuting = true } = options;
+  format4Settings(run);
   if (input.role === "preflight") {
-    const site = run.resolvedSettings.preflight;
+    const site = format4Settings(run).preflight;
     const expectedEnv = buildProcessExecutionEnvironment(input, run, null);
     const paths = processExecutionFiles(input, run.paths.runDirectory, null);
     const validDeadline = site !== null && site !== undefined
@@ -806,7 +929,7 @@ function assertProcessIdentity(
   }
   if (input.nodeId === null || input.attemptId === null) throw new Error("node process identity is incomplete");
   const attempt = requireAttempt(run, input.nodeId, input.attemptId);
-  const nodeSettings = run.resolvedSettings.nodes[input.nodeId];
+  const nodeSettings = format4Settings(run).nodes[input.nodeId];
   const site = input.role === "worker" ? nodeSettings?.run : nodeSettings?.validator;
   const command = site?.kind === "command" ? site.command : site?.kind === "agent" ? site.harnessCommand : null;
   const executionId = input.role === "worker" ? attempt.workerExecutionId : attempt.validatorExecutionId;
