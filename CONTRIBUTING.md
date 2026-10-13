@@ -90,8 +90,8 @@ overlap one in the table; if it will recur, add it to the table.
 - Domain nouns: **workflow** (the YAML definition), **run** (one occurrence of
   a workflow), **attempt** (one try at one node). These match the stored
   records and the run-directory layout.
-- `orchestrate` has a fixed meaning: an agent decides what happens after an
-  attempt fails. The background process that owns runs is the `service`.
+- The `service` owns runs. A step-local verifier checks results and can request
+  a retry or block. Fixed rules decide failure and retry transitions.
 - Checks before review:
 
   ```bash
@@ -120,8 +120,8 @@ flowchart TD
   WR --> NA[NodeAttempt task]
   NA --> PE[ProcessExecution task]
   PE --> P[pi / command process]
-  WR -->|on failure| FJ[FailureJudgment]
-  FJ -->|retry / block / fail| WR
+  WR -->|fixed decision table| D[retry / block / fail]
+  D --> WR
   PE --> V[state/captures: temporary bytes]
   SVC --> RF[runs: results.md + execution.log]
 ```
@@ -140,10 +140,11 @@ WorkflowRun                                define-workshop-tasks.ts
       parse stdout by frozen result mode
       validator → ProcessExecution
     if the attempt failed:
-      FailureJudgment                      define-failure-judgment-task.ts
-        retry → new NodeAttempt (needs replay: safe and attempts left)
-        block → wait for `workshop resolve`
-        fail  → the run ends
+      fixed decision table                 define-workshop-tasks.ts
+        retry → new NodeAttempt (needs replay: safe and retries left)
+        identical consecutive failures → repeated_failure block
+        exhausted retry → terminal failure
+    accepted success_and_complete → finish; mark successors skipped
   retain evidence; regenerate results.md and execution.log after every outcome
 ```
 
@@ -161,16 +162,15 @@ and validators are not Durable work: they are harness subprocesses launched by
 
 | Durable concept | How Workshop uses it |
 | --- | --- |
-| `Harness` and `Registry` | `service/open-service-runtime.ts` opens one Harness on `state/durable.db`, registers six task definitions and the judge extension, reconciles leftover processes, then calls `harness.resume()`. |
-| Tasks (`defineTask`) | `WorkflowRun`, `NodeAttempt`, `ProcessExecution`, `CapacityGate`, `ScheduleWakeup`, and `FailureJudgment` (registered as `workshop.workflow-run` and so on). Each task is a set of named phases. A phase ends by committing its next checkpoint, waiting on children, or settling as completed or failed. |
+| `Harness` and `Registry` | `service/open-service-runtime.ts` opens one Harness on `state/durable.db`, registers five task definitions, reconciles leftover processes, then calls `harness.resume()`. |
+| Tasks (`defineTask`) | `WorkflowRun`, `NodeAttempt`, `ProcessExecution`, `CapacityGate`, `ScheduleWakeup` (registered as `workshop.workflow-run` and so on). Each task is a set of named phases. A phase ends by committing its next checkpoint, waiting on children, or settling as completed or failed. |
 | Child tasks | A parent creates children with `tx.createTask` and waits for them with `allSettled`. A failed child comes back as data the parent classifies; it does not crash the parent. |
-| Conversations | Admission gives every run its own conversation. The run's tasks and records attach to it, so its history outlives the tasks. Each judgment gets a separate task-owned conversation. |
+| Conversations | Admission gives every run its own conversation. The run's tasks and records attach to it, so its history outlives the tasks. Historical judgments remain readable. |
 | Documents (`defineDoc`) | `workshop.run` holds a run's current state, scoped to its conversation. `workshop.installation` (workflows, activations) and `workshop.service-receipts` (idempotent controls) are session-scoped. |
 | Entries (`defineEntry`) | Append-only `workshop.event`, `workshop.process`, and `workshop.judgment` evidence for each run. `logs` reads the process and event entries. |
 | `runtime.commit` | The only way state changes. Document edits, new entries, new child tasks, and the task's own checkpoint land in one SQLite transaction. |
 | `runtime.sleep` | The scheduler waits for its next slot. The deadline lives in the checkpoint, so the wait survives restarts. |
-| Extensions and tools | The judge has exactly one tool, `record_workshop_failure_decision`. Its commit checks the action against the frozen retry policy and the deadline, then writes the decision into the run document and a judgment entry. |
-| `models` option (`pi-ai`) | Durable does not read Pi CLI settings, so `model/` compiles `~/.pi/agent/models.json` into the providers the Harness uses for the judge. |
+| `models` option (`pi-ai`) | The Harness has no model providers. Agent workers and verifiers use supervised harness subprocesses. |
 | `snapshot`, `inspect`, `abortTask`, `close` | Status and log reads, startup compatibility checks, stop intent, and graceful shutdown. |
 
 Durable leaves some work to its caller, and Workshop fills each gap:
@@ -186,8 +186,6 @@ Durable leaves some work to its caller, and Workshop fills each gap:
 - **Only one process may own the storage.** Durable has no cross-process
   locking, so the service holds a kernel lock (`acquire-service-lock.ts`) and
   the CLI goes through the socket.
-- **Tools cannot see the Harness clock.** The judge's tool receives the clock
-  explicitly, so its deadline check uses the same time as everything else.
 - **Task definitions carry versions.** Each run freezes the versions it started
   with. After an incompatible upgrade, that run gets a `runtime_incompatible`
   block instead of running under different code.
@@ -221,10 +219,9 @@ src/
 │  ├─ define-scheduler-wakeup-task.ts fixed-rate schedule; admits runs
 │  ├─ admit-run.ts                atomic, idempotent run admission
 │  ├─ define-capacity-gate-task.ts waits for a free run slot
-│  ├─ define-workshop-tasks.ts    WorkflowRun: preflight, chain, judgment
+│  ├─ define-workshop-tasks.ts    WorkflowRun: preflight, chain, retry decisions
 │  ├─ define-node-attempt-task.ts NodeAttempt: worker, result check, validator
 │  ├─ define-process-execution-task.ts ProcessExecution: spawn, capture, replay
-│  ├─ define-failure-judgment-task.ts the judge conversation and decision tool
 │  ├─ define-workshop-records.ts  versioned documents and immutable entries
 │  ├─ commit-service-mutation.ts  receipts that make controls idempotent
 │  ├─ render-worklog.ts           compact or verbose worklog from the committed run
@@ -244,8 +241,8 @@ src/
 │  ├─ parse-result.ts             historical JSON result contracts
 │  ├─ parse-tagged-result.ts      text and tagged stdout result parsing
 │  ├─ build-process-stdin.ts      committed role inputs, UTF-8 bytes, and hashes
+│  ├─ build-failure-feedback.ts   bounded feedback and raw failure-evidence hashes
 │  └─ render-agent-prompt.ts      format 4 worker and verifier prompts
-├─ model/                         models.json → pi-ai providers for the judge
 ├─ process/                       launch, identify, and kill process groups;
 │                                 read-retained-capture.ts preserves invalid UTF-8
 ├─ storage/disk/                  stream caps and checked process-capture removal

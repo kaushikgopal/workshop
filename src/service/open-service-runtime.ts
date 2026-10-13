@@ -2,8 +2,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { join, resolve as resolvePath } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import type { Models } from "@earendil-works/pi-ai/models";
-import { createWorkshopModels } from "../model/create-workshop-models.js";
+import { createModels } from "@earendil-works/pi-ai/models";
 import { createRegistry, Harness, type ConversationId, type TaskGraph, type TaskGraphWatch, type TaskId, type Tx } from "@earendil-works/pi-durable";
 import { canonicalHash } from "../definition/hash-canonical-json.js";
 import { resolveRetryLimit } from "../definition/resolve-retry-limit.js";
@@ -52,21 +51,19 @@ import { readRunEvidenceSnapshot, readInstallation, readRun, projectServiceRead 
 import { ServiceRequestError, ServiceShutdownError, serveWorkshopService, type WorkshopServiceRuntime } from "./serve-workshop-service.js";
 import type { ServiceMetadataV1, ServiceRequestV1 } from "./schema.js";
 
-const TASK_VERSIONS = { workflowRun: 10, nodeAttempt: 4, processExecution: 4, capacityGate: 1, failureJudgment: 1, scheduleWakeup: 1 } as const;
+const TASK_VERSIONS = { workflowRun: 10, nodeAttempt: 4, processExecution: 4, capacityGate: 1, scheduleWakeup: 1 } as const;
 const STARTUP_RECONCILIATION_MS = 10_000;
 
-export function startWorkshopService(installation: Installation, options: { readonly models?: Models } = {}) {
-  const models = options.models ?? createWorkshopModels();
+export function startWorkshopService(installation: Installation) {
   return serveWorkshopService({
     stateDirectory: installation.stateDirectory,
-    openRuntime: (metadata) => openServiceRuntime(installation, metadata, models),
+    openRuntime: (metadata) => openServiceRuntime(installation, metadata),
   });
 }
 
 async function openServiceRuntime(
   installation: Installation,
   metadata: ServiceMetadataV1,
-  models: Models,
 ): Promise<WorkshopServiceRuntime> {
   const opened = await openDurableStorage(installation.databasePath);
   if (!opened.ok) throw new Error(`${opened.failure.message}: ${String(opened.failure.cause)}`);
@@ -110,11 +107,10 @@ async function openServiceRuntime(
     const registry = createRegistry();
     registry.install({
       name: "workshop-service-runtime",
-      tasks: [tasks.WorkflowRunTask, tasks.NodeAttemptTask, tasks.ProcessExecutionTask, tasks.CapacityGateTask, tasks.FailureJudgmentTask, scheduleWakeupTask],
+      tasks: [tasks.WorkflowRunTask, tasks.NodeAttemptTask, tasks.ProcessExecutionTask, tasks.CapacityGateTask, scheduleWakeupTask],
     });
-    registry.install(tasks.FailureJudgmentExtension);
     harness = await Harness.open(storage, {
-      models,
+      models: createModels(),
       registry,
       onReport(error) {
         if (opening) openCleanupErrors.push(error);
@@ -693,6 +689,12 @@ async function controlWorkflow(
 
 type ResolutionBlockKind = NonNullable<ReadyRunForResolution["block"]>["kind"];
 
+const fabricatedVerdictBlockKinds: ReadonlySet<string> = new Set([
+  "verifier_block",
+  "verifier_failed",
+  "repeated_failure",
+]);
+
 export function format4ResolutionRejection(input: {
   readonly formatVersion: number | undefined;
   readonly blockKind: ResolutionBlockKind | undefined;
@@ -700,6 +702,9 @@ export function format4ResolutionRejection(input: {
 }): string | null {
   if (input.formatVersion !== 4) return null;
   if (input.action === "accept") {
+    if (input.blockKind !== undefined && fabricatedVerdictBlockKinds.has(input.blockKind)) {
+      return "format 4 verifier_block, verifier_failed, and repeated_failure blocks cannot accept a fabricated verifier verdict";
+    }
     return "format 4 accept --result-file is not supported yet; WP6 must define human text/tagged acceptance. Fail this run or use the previous build";
   }
   if ((input.blockKind === "runtime_incompatible" || input.blockKind === "integrity_failed") && input.action !== "fail") {

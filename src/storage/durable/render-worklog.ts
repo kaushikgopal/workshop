@@ -26,7 +26,7 @@ export function renderWorklog(value: WorkflowRunDocumentV1, options: { readonly 
   ];
 
   if (run.resolvedSettings.preflight !== null) lines.push(`- Preflight: ${run.preflight.kind}`);
-  if (run.resolvedSettings.orchestrator.model !== null) {
+  if (!("formatVersion" in run.resolvedSettings) && run.resolvedSettings.orchestrator.model !== null) {
     lines.push(`- Failure judge model: ${run.resolvedSettings.orchestrator.model}`);
   }
 

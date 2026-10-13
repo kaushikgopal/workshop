@@ -77,10 +77,7 @@ const source = [...header, ...(preflightMode ? [
   "",
 ])].join("\n");
 
-const machine = {
-  shell: "/bin/bash",
-  ...(mode === "identity" ? { orchestrator: { model: "missing/failure-judge:low", timeout: "10s" } } : {}),
-} as const;
+const machine = { shell: "/bin/bash" } as const;
 const checked = checkDefinitionText(source, "crash-recovery.yaml", "command-chain");
 const resolvedSettings = resolveWorkflowSettings({ definition: checked.def, machine, projectCwd: directory });
 const preparedResult = prepareRunAdmission({
@@ -95,7 +92,7 @@ const preparedResult = prepareRunAdmission({
   runtimeManifest: {
     durableVersion: "1.0.2",
     integrationManifestHash: `sha256:${createHash("sha256").update("durable crash recovery test").digest("hex")}`,
-    taskVersions: { workflowRun: 10, nodeAttempt: 4, processExecution: 4, capacityGate: 1, failureJudgment: 1 },
+    taskVersions: { workflowRun: 10, nodeAttempt: 4, processExecution: 4, capacityGate: 1 },
   },
   runId: `command-chain-crash-recovery-${mode}`,
   eventId: `crash-recovery-${mode}-admission`,
@@ -112,9 +109,8 @@ const tasks = defineWorkshopTasks();
 const registry = createRegistry();
 registry.install({
   name: "workshop-crash-recovery-test",
-  tasks: [tasks.WorkflowRunTask, tasks.NodeAttemptTask, tasks.ProcessExecutionTask, tasks.CapacityGateTask, tasks.FailureJudgmentTask],
+  tasks: [tasks.WorkflowRunTask, tasks.NodeAttemptTask, tasks.ProcessExecutionTask, tasks.CapacityGateTask],
 });
-registry.install(tasks.FailureJudgmentExtension);
 const harness = await Harness.open(opened.storage, { models: createModels(), registry }, BACKGROUND_CONTEXT);
 const installation = installationDocumentV1Schema.parse({
   state: "ready",

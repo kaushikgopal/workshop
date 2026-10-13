@@ -1038,7 +1038,7 @@ describe("public JSON projections", () => {
     expect(() => attemptDetailDtoSchema.parse(validatingAttempt))
       .toThrow(/validator launch follows worker completion/);
     expect(() => attemptDetailDtoSchema.parse({ ...validatingAttempt, candidate: null }))
-      .toThrow(/validator execution requires a committed candidate/);
+      .toThrow(/verifier execution requires committed worker evidence/);
   });
 
   test("validates node descriptions against runtime failure scope", () => {
@@ -1114,7 +1114,7 @@ describe("public JSON projections", () => {
     })).toThrow(/failed runs retain their terminal failure cause/);
     expect(() => nodeDescriptionDtoSchema.parse({
       ...unstartedDescription, runStatus: "completed", runFailure: null,
-    })).toThrow(/completed runs contain only succeeded nodes/);
+    })).toThrow(/completed runs contain only succeeded or skipped nodes/);
     expect(() => nodeDescriptionDtoSchema.parse({
       ...unstartedDescription, runStatus: "running", runFailure: null, node: unstartedNode,
     })).toThrow(/blocked node belongs to a blocked run/);

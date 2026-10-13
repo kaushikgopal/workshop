@@ -5,11 +5,14 @@ import { resolve } from "node:path";
 import type { Context } from "@earendil-works/chord";
 import { defineTask, type ConversationId, type Cursor, type Task, type TaskId, type TaskRuntime, type Tx } from "@earendil-works/pi-durable";
 import { z } from "zod";
+import { buildFailureFeedback, hashFailureEvidence } from "../../attempt/build-failure-feedback.js";
+import { resolveRetryLimit } from "../../definition/resolve-retry-limit.js";
 import { canonicalHash } from "../../definition/hash-canonical-json.js";
 import type { ResolvedExecutionSite } from "../../definition/schema-resolved.js";
 import { nodeIdSchema, workflowIdSchema } from "../../definition/schema.js";
 import { parseTextResult, parseTaggedWorkerResult, parseTaggedVerifierDecision } from "../../attempt/parse-tagged-result.js";
 import { reconstructProcessStdin } from "../../attempt/build-process-stdin.js";
+import { readCaptureBytes } from "../../process/read-retained-capture.js";
 import { installationDocumentV1Schema } from "../../installation/schema.js";
 import { executionIdSchema, incarnationIdSchema } from "../../process/schema.js";
 import {
@@ -212,12 +215,12 @@ export function defineNodeAttemptTask(
         const process = checked.data;
         if (process.timedOut) {
           const failure = failureInfo("timeout", "worker exceeded its absolute deadline", input, runtime.now());
-          await settleAttempt(task, runtime, input, { kind: "failed", failure, candidate: null, validator: null }, "failed", context);
+          await handleWorkerFailure(runtime, input, failure, context);
           return;
         }
         if (process.exit.kind !== "code" || process.exit.code !== 0) {
           const failure = failureInfo("process_error", "worker exited unsuccessfully", input, runtime.now());
-          await settleAttempt(task, runtime, input, { kind: "failed", failure, candidate: null, validator: null }, "failed", context);
+          await handleWorkerFailure(runtime, input, failure, context);
           return;
         }
         const settings = run.resolvedSettings.nodes[input.nodeId];
@@ -231,7 +234,7 @@ export function defineNodeAttemptTask(
         if (stdout.kind !== "captured") {
           const failure = failureInfo(stdout.kind === "too_large" ? "result_too_large" : "result_invalid",
             stdout.kind === "too_large" ? "worker stdout exceeded the 1 MiB result limit" : "worker stdout is not valid UTF-8", input, runtime.now());
-          await settleAttempt(task, runtime, input, { kind: "failed", failure, candidate: null, validator: null }, "failed", context);
+          await handleWorkerFailure(runtime, input, failure, context);
           return;
         }
         if (!("formatVersion" in run.resolvedSettings) || run.resolvedSettings.formatVersion !== 4) throw new Error("format 3 execution is unsupported");
@@ -239,7 +242,7 @@ export function defineNodeAttemptTask(
         const parsed = mode === "text" ? parseTextResult(Buffer.from(stdout.text, "utf8")) : parseTaggedWorkerResult(Buffer.from(stdout.text, "utf8"));
         if (!parsed.ok) {
           const failure = failureInfo(parsed.failure.kind, parsed.failure.message, input, runtime.now());
-          await settleAttempt(task, runtime, input, { kind: "failed", failure, candidate: null, validator: null }, "failed", context);
+          await handleWorkerFailure(runtime, input, failure, context);
           return;
         }
         const candidate = nodeResultSchema.parse({
@@ -263,11 +266,11 @@ export function defineNodeAttemptTask(
         assertNodeIdentity(input, run, runtime.taskId);
         const settings = run.resolvedSettings.nodes[input.nodeId];
         const attempt = requireAttempt(run, input.nodeId, input.attemptId);
-        if (settings === undefined || settings.validator === null || attempt.result.kind !== "candidate_committed") {
+        if (settings === undefined || settings.validator === null || (attempt.result.kind !== "candidate_committed" && attempt.result.kind !== "worker_failure_committed")) {
           throw new Error("validator checkpoint lacks a committed candidate and frozen validator");
         }
-        const candidate = attempt.result.candidate;
-        const missingArtifact = candidate.artifacts.find((artifact) => artifact.availability === "missing");
+        const candidate = attempt.result.kind === "candidate_committed" ? attempt.result.candidate : null;
+        const missingArtifact = candidate?.artifacts.find((artifact) => artifact.availability === "missing");
         if (missingArtifact !== undefined) {
           const failure = failureInfo("artifact_missing", missingArtifactFailureMessage(missingArtifact.path), input, runtime.now());
           await settleAttempt(task, runtime, input, { kind: "failed", failure, candidate, validator: null }, "failed", context);
@@ -280,8 +283,7 @@ export function defineNodeAttemptTask(
         try {
           deadlineAt = deadline(launchIntentAt, settings.validator.timeoutMs);
         } catch {
-          const failure = failureInfo("runtime_fault", "configured validator timeout exceeds the supported timestamp range", input, runtime.now());
-          await settleAttempt(task, runtime, input, { kind: "failed", failure, candidate, validator: null }, "failed", context);
+          await blockVerifier(runtime, input, candidate, "configured verifier timeout exceeds the supported timestamp range", context);
           return;
         }
         const executionId = executionIdSchema.parse(randomUUID());
@@ -290,7 +292,7 @@ export function defineNodeAttemptTask(
           const { draft, run: current } = await runDraft(tx, runtime.conversationId);
           assertNodeIdentity(input, current, runtime.taskId);
           const currentAttempt = requireAttempt(current, input.nodeId, input.attemptId);
-          if (currentAttempt.result.kind !== "candidate_committed" || currentAttempt.validatorExecutionId !== null) {
+          if ((currentAttempt.result.kind !== "candidate_committed" && currentAttempt.result.kind !== "worker_failure_committed") || currentAttempt.validatorExecutionId !== null) {
             throw new Error("node attempt is not ready to admit its validator");
           }
           const currentSettings = current.resolvedSettings.nodes[input.nodeId];
@@ -337,15 +339,15 @@ export function defineNodeAttemptTask(
         const run = await snapshotRun(runtime, context);
         assertNodeIdentity(input, run, runtime.taskId);
         const attempt = requireAttempt(run, input.nodeId, input.attemptId);
-        if (attempt.validatorExecutionId !== checkpoint.executionId || attempt.result.kind !== "candidate_committed") {
+        if (attempt.validatorExecutionId !== checkpoint.executionId || (attempt.result.kind !== "candidate_committed" && attempt.result.kind !== "worker_failure_committed")) {
           const block = blockInfo("integrity_failed", "validator checkpoint differs from committed worker state", input.runId, input.nodeId, input.attemptId, timestamp(runtime.now()));
           const candidate = attempt.result.kind === "candidate_committed" ? attempt.result.candidate : null;
           await settleAttempt(task, runtime, input, { kind: "blocked", block, candidate, validator: null }, "interrupted", context);
           return;
         }
-        const candidate = attempt.result.candidate;
+        const candidate = attempt.result.kind === "candidate_committed" ? attempt.result.candidate : null;
         if (taskOutcome === undefined || taskOutcome.status !== "completed") {
-          const block = blockInfo("external_outcome_unknown", "validator process task ended without a checked receipt", input.runId, input.nodeId, input.attemptId, timestamp(runtime.now()));
+          const block = blockInfo("process_death_unconfirmed", "verifier process task ended without a checked retirement receipt", input.runId, input.nodeId, input.attemptId, timestamp(runtime.now()));
           await settleAttempt(task, runtime, input, { kind: "blocked", block, candidate, validator: null }, "interrupted", context);
           return;
         }
@@ -374,13 +376,13 @@ export function defineNodeAttemptTask(
           return;
         }
         const process = checked.data;
-        if (process.timedOut) {
-          const failure = failureInfo("timeout", "validator exceeded its absolute deadline", input, runtime.now());
-          await settleAttempt(task, runtime, input, { kind: "failed", failure, candidate, validator: null }, "failed", context);
+        const validatorSite = run.resolvedSettings.nodes[input.nodeId]?.validator;
+        if (validatorSite === undefined || validatorSite === null) throw new Error("frozen verifier settings disappeared");
+        if (process.timedOut || process.exit.kind !== "code" || process.exit.code === 126 || process.exit.code === 127
+          || (validatorSite.kind === "agent" && process.exit.code !== 0)) {
+          await blockVerifier(runtime, input, candidate, "verifier process failed (launch, timeout, signal, or invalid exit)", context);
           return;
         }
-        const validatorSite = run.resolvedSettings.nodes[input.nodeId]?.validator;
-        if (validatorSite === undefined || validatorSite === null) throw new Error("frozen validator settings disappeared");
         let validator: ValidatorOutcome;
         if (validatorSite.kind === "command") {
           validator = validatorOutcomeSchema.parse({
@@ -390,21 +392,18 @@ export function defineNodeAttemptTask(
             stderrHash: process.stderrCaptureHash,
           });
         } else {
-          if (process.exit.kind !== "code" || process.exit.code !== 0) {
-            const failure = failureInfo("process_error", "agent validator exited unsuccessfully", input, runtime.now());
-            await settleAttempt(task, runtime, input, { kind: "failed", failure, candidate, validator: null }, "failed", context);
-            return;
-          }
           const stdout = process.semanticStdout;
           if (stdout.kind !== "captured") {
-            const failure = failureInfo(stdout.kind === "too_large" ? "result_too_large" : "result_invalid", "agent verifier stdout is unavailable, oversized, or invalid UTF-8", input, runtime.now());
-            await settleAttempt(task, runtime, input, { kind: "failed", failure, candidate, validator: null }, "failed", context);
+            await blockVerifier(runtime, input, candidate, "agent verifier stdout is unavailable, oversized, or invalid UTF-8", context);
             return;
           }
           const parsed = parseTaggedVerifierDecision(Buffer.from(stdout.text, "utf8"));
           if (!parsed.ok) {
-            const failure = failureInfo(parsed.failure.kind, parsed.failure.message, input, runtime.now());
-            await settleAttempt(task, runtime, input, { kind: "failed", failure, candidate, validator: null }, "failed", context);
+            await blockVerifier(runtime, input, candidate, parsed.failure.message, context);
+            return;
+          }
+          if (candidate === null && parsed.value.decision === "accept") {
+            await blockVerifier(runtime, input, candidate, "only retry or block is valid after worker failure", context);
             return;
           }
           validator = validatorOutcomeSchema.parse({
@@ -493,16 +492,29 @@ async function commitWorkerCandidate(
 async function commitValidatorOutcome(
   runtime: NodeRuntime,
   input: NodeAttemptTaskInput,
-  candidate: NodeResult,
+  candidate: NodeResult | null,
   validator: ValidatorOutcome,
   context: Context,
 ): Promise<void> {
-  const checkedCandidate = nodeResultSchema.parse(candidate);
+  const checkedCandidate = candidate === null ? null : nodeResultSchema.parse(candidate);
   const checkedValidator = validatorOutcomeSchema.parse(validator);
   await runtime.commit(async (tx) => {
     const { draft, run } = await runDraft(tx, runtime.conversationId);
     assertNodeIdentity(input, run, runtime.taskId);
     const attempt = requireAttempt(run, input.nodeId, input.attemptId);
+    if (attempt.result.kind === "worker_failure_committed") {
+      const failure = attempt.result.failure;
+      assign(draft, replaceRunAttempt(run, input.nodeId, input.attemptId, (value) => ({
+        ...value, status: "validating", phase: "finish",
+        result: { kind: "worker_failure_committed", failure, validator: checkedValidator },
+      })));
+      await appendEvent(tx, runtime.conversationId, {
+        version: 1, eventId: randomUUID(), type: "validator_result_committed", runId: input.runId,
+        nodeId: input.nodeId, attemptId: input.attemptId, validator: checkedValidator, occurredAt: timestamp(runtime.now()),
+      });
+      return { status: "running", checkpoint: { phase: "finish" } };
+    }
+    if (checkedCandidate === null) throw new Error("verifier candidate disappeared");
     if (attempt.result.kind !== "candidate_committed"
       || canonicalHash(attempt.result.candidate) !== canonicalHash(checkedCandidate)
       || attempt.validatorExecutionId === null) {
@@ -630,7 +642,7 @@ async function scheduleSafeProcessReplay(args: {
     const expectedExecutionId = role === "worker" ? latestAttempt.workerExecutionId : latestAttempt.validatorExecutionId;
     const expectedResult = role === "worker"
       ? latestAttempt.result.kind === "pending"
-      : latestAttempt.result.kind === "candidate_committed";
+      : latestAttempt.result.kind === "candidate_committed" || latestAttempt.result.kind === "worker_failure_committed";
     if (expectedExecutionId !== checkpoint.executionId || !expectedResult) {
       throw new Error("process replay no longer matches the active semantic attempt");
     }
@@ -822,7 +834,7 @@ export function resolveWorkerArtifacts(
 
 function workerResultRequiresRuntimeGate(candidate: NodeResult): boolean {
   return candidate.version === 2
-    && (candidate.stdioResult.status === "needs_input" || candidate.stdioResult.status === "success_and_complete");
+    && candidate.stdioResult.status === "needs_input";
 }
 
 function validatorFailureReason(validator: ValidatorOutcome): string {
@@ -877,13 +889,13 @@ async function checkedOperatorStopRetirement(
   const hasWorkerReceipt = attempt.workerExecutionId !== null
     && attempt.processIncarnations.some((reference) => reference.executionId === attempt.workerExecutionId);
   if (checkpoint.phase === "launchValidator") {
-    return attempt.result.kind === "candidate_committed" && hasWorkerReceipt
+    return (attempt.result.kind === "candidate_committed" || attempt.result.kind === "worker_failure_committed") && hasWorkerReceipt
       && attempt.validatorExecutionId === null;
   }
   if (checkpoint.phase === "finish") return false;
   const expectedRole = checkpoint.phase === "awaitWorker" ? "worker" : "validator";
   if ((expectedRole === "worker" && attempt.result.kind !== "pending")
-    || (expectedRole === "validator" && (attempt.result.kind !== "candidate_committed" || !hasWorkerReceipt))) return false;
+    || (expectedRole === "validator" && ((attempt.result.kind !== "candidate_committed" && attempt.result.kind !== "worker_failure_committed") || !hasWorkerReceipt))) return false;
   const processTaskId = durableTaskId<ProcessExecutionTaskResult>(checkpoint.processTaskId);
   const processTask = await runtime.getTask(processTaskId, context);
   if (processTask === undefined || processTask.kind !== "workshop.process-execution"
@@ -921,20 +933,30 @@ async function finishNodeAttempt(
   const run = await snapshotRun(runtime, context);
   assertNodeIdentity(input, run, runtime.taskId);
   const attempt = requireAttempt(run, input.nodeId, input.attemptId);
+  if (attempt.result.kind === "worker_failure_committed") {
+    const { failure, validator } = attempt.result;
+    if (validator?.kind === "agent" && validator.verdict.version === 2 && validator.verdict.decision === "block") {
+      const block = blockInfo("verifier_block", validator.verdict.reason, input.runId, input.nodeId, input.attemptId, timestamp(runtime.now()));
+      await settleAttempt(null, runtime, input, { kind: "blocked", block, candidate: null, validator }, "interrupted", context);
+    } else {
+      await settleAttempt(null, runtime, input, { kind: "failed", failure, candidate: null, validator }, "failed", context);
+    }
+    return;
+  }
   const candidate = attempt.result.kind === "candidate_committed" || attempt.result.kind === "validation_committed"
     ? attempt.result.candidate
     : null;
   if (candidate === null) throw new Error("attempt has no committed candidate to settle");
   const validator = attempt.result.kind === "validation_committed" ? attempt.result.validator : null;
-  const gatedStatus = workerResultRequiresRuntimeGate(candidate);
+  const gatedStatus = workerResultRequiresRuntimeGate(candidate) && (validator === null || validatorOutcomePasses(validator));
   const gatedVerdict = validator?.kind === "agent" && validator.verdict.version === 2 && validator.verdict.decision === "block";
   if (gatedStatus || gatedVerdict) {
-    const reason = gatedStatus ? "worker status requires a later runtime package" : "verifier block requires a later runtime package";
-    const block = blockInfo("runtime_incompatible", reason, input.runId, input.nodeId, input.attemptId, timestamp(runtime.now()));
+    const reason = gatedStatus ? "worker status requires a later runtime package" : validator === null ? "verifier blocked" : validatorFailureReason(validator);
+    const block = blockInfo(gatedStatus ? "runtime_incompatible" : "verifier_block", reason, input.runId, input.nodeId, input.attemptId, timestamp(runtime.now()));
     await settleAttempt(null, runtime, input, { kind: "blocked", block, candidate, validator }, "interrupted", context);
     return;
   }
-  const missingArtifact = candidate.artifacts.find((artifact) => artifact.availability === "missing");
+  const missingArtifact = candidate?.artifacts.find((artifact) => artifact.availability === "missing");
   const outcome = missingArtifact !== undefined
     ? nodeAttemptOutcomeSchema.parse({
       kind: "failed",
@@ -945,36 +967,12 @@ async function finishNodeAttempt(
     : validator !== null && !validatorOutcomePasses(validator)
       ? nodeAttemptOutcomeSchema.parse({
         kind: "failed",
-        failure: failureInfo("validator_rejection", validatorFailureReason(validator), input, runtime.now()),
+        failure: failureInfo("validator_rejection", buildFailureFeedback(validatorFailureReason(validator)), input, runtime.now()),
         candidate,
         validator,
       })
       : nodeAttemptOutcomeSchema.parse({ kind: "succeeded", candidate, validator });
-  await runtime.commit(async (tx) => {
-    const { draft, run: current } = await runDraft(tx, runtime.conversationId);
-    assertNodeIdentity(input, current, runtime.taskId);
-    const at = timestamp(runtime.now());
-    const next = replaceRunAttempt(current, input.nodeId, input.attemptId, (value) => ({
-      ...value,
-      status: outcome.kind === "succeeded" ? "succeeded" : "failed",
-      phase: null,
-      finishedAt: at,
-      elapsedMs: value.startedAt === null ? null : Date.parse(at) - Date.parse(value.startedAt),
-      result: { kind: "settled", outcome },
-    }));
-    assign(draft, next);
-    await appendEvent(tx, runtime.conversationId, {
-      version: 1,
-      eventId: randomUUID(),
-      type: "attempt_settled",
-      runId: input.runId,
-      nodeId: input.nodeId,
-      attemptId: input.attemptId,
-      outcome,
-      occurredAt: at,
-    });
-    return { status: "terminal", outcome: { status: "completed", result: outcome } };
-  }, context);
+  await settleAttempt(null, runtime, input, outcome, outcome.kind === "succeeded" ? "succeeded" : "failed", context);
 }
 
 
@@ -983,7 +981,7 @@ async function settleAttempt(
   runtime: NodeRuntime,
   input: NodeAttemptTaskInput,
   outcome: NodeAttemptOutcome,
-  status: "failed" | "interrupted" | "cancelled",
+  status: "succeeded" | "failed" | "interrupted" | "cancelled",
   context: Context,
   taskOutcome: "completed" | "aborted" = "completed",
   requireOperatorStop = false,
@@ -1005,8 +1003,12 @@ async function settleAttempt(
       validator: checked.kind === "cancelled" ? checked.validator : null,
     });
     const at = timestamp(runtime.now());
+    const failureMetadata = committedOutcome.kind === "failed"
+      ? await buildAttemptFailureMetadata(tx, runtime.conversationId, run, input, committedOutcome)
+      : {};
     const next = replaceRunAttempt(run, input.nodeId, input.attemptId, (currentAttempt) => ({
       ...currentAttempt,
+      ...failureMetadata,
       status: committedStatus,
       phase: null,
       finishedAt: at,
@@ -1195,4 +1197,71 @@ function replayDeadlineMatches(launchIntentAt: string, deadlineAt: string | null
   return Number.isSafeInteger(launchTime) && Number.isSafeInteger(deadlineTime)
     && Number.isFinite(new Date(deadlineTime).getTime())
     && remaining >= 0 && remaining <= timeoutMs;
+}
+
+async function handleWorkerFailure(runtime: NodeRuntime, input: NodeAttemptTaskInput, failure: FailureInfo, context: Context): Promise<void> {
+  const run = await snapshotRun(runtime, context);
+  const attempt = requireAttempt(run, input.nodeId, input.attemptId);
+  const settings = run.resolvedSettings.nodes[input.nodeId];
+  if (settings === undefined) throw new Error("failed worker lost its frozen settings");
+  const limit = resolveRetryLimit(settings);
+  const retryPermitted = settings.run.replay === "safe" && (limit === "unlimited" || attempt.number <= limit);
+  if (!retryPermitted || settings.validator?.kind !== "agent") {
+    await settleAttempt(null, runtime, input, { kind: "failed", failure, candidate: null, validator: null }, "failed", context);
+    return;
+  }
+  await runtime.commit(async (tx) => {
+    const { draft, run: current } = await runDraft(tx, runtime.conversationId);
+    assertNodeIdentity(input, current, runtime.taskId);
+    const metadata = await buildAttemptFailureMetadata(tx, runtime.conversationId, current, input,
+      { kind: "failed", failure, candidate: null, validator: null });
+    assign(draft, replaceRunAttempt(current, input.nodeId, input.attemptId, (value) => ({
+      ...value, ...metadata, workerFailure: failure, phase: "captureCandidate",
+      result: { kind: "worker_failure_committed", failure, validator: null },
+    })));
+    return { status: "running", checkpoint: { phase: "launchValidator" } };
+  }, context);
+}
+
+async function blockVerifier(runtime: NodeRuntime, input: NodeAttemptTaskInput, candidate: NodeResult | null, reason: string, context: Context): Promise<void> {
+  const block = blockInfo("verifier_failed", reason, input.runId, input.nodeId, input.attemptId, timestamp(runtime.now()));
+  await settleAttempt(null, runtime, input, { kind: "blocked", block, candidate, validator: null }, "interrupted", context);
+}
+
+async function buildAttemptFailureMetadata(
+  tx: Tx,
+  conversationId: ConversationId,
+  run: ReadyRun,
+  input: NodeAttemptTaskInput,
+  outcome: Extract<NodeAttemptOutcome, { kind: "failed" }>,
+) {
+  const attempt = requireAttempt(run, input.nodeId, input.attemptId);
+  const role = outcome.candidate === null ? "worker" : "validator";
+  const executionId = role === "worker" ? attempt.workerExecutionId : attempt.validatorExecutionId;
+  let process: z.infer<typeof workshopProcessV1Schema>["process"] | undefined;
+  let cursor: Cursor | undefined;
+  do {
+    const page = await tx.scanEntries({ conversationId }, 256, cursor);
+    for (const entry of page.items) {
+      if (!WorkshopProcessEntry.is(entry)) continue;
+      const record = workshopProcessV1Schema.parse(entry.data);
+      if (record.attemptId !== input.attemptId || record.process.executionId !== executionId || record.process.status !== "exited") continue;
+      if (process === undefined || record.process.incarnationNumber > process.incarnationNumber) process = record.process;
+    }
+    cursor = page.next;
+  } while (cursor !== undefined);
+  const stderr = process?.captures.find((capture) => capture.stream === "stderr");
+  const stdout = process?.captures.find((capture) => capture.stream === "stdout");
+  const stderrBytes = Buffer.from(stderr?.retained?.bytes ?? "", "base64");
+  const verifier = outcome.validator;
+  const verifierReason = verifier?.kind === "agent" && verifier.verdict.version === 2 ? verifier.verdict.reason : null;
+  const feedbackText = verifierReason !== null && verifier?.kind === "agent"
+    ? validatorFailureReason(verifier)
+    : outcome.failure.message + "\n\nstdout:\n" + (stdout?.retained === undefined ? "unavailable" : readCaptureBytes(Buffer.from(stdout.retained.bytes, "base64")))
+      + "\n\nstderr:\n" + (stderr?.retained === undefined ? "unavailable" : readCaptureBytes(stderrBytes))
+      + ((stdout?.truncatedBytes ?? 0) + (stderr?.truncatedBytes ?? 0) > 0 ? "\n[Captured failure output truncated.]" : "");
+  return {
+    failureEvidenceHash: hashFailureEvidence(role, process?.exit ?? null, stderrBytes, verifierReason),
+    feedback: { nodeId: input.nodeId, attemptId: input.attemptId, attemptNumber: attempt.number, text: buildFailureFeedback(feedbackText) },
+  };
 }

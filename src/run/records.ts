@@ -116,6 +116,7 @@ export const persistedJudgmentSchema = z.strictObject({
 
 const pendingAttemptResultSchema = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("pending") }),
+  z.strictObject({ kind: z.literal("worker_failure_committed"), failure: failureInfoSchema, validator: validatorOutcomeSchema.nullable() }),
   z.strictObject({ kind: z.literal("candidate_committed"), candidate: nodeResultSchema }),
   z.strictObject({
     kind: z.literal("validation_committed"),
@@ -140,7 +141,21 @@ export const persistedNodeAttemptSchema = z.strictObject({
   processIncarnations: z.array(processEvidenceReferenceSchema),
   blockIds: z.array(z.string().min(1)),
   judgments: z.array(persistedJudgmentSchema),
+  failureEvidenceHash: sha256Schema.optional(),
+  workerFailure: failureInfoSchema.optional(),
+  feedback: z.strictObject({
+    nodeId: nodeIdSchema,
+    attemptId: attemptIdSchema,
+    attemptNumber: positiveSafeInteger,
+    text: z.string().refine((value) => value.isWellFormed() && Buffer.byteLength(value, "utf8") <= 64 * 1024),
+  }).optional(),
 }).superRefine((attempt, context) => {
+  if (attempt.feedback !== undefined && (attempt.feedback.attemptId !== attempt.attemptId || attempt.feedback.attemptNumber !== attempt.number)) {
+    context.addIssue({ code: "custom", path: ["feedback"], message: "feedback identifies its source attempt" });
+  }
+  if (attempt.workerFailure !== undefined && (attempt.workerFailure.attemptId !== attempt.attemptId || attempt.status === "succeeded")) {
+    context.addIssue({ code: "custom", path: ["workerFailure"], message: "worker failure identifies an unsuccessful source attempt" });
+  }
   const isSettled = attempt.result.kind === "settled";
   if (terminalAttemptStatuses.has(attempt.status) !== isSettled) {
     context.addIssue({ code: "custom", path: ["result"], message: "terminal attempt state matches its committed domain outcome" });
@@ -190,7 +205,7 @@ export const persistedNodeAttemptSchema = z.strictObject({
 
 export const persistedNodeSchema = z.strictObject({
   nodeId: nodeIdSchema,
-  status: z.enum(["pending", "running", "succeeded", "failed", "blocked", "cancelled"]),
+  status: z.enum(["pending", "running", "succeeded", "failed", "blocked", "cancelled", "skipped"]),
   successfulAttemptId: attemptIdSchema.nullable(),
   attempts: z.array(persistedNodeAttemptSchema),
 }).superRefine((node, context) => {
@@ -213,7 +228,7 @@ export const persistedNodeSchema = z.strictObject({
     && (successfulAttempt?.attemptId !== node.successfulAttemptId || node.attempts.at(-1)?.attemptId !== node.successfulAttemptId)) {
     context.addIssue({ code: "custom", path: ["successfulAttemptId"], message: "successful node points to its final succeeded attempt" });
   }
-  if (node.status === "pending" && node.attempts.length > 0) {
+  if ((node.status === "pending" || node.status === "skipped") && node.attempts.length > 0) {
     context.addIssue({ code: "custom", path: ["attempts"], message: "pending nodes have no semantic attempts" });
   }
 });
@@ -333,7 +348,7 @@ const admittedRunDocumentV1Schema = z.strictObject({
   let nonSuccessSeen = false;
   let pendingSeen = false;
   for (const [index, node] of run.nodes.entries()) {
-    if (node.status === "pending") pendingSeen = true;
+    if (node.status === "pending" || node.status === "skipped") pendingSeen = true;
     else if (node.status === "succeeded") {
       if (nonSuccessSeen || pendingSeen) context.addIssue({ code: "custom", path: ["nodes", index, "status"], message: "succeeded nodes form a prefix" });
     } else {
@@ -363,7 +378,17 @@ const admittedRunDocumentV1Schema = z.strictObject({
   if (run.status === "cancelled" && run.desiredState !== "stopped") {
     context.addIssue({ code: "custom", path: ["desiredState"], message: "cancelled runs require stopped intent" });
   }
-  const chainSucceeded = run.nodes.every((node) => node.status === "succeeded");
+  const firstSkipped = run.nodes.findIndex((node) => node.status === "skipped");
+  const completingNode = firstSkipped < 0 ? undefined : run.nodes[firstSkipped - 1];
+  const completingAttempt = completingNode?.attempts.at(-1);
+  const earlyCompletion = completingAttempt?.result.kind === "settled" && completingAttempt.result.outcome.kind === "succeeded"
+    && completingAttempt.result.outcome.candidate.version === 2
+    && completingAttempt.result.outcome.candidate.stdioResult.status === "success_and_complete";
+  if (firstSkipped >= 0 && (run.status !== "completed" || !earlyCompletion
+    || run.nodes.slice(firstSkipped).some((node) => node.status !== "skipped"))) {
+    context.addIssue({ code: "custom", path: ["nodes"], message: "skipped nodes form the suffix of accepted early completion" });
+  }
+  const chainSucceeded = run.nodes.every((node) => node.status === "succeeded" || node.status === "skipped");
   if ((run.status === "completed") !== chainSucceeded) {
     context.addIssue({ code: "custom", path: ["nodes"], message: "a fully succeeded chain is completed, and completed runs have a fully succeeded chain" });
   }

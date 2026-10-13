@@ -317,7 +317,7 @@ export function defineProcessExecutionTask(
               const attempt = requireAttempt(run, input.nodeId, input.attemptId);
               return input.role === "worker"
                 ? attempt.status === "executing" && attempt.result.kind === "pending"
-                : attempt.status === "validating" && attempt.result.kind === "candidate_committed";
+                : attempt.status === "validating" && (attempt.result.kind === "candidate_committed" || attempt.result.kind === "worker_failure_committed");
             })();
         const runIsActive = run.status === "running" && run.desiredState === "running";
         const pausedValidatorMayFinish = input.role === "validator"
@@ -363,7 +363,7 @@ export function defineProcessExecutionTask(
             stderrFile: input.stderrPath,
           });
         } catch {
-          await blockProcess(task, runtime, input, process, "external_outcome_unknown", "process launch did not produce a durable identity", context);
+          await blockProcess(task, runtime, input, process, input.role === "validator" ? "verifier_failed" : "external_outcome_unknown", "process launch did not produce a durable identity", context);
           return;
         }
         trackedProcesses.set(input.executionId, child);
@@ -939,7 +939,7 @@ function assertProcessIdentity(
   const executionId = input.role === "worker" ? attempt.workerExecutionId : attempt.validatorExecutionId;
   const authorizedAttempt = input.role === "worker"
     ? attempt.status === "executing" && attempt.result.kind === "pending"
-    : attempt.status === "validating" && attempt.result.kind === "candidate_committed";
+    : attempt.status === "validating" && (attempt.result.kind === "candidate_committed" || attempt.result.kind === "worker_failure_committed");
   const executionIncarnations = attempt.processIncarnations.filter((item) => item.executionId === input.executionId);
   const recordedIncarnationIndex = executionIncarnations.findIndex((item) => item.incarnationId === input.incarnationId);
   const hasReference = recordedIncarnationIndex >= 0;

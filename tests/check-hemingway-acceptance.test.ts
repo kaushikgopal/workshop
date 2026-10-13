@@ -132,8 +132,8 @@ describe("recurring Hemingway acceptance", () => {
     writeFileSync(join(fixture.archiveDirectory, "prior-run.md"), `${reference}\n`, "utf8");
     try {
       const runId = await startSingleRun(fixture.root, "hemingway-reject");
-      const blocked = await waitForRunStatus(fixture.root, "hemingway-reject", runId, "blocked");
-      expect(blocked.block).not.toBeNull();
+      const failed = await waitForRunStatus(fixture.root, "hemingway-reject", runId, "failed");
+      expect(failed.failure?.kind).toBe("validator_rejection");
       const archiveFiles = readdirSync(fixture.archiveDirectory).filter((name) => name.endsWith(".md")).sort();
       expect(archiveFiles).toEqual(["prior-run.md"]);
       expect(readFileSync(join(fixture.archiveDirectory, "prior-run.md"), "utf8").trim()).toBe(reference);
@@ -152,8 +152,8 @@ describe("recurring Hemingway acceptance", () => {
     const fixture = createFixture({ id: "hemingway-invalid", schedule: false, malformedGenerator: true });
     try {
       const runId = await startSingleRun(fixture.root, "hemingway-invalid");
-      const blocked = await waitForRunStatus(fixture.root, "hemingway-invalid", runId, "blocked");
-      expect(blocked.block).not.toBeNull();
+      const failed = await waitForRunStatus(fixture.root, "hemingway-invalid", runId, "failed");
+      expect(failed.failure?.kind).toBe("result_invalid");
       expect(readdirSync(fixture.archiveDirectory)).toEqual([]);
       const activity = readActivity(fixture.activityLog);
       expect(activity.filter((record) => record.role === "generator" && record.event === "start")).toHaveLength(1);
@@ -196,8 +196,6 @@ function createFixture(options: {
     "  harness:",
     `    command: ${JSON.stringify(generatorCommand)}`,
     "  model: fixture/mock-model:medium",
-    "orchestrator:",
-    "  model: fixture/mock-model:low",
     "",
   ].join("\n"), "utf8");
 

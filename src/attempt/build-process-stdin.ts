@@ -80,20 +80,22 @@ export function reconstructProcessStdin(input: ProcessStdinIdentity, runDocument
       logPath: join(parsed.paths.runDirectory, "execution.log"),
       previousOutput,
       resultMode: nodeSettings.result,
+      feedback: earlierFeedback(node.attempts, attempt.number),
     };
     return buildProcessStdin({ role: "worker", kind: "agent", prompt });
   }
 
   if (nodeSettings.validator === null) throw new Error("validator stdin has no frozen validator settings");
-  if (attempt.result.kind !== "candidate_committed" && attempt.result.kind !== "validation_committed") {
-    throw new Error("validator stdin requires a committed candidate");
+  if (attempt.result.kind !== "candidate_committed" && attempt.result.kind !== "validation_committed" && attempt.result.kind !== "worker_failure_committed") {
+    throw new Error("verifier stdin requires committed worker evidence");
   }
-  const candidate = attempt.result.candidate;
-  const candidateStatus = candidate.version === 2 ? candidate.stdioResult.status : "succeeded";
+  const candidate = attempt.result.kind === "worker_failure_committed" ? null : attempt.result.candidate;
+  const candidateStatus = candidate === null ? "failed" : candidate.version === 2 ? candidate.stdioResult.status : "succeeded";
   const retriesRemaining = nodeSettings.retries === "unlimited"
     ? "unlimited"
     : Math.max(0, nodeSettings.retries + 1 - attempt.number);
   if (nodeSettings.validator.kind === "command") {
+    if (candidate === null) throw new Error("command verifier requires a valid candidate");
     return buildProcessStdin({ role: "verifier", kind: "command", candidateOutput: candidate.output });
   }
   const prompt: VerifierPromptV4Input = {
@@ -106,7 +108,9 @@ export function reconstructProcessStdin(input: ProcessStdinIdentity, runDocument
     resultsPath: join(parsed.paths.runDirectory, "results.md"),
     logPath: join(parsed.paths.runDirectory, "execution.log"),
     previousOutput,
-    candidateOutput: candidate.output,
+    candidateOutput: candidate?.output ?? "",
+    failureEvidence: candidate === null ? attempt.feedback?.text ?? "Failure evidence unavailable." : null,
+    feedback: earlierFeedback(node.attempts, attempt.number),
     candidateStatus,
     retriesRemaining,
   };
@@ -126,4 +130,9 @@ function committedPreviousOutput(run: ReadyRun, nodeId: string): { stepId: strin
     throw new Error("process stdin predecessor has no committed successful output");
   }
   return { stepId: predecessorId, output: previousAttempt.result.outcome.candidate.output };
+}
+
+function earlierFeedback(attempts: readonly PersistedNodeAttempt[], number: number): string | null {
+  const source = attempts.filter((attempt) => attempt.number < number && attempt.feedback !== undefined).at(-1)?.feedback;
+  return source === undefined ? null : "Source step: " + source.nodeId + "\nSource attempt: " + source.attemptNumber + "\n\n" + source.text;
 }

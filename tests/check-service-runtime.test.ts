@@ -1,11 +1,10 @@
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import { createModels } from "@earendil-works/pi-ai/models";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
-import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai";
-import { createModels } from "@earendil-works/pi-ai/models";
 import { createRegistry, Harness, type ConversationId } from "@earendil-works/pi-durable";
 import { loadInstallation, loadCheckedWorkflow } from "../src/installation/load-installation.js";
 import { installationDocumentV1Schema } from "../src/installation/schema.js";
@@ -46,7 +45,6 @@ describe("Durable service runtime", () => {
       .toContain("WP6 must define human text/tagged acceptance");
     expect(format4ResolutionRejection({ formatVersion: 4, blockKind: "runtime_incompatible", action: "fail" })).toBeNull();
     expect(format4ResolutionRejection({ formatVersion: 4, blockKind: "integrity_failed", action: "fail" })).toBeNull();
-    expect(format4ResolutionRejection({ formatVersion: 4, blockKind: "orchestrator_unavailable", action: "retry" })).toBeNull();
     expect(format4ResolutionRejection({ formatVersion: 3, blockKind: "runtime_incompatible", action: "retry" })).toBeNull();
   });
   test("serves start, status, runs, and logs for one canonical run through real SQLite and Harness resources", async () => {
@@ -201,121 +199,6 @@ describe("Durable service runtime", () => {
     }
   });
 
-  test("repairs an unavailable judge and retries only the judgment before authorizing a new attempt", async () => {
-    const root = mkdtempSync(join(tmpdir(), "workshop-judgment-repair-"));
-    const config = join(root, ".workshop");
-    const workflows = join(config, "workflows");
-    const workerLaunches = join(root, "worker-launches.txt");
-    const validatorLaunches = join(root, "validator-launches.txt");
-    const validatorFirstFailure = join(root, "validator-first-failure.txt");
-    mkdirSync(workflows, { recursive: true });
-    writeFileSync(join(config, "workshop.yaml"), "shell: /bin/sh\norchestrator:\n  model: faux/failure-judge:low\n  timeout: 20s\n", "utf8");
-    writeFileSync(join(workflows, "judgment-repair.yaml"), [
-      "version: 4",
-      "defaults:",
-      "  retries: 0",
-      "  replay: never",
-      "steps:",
-      "  - verify:",
-      "      retries: 1",
-      "      replay: safe",
-      "      run: >-",
-      `        printf w >> '${workerLaunches}'; printf candidate`,
-      "      verify:",
-      "        run: >-",
-      `          printf v >> '${validatorLaunches}'; if [ ! -e '${validatorFirstFailure}' ]; then touch '${validatorFirstFailure}'; exit 7; fi; exit 0`,
-      "",
-    ].join("\n"), "utf8");
-    const installation = loadInstallation(root);
-    const models = createModels();
-    const faux = fauxProvider({ provider: "faux", models: [{ id: "failure-judge", name: "Failure Judge" }] });
-    let releaseDecision!: () => void;
-    const decisionReleased = new Promise<void>((resolve) => { releaseDecision = resolve; });
-    let providerWaiting = false;
-    faux.setResponses([async () => {
-      providerWaiting = true;
-      await decisionReleased;
-      return fauxAssistantMessage(fauxToolCall("record_workshop_failure_decision", { action: "retry", reason: "A repaired judge authorized one safe new attempt." }), { stopReason: "toolUse" });
-    }]);
-    let owner: Awaited<ReturnType<typeof startWorkshopService>> | undefined;
-    const count = (path: string) => existsSync(path) ? readFileSync(path, "utf8").length : 0;
-    try {
-      owner = await startWorkshopService(installation, { models });
-      const health = await probeServiceHealth(installation.stateDirectory);
-      if (health.kind !== "ready") throw new Error(health.reason);
-      const socketPath = health.metadata.socketPath;
-      const started = await sendServiceRequest(socketPath, { version: 1, method: "start", requestId: "judgment-repair-start", workflowId: "judgment-repair" });
-      if (!started.ok) throw new Error(started.error.message);
-      const startResult = serviceStartResultV1Schema.parse(started.result);
-      let blocked: ReturnType<typeof statusDtoSchema.parse> | undefined;
-      const blockDeadline = Date.now() + 10_000;
-      while (Date.now() < blockDeadline) {
-        const response = await sendServiceRequest(socketPath, { version: 1, method: "status", workflowId: "judgment-repair" });
-        if (!response.ok) throw new Error(response.error.message);
-        const status = statusDtoSchema.parse(response.result);
-        if (status.workflows[0]?.unresolvedRun?.status === "blocked") { blocked = status; break; }
-        await new Promise((resolveDelay) => setTimeout(resolveDelay, 20));
-      }
-      if (blocked === undefined) throw new Error("workflow did not block on the unavailable native judge");
-      expect(blocked.workflows[0]?.unresolvedRun?.block?.kind).toBe("orchestrator_unavailable");
-      expect(count(workerLaunches)).toBe(1);
-      expect(count(validatorLaunches)).toBe(1);
-      const unsupportedAcceptance = await sendServiceRequest(socketPath, {
-        version: 1, method: "resolve", requestId: "judgment-repair-accept", workflowId: "judgment-repair",
-        runId: startResult.runId, action: "accept", reason: "Test the temporary format 4 acceptance guard.",
-        resultFile: "candidate.json", acknowledgeEffects: true,
-      });
-      expect(unsupportedAcceptance.ok).toBe(false);
-      if (unsupportedAcceptance.ok) throw new Error("format 4 file acceptance unexpectedly succeeded");
-      expect(unsupportedAcceptance.error.code).toBe("resolution_rejected");
-      expect(unsupportedAcceptance.error.message).toContain("format 4 accept --result-file is not supported yet");
-      expect(unsupportedAcceptance.error.message).toContain("WP6 must define human text/tagged acceptance");
-      models.setProvider(faux.provider);
-      const resolved = await sendServiceRequest(socketPath, {
-        version: 1, method: "resolve", requestId: "judgment-repair-rejudge", workflowId: "judgment-repair",
-        runId: startResult.runId, action: "retry", target: "judgment", reason: "Credentials were repaired; ask the same failed attempt again.",
-      });
-      if (!resolved.ok) throw new Error(resolved.error.message);
-      expect(resolved.result).toMatchObject({ workflowId: "judgment-repair", runId: startResult.runId, status: "queued" });
-      const callDeadline = Date.now() + 10_000;
-      while (Date.now() < callDeadline && (!providerWaiting || faux.state.callCount !== 1)) {
-        await new Promise((resolveDelay) => setTimeout(resolveDelay, 20));
-      }
-      expect(providerWaiting).toBe(true);
-      expect(faux.state.callCount).toBe(1);
-      const duringJudge = await sendServiceRequest(socketPath, { version: 1, method: "node.describe", workflowId: "judgment-repair", runId: startResult.runId, nodeId: "verify" });
-      if (!duringJudge.ok) throw new Error(duringJudge.error.message);
-      const nodeBeforeDecision = nodeDescriptionDtoSchema.parse(duringJudge.result).node;
-      expect(nodeBeforeDecision.attempts).toHaveLength(1);
-      expect(nodeBeforeDecision.attempts[0]?.number).toBe(1);
-      expect(nodeBeforeDecision.attempts[0]?.status).toBe("failed");
-      expect(count(workerLaunches)).toBe(1);
-      expect(count(validatorLaunches)).toBe(1);
-      releaseDecision();
-      let finalNode: ReturnType<typeof nodeDescriptionDtoSchema.parse> | undefined;
-      const retryDeadline = Date.now() + 10_000;
-      while (Date.now() < retryDeadline) {
-        const response = await sendServiceRequest(socketPath, { version: 1, method: "node.describe", workflowId: "judgment-repair", runId: startResult.runId, nodeId: "verify" });
-        if (!response.ok) throw new Error(response.error.message);
-        finalNode = nodeDescriptionDtoSchema.parse(response.result);
-        if (finalNode.runStatus === "completed" && finalNode.node.attempts.length === 2) break;
-        await new Promise((resolveDelay) => setTimeout(resolveDelay, 20));
-      }
-      if (finalNode?.runStatus !== "completed") {
-        const status = await sendServiceRequest(socketPath, { version: 1, method: "status", workflowId: "judgment-repair" });
-        throw new Error(`judgment repair did not complete: ${JSON.stringify({ finalNode, status: status.ok ? status.result : status.error, providerCalls: faux.state.callCount })}`);
-      }
-      expect(finalNode?.node.attempts.map((attempt) => attempt.number)).toEqual([1, 2]);
-      expect(finalNode?.node.attempts[0]?.blocks.some((block) => block.kind === "orchestrator_unavailable")).toBe(true);
-      expect(finalNode?.node.attempts[0]?.judgments).toHaveLength(1);
-      expect(count(workerLaunches)).toBe(2);
-      expect(count(validatorLaunches)).toBe(2);
-    } finally {
-      releaseDecision();
-      if (owner !== undefined) await owner.shutdown();
-      rmSync(root, { recursive: true, force: true });
-    }
-  }, 30_000);
   test("renders committed capture text, marks unavailable content, and skips empty captures", async () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-log-text-integrity-"));
     const config = join(root, ".workshop");
@@ -783,3 +666,71 @@ async function startCompletedRun(socketPath: string, requestId: string) {
   throw new Error(`run ${started.runId} did not complete before the fixture deadline`);
 }
 });
+
+for (const terminalKind of ["failure", "early completion"] as const) {
+  test(terminalKind + " releases capacity and the schedule admits the next occurrence", async () => {
+    const root = mkdtempSync(join(tmpdir(), "workshop-failure-schedule-"));
+    const config = join(root, ".workshop");
+    const workflows = join(config, "workflows");
+    const marker = join(root, "failed-once");
+    const successorMarker = join(root, "successor");
+    const startedMarker = join(root, "started");
+    const releaseMarker = join(root, "release");
+    mkdirSync(workflows, { recursive: true });
+    writeFileSync(join(config, "workshop.yaml"), "shell: /bin/sh\nmax_concurrent_runs: 1\n", "utf8");
+    writeFileSync(join(workflows, "scheduled.yaml"), JSON.stringify({ version: 4, schedule: { every: "1s", max_runs: 2 }, defaults: { retries: 0, replay: "safe" },
+      steps: [{ first: { result: terminalKind === "failure" ? "text" : "tagged", run:
+        "if [ ! -e '" + marker + "' ]; then touch '" + startedMarker + "'; while [ ! -e '" + releaseMarker + "' ]; do sleep 0.02; done; touch '" + marker + "'; "
+        + (terminalKind === "failure" ? "exit 9; " : "") + "fi; "
+        + (terminalKind === "failure" ? "printf scheduled-success" : "printf '<status>success_and_complete</status>\\n<output>done</output>'") } },
+        { later: "touch '" + successorMarker + "'; printf successor" }] }));
+    writeFileSync(join(workflows, "queued.yaml"), JSON.stringify({ version: 4, defaults: { retries: 0, replay: "safe" }, steps: [{ first: "printf queued-success" }] }));
+    let owner: Awaited<ReturnType<typeof startWorkshopService>> | undefined;
+    try {
+      owner = await startWorkshopService(loadInstallation(root));
+      const health = await probeServiceHealth(loadInstallation(root).stateDirectory);
+      if (health.kind !== "ready") throw new Error("service unavailable");
+      const socketPath = health.metadata.socketPath;
+      const start = await sendServiceRequest(socketPath, { version: 1, method: "start", workflowId: "scheduled", requestId: "failure-schedule" });
+      if (!start.ok) throw new Error(start.error.message);
+      const firstRunId = serviceStartResultV1Schema.parse(start.result).runId;
+      const deadline = Date.now() + 15_000;
+      while (!existsSync(startedMarker) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(existsSync(startedMarker)).toBe(true);
+      writeFileSync(releaseMarker, "go");
+      for (;;) {
+        const response = await sendServiceRequest(socketPath, { version: 1, method: "runs", workflowId: "scheduled" });
+        if (!response.ok) throw new Error(response.error.message);
+        if (serviceRunsPageV1Schema.parse(response.result).runs.find((run) => run.runId === firstRunId)?.status === (terminalKind === "failure" ? "failed" : "completed")) break;
+        if (Date.now() >= deadline) throw new Error("failure did not settle");
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      const queued = await sendServiceRequest(socketPath, { version: 1, method: "start", workflowId: "queued", requestId: "queued-after-failure" });
+      if (!queued.ok) throw new Error(queued.error.message);
+      const queuedRunId = serviceStartResultV1Schema.parse(queued.result).runId;
+      await waitForCompletedRun(socketPath, "queued", queuedRunId);
+      let scheduled: ReturnType<typeof serviceRunsPageV1Schema.parse> | undefined;
+      while (Date.now() < deadline) {
+        const response = await sendServiceRequest(socketPath, { version: 1, method: "runs", workflowId: "scheduled" });
+        if (!response.ok) throw new Error(response.error.message);
+        scheduled = serviceRunsPageV1Schema.parse(response.result);
+        if (scheduled.runs.length === 2 && scheduled.runs.filter((run) => run.status === "completed").length === (terminalKind === "failure" ? 1 : 2)) break;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      expect(scheduled?.runs).toHaveLength(2);
+      expect(scheduled?.runs.find((run) => run.runId === firstRunId)?.status).toBe(terminalKind === "failure" ? "failed" : "completed");
+      expect(scheduled?.runs.filter((run) => run.status === "completed")).toHaveLength(terminalKind === "failure" ? 1 : 2);
+      if (terminalKind === "early completion") expect(existsSync(successorMarker)).toBe(false);
+      const status = await sendServiceRequest(socketPath, { version: 1, method: "status" });
+      if (!status.ok) throw new Error(status.error.message);
+      expect(statusDtoSchema.parse(status.result).workflows.every((workflow) => workflow.unresolvedRun === null)).toBe(true);
+      for (const blockKind of ["verifier_block", "verifier_failed", "repeated_failure"] as const) {
+        expect(format4ResolutionRejection({ formatVersion: 4, blockKind, action: "accept" })).toContain("cannot accept a fabricated");
+        expect(format4ResolutionRejection({ formatVersion: 4, blockKind, action: "retry" })).toBeNull();
+      }
+    } finally {
+      if (owner !== undefined) await owner.shutdown();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+}

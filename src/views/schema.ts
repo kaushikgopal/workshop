@@ -312,6 +312,7 @@ export const attemptDetailDtoSchema = z.strictObject({
   operatorAcceptances: z.array(operatorAcceptanceSchema),
   blocks: z.array(blockInfoSchema),
   failure: failureInfoSchema.nullable(),
+  workerFailure: failureInfoSchema.optional(),
   processes: z.array(attemptProcessSchema),
 }).superRefine((attempt, context) => {
   const report: ReportIssue = (path, message) => context.addIssue({ code: "custom", path, message });
@@ -416,6 +417,9 @@ export const attemptDetailDtoSchema = z.strictObject({
     }
   }
 
+  if (attempt.workerFailure !== undefined && (attempt.workerFailure.attemptId !== attempt.attemptId || attempt.status === "succeeded")) {
+    report(["workerFailure"], "worker failure identifies an unsuccessful source attempt");
+  }
   if (attempt.status === "succeeded" && (attempt.candidate === null || attempt.failure !== null)) {
     report(["candidate"], "succeeded attempts require a candidate and carry no failure");
   }
@@ -464,8 +468,8 @@ export const attemptDetailDtoSchema = z.strictObject({
   if (attempt.candidate !== null && attempt.workerExecutionId === null) {
     report(["workerExecutionId"], "candidate evidence requires its worker execution ID");
   }
-  if (attempt.validatorExecutionId !== null && attempt.candidate === null) {
-    report(["candidate"], "validator execution requires a committed candidate");
+  if (attempt.validatorExecutionId !== null && attempt.candidate === null && attempt.workerFailure === undefined) {
+    report(["candidate"], "verifier execution requires committed worker evidence");
   }
   if (attempt.verdict !== null && attempt.validatorExecutionId === null) {
     report(["validatorExecutionId"], "verdict evidence requires its validator execution ID");
@@ -513,9 +517,9 @@ export const attemptDetailDtoSchema = z.strictObject({
     ].filter((value): value is string => value !== undefined && value !== null)
       .map(timestampMilliseconds)
       .reduce((latest, value) => Math.max(latest, value), Number.NEGATIVE_INFINITY);
-    if (attempt.candidate === null || lastWorker === undefined
+    if ((attempt.candidate === null && attempt.workerFailure === undefined) || lastWorker === undefined
       || workerProcesses.some((process) => process.cleanupState !== "confirmed_dead")) {
-      report(["processes"], "validator launch requires a committed candidate and confirmed worker-group death");
+      report(["processes"], "verifier launch requires committed worker evidence and confirmed worker-group death");
     }
     if (!Number.isFinite(workerReadyAt)) report(["processes"], "validator launch requires worker completion or acceptance time");
     for (const [index, process] of validatorProcesses.entries()) {
@@ -560,7 +564,7 @@ export const attemptDetailDtoSchema = z.strictObject({
   }
 });
 
-const nodeStatusDtoSchema = z.enum(["pending", "running", "succeeded", "failed", "blocked", "cancelled"]);
+const nodeStatusDtoSchema = z.enum(["pending", "running", "succeeded", "failed", "blocked", "cancelled", "skipped"]);
 
 export const nodeDetailDtoSchema = z.strictObject({
   nodeId: nodeIdSchema,
@@ -585,8 +589,8 @@ export const nodeDetailDtoSchema = z.strictObject({
   }
 
   const lastAttempt = node.attempts.at(-1);
-  if (node.status === "pending" && node.attempts.length > 0) {
-    report(["attempts"], "pending nodes have no semantic attempts");
+  if ((node.status === "pending" || node.status === "skipped") && node.attempts.length > 0) {
+    report(["attempts"], "pending and skipped nodes have no semantic attempts");
   }
   if (node.status === "cancelled" && lastAttempt !== undefined && lastAttempt.status !== "cancelled") {
     report(["attempts"], "cancelled nodes end with a cancelled attempt");
@@ -623,6 +627,9 @@ export const nodeDetailDtoSchema = z.strictObject({
       report(["attempts", index, "processes"], "unconfigured validators cannot have process evidence");
     }
     if (node.resolvedSettings.validator?.kind === "command") {
+      if (attempt.workerFailure !== undefined && validatorProcesses.length > 0) {
+        report(["attempts", index, "processes"], "command verifiers require a valid candidate");
+      }
       const lastValidator = validatorProcesses.at(-1);
       const validatorPassed = lastValidator?.status === "exited"
         && lastValidator.exit?.kind === "code" && lastValidator.exit.code === 0;
@@ -747,8 +754,8 @@ export const nodeDescriptionDtoSchema = z.strictObject({
   if (runStatus === "queued" && node.status !== "pending") {
     report(["node", "status"], "queued runs contain only pending nodes");
   }
-  if (runStatus === "completed" && node.status !== "succeeded") {
-    report(["node", "status"], "completed runs contain only succeeded nodes");
+  if (runStatus === "completed" && node.status !== "succeeded" && node.status !== "skipped") {
+    report(["node", "status"], "completed runs contain only succeeded or skipped nodes");
   }
   if (runStatus === "failed" && ["running", "blocked", "cancelled"].includes(node.status)) {
     report(["node", "status"], "failed runs have no running, blocked, or cancelled nodes");

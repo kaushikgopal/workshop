@@ -425,7 +425,7 @@ function projectAttemptDetail(
     : result.kind === "settled"
       ? result.outcome.kind === "cancelled" ? result.outcome.candidate ?? null : result.outcome.candidate
       : null;
-  const validator = result.kind === "validation_committed"
+  const validator = result.kind === "validation_committed" || result.kind === "worker_failure_committed"
     ? result.validator
     : result.kind === "settled"
       ? result.outcome.kind === "cancelled" ? result.outcome.validator ?? null : result.outcome.validator
@@ -511,6 +511,7 @@ function projectAttemptDetail(
       return block;
     }),
     failure,
+    ...(attempt.workerFailure === undefined ? {} : { workerFailure: attempt.workerFailure }),
     processes: attemptProcesses,
   };
 }

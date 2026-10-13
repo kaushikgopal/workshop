@@ -30,6 +30,9 @@ export const blockKindSchema = z.enum([
   "runtime_incompatible",
   "integrity_failed",
   "retry_exhausted",
+  "verifier_block",
+  "verifier_failed",
+  "repeated_failure",
 ]);
 
 export const failureKindSchema = z.enum([
@@ -341,7 +344,8 @@ export const nodeAttemptOutcomeSchema = z.discriminatedUnion("kind", [
     context.addIssue({ code: "custom", path: ["validator"], message: "a succeeded attempt requires a passing validator" });
   }
   if (outcome.kind === "failed" || outcome.kind === "blocked") {
-    if (outcome.validator !== null && outcome.candidate === null) {
+    if (outcome.validator !== null && outcome.candidate === null
+      && !(outcome.validator.kind === "agent" && outcome.validator.verdict.version === 2 && outcome.validator.verdict.decision !== "accept")) {
       context.addIssue({ code: "custom", path: ["candidate"], message: "validator outcomes require a committed candidate" });
     }
   }
@@ -360,10 +364,11 @@ export const nodeAttemptOutcomeSchema = z.discriminatedUnion("kind", [
     if (["timeout", "process_error", "result_invalid", "result_too_large"].includes(outcome.failure.kind) && validatorPassed) {
       context.addIssue({ code: "custom", path: ["validator"], message: "execution failures cannot retain a passing validator result" });
     }
-    if ((executionFailure || resultFailure) && outcome.validator?.kind === "agent") {
+    if ((executionFailure || resultFailure) && outcome.validator?.kind === "agent"
+      && !(outcome.candidate === null && outcome.validator.verdict.version === 2 && outcome.validator.verdict.decision === "retry")) {
       context.addIssue({ code: "custom", path: ["validator"], message: "execution failures retain process evidence, not an agent verdict" });
     }
-    if (validatorFailed && !rejected && !executionFailure) {
+    if (validatorFailed && !rejected && !executionFailure && !(resultFailure && outcome.candidate === null)) {
       context.addIssue({ code: "custom", path: ["failure", "kind"], message: "failing validator results are rejections unless execution failed" });
     }
   }

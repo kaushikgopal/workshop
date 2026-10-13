@@ -47,7 +47,7 @@ export function renderRunFiles(snapshot: RunFileSnapshot) {
     const candidate = attempt?.result.kind === "settled" && attempt.result.outcome.kind === "succeeded"
       ? attempt.result.outcome.candidate : null;
     return { stepId: node.nodeId, status: candidate?.version === 2 ? candidate.stdioResult.status : "succeeded",
-      output: candidate?.output ?? null, answer: null, skipped: false };
+      output: candidate?.output ?? null, answer: null, skipped: node.status === "skipped" };
   });
   const results = renderResultsFile(run.workflowId, run.runId, slots);
   const sections = ["# Execution: " + run.workflowId + " run " + run.runId];
@@ -56,6 +56,11 @@ export function renderRunFiles(snapshot: RunFileSnapshot) {
     const attemptId = "attemptId" in event ? event.attemptId : event.type === "run_resolved" ? event.resolution.sourceBlock.attemptId : null;
     const attempt = run.nodes.flatMap((node) => node.attempts).find((value) => value.attemptId === attemptId);
     sections.push(label(stepId, attempt?.number ?? null, "engine", event.type) + "\n" + JSON.stringify(event));
+  }
+  for (const node of run.nodes) {
+    for (const attempt of node.attempts) {
+      if (attempt.feedback !== undefined) sections.push(label(node.nodeId, attempt.number, "engine", "retry feedback") + "\n" + attempt.feedback.text);
+    }
   }
   for (const record of snapshot.processEvidence) {
     const process = record.process;

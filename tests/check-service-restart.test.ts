@@ -45,8 +45,6 @@ describe("public service restart", () => {
       "  harness:",
       `    command: 'WORKSHOP_MOCK_SLEEP_MS=800 WORKSHOP_LAUNCH_LOG=${launches} bun ${mockAgentPath}'`,
       "  model: fixture/mock-model:medium",
-      "orchestrator:",
-      "  model: fixture/mock-model:low",
       "",
     ].join("\n"), "utf8");
     writeFileSync(join(workflows, "hemingway.yaml"), [
@@ -815,7 +813,7 @@ describe("public service restart", () => {
     }
   }, 30_000);
 
-  test("pause defers failed-attempt finalization until resume", async () => {
+  test("retry exhaustion is terminal even when the run is paused", async () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-paused-failure-"));
     const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
@@ -844,13 +842,14 @@ describe("public service restart", () => {
 
       const failedAttempt = await waitForAttemptStatus(root, "paused-failure", runId, "fail", "failed");
       expect(failedAttempt.node.status).toBe("failed");
-      const stillPaused = await waitForRunStatus(root, "paused-failure", runId, "paused");
-      expect(stillPaused.status).toBe("paused");
-
-      const resume = runCli(root, ["resume", "paused-failure"]);
-      expect(resume.status).toBe(0);
       const failed = await waitForRunStatus(root, "paused-failure", runId, "failed");
       expect(failed.status).toBe("failed");
+      const status = runCli(root, ["status", "paused-failure", "--json"]);
+      expect(status.status).toBe(0);
+      expect(statusDtoSchema.parse(JSON.parse(status.stdout)).workflows[0]?.unresolvedRun).toBeNull();
+      const resume = runCli(root, ["resume", "paused-failure"]);
+      expect(resume.status).toBe(0);
+      expect((await waitForRunStatus(root, "paused-failure", runId, "failed")).status).toBe("failed");
     } finally {
       await stopService(root);
       rmSync(root, { recursive: true, force: true });
@@ -1098,8 +1097,6 @@ describe("public service restart", () => {
       "  harness:",
       `    command: 'WORKSHOP_LAUNCH_LOG=${workerLaunches} bun ${mockAgentPath}'`,
       "  model: fixture/mock-model:medium",
-      "orchestrator:",
-      "  model: fixture/mock-model:low",
       "",
     ].join("\n"), "utf8");
     writeFileSync(join(workflows, "capture-recovery.yaml"), [
@@ -1889,8 +1886,7 @@ async function admitQueuedRunOffline(root: string, workflowId: string): Promise<
   if (!openedStorage.ok) throw new Error(`${openedStorage.failure.message}: ${String(openedStorage.failure.cause)}`);
   const tasks = defineWorkshopTasks();
   const registry = createRegistry();
-  registry.install({ name: "workshop-queued-admission-fixture", tasks: [tasks.WorkflowRunTask, tasks.NodeAttemptTask, tasks.ProcessExecutionTask, tasks.CapacityGateTask, tasks.FailureJudgmentTask] });
-  registry.install(tasks.FailureJudgmentExtension);
+  registry.install({ name: "workshop-queued-admission-fixture", tasks: [tasks.WorkflowRunTask, tasks.NodeAttemptTask, tasks.ProcessExecutionTask, tasks.CapacityGateTask] });
   let harness: Harness | undefined;
   try {
     harness = await Harness.open(openedStorage.storage, { models: createModels(), registry }, BACKGROUND_CONTEXT);
@@ -1923,7 +1919,7 @@ async function admitQueuedRunOffline(root: string, workflowId: string): Promise<
         workflows: { ...current.workflows, [workflowId]: workflowIndex },
       }));
     }, BACKGROUND_CONTEXT);
-    const taskVersions = { workflowRun: 10, nodeAttempt: 4, processExecution: 4, capacityGate: 1, failureJudgment: 1 } as const;
+    const taskVersions = { workflowRun: 10, nodeAttempt: 4, processExecution: 4, capacityGate: 1 } as const;
     const prepared = prepareRunAdmission({
       sourceText: checked.sourceText,
       sourceLabel: checked.sourcePath,

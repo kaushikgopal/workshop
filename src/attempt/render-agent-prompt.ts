@@ -20,7 +20,8 @@ export interface WorkerPromptV4Input extends AgentPromptIdentity {
 
 export interface VerifierPromptV4Input extends AgentPromptIdentity {
   candidateOutput: string;
-  candidateStatus: "succeeded" | "success_and_complete" | "needs_input";
+  candidateStatus: "succeeded" | "success_and_complete" | "needs_input" | "failed";
+  failureEvidence?: string | null;
   retriesRemaining: number | "unlimited";
 }
 
@@ -153,6 +154,11 @@ function decodeUtf8Head(bytes: Uint8Array, limit: number): string {
 }
 
 function renderVerifierData(input: VerifierPromptV4Input): string {
+  if (input.candidateStatus === "failed") {
+    return "### Worker failure evidence (data)\n\n" + (input.failureEvidence ?? "unavailable")
+      + "\n\nWorker failed. Only retry or block is valid. Accept cannot repair a failed worker."
+      + "\nRetries remaining: " + input.retriesRemaining;
+  }
   return "### Candidate output (data)\n\n" + input.candidateOutput
     + "\n\nCandidate status: " + input.candidateStatus
     + "\nRetries remaining: " + input.retriesRemaining;
