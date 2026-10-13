@@ -66,17 +66,18 @@ describe("public inspection parity", () => {
       expect(status.workflows.find((workflow) => workflow.workflowId === "idle")?.unresolvedRun).toBeNull();
       const statusText = runCli(root, ["status"]);
       expect(statusText.status).toBe(0);
-      expect(statusText.stdout).toContain(`chain: exhausted (1/1); running ${runId}`);
-      expect(statusText.stdout).toContain("idle: inactive; no unresolved run");
+      expect(statusText.stdout).toMatch(/chain\s+Running\s+—/);
+      expect(statusText.stdout).toMatch(/idle\s+Ready\s+—/);
       const filteredText = runCli(root, ["status", "chain"]);
-      expect(filteredText.stdout.trim()).toBe(`chain: exhausted (1/1); running ${runId}`);
+      expect(filteredText.stdout).toMatch(/chain\s+Running\s+—/);
+      expect(filteredText.stdout).not.toContain("idle");
 
       writeFileSync(releaseFirst, "go", "utf8");
       const failed = await waitForRunStatus(root, "chain", runId, "failed");
       expect(failed.currentNodeId).toBe("second");
       expect(existsSync(thirdStarted)).toBe(false);
       const settledText = runCli(root, ["status", "chain"]);
-      expect(settledText.stdout.trim()).toBe("chain: exhausted (1/1); no unresolved run");
+      expect(settledText.stdout).toMatch(/chain\s+Failed\s+—/);
 
       const logsJson = runCli(root, ["logs", "chain", "--run", runId, "--json"]);
       expect(logsJson.status).toBe(0);

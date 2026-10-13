@@ -53,9 +53,9 @@ describe("CLI commands", () => {
         expect(result.stderr).toContain(`unknown command: ${args[0]}`);
         expect(result.stdout).toBe("");
       }
-      const invalidWatch = runCli(directory, ["watch", "--json"]);
+      const invalidWatch = runCli(directory, ["watch", "--unknown"]);
       expect(invalidWatch.status).toBe(64);
-      expect(invalidWatch.stderr).toContain("usage: workshop watch");
+      expect(invalidWatch.stderr).toContain("usage: workshop status");
       expect(existsSync(join(directory, ".workshop"))).toBe(false);
     } finally {
       rmSync(directory, { recursive: true, force: true });
@@ -343,21 +343,26 @@ describe("CLI commands", () => {
       const socketPath = status.service.socketPath;
       if (socketPath === null) throw new Error("service socket path is missing");
       const viewerSource = createViewerSource(socketPath);
-      const viewerSnapshot = await viewerSource.snapshot("clock", runId);
-      expect(viewerSnapshot.runs.runs.map((run) => run.id)).toEqual([secondRunId, runId]);
-      expect(viewerSnapshot.runs.runs.find((run) => run.id === runId)?.nodes.map((node) => [node.id, node.status])).toEqual([["tick", "completed"]]);
-      expect(viewerSnapshot.runs.runs.find((run) => run.id === secondRunId)?.nodes).toEqual([]);
+      const viewerSnapshot = await viewerSource.snapshot("clock");
+      expect(viewerSnapshot.detail?.diagram.runId).toBe(secondRunId);
+      expect(viewerSnapshot.detail?.nodes.map(node => [node.nodeId, node.status])).toEqual([["tick", "succeeded"]]);
       const worklogSection = logs.sections.find((section) => section.kind === "worklog");
       if (worklogSection?.kind !== "worklog") throw new Error("worklog section is missing");
       expect(worklogSection.content).toStartWith("# Workflow run: clock");
-      expect(await viewerSource.log("clock", runId)).toStartWith(`# clock — completed\nRun ${runId}`);
-      const collatedViewerLog = await viewerSource.log("clock", null);
-      const firstViewerLog = collatedViewerLog.indexOf(`━━ run ${runId} — completed ━━`);
-      const secondViewerLog = collatedViewerLog.indexOf(`━━ run ${secondRunId} — completed ━━`);
-      expect(firstViewerLog).toBeGreaterThanOrEqual(0);
-      expect(secondViewerLog).toBeGreaterThan(firstViewerLog);
-      const pickerSnapshot = await viewerSource.snapshot(null);
-      expect(pickerSnapshot.status.workflows.map((workflow) => workflow.id)).toContain("clock");
+      const overviewSnapshot = await viewerSource.snapshot(null);
+      expect(overviewSnapshot.status.workflows.map(workflow => workflow.workflowId)).toContain("clock");
+      expect(overviewSnapshot.detail).toBeNull();
+      for (const args of [["status"], ["watch"], ["status", "clock"], ["watch", "clock"]]) {
+        const snapshot = runCli(directory, args);
+        expect(snapshot.status).toBe(0);
+        expect(snapshot.stdout).toContain("Title");
+        expect(snapshot.stdout).toContain("Next run");
+        expect(snapshot.stdout).toContain("Completed");
+        expect(snapshot.stdout).not.toContain("inactive");
+      }
+      const aliasJson = runCli(directory, ["watch", "clock", "--json"]);
+      expect(aliasJson.status).toBe(0);
+      expect(statusDtoSchema.parse(JSON.parse(aliasJson.stdout)).workflows[0]?.latestRun?.runId).toBe(secondRunId);
 
       const laterStatusResult = runCli(directory, ["status", "clock", "--json"]);
       expect(laterStatusResult.status).toBe(0);

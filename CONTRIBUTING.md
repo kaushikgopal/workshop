@@ -204,14 +204,14 @@ src/
 │  ├─ dispatch-command.ts         help, offline validate, command routing
 │  ├─ dispatch-public-command.ts  socket client for every other command
 │  ├─ service.ts                  service start | status | stop
-│  └─ watch.ts                    feeds service projections to the viewer
+│  └─ watch.ts                    status/watch routing and selected-run service reads
 ├─ service/                       one owner process per installation
 │  ├─ serve-service-process.ts    process entry: lock, open, serve, shut down
 │  ├─ serve-workshop-service.ts   socket server and request dispatch
 │  ├─ open-service-runtime.ts     Durable Harness, task registry, reconciliation
 │  ├─ reply-human-wait.ts         checked human replies and atomic wait settlement
 │  ├─ check-legacy-runs.ts        refuses to open while a format 3 run is open
-│  ├─ project-service-reads.ts    status, run pages, and retained-byte logs
+│  ├─ project-service-reads.ts    latest status, node previews, run pages, retained logs
 │  ├─ project-run-files.ts        serialized, atomic readable-file projections
 │  ├─ launch-service-process.ts   reuse a healthy service or spawn one
 │  ├─ stop-service-process.ts     verified SIGTERM and bounded wait
@@ -253,8 +253,11 @@ src/
 │                                 read-retained-capture.ts preserves invalid UTF-8
 ├─ storage/disk/                  stream caps and checked process-capture removal
 ├─ views/                         versioned JSON contracts and terminal text
-├─ tui/                           the `watch` viewer (OpenTUI), loaded lazily;
-│                                 data-source.ts is the contract it renders
+│  └─ render-status.ts            three-column snapshots and state-based previews
+├─ tui/                           status/watch viewer (OpenTUI), loaded lazily
+│  ├─ data-source.ts              public service snapshot contract
+│  ├─ build-panes.ts              overview and selected frozen-chain screen models
+│  └─ mount-viewer.ts             persistent scrolling, navigation, serial refresh
 └─ util/                          units, shared schemas
 ```
 

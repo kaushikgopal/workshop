@@ -46,6 +46,7 @@ function installation(root: string) {
     "  - first:",
     "      run: |",
     "        printf x >> first-launches",
+    "        printf 'live diagnostic\\n' >&2",
     "        touch first-started",
     "        while ! test -f release-first; do sleep 0.02; done",
     "        printf alpha",
@@ -73,6 +74,9 @@ describe("service run projections", () => {
       if (!response.ok) throw new Error(response.error.message);
       const { runId } = serviceStartResultV1Schema.parse(response.result);
       await until(async () => existsSync(join(root, "first-started")) ? true : undefined);
+      const live = await node(socket, runId, "first");
+      expect(live.node.status).toBe("running");
+      expect(live.node.liveStderr).toContain("live diagnostic");
       writeFileSync(join(root, "release-first"), "");
       const completed = await until(async () => { const value = await node(socket, runId, "second"); return value.runStatus === "completed" ? value : undefined; });
       expect(completed.node.status).toBe("succeeded");
@@ -82,7 +86,7 @@ describe("service run projections", () => {
       const runTag = createHash("sha256").update(runId).digest("hex").slice(0, 8);
       expect(readFileSync(join(root, "successor-results"), "utf8")).toContain("<result-first-" + runTag + ' status="succeeded">\nalpha\n</result-first-' + runTag + ">");
       expect(readFileSync(resultsPath, "utf8")).toContain("alpha-beta");
-      expect(readFileSync(logPath, "utf8")).toContain("[step=first attempt=1 role=worker] incarnation 1 stderr\nfirst diagnostic");
+      expect(readFileSync(logPath, "utf8")).toContain("[step=first attempt=1 role=worker] incarnation 1 stderr\nlive diagnostic\nfirst diagnostic");
       const first = await node(socket, runId, "first");
       const captures = first.node.attempts[0]!.processes[0]!.captures;
       expect(captures).toHaveLength(2);

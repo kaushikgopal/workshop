@@ -111,13 +111,11 @@ describe("recurring Hemingway acceptance", () => {
 
       const service = JSON.parse(readFileSync(join(fixture.stateDirectory, "service.json"), "utf8")) as { socketPath: string };
       const viewer = createViewerSource(service.socketPath);
-      const snapshot = await viewer.snapshot(workflowId, firstRunId);
-      expect(snapshot.runs.total).toBe(6);
-      expect(snapshot.runs.runs.map((run) => run.id).sort()).toEqual([...runIds].sort());
-      const viewerWorkflow = snapshot.status.workflows.find((entry) => entry.id === workflowId);
-      expect(viewerWorkflow?.activation?.startedRuns).toBe(6);
-      const viewerLog = await viewer.log(workflowId, null);
-      for (const runId of runIds) expect(viewerLog).toContain(runId);
+      const snapshot = await viewer.snapshot(workflowId);
+      expect(snapshot.detail?.diagram.runId).toBe(snapshot.status.workflows[0]?.latestRun?.runId ?? null);
+      expect(snapshot.detail?.nodes.map(node => node.nodeId)).toEqual(["generate", "publish"]);
+      const viewerWorkflow = snapshot.status.workflows.find(entry => entry.workflowId === workflowId);
+      expect(viewerWorkflow?.activation?.admittedCount).toBe(6);
     } finally {
       await stopService(fixture.root);
       rmSync(fixture.root, { recursive: true, force: true });

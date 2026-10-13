@@ -211,7 +211,11 @@ const workflowStatusDtoSchema = z.strictObject({
   configurationError: boundedText(64 * 1024).nullable(),
   activation: workflowActivationDtoSchema.nullable(),
   unresolvedRun: runSummaryDtoSchema.nullable(),
+  latestRun: runSummaryDtoSchema.nullable().optional(),
 }).superRefine((workflow, context) => {
+  if (workflow.latestRun && workflow.latestRun.workflowId !== workflow.workflowId) {
+    context.addIssue({ code: "custom", path: ["latestRun", "workflowId"], message: "latest run belongs to a different workflow" });
+  }
   if (workflow.unresolvedRun && workflow.unresolvedRun.workflowId !== workflow.workflowId) {
     context.addIssue({ code: "custom", path: ["unresolvedRun", "workflowId"], message: "unresolved run belongs to a different workflow" });
   }
@@ -589,6 +593,10 @@ export const nodeDetailDtoSchema = z.strictObject({
   block: blockInfoSchema.nullable(),
   resolvedSettings: resolvedNodeSettingsSchema,
   successfulOutput: boundedText(1024 * 1024).nullable(),
+  liveStderr: boundedText(256 * 1024).nullable().optional(),
+  failureEvidence: boundedText(128 * 1024).nullable().optional(),
+  failureReason: boundedText(64 * 1024).nullable().optional(),
+  evidenceTruncated: z.boolean().optional(),
   attempts: z.array(attemptDetailDtoSchema),
   wait: humanWaitSchema.nullable().optional(),
 }).superRefine((node, context) => {

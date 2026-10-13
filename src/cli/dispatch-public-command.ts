@@ -248,24 +248,8 @@ async function statusCommand(args: readonly string[]): Promise<void> {
   const installation = loadInstallationForCommand();
   const socketPath = await ensureService(installation);
   const workflowId = positional[0];
-  const response = await request(socketPath, {
-    version: 1,
-    method: "status",
-    ...(workflowId === undefined ? {} : { workflowId }),
-  });
-  if (!response.ok) throw new Error(`${response.error.code}: ${response.error.message}`);
-  const status = statusDtoSchema.parse(response.result);
-  if (json) process.stdout.write(`${JSON.stringify(status, null, 2)}\n`);
-  else {
-    for (const workflow of status.workflows) {
-      const activation = workflow.activation === null ? "inactive" : `${workflow.activation.state} (${workflow.activation.admittedCount}/${workflow.activation.maxRuns})`;
-      const run = workflow.unresolvedRun === null ? "no unresolved run" : `${(workflow.unresolvedRun.status === "waiting" ? "Needs input" : workflow.unresolvedRun.status)} ${workflow.unresolvedRun.runId}`;
-      process.stdout.write(workflow.workflowId + ": " + activation + "; " + run + "\n");
-      const wait = workflow.unresolvedRun?.wait;
-      if (wait != null) process.stdout.write("  waitId=" + wait.waitId + "\n  Question: " + wait.question + "\n");
-      if (workflow.configurationError !== null) process.stdout.write(`  configuration error: ${workflow.configurationError}\n`);
-    }
-  }
+  const { showStatus } = await import("./watch.js");
+  await showStatus(socketPath, workflowId ?? null, json);
 }
 
 async function runsCommand(args: readonly string[]): Promise<void> {
@@ -633,14 +617,9 @@ async function findRunSummary(socketPath: string, workflowId: string, runId: Run
 }
 
 async function watchCommand(args: readonly string[]): Promise<void> {
-  if (args.length > 1 || args.some((argument) => argument.startsWith("-"))) {
-    return usage("usage: workshop watch [<workflow>]");
-  }
-  const installation = loadInstallationForCommand();
-  const socketPath = await ensureService(installation);
-  const { openWatch } = await import("./watch.js");
-  await openWatch(socketPath, args[0] ?? null);
+  await statusCommand(args);
 }
+
 
 async function stepDescribeCommand(args: readonly string[]): Promise<void> {
   let runId: string | undefined;

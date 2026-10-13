@@ -1,6 +1,6 @@
 import { Buffer } from "node:buffer";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, openSync, readSync, readdirSync, readFileSync } from "node:fs";
 import type { ConversationId, Cursor, EntryRecord, Harness } from "@earendil-works/pi-durable";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { z } from "zod";
@@ -11,6 +11,7 @@ import {
 } from "../installation/schema.js";
 import { loadCheckedWorkflow, type Installation } from "../installation/load-installation.js";
 import { runIdSchema } from "../run/schema.js";
+import { locateProcessFiles } from "../run/locate-run-files.js";
 import { readRetainedCapture } from "../process/read-retained-capture.js";
 import type { ProcessCapture } from "../process/schema.js";
 import { workshopEventV1Schema, workshopProcessV1Schema, workflowRunDocumentV1Schema } from "../run/records.js";
@@ -164,6 +165,10 @@ async function buildStatusDto(
       if (reference === undefined) throw new Error(`open run ${workflowIndex.openRunId} is missing from the installation index`);
       unresolvedRun = summarizeRun(await readRun(harness, reference));
     }
+    const latestReference = workflowIndex?.runs.slice().sort(compareRunReferences)[0];
+    const latestRun = latestReference === undefined ? null
+      : latestReference.runId === unresolvedRun?.runId ? unresolvedRun
+      : summarizeRun(await readRun(harness, latestReference));
     workflows.push({
       workflowId,
       description: checked?.definition.description ?? null,
@@ -180,6 +185,7 @@ async function buildStatusDto(
         lastSkippedSlotAt: latestActivation.lastSkippedSlotAt,
       },
       unresolvedRun,
+      latestRun,
     });
   }
   return statusDtoSchema.parse({
@@ -276,9 +282,49 @@ async function buildNodeDescriptionDto(
       block: nodeBlock,
       resolvedSettings,
       successfulOutput,
+      ...projectNodeEvidence(run, persistedNode, processes),
       attempts: persistedNode.attempts.map((attempt) => projectAttemptDetail(run, persistedNode, attempt, processes, events)),
     },
   });
+}
+
+/** Live reads are bounded and read-only. Settled previews use immutable retained bytes. */
+function projectNodeEvidence(run: ReadyRun, node: PersistedNode, records: readonly ProcessEvidenceRecord[]): {
+  liveStderr: string | null; failureEvidence: string | null; failureReason: string | null; evidenceTruncated: boolean;
+} {
+  const attempt = node.attempts.at(-1);
+  const processes = records.filter(record => record.nodeId === node.nodeId && record.attemptId === attempt?.attemptId);
+  const live = processes.findLast(record => record.process.status === "running" || record.process.status === "launching");
+  let liveStderr: string | null = null;
+  if (node.status === "running" && live && attempt) {
+    const files = locateProcessFiles(run.paths.runDirectory, { role: live.process.role, nodeId: node.nodeId,
+      attemptNumber: attempt.number, incarnationNumber: live.process.incarnationNumber, executionId: live.process.executionId });
+    liveStderr = readLiveTail(files.stderrPath);
+  }
+  const evidence = node.status === "failed" || node.status === "blocked"
+    ? processes.flatMap(record => record.process.captures.map(capture =>
+      record.process.role + " " + capture.stream + "\n" + (readRetainedCapture(capture) ?? "Evidence unavailable"))).join("\n")
+    : "";
+  const bytes = Buffer.from(evidence);
+  return { liveStderr, failureEvidence: evidence === "" ? null : new TextDecoder().decode(bytes.subarray(0, 64 * 1024)),
+    failureReason: node.status === "failed" && run.failure !== null
+      ? run.failure.kind === "operator" ? run.failure.reason : run.failure.nodeId === node.nodeId ? run.failure.message : null
+      : null,
+    evidenceTruncated: bytes.byteLength > 64 * 1024 };
+}
+
+function readLiveTail(path: string): string | null {
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) return null;
+    const size = Math.min(stat.size, 64 * 1024);
+    const bytes = Buffer.alloc(size);
+    const count = readSync(fd, bytes, 0, size, stat.size - size);
+    return (stat.size > size ? "[live stderr tail; earlier bytes omitted]\n" : "") + new TextDecoder().decode(bytes.subarray(0, count));
+  } catch { return null; }
+  finally { if (fd !== undefined) closeSync(fd); }
 }
 
 async function buildDiagramDto(

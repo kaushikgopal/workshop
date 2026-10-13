@@ -1,221 +1,65 @@
-import { readServiceWorklog, sendServiceRequest } from "../service/send-service-request.js";
-import { serviceRunsPageV1Schema } from "../service/schema.js";
-import type { ActivationDto, NodeStatusDto, RunsFeed, RunsFeedEntry, StatusDto, ViewerSource } from "../tui/data-source.js";
-import {
-  diagramDtoSchema,
-  nodeDescriptionDtoSchema,
-  statusDtoSchema,
-  type RunSummaryDto,
-  type StatusDto as ServiceStatusDto,
-} from "../views/schema.js";
+import { sendServiceRequest, streamServiceLogChunks } from "../service/send-service-request.js";
+import type { ServiceRequestV1 } from "../service/schema.js";
+import type { ViewerSource } from "../tui/data-source.js";
+import { diagramDtoSchema, nodeDescriptionDtoSchema, statusDtoSchema } from "../views/schema.js";
+import { renderStatusSnapshot } from "../views/render-status.js";
 
-/** How many occurrences the viewer's feed carries; `total` still counts every run. */
-const VIEWER_RUNS_LIMIT = 50;
+export function statusIsInteractive(json: boolean, stdoutTTY: boolean, stdinTTY: boolean): boolean {
+  return !json && stdoutTTY && stdinTTY;
+}
 
 export async function openWatch(socketPath: string, workflowId: string | null): Promise<void> {
   const source = createViewerSource(socketPath);
-  const status = await readStatus(socketPath);
-  if (workflowId !== null && !status.workflows.some((workflow) => workflow.workflowId === workflowId)) {
-    throw new Error(`no workflow ${JSON.stringify(workflowId)}`);
-  }
-  if (workflowId === null && status.workflows.length === 0) throw new Error("no workflows configured");
   const { openViewer } = await import("../tui/mount-viewer.js");
   await openViewer({ workflowId, source });
 }
 
-/** The viewer consumes the service's public DTOs; it never reads run files or SQLite. */
+/** JSON and pipes never load OpenTUI. watch and status share this routing. */
+export async function showStatus(socketPath: string, workflowId: string | null, json = false): Promise<void> {
+  if (statusIsInteractive(json, process.stdout.isTTY === true, process.stdin.isTTY === true)) return openWatch(socketPath, workflowId);
+  const result = await sendServiceRequest(socketPath, { version: 1, method: "status", ...(workflowId === null ? {} : { workflowId }) });
+  if (!result.ok) throw new Error(result.error.code + ": " + result.error.message);
+  const status = statusDtoSchema.parse(result.result);
+  process.stdout.write(json ? JSON.stringify(status, null, 2) + "\n" : renderStatusSnapshot(status));
+}
+
+/** Reads only overview and one displayed run. No history or worklog polling. */
 export function createViewerSource(socketPath: string): ViewerSource {
-  let currentRuns: RunSummaryDto[] = [];
+  const read = async (request: ServiceRequestV1) => {
+    const response = await sendServiceRequest(socketPath, request);
+    if (!response.ok) throw new Error(response.error.code + ": " + response.error.message);
+    return response.result;
+  };
   return {
-    async snapshot(workflowId, selectedRunId) {
-      const status = await readStatus(socketPath, workflowId ?? undefined);
-      if (workflowId === null) {
-        currentRuns = [];
-        return { status: adaptStatus(status), runs: emptyFeed() };
+    async snapshot(workflowId, expanded = []) {
+      const status = statusDtoSchema.parse(await read({ version: 1, method: "status" }));
+      if (workflowId === null) return { status, detail: null };
+      const workflow = status.workflows.find(entry => entry.workflowId === workflowId);
+      if (!workflow) throw new Error("No workflow " + JSON.stringify(workflowId));
+      const run = workflow.unresolvedRun ?? workflow.latestRun;
+      if (workflow.configurationError && run == null) return { status, detail: null };
+      const diagram = diagramDtoSchema.parse(await read({ version: 1, method: "diagram", workflowId,
+        ...(run == null ? {} : { runId: run.runId }) }));
+      const nodes = await Promise.all(diagram.nodes.map(async entry => {
+        const description = nodeDescriptionDtoSchema.parse(await read({ version: 1, method: "node.describe", workflowId,
+          nodeId: entry.nodeId, ...(diagram.runId === null ? {} : { runId: diagram.runId }) }));
+        if (description.runId !== diagram.runId || description.node.nodeId !== entry.nodeId) throw new Error("Service changed the selected run or step");
+        return description.node;
+      }));
+      if (diagram.runId !== null && nodes.some(node => expanded.includes(node.nodeId) && node.evidenceTruncated)) {
+        const evidence = new Map<string, string>();
+        await streamServiceLogChunks(socketPath, workflowId, diagram.runId, (section, _runId, chunk) => {
+          if (section.kind !== "capture") return;
+          evidence.set(section.executionId, (evidence.get(section.executionId) ?? "") + (chunk.offsetBytes === 0 ? "\n" + section.label + "\n" : "") + (section.content ?? "Evidence unavailable"));
+        });
+        for (const [index, node] of nodes.entries()) {
+          if (!expanded.includes(node.nodeId) || !node.evidenceTruncated) continue;
+          const attempt = node.attempts.at(-1);
+          const ids = [...new Set(attempt?.processes.map(process => process.executionId) ?? [])];
+          nodes[index] = { ...node, failureEvidence: ids.map(id => evidence.get(id) ?? "Evidence unavailable").join("\n"), evidenceTruncated: false };
+        }
       }
-
-      const history = await readAllRunSummaries(socketPath, workflowId);
-      currentRuns = history.runs;
-      const selected = selectedRunId === null || selectedRunId === undefined
-        ? history.runs[0]
-        : history.runs.find((run) => run.runId === selectedRunId) ?? history.runs[0];
-      const selectedNodes = selected === undefined
-        ? []
-        : await readSelectedRunNodes(socketPath, workflowId, selected.runId);
-      return {
-        status: adaptStatus(status, selected?.runId, selectedNodes),
-        runs: adaptRuns(workflowId, history.total, history.runs, selected?.runId, selectedNodes),
-      };
+      return { status, detail: { diagram, nodes } };
     },
-    async log(workflowId, runId) {
-      if (workflowId === null) return "";
-      if (runId !== null) {
-        const run = currentRuns.find((entry) => entry.runId === runId);
-        return run === undefined ? "(run not found)" : await readWorklog(socketPath, workflowId, run.runId);
-      }
-      const oldestFirst = currentRuns.slice().reverse();
-      const sections: string[] = [];
-      for (const run of oldestFirst) {
-        sections.push(`\n━━ run ${run.runId} — ${run.status} ━━\n`);
-        sections.push(await readWorklog(socketPath, workflowId, run.runId));
-      }
-      return sections.join("");
-    },
   };
 }
-
-async function readStatus(socketPath: string, workflowId?: string): Promise<ServiceStatusDto> {
-  const response = await sendServiceRequest(socketPath, {
-    version: 1,
-    method: "status",
-    ...(workflowId === undefined ? {} : { workflowId }),
-  });
-  if (!response.ok) throw new Error(`${response.error.code}: ${response.error.message}`);
-  return statusDtoSchema.parse(response.result);
-}
-
-async function readAllRunSummaries(
-  socketPath: string,
-  workflowId: string,
-): Promise<{ readonly total: number; readonly runs: RunSummaryDto[] }> {
-  const runs: RunSummaryDto[] = [];
-  const seenCursors = new Set<string>();
-  let cursor: string | undefined;
-  let total: number | undefined;
-  let highWaterMark: number | undefined;
-  do {
-    const response = await sendServiceRequest(socketPath, {
-      version: 1,
-      method: "runs",
-      workflowId,
-      limit: 100,
-      ...(cursor === undefined ? {} : { cursor }),
-    });
-    if (!response.ok) throw new Error(`${response.error.code}: ${response.error.message}`);
-    const page = serviceRunsPageV1Schema.parse(response.result);
-    if (total !== undefined && (page.total !== total || page.highWaterMark !== highWaterMark)) {
-      throw new Error("run pages changed their admission snapshot");
-    }
-    total = page.total;
-    highWaterMark = page.highWaterMark;
-    runs.push(...page.runs);
-    if (page.nextCursor === null) break;
-    if (seenCursors.has(page.nextCursor)) throw new Error("service repeated a run-page cursor");
-    seenCursors.add(page.nextCursor);
-    cursor = page.nextCursor;
-  } while (true);
-  if (runs.length !== (total ?? 0)) throw new Error("service ended run history before its snapshot was complete");
-  return { total: total ?? 0, runs };
-}
-
-async function readSelectedRunNodes(
-  socketPath: string,
-  workflowId: string,
-  runId: RunSummaryDto["runId"],
-): Promise<NodeStatusDto[]> {
-  const response = await sendServiceRequest(socketPath, { version: 1, method: "diagram", workflowId, runId });
-  if (!response.ok) throw new Error(`${response.error.code}: ${response.error.message}`);
-  const diagram = diagramDtoSchema.parse(response.result);
-  if (diagram.runId !== runId) throw new Error("service returned a different run diagram");
-  return Promise.all(diagram.nodes.map(async (diagramNode) => {
-    const nodeResponse = await sendServiceRequest(socketPath, {
-      version: 1,
-      method: "node.describe",
-      workflowId,
-      nodeId: diagramNode.nodeId,
-      runId,
-    });
-    if (!nodeResponse.ok) throw new Error(`${nodeResponse.error.code}: ${nodeResponse.error.message}`);
-    const description = nodeDescriptionDtoSchema.parse(nodeResponse.result);
-    if (description.runId !== runId || description.node.nodeId !== diagramNode.nodeId) {
-      throw new Error("service returned node details for a different run or node");
-    }
-    return {
-      id: description.node.nodeId,
-      status: displayNodeStatus(description.node.status),
-      attempts: description.node.attempts.map((attempt) => ({
-        number: attempt.number,
-        status: attempt.status,
-        progress: attempt.phase,
-        validator: attempt.verdict === null ? null : attempt.failure?.kind === "validator_rejection" ? "failed" : "passed",
-        failure: attempt.failure?.kind ?? null,
-        blocker: attempt.blocks.at(-1)?.kind ?? null,
-        startedAt: attempt.startedAt,
-        finishedAt: attempt.finishedAt,
-      })),
-    };
-  }));
-}
-
-async function readWorklog(socketPath: string, workflowId: string, runId: RunSummaryDto["runId"]): Promise<string> {
-  return readServiceWorklog(socketPath, workflowId, runId);
-}
-
-function adaptStatus(status: ServiceStatusDto, selectedRunId?: RunSummaryDto["runId"], selectedNodes: NodeStatusDto[] = []): StatusDto {
-  return {
-    version: 1,
-    workflows: status.workflows.map((workflow) => {
-      const run = workflow.unresolvedRun;
-      return {
-        id: workflow.workflowId,
-        definitionHash: workflow.definitionHash ?? "",
-        activation: workflow.activation === null ? null : adaptActivation(workflow.activation),
-        currentRun: run === null ? null : {
-          id: run.runId,
-          status: run.status,
-          desiredState: run.desiredState,
-          orchestratorPhase: "durable",
-          startedAt: run.startedAt ?? run.admittedAt,
-          blocker: run.block?.kind ?? run.failure?.kind ?? null,
-          nodes: run.runId === selectedRunId ? selectedNodes : [],
-        },
-      };
-    }),
-  };
-}
-
-function adaptActivation(activation: NonNullable<ServiceStatusDto["workflows"][number]["activation"]>): ActivationDto {
-  return {
-    state: activation.state,
-    startedAt: activation.activatedAt,
-    startedRuns: activation.admittedCount,
-    maxRuns: activation.maxRuns === "unlimited" ? null : activation.maxRuns,
-    nextRunAt: activation.nextDueAt,
-  };
-}
-
-function adaptRuns(
-  workflowId: string,
-  total: number,
-  runs: RunSummaryDto[],
-  selectedRunId: RunSummaryDto["runId"] | undefined,
-  selectedNodes: NodeStatusDto[],
-): RunsFeed {
-  return {
-    version: 1,
-    workflowId,
-    total,
-    runs: runs.slice(0, VIEWER_RUNS_LIMIT).map((run) => adaptRun(run, run.runId === selectedRunId ? selectedNodes : [])),
-  };
-}
-
-function adaptRun(run: RunSummaryDto, nodes: NodeStatusDto[]): RunsFeedEntry {
-  return {
-    id: run.runId,
-    status: run.status,
-    desiredState: run.desiredState,
-    startedAt: run.startedAt ?? run.admittedAt,
-    finishedAt: run.finishedAt,
-    blocker: run.block?.kind ?? run.failure?.kind ?? null,
-    nodes,
-  };
-}
-
-function displayNodeStatus(status: string): string {
-  return status === "succeeded" ? "completed" : status;
-}
-
-function emptyFeed(): RunsFeed {
-  return { version: 1, workflowId: "", total: 0, runs: [] };
-}
-

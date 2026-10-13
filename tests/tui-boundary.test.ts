@@ -71,7 +71,7 @@ describe("TUI boundary — the folder says what a file is for", () => {
     const importers = rest.filter((file) =>
       allImports(readFileSync(file, "utf8")).some(isTuiSpec),
     );
-    // The watch command loads the viewer on demand.
+    // Status and watch load the same viewer on demand.
     expect(importers.map(relative)).toEqual(["src/cli/watch.ts"]);
 
     const cli = readFileSync(join(REPO_ROOT, "src/cli/watch.ts"), "utf8");
@@ -122,7 +122,7 @@ describe("TUI boundary — the folder says what a file is for", () => {
     expect(violations).toEqual([]);
   });
 
-  test("the viewer's reachable graph is exactly the pure projections", () => {
+  test("the viewer uses pure terminal formatting", () => {
     // A guard on the guard: if the walk silently stopped resolving anything,
     // the assertion above would pass vacuously.
     const reachable = relative(join(REPO_ROOT, "src/tui/build-panes.ts"));
@@ -138,7 +138,7 @@ describe("TUI boundary — the folder says what a file is for", () => {
     const panes = readFileSync(join(REPO_ROOT, "src/tui/build-panes.ts"), "utf8");
     // Panes are pure: types in, data out. A store parameter here would mean the
     // layout had learned to query.
-    expect(panes).toContain("export interface ViewerPane");
+    expect(panes).toContain("export interface ViewerModel");
     expect(panes).not.toContain("Store");
     expect(panes).not.toContain("readFileSync");
   });

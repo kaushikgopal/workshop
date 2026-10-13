@@ -1325,9 +1325,9 @@ describe("public service restart", () => {
       expect(historicalDiagram.stdout).not.toContain("replacement");
       const service = JSON.parse(readFileSync(join(root, ".workshop", "state", "service.json"), "utf8")) as { socketPath: string };
       const viewerSource = createViewerSource(service.socketPath);
-      const historicalView = await viewerSource.snapshot("frozen-chain", runId);
-      expect(historicalView.runs.runs.find((run) => run.id === runId)?.nodes.map((node) => node.id)).toEqual(["first", "second"]);
-      expect(historicalView.runs.runs.find((run) => run.id === runId)?.nodes.map((node) => node.status)).toEqual(["completed", "completed"]);
+      const latestView = await viewerSource.snapshot("frozen-chain");
+      expect(latestView.detail?.nodes.map(node => node.nodeId)).toEqual(["replacement"]);
+      expect(latestView.detail?.nodes.map(node => node.status)).toEqual(["succeeded"]);
       const latestDiagram = runCli(root, ["diagram", "frozen-chain", "--mermaid"]);
       expect(latestDiagram.status).toBe(0);
       expect(latestDiagram.stdout).toContain('replacement["replacement [succeeded]"]');

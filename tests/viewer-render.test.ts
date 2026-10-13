@@ -1,514 +1,229 @@
-import { describe, test, expect } from "bun:test";
+import { expect, test } from "bun:test";
+import { InputRenderable, RGBA } from "@opentui/core";
 import { createTestRenderer } from "@opentui/core/testing";
-import { createViewerRefresh, makeShutdown, mountViewer, reduceKey, type ViewerRefreshSelection, type ViewerState } from "../src/tui/mount-viewer.js";
-import { buildViewerModel, pickerModel } from "../src/tui/build-panes.js";
-import type { RunsFeed, RunsFeedEntry, StatusDto, ViewerSource } from "../src/tui/data-source.js";
+import { createViewerRefresh, makeShutdown, mountViewer, reduceKey, type ViewerState } from "../src/tui/mount-viewer.js";
+import type { ViewerSource, ViewerSnapshot } from "../src/tui/data-source.js";
+import { buildNode, buildRun, buildSnapshot, WAIT } from "./build-viewer-fixture.js";
 
-/**
- * The binding, asserted against a real render.
- *
- * These drive the same `mountViewer` the app uses and read the captured frame,
- * so a layout regression fails here rather than in someone's terminal. A test
- * that rebuilt the tree itself would prove nothing about the binding.
- */
-const NOW = new Date("2026-09-24T12:00:00.000Z");
-
-const dto: StatusDto = {
-  version: 1,
-  workflows: [
-    {
-      id: "wf",
-      definitionHash: "sha256:x",
-      activation: { state: "active", startedAt: "2026-09-24T09:00:00.000Z", startedRuns: 3, maxRuns: 6, nextRunAt: null },
-      currentRun: {
-        id: "wf-20260924-003",
-        status: "running",
-        desiredState: "running",
-        orchestratorPhase: "idle",
-        startedAt: "2026-09-24T11:59:00.000Z",
-        blocker: null,
-        nodes: [
-          {
-            id: "node-timestamp",
-            status: "completed",
-            attempts: [{ number: 1, status: "completed", progress: null, validator: "passed", failure: null, blocker: null, startedAt: "2026-09-24T11:59:00.000Z", finishedAt: "2026-09-24T11:59:00.200Z" }],
-          },
-          {
-            id: "node-generate-line",
-            status: "running",
-            attempts: [
-              { number: 1, status: "failed", progress: null, validator: null, failure: "worklog_integrity", blocker: null, startedAt: "2026-09-24T11:59:00.000Z", finishedAt: "2026-09-24T11:59:00.500Z" },
-              { number: 2, status: "running", progress: "drafting a line", validator: null, failure: null, blocker: null, startedAt: "2026-09-24T11:59:01.000Z", finishedAt: null },
-            ],
-          },
-          { id: "node-append-quote", status: "pending", attempts: [] },
-        ],
-      },
-    },
-  ],
-};
-
-const feed: RunsFeed = {
-  version: 1,
-  workflowId: "wf",
-  total: 3,
-  runs: [
-    { id: "wf-20260924-003", status: "running", desiredState: "running", startedAt: "2026-09-24T11:59:00.000Z", finishedAt: null, blocker: null, nodes: dto.workflows[0]!.currentRun!.nodes },
-    {
-      id: "wf-20260924-002",
-      status: "failed",
-      desiredState: "running",
-      startedAt: "2026-09-24T11:00:00.000Z",
-      finishedAt: "2026-09-24T11:02:00.000Z",
-      blocker: "orchestrator_unresolved",
-      nodes: [
-        { id: "node-timestamp", status: "completed", attempts: [{ number: 1, status: "completed", progress: null, validator: "passed", failure: null, blocker: null, startedAt: "2026-09-24T11:00:00.000Z", finishedAt: "2026-09-24T11:00:00.100Z" }] },
-        { id: "node-generate-line", status: "failed", attempts: [{ number: 1, status: "failed", progress: null, validator: "failed", failure: "validator_rejection", blocker: null, startedAt: "2026-09-24T11:00:01.000Z", finishedAt: "2026-09-24T11:00:30.000Z" }] },
-      ],
-    },
-    { id: "wf-20260924-001", status: "completed", desiredState: "running", startedAt: "2026-09-24T10:00:00.000Z", finishedAt: "2026-09-24T10:01:00.000Z", blocker: null, nodes: [] },
-  ],
-};
-
-const model = buildViewerModel({
-  workflowId: "wf",
-  dto,
-  feed,
-  logText: "# Workflow run: wf\n\n## Goal\n\nGenerate one original line.\n",
-  selectedRunId: "wf-20260924-003",
-  streamHeight: 6,
-  now: NOW,
-});
-
-describe("viewer frame — what an operator actually sees", () => {
-  test("header, chain, runs, log, and keybindings all reach the screen", async () => {
-    const { renderer, renderOnce, captureCharFrame } = await createTestRenderer({ width: 100, height: 24 });
-    mountViewer(renderer, { rows: 6 }).paint(model);
-    await renderOnce();
-    const frame = captureCharFrame();
-
-    // Header: a badged product name, the workflow, activation progress, tally.
-    expect(frame).toContain("WORKSHOP");
-    expect(frame).toContain("wf  active 3/6");
-    expect(frame).toContain("◉1 · ◎1 · ○1");
-
-    // Chain: spine, glyphs, the retry count, a finished duration, live detail.
-    expect(frame).toContain("chain · 003 · running");
-    expect(frame).toContain("├─ ◉ node-timestamp  200ms");
-    expect(frame).toContain("├─ ◎ node-generate-line #2 — drafting a line");
-
-    // Runs: the selected occurrence is marked, and ages read as a timeline.
-    expect(frame).toContain("runs · 3");
-    expect(frame).toContain("▶ ◎ 003");
-    expect(frame).toContain("(orchestrator_unresolved)");
-
-    // Log: titled with the run it follows, tail-first.
-    expect(frame).toContain("log · 003");
-    expect(frame).toContain("Generate one original line.");
-
-    // Footer: what the keys do.
-    expect(frame).toContain("q quit");
-    expect(frame).toContain("f follow");
-  });
-
-  test("the feed sits above the detail panes, in reading order", async () => {
-    const { renderer, renderOnce, captureCharFrame } = await createTestRenderer({ width: 100, height: 24 });
-    mountViewer(renderer, { rows: 6, runsRows: 6 }).paint(model);
-    await renderOnce();
-    const rows = captureCharFrame().split("\n");
-    const runsTitle = rows.findIndex((row) => row.includes("runs · 3"));
-    const chainTitle = rows.findIndex((row) => row.includes("chain · "));
-    const logTitle = rows.findIndex((row) => row.includes("log · "));
-    const header = rows.findIndex((row) => row.includes("WORKSHOP"));
-    const footer = rows.findIndex((row) => row.includes("q quit"));
-    expect(header).toBeLessThan(runsTitle);
-    expect(runsTitle).toBeLessThan(chainTitle);
-    expect(chainTitle).toBe(logTitle); // side by side, below the feed
-    expect(Math.max(chainTitle, logTitle)).toBeLessThan(footer);
-  });
-
-  test("a poll failure is reported in the header rather than blanking the panes", async () => {
-    const { renderer, renderOnce, captureCharFrame } = await createTestRenderer({ width: 100, height: 24 });
-    const mount = mountViewer(renderer, { rows: 6 });
-    mount.paint(model, { pollError: "database is locked" });
-    await renderOnce();
-    const frame = captureCharFrame();
-    expect(frame).toContain("STALE · poll failed: database is locked");
-    // The last good frame is still on screen: a viewer that blanks on a hiccup
-    // is worse than one that shows slightly stale truth.
-    expect(frame).toContain("node-timestamp");
-  });
-
-  test("collated mode says so in the log title and the footer", async () => {
-    const { renderer, renderOnce, captureCharFrame } = await createTestRenderer({ width: 100, height: 24 });
-    const collated = buildViewerModel({ workflowId: "wf", dto, feed, logText: "all runs", collated: true, now: NOW });
-    mountViewer(renderer, { rows: 6 }).paint(collated, { collated: true });
-    await renderOnce();
-    const frame = captureCharFrame();
-    expect(frame).toContain("log · all runs");
-    expect(frame).toContain("all runs  ·");
-  });
-
-  test("a narrow terminal degrades without losing the panes", async () => {
-    const { renderer, renderOnce, captureCharFrame } = await createTestRenderer({ width: 56, height: 20 });
-    mountViewer(renderer, { rows: 4 }).paint(model);
-    await renderOnce();
-    const frame = captureCharFrame();
-    expect(frame).toContain("WORKSHOP");
-    expect(frame).toContain("runs · 3");
-    // Chrome stays one row per element: a wrapping footer would eat the panes.
-    // (The hints themselves may be clipped at this width, so assert on the
-    // row count rather than on any particular hint surviving.)
-    const footerRows = frame.split("\n").filter((row) => row.includes("↑↓ select run"));
-    expect(footerRows.length).toBe(1);
-  });
-
-  test("one long log line cannot push the layout around", async () => {
-    const long = `## Run outcome\n${"x".repeat(400)}\nshort tail line`;
-    const { renderer, renderOnce, captureCharFrame } = await createTestRenderer({ width: 90, height: 20 });
-    const wide = buildViewerModel({ workflowId: "wf", dto, feed, logText: long, now: NOW });
-    mountViewer(renderer, { rows: 4 }).paint(wide);
-    await renderOnce();
-    const frame = captureCharFrame();
-    // Panes keep their positions: a wrapped log line would displace the runs
-    // pane downwards and take the rows with it.
-    expect(frame).toContain("chain · ");
-    expect(frame).toContain("runs · 3");
-    expect(frame).toContain("short tail line");
-    for (const row of frame.split("\n")) expect(row.length).toBeLessThanOrEqual(90);
-  });
-});
-
-describe("viewer keys — pure state transitions", () => {
-  const ids = ["wf-003", "wf-002", "wf-001"]; // newest first, as the feed sorts
-  const fresh = (): ViewerState => ({ selectedRunId: "wf-003", follow: true, collated: false });
-
-  test("j walks back through occurrences and stops at the oldest", () => {
-    const state = fresh();
-    reduceKey(state, { name: "j" }, ids);
-    expect(state.selectedRunId).toBe("wf-002");
-    expect(state.follow).toBe(false); // manual navigation takes over from follow
-    reduceKey(state, { name: "j" }, ids);
-    reduceKey(state, { name: "j" }, ids);
-    expect(state.selectedRunId).toBe("wf-001");
-    reduceKey(state, { name: "down" }, ids);
-    expect(state.selectedRunId).toBe("wf-001");
-  });
-
-  test("k walks forward and stops at the newest", () => {
-    const state: ViewerState = { selectedRunId: "wf-002", follow: false, collated: false };
-    reduceKey(state, { name: "k" }, ids);
-    expect(state.selectedRunId).toBe("wf-003");
-    reduceKey(state, { name: "up" }, ids);
-    expect(state.selectedRunId).toBe("wf-003");
-  });
-
-  test("f re-enables follow and snaps to the newest occurrence", () => {
-    const state: ViewerState = { selectedRunId: "wf-001", follow: false, collated: false };
-    reduceKey(state, { name: "f" }, ids);
-    expect(state.follow).toBe(true);
-    expect(state.selectedRunId).toBe("wf-003");
-  });
-
-  test("a toggles the collated stream and leaves the selection alone", () => {
-    const state = fresh();
-    reduceKey(state, { name: "a" }, ids);
-    expect(state.collated).toBe(true);
-    expect(state.selectedRunId).toBe("wf-003");
-    reduceKey(state, { name: "a" }, ids);
-    expect(state.collated).toBe(false);
-  });
-
-  test("q and ctrl+c quit; r asks for a repaint; other keys are inert", () => {
-    const state = fresh();
-    expect(reduceKey(state, { name: "q" }, ids)).toBe("quit");
-    expect(reduceKey(state, { name: "c", ctrl: true }, ids)).toBe("quit");
-    expect(reduceKey(state, { name: "r" }, ids)).toBe("refresh");
-    expect(reduceKey(state, { name: "z" }, ids)).toBeNull();
-    expect(state.selectedRunId).toBe("wf-003");
-  });
-});
-
-describe("viewer frame — picker and a scrolled feed", () => {
-  const run = (over: { id: string; status?: string }): RunsFeedEntry => ({
-    id: over.id,
-    status: over.status ?? "completed",
-    desiredState: "running",
-    startedAt: "2026-09-24T11:00:00.000Z",
-    finishedAt: "2026-09-24T11:01:00.000Z",
-    blocker: null,
-    nodes: [],
-  });
-
-  test("no workflow given: the picker lists what is configured", async () => {
-    const { renderer, renderOnce, captureCharFrame } = await createTestRenderer({ width: 100, height: 22 });
-    const dto2: StatusDto = {
-      version: 1,
-      workflows: [
-        { id: "hemingway-clock", definitionHash: "x", activation: { state: "exhausted", startedAt: "2026-09-24T09:00:00.000Z", startedRuns: 6, maxRuns: 6, nextRunAt: null }, currentRun: null },
-        { id: "nightly-report", definitionHash: "y", activation: null, currentRun: null },
-      ],
-    };
-    mountViewer(renderer, { rows: 6 }).paint(pickerModel({ dto: dto2, cursor: 1 }), { picking: true });
-    await renderOnce();
-    const frame = captureCharFrame();
-    expect(frame).toContain("pick a workflow");
-    expect(frame).toContain("hemingway-clock  exhausted 6/6");
-    expect(frame).toContain("▶ nightly-report  one-shot");
-    expect(frame).toContain("enter  open this workflow");
-    // The footer advertises the picker's keys, not the viewer's run controls.
-    expect(frame).toContain("↑↓ choose · enter open · q quit");
-    expect(frame).not.toContain("a all runs");
-  });
-
-  test("with more runs than rows, the feed scrolls to keep the selection visible", async () => {
-    const many = Array.from({ length: 20 }, (_, i) =>
-      run({ id: `wfy-${String(i + 1).padStart(3, "0")}`, status: i % 2 === 0 ? "failed" : "completed" }),
-    ).reverse();
-    const long: RunsFeed = { version: 1, workflowId: "wf", total: many.length, runs: many };
-    const { renderer, renderOnce, captureCharFrame } = await createTestRenderer({ width: 100, height: 24 });
-    mountViewer(renderer, { rows: 4, runsRows: 5 }).paint(
-      buildViewerModel({ workflowId: "wf", dto, feed: long, logText: null, selectedRunId: "wfy-007", now: NOW, runsHeight: 5 }),
-    );
-    await renderOnce();
-    const frame = captureCharFrame();
-    // The selected occurrence is on screen even though it is deep in the feed.
-    const selectedRow = frame.split("\n").find((row) => row.includes("▶"));
-    expect(selectedRow).toBeDefined();
-    expect(selectedRow).toContain("007");
-    // And the title says which slice is shown, so the viewport is never a mystery.
-    expect(frame).toMatch(/runs · 20 · \d+–\d+\/20/);
-  });
-});
+const state = (): ViewerState => ({ workflowId: null, selectedId: "alpha", selectedStepId: null, expanded: [] });
 
 function deferred<T>() {
-  let resolvePromise = (_value: T): void => { throw new Error("deferred promise is not initialized"); };
-  let rejectPromise = (_reason: unknown): void => { throw new Error("deferred promise is not initialized"); };
-  const promise = new Promise<T>((resolve, reject) => {
-    resolvePromise = resolve;
-    rejectPromise = reject;
-  });
-  return { promise, resolve: resolvePromise, reject: rejectPromise };
+  let resolve = (_value: T): void => { throw new Error("Deferred promise not initialized"); };
+  const promise = new Promise<T>(complete => { resolve = complete; });
+  return { promise, resolve };
 }
 
-describe("viewer refresh — serial, selection-safe, and visibly stale", () => {
-  const snapshot = { status: dto, runs: feed };
-  const defaultSelection = (): ViewerRefreshSelection => ({
-    workflowId: "wf",
-    selectedRunId: "wf-20260924-003",
-    follow: false,
-    collated: false,
-    cursor: 0,
-  });
-
-  test("a selection and collation change discards the old result and reads the new mode", async () => {
-    const oldSnapshot = deferred<typeof snapshot>();
-    const currentSnapshot = deferred<typeof snapshot>();
-    const oldStarted = deferred<void>();
-    const currentStarted = deferred<void>();
-    const requests: Array<{ workflowId: string | null; selectedRunId?: string | null }> = [];
-    const logRequests: Array<{ workflowId: string | null; runId: string | null }> = [];
-    let activeSnapshots = 0;
-    let maxActiveSnapshots = 0;
-    const source: ViewerSource = {
-      snapshot: async (workflowId, selectedRunId) => {
-        requests.push({ workflowId, selectedRunId });
-        activeSnapshots++;
-        maxActiveSnapshots = Math.max(maxActiveSnapshots, activeSnapshots);
-        try {
-          if (requests.length === 1) {
-            oldStarted.resolve(undefined);
-            return await oldSnapshot.promise;
-          }
-          currentStarted.resolve(undefined);
-          return await currentSnapshot.promise;
-        } finally {
-          activeSnapshots--;
-        }
-      },
-      log: async (workflowId, runId) => {
-        logRequests.push({ workflowId, runId });
-        return "new collated log";
-      },
-    };
-    let selection = defaultSelection();
-    const painted: Array<{ model: ReturnType<typeof buildViewerModel>; extra?: { collated?: boolean; picking?: boolean; pollError?: string | null } }> = [];
-    const refresh = createViewerRefresh({
-      source,
-      selection: () => selection,
-      commit: () => {},
-      paint: (model, extra) => painted.push({ model, extra }),
-      terminalWidth: () => 100,
-      rows: 6,
-      runsRows: 6,
-    });
-
-    const oldPoll = refresh.refresh();
-    await oldStarted.promise;
-    selection = { ...selection, selectedRunId: "wf-20260924-002", collated: true };
-    refresh.invalidate();
-    const currentPoll = refresh.refresh();
-    const coalescedPoll = refresh.refresh();
-    oldSnapshot.resolve(snapshot);
-    await currentStarted.promise;
-    expect(requests).toEqual([
-      { workflowId: "wf", selectedRunId: "wf-20260924-003" },
-      { workflowId: "wf", selectedRunId: "wf-20260924-002" },
-    ]);
-    expect(logRequests).toEqual([]); // the invalidated selection never reaches the log read
-    currentSnapshot.resolve(snapshot);
-    await Promise.all([oldPoll, currentPoll, coalescedPoll]);
-
-    expect(maxActiveSnapshots).toBe(1);
-    expect(logRequests).toEqual([{ workflowId: "wf", runId: null }]);
-    expect(painted).toHaveLength(1);
-    expect(painted[0]!.model.stream.title).toBe("log · all runs");
-    expect(painted[0]!.model.stream.lines).toContain("new collated log");
-    expect(painted[0]!.extra?.collated).toBe(true);
-  });
-
-  test("overlapping slow polls serialize and coalesce into one follow-up", async () => {
-    const firstSnapshot = deferred<typeof snapshot>();
-    const secondSnapshot = deferred<typeof snapshot>();
-    const firstStarted = deferred<void>();
-    const secondStarted = deferred<void>();
-    let snapshotCalls = 0;
-    let activeSnapshots = 0;
-    let maxActiveSnapshots = 0;
-    const source: ViewerSource = {
-      snapshot: async () => {
-        const call = snapshotCalls++;
-        activeSnapshots++;
-        maxActiveSnapshots = Math.max(maxActiveSnapshots, activeSnapshots);
-        try {
-          if (call === 0) {
-            firstStarted.resolve(undefined);
-            return await firstSnapshot.promise;
-          }
-          secondStarted.resolve(undefined);
-          return await secondSnapshot.promise;
-        } finally {
-          activeSnapshots--;
-        }
-      },
-      log: async (_workflowId, runId) => `log for ${runId}`,
-    };
-    const painted: string[] = [];
-    const refresh = createViewerRefresh({
-      source,
-      selection: defaultSelection,
-      commit: () => {},
-      paint: (model) => painted.push(model.stream.lines.join("\n")),
-      terminalWidth: () => 100,
-      rows: 6,
-      runsRows: 6,
-    });
-
-    const firstPoll = refresh.refresh();
-    await firstStarted.promise;
-    const secondPoll = refresh.refresh();
-    const thirdPoll = refresh.refresh();
-    firstSnapshot.resolve(snapshot);
-    await secondStarted.promise;
-    secondSnapshot.resolve(snapshot);
-    await Promise.all([firstPoll, secondPoll, thirdPoll]);
-
-    expect(snapshotCalls).toBe(2);
-    expect(maxActiveSnapshots).toBe(1);
-    expect(painted).toHaveLength(2);
-    expect(painted[1]).toContain("log for wf-20260924-003");
-  });
-
-  test("initial failures render an error, then recover and preserve stale data on a later failure", async () => {
-    const { renderer, renderOnce, captureCharFrame } = await createTestRenderer({ width: 100, height: 24 });
-    const mount = mountViewer(renderer, { rows: 6, runsRows: 6 });
-    let poll = 0;
-    const source: ViewerSource = {
-      snapshot: async () => {
-        poll++;
-        if (poll === 1) throw new Error("initial read failed");
-        if (poll === 3) throw new Error("temporary read failure");
-        return snapshot;
-      },
-      log: async (_workflowId, runId) => runId === "wf-20260924-003" ? `fresh log after poll ${poll}` : "unexpected run",
-    };
-    const refresh = createViewerRefresh({
-      source,
-      selection: defaultSelection,
-      commit: () => {},
-      paint: (model, extra) => mount.paint(model, extra),
-      terminalWidth: () => renderer.terminalWidth,
-      rows: 6,
-      runsRows: 6,
-    });
-
+test("fake service updates preserve workflow selection and back navigation", async () => {
+  const selection = state();
+  const snapshot = buildSnapshot([buildNode()]);
+  const source: ViewerSource = { snapshot: async workflowId => ({ ...snapshot, detail: workflowId ? snapshot.detail : null }) };
+  const frames: string[] = [];
+  const refresh = createViewerRefresh({ source, state: selection, paint: model => frames.push(model.header) });
+  await refresh.refresh();
+  reduceKey(selection, { name: "j" }, ["alpha", "beta"], []);
+  await refresh.refresh();
+  expect(selection.selectedId).toBe("beta");
+  snapshot.status.workflows.reverse();
+  await refresh.refresh();
+  expect(selection.selectedId).toBe("beta");
+  reduceKey(selection, { name: "return" }, ["beta", "alpha"], []);
+  await refresh.refresh();
+  expect(selection.workflowId).toBe("beta");
+  for (const key of ["escape", "backspace"]) {
+    reduceKey(selection, { name: key }, ["beta", "alpha"], ["first"]);
     await refresh.refresh();
-    await renderOnce();
-    const initialErrorFrame = captureCharFrame();
-    expect(initialErrorFrame).toContain("STALE · poll failed: initial read failed");
-    expect(initialErrorFrame).toContain("(no runs yet)");
-
-    await refresh.refresh();
-    await renderOnce();
-    const recoveredFrame = captureCharFrame();
-    expect(recoveredFrame).not.toContain("STALE · poll failed");
-    expect(recoveredFrame).toContain("node-timestamp");
-    expect(recoveredFrame).toContain("fresh log after poll 2");
-
-    await refresh.refresh();
-    await renderOnce();
-    const staleFrame = captureCharFrame();
-    expect(staleFrame).toContain("STALE · poll failed: temporary read failure");
-    expect(staleFrame).toContain("node-timestamp");
-    expect(staleFrame).toContain("fresh log after poll 2");
-
-    await refresh.refresh();
-    await renderOnce();
-    const recoveredAgain = captureCharFrame();
-    expect(recoveredAgain).not.toContain("STALE · poll failed");
-    expect(recoveredAgain).toContain("fresh log after poll 4");
-  });
+    expect(selection.workflowId).toBeNull();
+    expect(selection.selectedId).toBe("beta");
+    reduceKey(selection, { name: "enter" }, ["beta", "alpha"], []);
+  }
+  expect(frames).toContain("Workflows");
+  expect(frames).toContain("beta");
+  expect(reduceKey(selection, { name: "q" }, [], [])).toBe("quit");
 });
 
-describe("viewer shutdown — quitting must actually quit", () => {
-  const spy = () => {
-    const calls: string[] = [];
-    return {
-      calls,
-      deps: {
-        clear: () => calls.push("clear"),
-        detach: () => calls.push("detach"),
-        stop: () => calls.push("stop"),
-        destroy: () => calls.push("destroy"),
-        exit: (code: number) => calls.push(`exit:${code}`),
-      },
-    };
-  };
+test("rendered detail places previews beneath boxes and dims skipped steps", async () => {
+  const setup = await createTestRenderer({ width: 100, height: 30 });
+  try {
+    const mount = mountViewer(setup.renderer);
+    const snapshot = buildSnapshot([
+      { ...buildNode(), status: "succeeded", successfulOutput: "accepted result" },
+      { ...buildNode("second"), status: "waiting", wait: { ...WAIT, nodeId: "second" } },
+      { ...buildNode("third"), status: "skipped" },
+    ]);
+    const selection = { ...state(), workflowId: "alpha" };
+    await createViewerRefresh({ source: { snapshot: async () => snapshot }, state: selection, paint: model => mount.paint(model) }).refresh();
+    await setup.renderOnce();
+    const frame = setup.captureCharFrame();
+    expect(frame).toContain("[ first · Completed ]");
+    expect(frame).toContain("[ second · Needs input ]");
+    expect(frame).toContain("[ third · Skipped ]");
+    expect(frame.indexOf("accepted result")).toBeGreaterThan(frame.indexOf("[ first"));
+    expect(frame.indexOf("accepted result")).toBeLessThan(frame.indexOf("[ second"));
+    expect(frame).toContain(WAIT.waitId);
+    expect(frame).toContain("Approve this proposal?");
+    expect(frame).toContain("↓");
+    expect(frame).not.toMatch(/activation|attempt|duration|hash|pid|history/i);
+    const spans = setup.captureSpans().lines.flatMap(line => line.spans);
+    const skipped = spans.find(span => span.text.includes("third"));
+    expect(skipped?.fg.equals(RGBA.fromHex("#6e7681"))).toBe(true);
+    const arrows = spans.filter(span => span.text.includes("↓"));
+    expect(arrows.some(span => span.fg.equals(RGBA.fromHex("#6e7681")))).toBe(true);
+  } finally { setup.renderer.destroy(); }
+});
 
-  test("q takes down the poll loop, the renderer, and the process", async () => {
-    const { calls, deps } = spy();
-    makeShutdown(deps)();
-    // The exit waits a tick so the terminal-restoring writes land first.
-    expect(calls).toEqual(["clear", "detach", "stop", "destroy"]);
-    await new Promise((r) => setTimeout(r, 1));
-    expect(calls).toEqual(["clear", "detach", "stop", "destroy", "exit:0"]);
-  });
+test("fake streaming service preserves detail scroll, bot scroll, and focused typing", async () => {
+  const setup = await createTestRenderer({ width: 100, height: 30 });
+  try {
+    const mount = mountViewer(setup.renderer);
+    const input = new InputRenderable(setup.renderer, { width: 20 });
+    setup.renderer.root.add(input);
+    input.focus();
+    let tick = 0;
+    const selection = { ...state(), workflowId: "alpha" };
+    const source: ViewerSource = { snapshot: async () => buildSnapshot(Array.from({ length: 40 }, (_, i) => ({ ...buildNode("step-" + i), status: "running", liveStderr: "stream " + tick }))) };
+    const refresh = createViewerRefresh({ source, state: selection, paint: model => mount.paint(model) });
+    await refresh.refresh(); await setup.renderOnce();
+    expect(mount.bot.scrollTop).toBeGreaterThan(0);
+    mount.content.scrollTo(15); mount.bot.scrollTo(12);
+    await setup.renderOnce();
+    const scroll = mount.content.scrollTop;
+    const botScroll = mount.bot.scrollTop;
+    for (const character of "reply") {
+      tick++;
+      await setup.mockInput.typeText(character);
+      await refresh.refresh(); await setup.renderOnce();
+      expect(mount.content.scrollTop).toBe(scroll);
+      expect(mount.bot.scrollTop).toBe(botScroll);
+      expect(selection.selectedStepId).toBe("step-0");
+    }
+    expect(input.value).toBe("reply");
+    expect(input.focused).toBe(true);
+  } finally { setup.renderer.destroy(); }
+});
 
-  test("quitting twice does not exit twice mid-restore", async () => {
-    const { calls, deps } = spy();
-    const shutdown = makeShutdown(deps);
-    shutdown();
-    shutdown();
-    await new Promise((r) => setTimeout(r, 1));
-    expect(calls.filter((c) => c.startsWith("exit:"))).toEqual(["exit:0"]);
-    expect(calls.filter((c) => c === "destroy")).toEqual(["destroy"]);
-  });
+test("expansion re-reads the selected projection and shows retained evidence beyond 40 lines", async () => {
+  const setup = await createTestRenderer({ width: 100, height: 65 });
+  try {
+    const mount = mountViewer(setup.renderer);
+    const selection = { ...state(), workflowId: "alpha" };
+    const calls: Array<readonly string[] | undefined> = [];
+    const source: ViewerSource = { snapshot: async (_workflow, expanded) => {
+      calls.push(expanded);
+      return buildSnapshot([{ ...buildNode(), status: "succeeded", successfulOutput: Array.from({ length: 45 }, (_, i) => "result " + i).join("\n") }]);
+    } };
+    const refresh = createViewerRefresh({ source, state: selection, paint: model => mount.paint(model) });
+    await refresh.refresh(); await setup.renderOnce();
+    expect(setup.captureCharFrame()).toContain("e expand retained evidence");
+    expect(setup.captureCharFrame()).not.toContain("result 44");
+    reduceKey(selection, { name: "e" }, ["alpha"], ["first"]);
+    refresh.invalidate(); await refresh.refresh(); await setup.renderOnce();
+    expect(calls).toEqual([[], ["first"]]);
+    expect(setup.captureCharFrame()).toContain("result 44");
+    expect(setup.captureCharFrame()).toContain("e collapse");
+  } finally { setup.renderer.destroy(); }
+});
 
-  test("a renderer that is already stopping does not block the exit", async () => {
-    const { calls, deps } = spy();
-    makeShutdown({ ...deps, stop: () => { throw new Error("already stopped"); } })();
-    await new Promise((r) => setTimeout(r, 1));
-    expect(calls).toContain("destroy");
-    expect(calls).toContain("exit:0");
-  });
+test("narrow terminal uses stacked overview and wraps detail previews", async () => {
+  const setup = await createTestRenderer({ width: 28, height: 22 });
+  try {
+    const mount = mountViewer(setup.renderer);
+    const selection = state();
+    const source: ViewerSource = { snapshot: async () => buildSnapshot([{ ...buildNode(), status: "succeeded", successfulOutput: "long output with enough words to wrap across the narrow viewport" }]) };
+    const refresh = createViewerRefresh({ source, state: selection, paint: model => mount.paint(model) });
+    await refresh.refresh(); await setup.renderOnce();
+    expect(setup.captureCharFrame()).toContain("Title: alpha");
+    expect(setup.captureCharFrame()).toContain("Status: Ready");
+    expect(setup.captureCharFrame()).toContain("Next run: —");
+    selection.workflowId = "alpha";
+    refresh.invalidate(); await refresh.refresh(); await setup.renderOnce();
+    const frame = setup.captureCharFrame();
+    expect(frame).toContain("long output");
+    expect(frame).toContain("narrow viewport");
+  } finally { setup.renderer.destroy(); }
+});
+
+test("refresh serializes polls, coalesces ticks, and discards reads for an old selection", async () => {
+  const first = deferred<ViewerSnapshot>();
+  const started = deferred<void>();
+  const selection = state();
+  let calls = 0;
+  let active = 0;
+  let maxActive = 0;
+  const painted: string[] = [];
+  const source: ViewerSource = { snapshot: async workflow => {
+    calls++; active++; maxActive = Math.max(maxActive, active);
+    try { if (calls === 1) { started.resolve(); return await first.promise; } return buildSnapshot([buildNode()]); }
+    finally { active--; }
+  } };
+  const refresh = createViewerRefresh({ source, state: selection, paint: model => painted.push(model.header) });
+  const old = refresh.refresh();
+  await started.promise;
+  selection.workflowId = "alpha";
+  refresh.invalidate();
+  const current = refresh.refresh(); const coalesced = refresh.refresh();
+  first.resolve(buildSnapshot());
+  await Promise.all([old, current, coalesced]);
+  expect(calls).toBe(2); expect(maxActive).toBe(1); expect(painted).toEqual(["alpha"]);
+});
+
+test("refresh errors mark the last frame stale and recover without clearing selection", async () => {
+  const selection = state();
+  let poll = 0;
+  const errors: Array<string | null | undefined> = [];
+  const source: ViewerSource = { snapshot: async () => { if (++poll === 1 || poll === 3) throw new Error("Read failed"); return buildSnapshot(); } };
+  const refresh = createViewerRefresh({ source, state: selection, paint: (_model, error) => errors.push(error) });
+  for (let i = 0; i < 4; i++) await refresh.refresh();
+  expect(errors).toEqual(["Read failed", undefined, "Read failed", undefined]);
+  expect(selection.selectedId).toBe("alpha");
+});
+
+test("shutdown clears polling and restores the terminal exactly once", async () => {
+  const calls: string[] = [];
+  const shutdown = makeShutdown({ clear: () => calls.push("clear"), detach: () => calls.push("detach"), stop: () => { calls.push("stop"); throw new Error("Already stopped"); }, destroy: () => calls.push("destroy"), exit: code => calls.push("exit:" + code) });
+  shutdown(); shutdown();
+  await new Promise(resolve => setTimeout(resolve, 1));
+  expect(calls).toEqual(["clear", "detach", "stop", "destroy", "exit:0"]);
+});
+
+test("returning from a short detail keeps a deep overview selection visible", async () => {
+  const setup = await createTestRenderer({ width: 100, height: 22 });
+  try {
+    const mount = mountViewer(setup.renderer);
+    const selection = state();
+    const snapshot = buildSnapshot([buildNode()]);
+    const workflow = snapshot.status.workflows[0];
+    if (!workflow) throw new Error("Missing fixture workflow");
+    snapshot.status.workflows = Array.from({ length: 60 }, (_, i) => ({ ...workflow, workflowId: "workflow-" + String(i).padStart(2, "0") }));
+    selection.selectedId = "workflow-55";
+    const source: ViewerSource = { snapshot: async workflowId => ({ ...snapshot, detail: workflowId ? snapshot.detail : null }) };
+    const refresh = createViewerRefresh({ source, state: selection, paint: model => mount.paint(model) });
+    await refresh.refresh(); await setup.flush();
+    expect(setup.captureCharFrame()).toContain("▶ workflow-55");
+    reduceKey(selection, { name: "enter" }, [], []);
+    refresh.invalidate(); await refresh.refresh(); await setup.flush();
+    expect(setup.captureCharFrame()).toContain("[ first");
+    reduceKey(selection, { name: "backspace" }, [], []);
+    refresh.invalidate(); await refresh.refresh(); await setup.flush();
+    expect(setup.captureCharFrame()).toContain("▶ workflow-55");
+    expect(selection.selectedId).toBe("workflow-55");
+  } finally { setup.renderer.destroy(); }
+});
+
+test("a new displayed run removes the old frozen chain", async () => {
+  const setup = await createTestRenderer({ width: 100, height: 22 });
+  try {
+    const mount = mountViewer(setup.renderer);
+    const selection = { ...state(), workflowId: "alpha" };
+    let snapshot = buildSnapshot([buildNode("old-first"), buildNode("old-second")]);
+    const refresh = createViewerRefresh({ source: { snapshot: async () => snapshot }, state: selection, paint: model => mount.paint(model) });
+    await refresh.refresh(); await setup.flush();
+    expect(setup.captureCharFrame()).toContain("old-first");
+    snapshot = buildSnapshot([buildNode("new-first")]);
+    if (!snapshot.detail) throw new Error("Missing fixture detail");
+    snapshot = { ...snapshot, detail: { ...snapshot.detail, diagram: { ...snapshot.detail.diagram, runId: buildRun().runId } } };
+    await refresh.refresh(); await setup.flush();
+    expect(setup.captureCharFrame()).toContain("new-first");
+    expect(setup.captureCharFrame()).not.toContain("old-first");
+    expect(setup.captureCharFrame()).not.toContain("old-second");
+  } finally { setup.renderer.destroy(); }
 });
