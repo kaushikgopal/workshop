@@ -164,7 +164,7 @@ export const resultArtifactSchema = z.discriminatedUnion("availability", [
   }),
 ]);
 
-const nodeResultFields = {
+const nodeResultV1Fields = {
   version: z.literal(1),
   output: boundedCandidateText(1024 * 1024),
   summary: boundedCandidateText(64 * 1024),
@@ -172,49 +172,111 @@ const nodeResultFields = {
   sourceBytesHash: sha256Schema,
 };
 
-/** Canonical checked candidate. Operator acceptance preserves its own provenance and source block. */
-export const nodeResultSchema = z.discriminatedUnion("source", [
+const nodeResultV1Schema = z.discriminatedUnion("source", [
+  z.strictObject({ ...nodeResultV1Fields, source: z.literal("command"), exit: processExitSchema }),
+  z.strictObject({ ...nodeResultV1Fields, source: z.literal("agent"), exit: processExitSchema }),
   z.strictObject({
-    ...nodeResultFields,
-    source: z.literal("command"),
-    exit: processExitSchema,
-  }),
-  z.strictObject({
-    ...nodeResultFields,
-    source: z.literal("agent"),
-    exit: processExitSchema,
-  }),
-  z.strictObject({
-    ...nodeResultFields,
+    ...nodeResultV1Fields,
     source: z.literal("operator"),
     workerKind: z.enum(["command", "agent"]),
     exit: z.null(),
     acceptance: operatorAcceptanceSchema,
   }),
-]).superRefine((result, context) => {
-  if (result.source === "agent" && result.output.length === 0) {
-    context.addIssue({ code: "custom", path: ["output"], message: "agent output must be nonempty" });
+]);
+
+const nonemptyWellFormedCandidateField = (maximumBytes: number, label: string) => z.string().min(1)
+  .refine((value) => value.trim().length > 0, label + " must contain non-whitespace text")
+  .refine((value) => value.isWellFormed(), label + " must be well-formed Unicode")
+  .refine(
+    (value) => new TextEncoder().encode(value).byteLength <= maximumBytes,
+    label + " must be at most " + maximumBytes + " UTF-8 bytes",
+  );
+
+const stdioResultSchema = z.strictObject({
+  version: z.literal(1),
+  mode: z.enum(["text", "tagged"]),
+  status: z.enum(["succeeded", "success_and_complete", "needs_input"]),
+  reason: nonemptyWellFormedCandidateField(64 * 1024, "reason").nullable(),
+  question: nonemptyWellFormedCandidateField(64 * 1024, "question").nullable(),
+});
+
+const nodeResultV2Fields = {
+  version: z.literal(2),
+  output: boundedCandidateText(1024 * 1024),
+  summary: boundedCandidateText(64 * 1024),
+  artifacts: z.array(resultArtifactSchema).max(100),
+  sourceBytesHash: sha256Schema,
+  stdioResult: stdioResultSchema,
+};
+
+const nodeResultV2Schema = z.discriminatedUnion("source", [
+  z.strictObject({ ...nodeResultV2Fields, source: z.literal("command"), exit: processExitSchema }),
+  z.strictObject({ ...nodeResultV2Fields, source: z.literal("agent"), exit: processExitSchema }),
+]);
+
+/** Canonical checked candidate. Operator acceptance preserves its own provenance and source block. */
+export const nodeResultSchema = z.union([nodeResultV1Schema, nodeResultV2Schema]).superRefine((result, context) => {
+  if (result.version === 1) {
+    if (result.source === "agent" && result.output.length === 0) {
+      context.addIssue({ code: "custom", path: ["output"], message: "agent output must be nonempty" });
+    }
+    if (result.source === "command" || result.source === "agent") {
+      if (result.exit.kind !== "code" || result.exit.code !== 0) {
+        context.addIssue({ code: "custom", path: ["exit"], message: "successful candidate results require exit code 0" });
+      }
+    } else {
+      if (result.acceptance.target !== "worker") {
+        context.addIssue({ code: "custom", path: ["acceptance", "target"], message: "candidate acceptance must target a worker result" });
+      }
+      if (result.acceptance.resultBytesHash !== result.sourceBytesHash) {
+        context.addIssue({ code: "custom", path: ["sourceBytesHash"], message: "accepted candidate hash must match its supplied result bytes" });
+      }
+      if (result.workerKind === "agent" && result.output.length === 0) {
+        context.addIssue({ code: "custom", path: ["output"], message: "agent results must be nonempty" });
+      }
+    }
+    return;
   }
-  if (result.source === "command" || result.source === "agent") {
-    if (result.exit.kind !== "code" || result.exit.code !== 0) {
-      context.addIssue({ code: "custom", path: ["exit"], message: "successful candidate results require exit code 0" });
+
+  const { stdioResult } = result;
+  if (result.exit.kind !== "code" || result.exit.code !== 0) {
+    context.addIssue({ code: "custom", path: ["exit"], message: "successful candidate results require exit code 0" });
+  }
+  if (result.artifacts.length !== 0) {
+    context.addIssue({ code: "custom", path: ["artifacts"], message: "stdout candidates do not contain artifacts" });
+  }
+  if (result.summary !== (stdioResult.reason ?? "")) {
+    context.addIssue({ code: "custom", path: ["summary"], message: "stdout candidate summary matches its reason" });
+  }
+  if (stdioResult.mode === "text" && (stdioResult.status !== "succeeded" || stdioResult.reason !== null || stdioResult.question !== null)) {
+    context.addIssue({ code: "custom", path: ["stdioResult"], message: "text results have succeeded status without tagged fields" });
+  }
+  if (stdioResult.status === "needs_input") {
+    if (stdioResult.question === null) {
+      context.addIssue({ code: "custom", path: ["stdioResult", "question"], message: "needs_input requires a question" });
     }
-  } else {
-    if (result.acceptance.target !== "worker") {
-      context.addIssue({ code: "custom", path: ["acceptance", "target"], message: "candidate acceptance must target a worker result" });
+    if (result.output.trim().length === 0) {
+      context.addIssue({ code: "custom", path: ["output"], message: "needs_input requires nonempty output" });
     }
-    if (result.acceptance.resultBytesHash !== result.sourceBytesHash) {
-      context.addIssue({ code: "custom", path: ["sourceBytesHash"], message: "accepted candidate hash must match its supplied result bytes" });
-    }
-    if (result.workerKind === "agent" && result.output.length === 0) {
-      context.addIssue({ code: "custom", path: ["output"], message: "agent results must be nonempty" });
-    }
+  } else if (stdioResult.question !== null) {
+    context.addIssue({ code: "custom", path: ["stdioResult", "question"], message: "question is only valid for needs_input" });
   }
 });
 
 const successfulValidatorExitSchema = z.strictObject({
   kind: z.literal("code"),
   code: z.literal(0),
+});
+
+export const taggedValidatorVerdictSchema = z.strictObject({
+  version: z.literal(2),
+  decision: z.enum(["accept", "retry", "block"]),
+  reason: nonemptyWellFormedCandidateField(64 * 1024, "reason"),
+  corrections: nonemptyWellFormedCandidateField(64 * 1024, "corrections").nullable(),
+}).superRefine((verdict, context) => {
+  if (verdict.decision !== "retry" && verdict.corrections !== null) {
+    context.addIssue({ code: "custom", path: ["corrections"], message: "corrections are only valid for retry" });
+  }
 });
 
 export const validatorOutcomeSchema = z.discriminatedUnion("kind", [
@@ -227,7 +289,7 @@ export const validatorOutcomeSchema = z.discriminatedUnion("kind", [
   z.strictObject({
     kind: z.literal("agent"),
     exit: successfulValidatorExitSchema,
-    verdict: validatorVerdictSchema,
+    verdict: z.union([validatorVerdictSchema, taggedValidatorVerdictSchema]),
     resultBytesHash: sha256Schema,
   }),
   z.strictObject({
@@ -248,7 +310,7 @@ export const validatorOutcomeSchema = z.discriminatedUnion("kind", [
 type ValidatorOutcomeValue = z.infer<typeof validatorOutcomeSchema>;
 export function validatorOutcomePasses(outcome: ValidatorOutcomeValue): boolean {
   if (outcome.kind === "command") return outcome.exit.kind === "code" && outcome.exit.code === 0;
-  return outcome.verdict.passed;
+  return outcome.verdict.version === 1 ? outcome.verdict.passed : outcome.verdict.decision === "accept";
 }
 
 export const nodeAttemptOutcomeSchema = z.discriminatedUnion("kind", [

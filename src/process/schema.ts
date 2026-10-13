@@ -57,6 +57,31 @@ export const processCaptureSchema = z.strictObject({
   }
 });
 
+const stdioDiagnosticCodeSchema = z.string().min(1).max(64).regex(
+  /^[A-Za-z0-9_.-]+$/u,
+  "stdio diagnostic codes use at most 64 safe characters",
+);
+
+export const processStdioWriteSchema = z.discriminatedUnion("kind", [
+  z.strictObject({ kind: z.literal("pending"), queuedBytes: byteCountSchema }),
+  z.strictObject({ kind: z.literal("finished"), queuedBytes: byteCountSchema }),
+  z.strictObject({ kind: z.literal("early_closed"), queuedBytes: byteCountSchema, diagnosticCode: stdioDiagnosticCodeSchema.optional() }),
+  z.strictObject({ kind: z.literal("cancelled"), queuedBytes: byteCountSchema, diagnosticCode: stdioDiagnosticCodeSchema.optional() }),
+  z.strictObject({ kind: z.literal("write_error"), queuedBytes: byteCountSchema, diagnosticCode: stdioDiagnosticCodeSchema }),
+  z.strictObject({ kind: z.literal("unknown_after_restart"), queuedBytes: byteCountSchema }),
+]);
+
+export const processStdioSchema = z.strictObject({
+  version: z.literal(1),
+  stdinSha256: sha256Schema,
+  stdinByteCount: byteCountSchema,
+  write: processStdioWriteSchema,
+}).superRefine((stdio, context) => {
+  if (stdio.write.queuedBytes > stdio.stdinByteCount) {
+    context.addIssue({ code: "custom", path: ["write", "queuedBytes"], message: "queued stdin bytes cannot exceed input bytes" });
+  }
+});
+
 /** One process incarnation; a safe replay retains the execution ID and adds an incarnation. */
 export const processIncarnationSchema = z.strictObject({
   executionId: executionIdSchema,
@@ -75,6 +100,7 @@ export const processIncarnationSchema = z.strictObject({
   exit: processExitSchema.nullable(),
   cleanupState: processCleanupStateSchema,
   captures: z.array(processCaptureSchema),
+  stdio: processStdioSchema.optional(),
 }).superRefine((process, context) => {
   if (process.launchIntentAt === null && (process.deadlineAt !== null || process.startedAt !== null)) {
     context.addIssue({ code: "custom", path: ["launchIntentAt"], message: "deadlines and process starts require launch intent" });

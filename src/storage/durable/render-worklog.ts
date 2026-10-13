@@ -56,6 +56,12 @@ export function renderWorklog(value: WorkflowRunDocumentV1, options: { readonly 
       if (candidate !== null) {
         lines.push(`- Candidate source: ${candidate.source}`);
         lines.push(`- Candidate SHA-256: ${candidate.sourceBytesHash}`);
+        if (candidate.version === 2) {
+          lines.push("- Stdout result: " + candidate.stdioResult.mode + " / " + candidate.stdioResult.status);
+          if (candidate.stdioResult.question !== null) {
+            lines.push("- Question:", ...quote(candidate.stdioResult.question));
+          }
+        }
         if (candidate.source === "operator") {
           lines.push(`- Operator acceptance: ${inlineCode(candidate.acceptance.resolutionId)}`);
           lines.push(...quote(candidate.acceptance.reason));
@@ -135,10 +141,28 @@ function describeValidator(validator: ValidatorOutcome): string[] {
     lines.push(`  - Stdout SHA-256: ${validator.stdoutHash ?? "not captured"}`);
     lines.push(`  - Stderr SHA-256: ${validator.stderrHash ?? "not captured"}`);
   } else {
-    lines.push(`  - Verdict: ${validator.verdict.passed ? "passed" : "rejected"}`);
-    lines.push(...quote(validator.verdict.reason));
+    lines.push(...describeVerdict(validator.verdict));
   }
   return lines;
+}
+
+type AgentOrOperatorVerdict = Extract<ValidatorOutcome, { kind: "agent" | "operator" }>["verdict"];
+
+function describeVerdict(verdict: AgentOrOperatorVerdict): string[] {
+  if (verdict.version === 1) {
+    return ["  - Verdict: " + (verdict.passed ? "passed" : "rejected"), ...quote(verdict.reason)];
+  }
+  return [
+    "  - Decision: " + verdict.decision,
+    ...quote(verdict.reason),
+    ...(verdict.corrections === null ? [] : ["  - Corrections:", ...quote(verdict.corrections)]),
+  ];
+}
+
+function renderedVerdictReason(verdict: AgentOrOperatorVerdict): string {
+  return verdict.version === 1
+    ? verdict.reason
+    : verdict.decision + ": " + (verdict.corrections === null ? verdict.reason : verdict.reason + "\nCorrections: " + verdict.corrections);
 }
 
 function describeSite(site: ResolvedExecutionSite): string {
@@ -184,10 +208,17 @@ function renderCompactWorklog(run: Extract<WorkflowRunDocumentV1, { state: "read
           : attempt.result.outcome.kind === "blocked" ? attempt.result.outcome.block.reason
             : ""
         : "";
-      const summary = compactText(candidate?.summary || outcomeDetail || "no summary");
+      const candidateSummary = candidate === null ? "" : candidate.version === 1
+        ? candidate.summary
+        : [
+            candidate.stdioResult.mode + " " + candidate.stdioResult.status,
+            candidate.summary,
+            candidate.stdioResult.question === null ? "" : "Question: " + candidate.stdioResult.question,
+          ].filter(Boolean).join(" · ");
+      const summary = compactText(candidateSummary || outcomeDetail || "no summary");
       const validator = validatorOf(attempt);
       const verdictReason = validator?.kind === "agent" || validator?.kind === "operator"
-        ? compactText(validator.verdict.reason)
+        ? compactText(renderedVerdictReason(validator.verdict))
         : null;
       lines.push(`- ${node.nodeId} #${attempt.number} ${outcome} · ${duration} · ${summary}${verdictReason === null ? "" : ` · verdict: ${verdictReason}`}`);
     }

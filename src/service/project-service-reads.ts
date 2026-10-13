@@ -514,6 +514,7 @@ function projectAttemptDetail(
   };
 }
 
+// Hash the complete checked record so references remain stable across contract versions.
 function makeEvidenceReference(
   kind: "candidate" | "verdict" | "judgment",
   evidenceId: string,

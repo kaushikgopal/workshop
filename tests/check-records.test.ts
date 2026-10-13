@@ -19,6 +19,7 @@ import {
   operatorResolutionSchema,
   resultArtifactSchema,
   runOutcomeSchema,
+  validatorOutcomePasses,
   validatorOutcomeSchema,
 } from "../src/run/schema.js";
 import {
@@ -136,6 +137,10 @@ function evidence(
     byteCount: 12,
     recordedAt: FINISHED_AT,
   };
+}
+
+function roundTrip(schema: { parse(value: unknown): unknown }, value: unknown): unknown {
+  return schema.parse(JSON.parse(JSON.stringify(value)));
 }
 
 function succeededAttempt(overrides: Record<string, unknown> = {}) {
@@ -263,6 +268,124 @@ describe("worker and verdict contracts", () => {
       ok: false,
       failure: { kind: "result_too_large" },
     });
+  });
+});
+
+describe("versioned persisted contracts", () => {
+  test("round-trips historical and stdout candidates without changing version 1", () => {
+    const historical = {
+      version: 1, source: "agent", output: "A checked historical result.", summary: "Checked.", artifacts: [],
+      sourceBytesHash: HASH_A, exit: { kind: "code", code: 0 },
+    };
+    expect(roundTrip(nodeResultSchema, historical)).toEqual(historical);
+
+    const textCandidate = {
+      version: 2, source: "agent", output: "Text result.", summary: "", artifacts: [],
+      sourceBytesHash: HASH_B, exit: { kind: "code", code: 0 },
+      stdioResult: { version: 1, mode: "text", status: "succeeded", reason: null, question: null },
+    };
+    expect(roundTrip(nodeResultSchema, textCandidate)).toEqual(textCandidate);
+
+    const stdoutCandidate = {
+      version: 2, source: "agent", output: "", summary: "Tagged reason.", artifacts: [],
+      sourceBytesHash: HASH_B, exit: { kind: "code", code: 0 },
+      stdioResult: { version: 1, mode: "tagged", status: "succeeded", reason: "Tagged reason.", question: null },
+    };
+    expect(roundTrip(nodeResultSchema, stdoutCandidate)).toEqual(stdoutCandidate);
+
+    const needsInput = {
+      ...stdoutCandidate,
+      output: "Waiting for a person.", summary: "",
+      stdioResult: { version: 1, mode: "tagged", status: "needs_input", reason: null, question: "Which project should I use?" },
+    };
+    expect(roundTrip(nodeResultSchema, needsInput)).toEqual(needsInput);
+    const earlyCompletion = {
+      ...stdoutCandidate,
+      output: "The workflow is complete.", summary: "Finished early.",
+      stdioResult: { version: 1, mode: "tagged", status: "success_and_complete", reason: "Finished early.", question: null },
+    };
+    expect(roundTrip(nodeResultSchema, earlyCompletion)).toEqual(earlyCompletion);
+  });
+
+  test("round-trips historical and tagged agent verdicts with explicit pass decisions", () => {
+    const historical = {
+      kind: "agent", exit: { kind: "code", code: 0 },
+      verdict: { version: 1, passed: false, reason: "Historical rejection." }, resultBytesHash: HASH_A,
+    };
+    expect(roundTrip(validatorOutcomeSchema, historical)).toEqual(historical);
+    expect(validatorOutcomePasses(validatorOutcomeSchema.parse(historical))).toBe(false);
+
+    const retry = {
+      kind: "agent", exit: { kind: "code", code: 0 },
+      verdict: { version: 2, decision: "retry", reason: "The parser rejects malformed input.", corrections: "Add a regression test." },
+      resultBytesHash: HASH_B,
+    };
+    expect(roundTrip(validatorOutcomeSchema, retry)).toEqual(retry);
+    expect(validatorOutcomePasses(validatorOutcomeSchema.parse(retry))).toBe(false);
+    expect(nodeAttemptOutcomeSchema.parse({
+      kind: "failed",
+      failure: failureInfo(),
+      candidate: {
+        version: 1, source: "command", output: "Candidate", summary: "", artifacts: [],
+        sourceBytesHash: HASH_A, exit: { kind: "code", code: 0 },
+      },
+      validator: validatorOutcomeSchema.parse(retry),
+    }).kind).toBe("failed");
+    expect(validatorOutcomePasses(validatorOutcomeSchema.parse({
+      ...retry, verdict: { version: 2, decision: "accept", reason: "The candidate passes.", corrections: null },
+    }))).toBe(true);
+    expect(validatorOutcomePasses(validatorOutcomeSchema.parse({
+      ...retry, verdict: { version: 2, decision: "block", reason: "The evidence is incomplete.", corrections: null },
+    }))).toBe(false);
+  });
+
+  test("round-trips optional stdin evidence and rejects malformed contract metadata", () => {
+    const historical = processIncarnation();
+    expect(roundTrip(processIncarnationSchema, historical)).toEqual(historical);
+
+    const stdio = {
+      version: 1, stdinSha256: HASH_B, stdinByteCount: 11,
+      write: { kind: "write_error", queuedBytes: 8, diagnosticCode: "EPIPE" },
+    };
+    const taggedCandidate = {
+      version: 2, source: "agent", output: "", summary: "Tagged reason.", artifacts: [],
+      sourceBytesHash: HASH_B, exit: { kind: "code", code: 0 },
+      stdioResult: { version: 1, mode: "tagged", status: "succeeded", reason: "Tagged reason.", question: null },
+    };
+    expect(roundTrip(processIncarnationSchema, { ...historical, stdio })).toEqual(JSON.parse(JSON.stringify({ ...historical, stdio })));
+
+    expect(() => nodeResultSchema.parse({ version: 3, ...historical })).toThrow();
+    expect(() => nodeResultSchema.parse({ ...taggedCandidate, retainedStdoutBytes: "forbidden" })).toThrow();
+    expect(() => nodeResultSchema.parse({
+      version: 2, source: "agent", output: "", summary: "", artifacts: [], sourceBytesHash: HASH_A,
+      exit: { kind: "code", code: 0 },
+      stdioResult: { version: 1, mode: "text", status: "needs_input", reason: null, question: null },
+    })).toThrow();
+    expect(() => nodeResultSchema.parse({
+      ...historical, version: 2, stdioResult: { version: 1, mode: "tagged", status: "succeeded", reason: "", question: null },
+    })).toThrow();
+    expect(() => nodeResultSchema.parse({
+      ...historical, version: 2, stdioResult: { version: 1, mode: "tagged", status: "succeeded", reason: "  ", question: null },
+    })).toThrow();
+    expect(() => nodeResultSchema.parse({
+      ...taggedCandidate,
+      stdioResult: { ...taggedCandidate.stdioResult, status: "succeeded", question: "Not valid here." },
+    })).toThrow();
+    expect(() => validatorOutcomeSchema.parse({
+      kind: "agent", exit: { kind: "code", code: 0 }, resultBytesHash: HASH_A,
+      verdict: { version: 2, decision: "accept", reason: "Accepted.", corrections: "Not allowed." },
+    })).toThrow();
+    expect(() => validatorOutcomeSchema.parse({
+      kind: "operator", resultBytesHash: HASH_A,
+      verdict: { version: 2, decision: "accept", reason: "Accepted.", corrections: null },
+      acceptance: { target: "validator" },
+    })).toThrow();
+    expect(() => processIncarnationSchema.parse({
+      ...historical, stdio: { ...stdio, write: { ...stdio.write, queuedBytes: 12 } },
+    })).toThrow(/queued stdin bytes/);
+    expect(() => processIncarnationSchema.parse({
+      ...historical, stdio: { ...stdio, write: { ...stdio.write, diagnosticCode: "EPIPE/unsafe" } },
+    })).toThrow();
   });
 });
 
@@ -652,6 +775,7 @@ describe("public JSON projections", () => {
   test("validates process replay history and millisecond timestamps", () => {
     const firstIncarnation = processIncarnation({
       status: "blocked", exit: null, cleanupState: "confirmed_dead", replay: "safe",
+      stdio: { version: 1, stdinSha256: HASH_A, stdinByteCount: 5, write: { kind: "unknown_after_restart", queuedBytes: 2 } },
     });
     const secondIncarnation = processIncarnation({
       incarnationId: "incarnation-worker-a-2", incarnationNumber: 2, replay: "safe",
@@ -663,7 +787,12 @@ describe("public JSON projections", () => {
       candidate: { ...evidence("candidate", "evidence-candidate-a", HASH_A), recordedAt: "2026-10-05T12:00:04.000Z" },
       processes: [firstIncarnation, secondIncarnation],
     });
-    expect(attemptDetailDtoSchema.parse(replayedAttempt).processes).toHaveLength(2);
+    const projectedProcesses = attemptDetailDtoSchema.parse(replayedAttempt).processes;
+    expect(projectedProcesses).toHaveLength(2);
+    expect(projectedProcesses[0]?.stdio).toEqual({
+      version: 1, stdinSha256: HASH_A, stdinByteCount: 5,
+      write: { kind: "unknown_after_restart", queuedBytes: 2 },
+    });
     const knownFailureExit = { ...firstIncarnation, status: "exited", exit: { kind: "code", code: 1 } };
     const knownSuccessExit = { ...firstIncarnation, status: "exited", exit: { kind: "code", code: 0 } };
     expect(() => attemptDetailDtoSchema.parse({
