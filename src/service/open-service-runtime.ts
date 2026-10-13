@@ -26,6 +26,8 @@ import {
   runFailureInfoSchema,
   validatorOutcomeSchema,
 } from "../run/schema.js";
+import { checkBlockResolution } from "../run/check-block-resolution.js";
+import { parseTextResult, parseTaggedWorkerResult } from "../attempt/parse-tagged-result.js";
 import { prepareRunAdmission } from "../run/prepare-admission.js";
 import { firstFixedRateDeadline } from "../run/decide-fixed-rate-schedule.js";
 import { parseDuration } from "../util/parse-units.js";
@@ -40,7 +42,7 @@ import {
   recoverRetainedProcessCaptureRecords,
 } from "../storage/durable/define-process-execution-task.js";
 import { resolveWorkerArtifacts } from "../storage/durable/define-node-attempt-task.js";
-import { parseValidatorVerdictFile, parseWorkerResultFile } from "../attempt/parse-result.js";
+import { parseValidatorVerdictFile, parseWorkerResultFile, readResultFileBytes } from "../attempt/parse-result.js";
 import { workflowRunDocumentV1Schema, workshopEventV1Schema, workshopProcessV1Schema } from "../run/records.js";
 import { WorkshopEventEntry, WorkshopInstallationDoc, WorkshopRunDoc, WorkshopServiceReceiptsDoc } from "../storage/durable/define-workshop-records.js";
 import { checkpointDurableWal } from "../storage/durable/checkpoint-durable-wal.js";
@@ -687,41 +689,20 @@ async function controlWorkflow(
   return result.response;
 }
 
-type ResolutionBlockKind = NonNullable<ReadyRunForResolution["block"]>["kind"];
-
-const fabricatedVerdictBlockKinds: ReadonlySet<string> = new Set([
-  "verifier_block",
-  "verifier_failed",
-  "repeated_failure",
-]);
-
-export function format4ResolutionRejection(input: {
-  readonly formatVersion: number | undefined;
-  readonly blockKind: ResolutionBlockKind | undefined;
-  readonly action: Extract<ServiceRequestV1, { method: "resolve" }>["action"];
-}): string | null {
-  if (input.formatVersion !== 4) return null;
-  if (input.action === "accept") {
-    if (input.blockKind !== undefined && fabricatedVerdictBlockKinds.has(input.blockKind)) {
-      return "format 4 verifier_block, verifier_failed, and repeated_failure blocks cannot accept a fabricated verifier verdict";
-    }
-    return "format 4 accept --result-file is not supported yet; WP6 must define human text/tagged acceptance. Fail this run or use the previous build";
-  }
-  if ((input.blockKind === "runtime_incompatible" || input.blockKind === "integrity_failed") && input.action !== "fail") {
-    return "format 4 runtime_incompatible and integrity_failed blocks permit only fail; retry, including judgment retry, cannot bypass the runtime gate";
-  }
-  return null;
-}
-
 function checkFormat4Resolution(run: ReadyRunForResolution, request: Extract<ServiceRequestV1, { method: "resolve" }>): void {
   const formatVersion = "formatVersion" in run.resolvedSettings && typeof run.resolvedSettings.formatVersion === "number"
     ? run.resolvedSettings.formatVersion
     : undefined;
-  const rejection = format4ResolutionRejection({ formatVersion, blockKind: run.block?.kind, action: request.action });
+  const rejection = checkBlockResolution({
+    formatVersion, blockKind: run.block?.kind, action: request.action, resolver: request.resolver ?? "human",
+    allowRepeat: request.allowRepeat, extraAttempt: request.extraAttempt, target: request.target,
+    botAlreadyResolved: run.resolutions.some((resolution) => resolution.provenance === "bot"
+      && resolution.sourceBlock.nodeId === run.block?.nodeId),
+  });
   if (rejection !== null) throw new ServiceRequestError("resolution_rejected", rejection);
 }
 
-async function resolveBlockedWorkflow(
+export async function resolveBlockedWorkflow(
   harness: Harness,
   tasks: ReturnType<typeof defineWorkshopTasks>,
   installation: Installation,
@@ -732,6 +713,7 @@ async function resolveBlockedWorkflow(
     workflowId: request.workflowId,
     runId: request.runId ?? null,
     action: request.action,
+    resolver: request.resolver ?? "human",
     reason: request.reason,
     allowRepeat: request.allowRepeat ?? false,
     extraAttempt: request.extraAttempt ?? false,
@@ -781,6 +763,7 @@ async function resolveBlockedWorkflow(
     const selectedRun = await readRun(harness, reference);
     if (selectedRun.status !== "blocked" || selectedRun.block === null) throw new ServiceRequestError("resolution_rejected", "run_blocked: only the current blocked run can be resolved");
     const source = selectedRun.block;
+    const format4 = "formatVersion" in selectedRun.resolvedSettings && selectedRun.resolvedSettings.formatVersion === 4;
     checkFormat4Resolution(selectedRun, request);
     const attemptLocation = source.attemptId === null ? null : findRunAttempt(selectedRun, source.nodeId, source.attemptId);
     if (source.attemptId !== null && attemptLocation === null) throw new ServiceRequestError("resolution_rejected", "resolution source attempt is missing");
@@ -793,10 +776,11 @@ async function resolveBlockedWorkflow(
     const sourceProcesses = attemptLocation === null
       ? checkedProcesses.filter((entry) => entry.process.role === "preflight")
       : attemptProcesses(attemptLocation.attempt, checkedProcesses);
-    const needsRepeat = !judgmentRetry && (source.kind === "external_outcome_unknown"
-      || sourceProcesses.some((entry) => entry.process.replay === "never"));
+    const needsRepeat = format4
+      ? source.kind === "external_outcome_unknown" || source.kind === "process_death_unconfirmed"
+      : !judgmentRetry && (source.kind === "external_outcome_unknown" || sourceProcesses.some((entry) => entry.process.replay === "never"));
     const retryLimit = attemptLocation === null ? 0 : resolveRetryLimit(selectedRun.resolvedSettings.nodes[attemptLocation.node.nodeId]!);
-    const needsExtraAttempt = !judgmentRetry && attemptLocation !== null
+    const needsExtraAttempt = !format4 && !judgmentRetry && attemptLocation !== null
       && retryLimit !== "unlimited" && attemptLocation.attempt.number > retryLimit;
     if (judgmentRetry) assertJudgmentRetrySource(selectedRun, source, attemptLocation);
     if (request.action === "retry" && !judgmentRetry
@@ -804,7 +788,8 @@ async function resolveBlockedWorkflow(
         || (request.extraAttempt ?? false) !== needsExtraAttempt)) {
       throw new ServiceRequestError("resolution_rejected", `retry flags required by this block: --allow-repeat ${needsRepeat ? "required" : "not allowed"}; --extra-attempt ${needsExtraAttempt ? "required" : "not allowed"}`);
     }
-    if (request.action === "retry" && !judgmentRetry && attemptLocation === null && source.kind !== "preflight_failed") {
+    if (request.action === "retry" && !judgmentRetry && attemptLocation === null && source.kind !== "preflight_failed"
+      && !(format4 && selectedRun.resolvedSettings.preflight !== null && ["external_outcome_unknown", "process_death_unconfirmed"].includes(source.kind))) {
       throw new ServiceRequestError("resolution_rejected", "retry requires a preflight block or a block tied to a semantic attempt");
     }
     if (request.action === "accept" && (source.kind !== "external_outcome_unknown" || attemptLocation === null)) {
@@ -814,7 +799,7 @@ async function resolveBlockedWorkflow(
     const newResolutionId = randomUUID();
     const resolution = request.action === "accept" ? null : operatorResolutionSchema.parse({
       resolutionId: newResolutionId,
-      provenance: "operator",
+      provenance: format4 ? request.resolver ?? "human" : "operator",
       reason: request.reason,
       resolvedAt,
       processGroupsConfirmedDead: true,
@@ -876,13 +861,13 @@ async function resolveBlockedWorkflow(
       const parsedRun = workflowRunDocumentV1Schema.safeParse(runDraft);
       if (!parsedRun.success || parsedRun.data.state !== "ready") throw new ServiceRequestError("resolution_rejected", "open run document is invalid");
       const currentRun = parsedRun.data;
+      checkFormat4Resolution(currentRun, request);
       if (canonicalHash(currentRun) !== canonicalHash(run)) throw new ServiceRequestError("resolution_rejected", "run state changed before resolution; inspect status and retry");
       if (currentRun.status !== "blocked" || currentRun.block === null) throw new ServiceRequestError("resolution_rejected", "run_blocked: only the current blocked run can be resolved");
       if (request.runId !== undefined && request.runId !== currentRun.runId) throw new ServiceRequestError("resolution_rejected", "requested run ID differs from the open run");
       const currentProcesses = processRecords;
       assertRunProcessGroupsConfirmedDead(currentRun, currentProcesses);
       const currentBlock = currentRun.block;
-      checkFormat4Resolution(currentRun, request);
       if (currentBlock.blockId !== sourceBlock.blockId) throw new ServiceRequestError("resolution_rejected", "resolution source block changed before commit");
       const currentLocation = currentBlock.attemptId === null ? null : findRunAttempt(currentRun, currentBlock.nodeId, currentBlock.attemptId);
       if (currentBlock.attemptId !== null && currentLocation === null) throw new ServiceRequestError("resolution_rejected", "resolution source attempt is missing");
@@ -903,7 +888,7 @@ async function resolveBlockedWorkflow(
         const failure = runFailureInfoSchema.parse({
           kind: "operator",
           resolutionId,
-          provenance: "operator",
+          provenance: operatorResolution.provenance,
           reason: request.reason,
           failedAt: at,
           processGroupsConfirmedDead: true,
@@ -936,7 +921,29 @@ async function resolveBlockedWorkflow(
       const stopped = currentRun.desiredState === "stopped";
       let nodes = currentRun.nodes;
       let currentAttemptId = currentRun.currentAttemptId;
-      if (request.action === "retry" && currentLocation !== null) {
+      const verifierRetry = request.action === "retry" && sourceBlock.kind === "verifier_failed";
+      if (verifierRetry && currentLocation !== null) {
+        const attempt = currentLocation.attempt;
+        if (attempt.result.kind !== "settled" || attempt.result.outcome.kind !== "blocked"
+          || (attempt.result.outcome.candidate === null && attempt.workerFailure === undefined)) {
+          throw new ServiceRequestError("resolution_rejected", "verifier retry requires saved worker candidate or failure evidence");
+        }
+        const candidate = attempt.result.outcome.candidate;
+        nodes = currentRun.nodes.map((node) => node.nodeId !== currentLocation.node.nodeId ? node : {
+          ...node, status: "running" as const,
+          attempts: node.attempts.map((value) => value.attemptId !== attempt.attemptId ? value : {
+            ...value, status: "executing" as const, phase: "captureCandidate" as const, finishedAt: null, elapsedMs: null,
+            validatorExecutionId: null,
+            supersededValidatorExecutionIds: [...(value.supersededValidatorExecutionIds ?? []),
+              ...(value.validatorExecutionId === null ? [] : [value.validatorExecutionId])],
+            result: candidate === null
+              // SAFETY: a null saved candidate requires workerFailure in the guard above.
+              ? { kind: "worker_failure_committed" as const, failure: attempt.workerFailure!, validator: null }
+              : { kind: "candidate_committed" as const, candidate },
+          }),
+        });
+      }
+      if (request.action === "retry" && currentLocation !== null && !verifierRetry) {
         nodes = currentRun.nodes.map((node) => node.nodeId === currentLocation.node.nodeId ? { ...node, status: "failed" } : node);
         if (!judgmentRetry) currentAttemptId = null;
       } else if (accepted !== null && currentLocation !== null) {
@@ -977,7 +984,8 @@ async function resolveBlockedWorkflow(
         );
         capacityGateTaskId = Number(gateId);
       }
-      const preflight = request.action === "retry" && sourceBlock.kind === "preflight_failed" && currentRun.preflight.kind === "failed"
+      const preflight = request.action === "retry" && sourceBlock.nodeId === null
+        && (currentRun.preflight.kind === "failed" || currentRun.preflight.kind === "pending")
         ? { kind: "pending" as const, cacheKeyHash: currentRun.preflight.cacheKeyHash, processExecutionIds: currentRun.preflight.processExecutionIds }
         : currentRun.preflight;
       const nextRun = workflowRunDocumentV1Schema.parse({
@@ -1126,6 +1134,31 @@ function buildOperatorAcceptance(
   const settings = run.resolvedSettings.nodes[node.nodeId];
   if (settings === undefined) throw new ServiceRequestError("resolution_rejected", "frozen node settings are missing");
   const resultPath = resolvePath(installation.root, input.resultFile);
+  if ("formatVersion" in run.resolvedSettings && run.resolvedSettings.formatVersion === 4) {
+    if (target !== "worker" || attempt.workerExecutionId === null) {
+      throw new ServiceRequestError("resolution_rejected", "format 4 accept supplies a worker result, never a verifier verdict; retry the verifier or fail");
+    }
+    const loaded = readResultFileBytes(resultPath);
+    if (!loaded.ok) throw new ServiceRequestError("accept_result_invalid", loaded.failure.kind + ": " + loaded.failure.message);
+    const bytes = loaded.bytes;
+    const mode = run.resolvedSettings.nodes[node.nodeId]?.result;
+    if (mode === undefined) throw new ServiceRequestError("resolution_rejected", "frozen result mode is missing");
+    const parsed = mode === "text" ? parseTextResult(bytes) : parseTaggedWorkerResult(bytes);
+    if (!parsed.ok) throw new ServiceRequestError("accept_result_invalid", parsed.failure.kind + ": " + parsed.failure.message);
+    const result = parsed.value;
+    const reason = "reason" in result ? result.reason : null;
+    const question = "question" in result ? result.question : null;
+    const acceptance = operatorAcceptanceSchema.parse({
+      kind: "operator_acceptance", resolutionId: input.resolutionId, provenance: "human", target, reason: input.reason,
+      resolvedAt: input.resolvedAt, processGroupsConfirmedDead: true, acknowledgedEffects: true,
+      sourceBlock, resultBytesHash: parsed.sourceBytesHash,
+    });
+    return { target, validator: null, candidate: nodeResultSchema.parse({
+      version: 2, source: "operator", workerKind: settings.run.kind, exit: null, acceptance,
+      output: result.output, summary: reason ?? "", artifacts: [], sourceBytesHash: parsed.sourceBytesHash,
+      stdioResult: { version: 1, mode, status: result.status, reason, question },
+    }) };
+  }
   if (target === "worker") {
     if (attempt.workerExecutionId === null) throw new ServiceRequestError("resolution_rejected", "unknown worker outcome has no launched worker execution");
     const parsed = parseWorkerResultFile(resultPath);

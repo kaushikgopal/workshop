@@ -79,7 +79,7 @@ export const blockInfoSchema = z.strictObject({
 export const operatorAcceptanceSchema = z.strictObject({
   kind: z.literal("operator_acceptance"),
   resolutionId: resolutionIdSchema,
-  provenance: z.literal("operator"),
+  provenance: z.enum(["operator", "human"]),
   target: z.enum(["worker", "validator"]),
   reason: boundedReason,
   resolvedAt: utcTimestampSchema,
@@ -98,7 +98,7 @@ export const operatorAcceptanceSchema = z.strictObject({
 
 const operatorResolutionFields = {
   resolutionId: resolutionIdSchema,
-  provenance: z.literal("operator"),
+  provenance: z.enum(["operator", "human", "bot"]),
   reason: boundedReason,
   resolvedAt: utcTimestampSchema,
   processGroupsConfirmedDead: z.literal(true),
@@ -128,7 +128,7 @@ export const operatorResolutionSchema = z.discriminatedUnion("action", [
 export const operatorRunFailureSchema = z.strictObject({
   kind: z.literal("operator"),
   resolutionId: resolutionIdSchema,
-  provenance: z.literal("operator"),
+  provenance: z.enum(["operator", "human", "bot"]),
   reason: boundedReason,
   failedAt: utcTimestampSchema,
   processGroupsConfirmedDead: z.literal(true),
@@ -215,6 +215,10 @@ const nodeResultV2Fields = {
 const nodeResultV2Schema = z.discriminatedUnion("source", [
   z.strictObject({ ...nodeResultV2Fields, source: z.literal("command"), exit: processExitSchema }),
   z.strictObject({ ...nodeResultV2Fields, source: z.literal("agent"), exit: processExitSchema }),
+  z.strictObject({
+    ...nodeResultV2Fields, source: z.literal("operator"), workerKind: z.enum(["command", "agent"]),
+    exit: z.null(), acceptance: operatorAcceptanceSchema,
+  }),
 ]);
 
 /** Canonical checked candidate. Operator acceptance preserves its own provenance and source block. */
@@ -242,7 +246,12 @@ export const nodeResultSchema = z.union([nodeResultV1Schema, nodeResultV2Schema]
   }
 
   const { stdioResult } = result;
-  if (result.exit.kind !== "code" || result.exit.code !== 0) {
+  if (result.source === "operator") {
+    if (result.acceptance.provenance !== "human" || result.acceptance.target !== "worker"
+      || result.acceptance.resultBytesHash !== result.sourceBytesHash) {
+      context.addIssue({ code: "custom", path: ["acceptance"], message: "stdout acceptance requires human worker provenance and matching bytes" });
+    }
+  } else if (result.exit.kind !== "code" || result.exit.code !== 0) {
     context.addIssue({ code: "custom", path: ["exit"], message: "successful candidate results require exit code 0" });
   }
   if (result.artifacts.length !== 0) {

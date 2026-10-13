@@ -306,6 +306,7 @@ export const attemptDetailDtoSchema = z.strictObject({
   elapsedMs: elapsedMillisecondsSchema.nullable(),
   workerExecutionId: executionIdSchema.nullable(),
   validatorExecutionId: executionIdSchema.nullable(),
+  supersededValidatorExecutionIds: z.array(executionIdSchema).optional(),
   candidate: evidenceReferenceDtoSchema.nullable(),
   verdict: evidenceReferenceDtoSchema.nullable(),
   judgments: z.array(evidenceReferenceDtoSchema),
@@ -481,6 +482,16 @@ export const attemptDetailDtoSchema = z.strictObject({
     report(["validatorExecutionId"], "worker and validator execution IDs are distinct");
   }
 
+  const superseded = attempt.supersededValidatorExecutionIds ?? [];
+  if (new Set(superseded).size !== superseded.length
+    || superseded.some((id) => id === attempt.workerExecutionId || id === attempt.validatorExecutionId)) {
+    report(["supersededValidatorExecutionIds"], "superseded verifier IDs are unique and distinct from active executions");
+  }
+  for (const id of superseded) {
+    if (!attempt.processes.some((process) => process.executionId === id && process.role === "validator")) {
+      report(["supersededValidatorExecutionIds"], "superseded verifiers retain their process evidence");
+    }
+  }
   checkProcessIncarnations(attempt.processes, report, ["processes"]);
   if (attempt.workerExecutionId !== null && !attempt.processes.some((process) => process.role === "worker")
     && !(attempt.status === "executing" && attempt.phase === "awaitWorker" && attempt.candidate === null)) {
@@ -546,7 +557,8 @@ export const attemptDetailDtoSchema = z.strictObject({
   }
   for (const [index, process] of attempt.processes.entries()) {
     const expectedExecutionId = process.role === "worker" ? attempt.workerExecutionId : attempt.validatorExecutionId;
-    if (expectedExecutionId === null || process.executionId !== expectedExecutionId) {
+    const superseded = process.role === "validator" && attempt.supersededValidatorExecutionIds?.includes(process.executionId);
+    if (!superseded && (expectedExecutionId === null || process.executionId !== expectedExecutionId)) {
       report(["processes", index, "executionId"], `${process.role} process must match its attempt execution ID`);
     }
     if (attempt.startedAt !== null && process.launchIntentAt !== null

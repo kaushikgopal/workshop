@@ -18,7 +18,12 @@ Commands:
   stop <workflow>
       Stop activation and cancel only after safe task cleanup.
   resolve <workflow> --action retry|accept|fail --reason <text> [options]
-      Explicitly resolve a blocked run after process cleanup is confirmed.
+      Resolve only the actions permitted by the block kind after confirmed cleanup.
+      retry grants one attempt outside retries; verifier_failed reruns only the verifier.
+      Unknown effects require --allow-repeat for retry.
+      accept requires --result-file <path> --acknowledge-effects for external_outcome_unknown.
+      Supply UTF-8 text or tagged worker output in the step result mode.
+      Format 4 does not support --extra-attempt or --target judgment.
   status [<workflow>] [--json]
       Read service-backed workflow state.
   runs <workflow> [--json] [--all]

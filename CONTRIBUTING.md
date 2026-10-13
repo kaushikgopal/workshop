@@ -235,6 +235,7 @@ src/
 │  └─ schema-resolved.ts, parse-model.ts, hash-canonical-json.ts
 ├─ installation/                  find .workshop/, load workshop.yaml and workflows/
 ├─ run/                           run records, outcomes, admission, schedule math
+│  ├─ check-block-resolution.ts   format 4 action and resolver authority table
 │  ├─ locate-run-files.ts         readable paths and temporary capture identity
 │  └─ render-run-files.ts         results blocks and labeled execution evidence
 ├─ attempt/                       result parsing and agent prompts

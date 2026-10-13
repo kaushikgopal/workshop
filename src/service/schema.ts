@@ -51,6 +51,7 @@ export const serviceRequestV1Schema = z.discriminatedUnion("method", [
     method: z.literal("resolve"),
     runId: runIdSchema.optional(),
     action: z.enum(["retry", "accept", "fail"]),
+    resolver: z.enum(["human", "bot"]).optional(),
     target: z.literal("judgment").optional(),
     reason: z.string().min(1).max(16_384),
     allowRepeat: z.boolean().optional(),

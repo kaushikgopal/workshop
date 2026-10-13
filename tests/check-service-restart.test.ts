@@ -597,7 +597,7 @@ describe("public service restart", () => {
   }, 30_000);
 
 
-  test("operator retry and fail resolution require evidence; format 4 rejects human acceptance files", async () => {
+  test("human retry, accept, and fail require evidence and retain idempotent receipts", async () => {
     const retryRoot = mkdtempSync(join(tmpdir(), "workshop-resolve-retry-"));
     const retryMarker = join(retryRoot, "worker-launches.txt");
     try {
@@ -606,12 +606,12 @@ describe("public service restart", () => {
       const resume = runCli(retryRoot, ["resume", "retryable"]);
       expect(resume.status).not.toBe(0);
       expect(resume.stderr).toContain("resolve the current block");
-      const missingOverrides = runCli(retryRoot, ["resolve", "retryable", "--action", "retry", "--reason", "retry after checking the external effect", "--allow-repeat"]);
+      const missingOverrides = runCli(retryRoot, ["resolve", "retryable", "--action", "retry", "--reason", "retry after checking the external effect"]);
       expect(missingOverrides.status).not.toBe(0);
-      expect(missingOverrides.stderr).toContain("--extra-attempt required");
+      expect(missingOverrides.stderr).toContain("requires --allow-repeat");
       expect(missingOverrides.stdout).toContain(`Resolving run ${retry.runId}`);
       const retryService = JSON.parse(readFileSync(join(retryRoot, ".workshop", "state", "service.json"), "utf8")) as { socketPath: string };
-      const retryRequest = { version: 1 as const, requestId: randomUUID(), method: "resolve" as const, workflowId: "retryable", action: "retry" as const, reason: "retry after checking the external effect", allowRepeat: true, extraAttempt: true };
+      const retryRequest = { version: 1 as const, requestId: randomUUID(), method: "resolve" as const, workflowId: "retryable", action: "retry" as const, reason: "retry after checking the external effect", allowRepeat: true };
       await dropFirstServiceReply(retryService.socketPath, retryRequest);
       await waitForFileLength(retryMarker, 2);
       await waitForFile(retryStarted);
@@ -651,13 +651,13 @@ describe("public service restart", () => {
         { validatorCommand: "printf v >> '" + acceptedValidatorMarker + "'; touch '" + acceptedValidatorStarted + "'; sleep 3; test -n \"$(cat)\"" },
       );
       const resultFile = join(acceptRoot, "accepted-result.json");
-      writeFileSync(resultFile, JSON.stringify({ version: 1, output: "operator-accepted", summary: "checked by the operator", artifacts: [] }), "utf8");
+      writeFileSync(resultFile, "human-accepted", "utf8");
       const cliAcceptance = runCli(acceptRoot, [
         "resolve", "acceptable", "--action", "accept", "--reason", "the recorded worker effect was checked",
         "--result-file", resultFile, "--acknowledge-effects",
       ]);
-      expect(cliAcceptance.status).not.toBe(0);
-      expect(cliAcceptance.stderr).toMatch(/format.?4/i);
+      expect(cliAcceptance.status).toBe(0);
+      await waitForFile(acceptedValidatorStarted);
 
       const acceptService = JSON.parse(readFileSync(join(acceptRoot, ".workshop", "state", "service.json"), "utf8")) as { socketPath: string };
       const acceptRequest = {
@@ -672,18 +672,16 @@ describe("public service restart", () => {
       };
       const directAcceptance = await sendServiceRequest(acceptService.socketPath, acceptRequest);
       expect(directAcceptance.ok).toBe(false);
-      if (directAcceptance.ok) throw new Error("format 4 accepted a human result file");
-      expect(directAcceptance.error.message).toMatch(/format.?4/i);
-      const stillBlocked = await waitForRunStatus(acceptRoot, "acceptable", blocked.runId, "blocked");
-      expect(stillBlocked.status).toBe("blocked");
-      expect(stillBlocked.terminalOutput).toBeNull();
+      const acceptedRun = await waitForRun(acceptRoot, "acceptable", blocked.runId);
+      expect(acceptedRun.status).toBe("completed");
+      expect(acceptedRun.terminalOutput).toBe("human-accepted");
       expect(readFileSync(acceptMarker, "utf8")).toBe("w");
-      expect(existsSync(acceptedValidatorStarted)).toBe(false);
-      const blockedNode = runCli(acceptRoot, ["step", "describe", "acceptable", "work", "--run", blocked.runId, "--json"]);
-      expect(blockedNode.status).toBe(0);
-      const blockedDescription = nodeDescriptionDtoSchema.parse(JSON.parse(blockedNode.stdout));
-      expect(blockedDescription.node.successfulOutput).toBeNull();
-      expect(blockedDescription.node.attempts[0]?.candidate).toBeNull();
+      expect(readFileSync(acceptedValidatorMarker, "utf8")).toBe("v");
+      const acceptedNode = runCli(acceptRoot, ["step", "describe", "acceptable", "work", "--run", blocked.runId, "--json"]);
+      expect(acceptedNode.status).toBe(0);
+      const acceptedDescription = nodeDescriptionDtoSchema.parse(JSON.parse(acceptedNode.stdout));
+      expect(acceptedDescription.node.successfulOutput).toBe("human-accepted");
+      expect(acceptedDescription.node.attempts[0]?.operatorAcceptances).toMatchObject([{ provenance: "human" }]);
     } finally {
       await stopService(acceptRoot);
       rmSync(acceptRoot, { recursive: true, force: true });
@@ -2188,7 +2186,7 @@ async function waitForRetainedCapture(directory: string, retainedBytes: number):
   const deadline = Date.now() + 30_000;
   while (Date.now() < deadline) {
     if (existsSync(directory)) {
-      for (const name of readdirSync(directory)) {
+      for (const name of readdirSync(directory, { recursive: true, encoding: "utf8" })) {
         if (!name.endsWith(".stderr")) continue;
         const path = join(directory, name);
         if (existsSync(`${path}.retention.json`) && statSync(path).size === retainedBytes) return path;

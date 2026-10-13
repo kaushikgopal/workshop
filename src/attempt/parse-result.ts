@@ -139,7 +139,7 @@ export function parseValidatorVerdictFile(path: string): ResultEnvelopeParse<Val
   return loaded.ok ? parseValidatorVerdictBytes(loaded.bytes) : loaded;
 }
 
-function readResultFileBytes(path: string):
+export function readResultFileBytes(path: string):
   | { ok: true; bytes: Buffer }
   | { ok: false; failure: { kind: "result_invalid" | "result_too_large"; message: string } } {
   let fd: number;

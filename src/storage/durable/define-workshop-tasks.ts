@@ -275,7 +275,7 @@ export function defineWorkshopTasks(
             const node = current.nodes[nodeIndex];
             const attempt = node?.attempts.find((value) => value.attemptId === current.currentAttemptId);
             if (nodeIndex < 0 || node === undefined || node.status !== "running" || attempt === undefined
-              || (attempt.result.kind !== "candidate_committed" && attempt.result.kind !== "validation_committed")) {
+              || (attempt.result.kind !== "candidate_committed" && attempt.result.kind !== "validation_committed" && attempt.result.kind !== "worker_failure_committed")) {
               throw new Error("resolved current attempt is not ready to resume after capacity acquisition");
             }
             const childInput = nodeAttemptTaskInputSchema.parse({

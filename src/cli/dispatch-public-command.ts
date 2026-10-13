@@ -163,7 +163,7 @@ async function resolveCommand(args: readonly string[]): Promise<void> {
     positional.push(argument);
   }
   if (positional.length !== 1 || action === undefined || reason === undefined || reason.trim() === "") {
-    return usage("usage: workshop resolve <workflow> --action retry|accept|fail --reason <text> [--run <id>] [--target judgment] [--allow-repeat] [--extra-attempt] [--result-file <path> --acknowledge-effects]");
+    return usage("usage: workshop resolve <workflow> --action retry|accept|fail --reason <text> [--run <id>] [--allow-repeat] [--result-file <path> --acknowledge-effects]");
   }
   if ((action === "accept") !== (resultFile !== undefined && acknowledgeEffects)) {
     return usage("accept requires both --result-file and --acknowledge-effects");
@@ -187,7 +187,7 @@ async function resolveCommand(args: readonly string[]): Promise<void> {
   const resolvedRunId = runIdSchema.parse(blockedRun.runId);
   process.stdout.write(`Resolving run ${resolvedRunId}\n`);
   const response = await request(socketPath, {
-    version: 1, method: "resolve", requestId: randomUUID(), workflowId, runId: resolvedRunId, action, reason,
+    version: 1, method: "resolve", requestId: randomUUID(), workflowId, runId: resolvedRunId, action, reason, resolver: "human",
     ...(retryTarget === undefined ? {} : { target: retryTarget }),
     ...(allowRepeat ? { allowRepeat: true } : {}),
     ...(extraAttempt ? { extraAttempt: true } : {}),

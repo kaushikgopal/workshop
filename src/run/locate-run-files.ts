@@ -23,7 +23,7 @@ export function locateProcessFiles(runDirectory: string, identity: ProcessFileId
   const captureDirectory = join(dirname(dirname(runDirectory)), "state", "captures", basename(runDirectory));
   const directory = identity.role === "preflight"
     ? join(captureDirectory, "preflight", identity.executionId)
-    : join(captureDirectory, `${requireValue(identity.nodeId)}.${requireValue(identity.attemptNumber)}`);
+    : join(captureDirectory, `${requireValue(identity.nodeId)}.${requireValue(identity.attemptNumber)}`, identity.executionId);
   const stem = identity.incarnationNumber === 1 ? identity.role : `${identity.role}.${identity.incarnationNumber}`;
   return {
     directory,

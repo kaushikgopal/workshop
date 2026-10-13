@@ -407,7 +407,8 @@ function assertProcessEvidenceJoin(
   const executionId = process.role === "worker" ? attempt?.workerExecutionId : attempt?.validatorExecutionId;
   const reference = attempt?.processIncarnations.find((candidate) => candidate.executionId === process.executionId
     && candidate.incarnationId === process.incarnationId);
-  if (executionId !== process.executionId || reference === undefined) {
+  const superseded = process.role === "validator" && attempt?.supersededValidatorExecutionIds?.includes(process.executionId);
+  if ((!superseded && executionId !== process.executionId) || reference === undefined) {
     throw new Error(`process evidence ${entry.id} does not match its run attempt`);
   }
 }
@@ -501,6 +502,7 @@ function projectAttemptDetail(
     elapsedMs: attempt.elapsedMs,
     workerExecutionId: attempt.workerExecutionId,
     validatorExecutionId: attempt.validatorExecutionId,
+    ...(attempt.supersededValidatorExecutionIds === undefined ? {} : { supersededValidatorExecutionIds: attempt.supersededValidatorExecutionIds }),
     candidate: candidateEvidence,
     verdict: validatorEvidence,
     judgments,

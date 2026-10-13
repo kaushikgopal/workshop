@@ -15,7 +15,8 @@ import { readServiceWorklog, sendServiceRequest, streamServiceLogChunks } from "
 import { acquireServiceLock } from "../src/service/acquire-service-lock.js";
 import { WorkshopInstallationDoc, WorkshopProcessEntry } from "../src/storage/durable/define-workshop-records.js";
 import { openDurableStorage } from "../src/storage/durable/open-durable-storage.js";
-import { format4ResolutionRejection, startWorkshopService } from "../src/service/open-service-runtime.js";
+import { startWorkshopService } from "../src/service/open-service-runtime.js";
+import { checkBlockResolution } from "../src/run/check-block-resolution.js";
 import { logsDtoSchema, nodeDescriptionDtoSchema, statusDtoSchema, type LogsDto } from "../src/views/schema.js";
 
 async function waitForCompletedRun(socketPath: string, workflowId: string, runId: string): Promise<void> {
@@ -37,15 +38,15 @@ async function waitForCompletedRun(socketPath: string, workflowId: string, runId
 
 describe("Durable service runtime", () => {
   test("limits format 4 runtime and integrity blocks to fail", () => {
-    expect(format4ResolutionRejection({ formatVersion: 4, blockKind: "runtime_incompatible", action: "retry" }))
-      .toContain("permit only fail");
-    expect(format4ResolutionRejection({ formatVersion: 4, blockKind: "integrity_failed", action: "retry" }))
-      .toContain("permit only fail");
-    expect(format4ResolutionRejection({ formatVersion: 4, blockKind: "integrity_failed", action: "accept" }))
-      .toContain("WP6 must define human text/tagged acceptance");
-    expect(format4ResolutionRejection({ formatVersion: 4, blockKind: "runtime_incompatible", action: "fail" })).toBeNull();
-    expect(format4ResolutionRejection({ formatVersion: 4, blockKind: "integrity_failed", action: "fail" })).toBeNull();
-    expect(format4ResolutionRejection({ formatVersion: 3, blockKind: "runtime_incompatible", action: "retry" })).toBeNull();
+    expect(checkBlockResolution({ formatVersion: 4, blockKind: "runtime_incompatible", action: "retry" }))
+      .toContain("permits only fail");
+    expect(checkBlockResolution({ formatVersion: 4, blockKind: "integrity_failed", action: "retry" }))
+      .toContain("permits only fail");
+    expect(checkBlockResolution({ formatVersion: 4, blockKind: "integrity_failed", action: "accept" }))
+      .toContain("permits only fail");
+    expect(checkBlockResolution({ formatVersion: 4, blockKind: "runtime_incompatible", action: "fail" })).toBeNull();
+    expect(checkBlockResolution({ formatVersion: 4, blockKind: "integrity_failed", action: "fail" })).toBeNull();
+    expect(checkBlockResolution({ formatVersion: 3, blockKind: "runtime_incompatible", action: "retry" })).toBeNull();
   });
   test("serves start, status, runs, and logs for one canonical run through real SQLite and Harness resources", async () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-service-runtime-"));
@@ -725,8 +726,8 @@ for (const terminalKind of ["failure", "early completion"] as const) {
       if (!status.ok) throw new Error(status.error.message);
       expect(statusDtoSchema.parse(status.result).workflows.every((workflow) => workflow.unresolvedRun === null)).toBe(true);
       for (const blockKind of ["verifier_block", "verifier_failed", "repeated_failure"] as const) {
-        expect(format4ResolutionRejection({ formatVersion: 4, blockKind, action: "accept" })).toContain("cannot accept a fabricated");
-        expect(format4ResolutionRejection({ formatVersion: 4, blockKind, action: "retry" })).toBeNull();
+        expect(checkBlockResolution({ formatVersion: 4, blockKind, action: "accept" })).toContain("accept is only available for external_outcome_unknown");
+        expect(checkBlockResolution({ formatVersion: 4, blockKind, action: "retry" })).toBeNull();
       }
     } finally {
       if (owner !== undefined) await owner.shutdown();

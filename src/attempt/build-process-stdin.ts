@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { join } from "node:path";
+import { buildFailureFeedback } from "./build-failure-feedback.js";
 import { workflowRunDocumentV1Schema, type WorkflowRunDocumentV1 } from "../run/records.js";
 import type { persistedNodeAttemptSchema } from "../run/records.js";
 import {
@@ -80,7 +81,7 @@ export function reconstructProcessStdin(input: ProcessStdinIdentity, runDocument
       logPath: join(parsed.paths.runDirectory, "execution.log"),
       previousOutput,
       resultMode: nodeSettings.result,
-      feedback: earlierFeedback(node.attempts, attempt.number),
+      feedback: workerFeedback(parsed, input.nodeId, attempt),
     };
     return buildProcessStdin({ role: "worker", kind: "agent", prompt });
   }
@@ -135,4 +136,15 @@ function committedPreviousOutput(run: ReadyRun, nodeId: string): { stepId: strin
 function earlierFeedback(attempts: readonly PersistedNodeAttempt[], number: number): string | null {
   const source = attempts.filter((attempt) => attempt.number < number && attempt.feedback !== undefined).at(-1)?.feedback;
   return source === undefined ? null : "Source step: " + source.nodeId + "\nSource attempt: " + source.attemptNumber + "\n\n" + source.text;
+}
+
+function workerFeedback(run: ReadyRun, nodeId: string, attempt: PersistedNodeAttempt): string | null {
+  const node = run.nodes.find((value) => value.nodeId === nodeId);
+  const previousAttempt = node?.attempts.find((value) => value.number === attempt.number - 1);
+  const botResolution = run.resolutions.find((resolution) => resolution.provenance === "bot" && resolution.action === "retry"
+    && (resolution.sourceBlock.nodeId === nodeId && resolution.sourceBlock.attemptId === previousAttempt?.attemptId
+      || resolution.sourceBlock.nodeId === null && run.chain.order[0] === nodeId && attempt.number === 1));
+  const failureFeedback = earlierFeedback(node?.attempts ?? [], attempt.number);
+  if (botResolution === undefined) return failureFeedback;
+  return buildFailureFeedback("Bot resolution: " + botResolution.reason + (failureFeedback === null ? "" : "\n\n" + failureFeedback));
 }

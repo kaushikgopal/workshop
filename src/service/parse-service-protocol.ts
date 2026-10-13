@@ -79,6 +79,9 @@ export function parseServiceRequestLine(line: string | Uint8Array): ParsedServic
       })),
     });
   }
+  if (parsed.data.method === "resolve" && parsed.data.resolver === "bot") {
+    return failure(correlatedId, "resolution_rejected", "socket resolve is human-only; bot tools must run inside the service");
+  }
   return { ok: true, request: parsed.data };
 }
 

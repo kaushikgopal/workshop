@@ -137,6 +137,7 @@ export const persistedNodeAttemptSchema = z.strictObject({
   elapsedMs: nonnegativeSafeInteger.nullable(),
   workerExecutionId: executionIdSchema.nullable(),
   validatorExecutionId: executionIdSchema.nullable(),
+  supersededValidatorExecutionIds: z.array(executionIdSchema).optional(),
   result: pendingAttemptResultSchema,
   processIncarnations: z.array(processEvidenceReferenceSchema),
   blockIds: z.array(z.string().min(1)),
@@ -176,8 +177,13 @@ export const persistedNodeAttemptSchema = z.strictObject({
     && Date.parse(attempt.finishedAt) - Date.parse(attempt.startedAt) !== attempt.elapsedMs) {
     context.addIssue({ code: "custom", path: ["elapsedMs"], message: "elapsed time matches the recorded timestamp difference" });
   }
+  const superseded = attempt.supersededValidatorExecutionIds ?? [];
+  if (new Set(superseded).size !== superseded.length
+    || superseded.some((id) => id === attempt.workerExecutionId || id === attempt.validatorExecutionId)) {
+    context.addIssue({ code: "custom", path: ["supersededValidatorExecutionIds"], message: "superseded verifier IDs are unique and distinct from active executions" });
+  }
   const processIds = new Map<string, Set<string>>();
-  const executionIds = new Set([attempt.workerExecutionId, attempt.validatorExecutionId].filter((id) => id !== null));
+  const executionIds = new Set([attempt.workerExecutionId, attempt.validatorExecutionId, ...(attempt.supersededValidatorExecutionIds ?? [])].filter((id) => id !== null));
   for (const [index, process] of attempt.processIncarnations.entries()) {
     const incarnations = processIds.get(process.executionId) ?? new Set<string>();
     if (incarnations.has(process.incarnationId)) {

@@ -63,7 +63,7 @@ export function renderWorklog(value: WorkflowRunDocumentV1, options: { readonly 
           }
         }
         if (candidate.source === "operator") {
-          lines.push(`- Operator acceptance: ${inlineCode(candidate.acceptance.resolutionId)}`);
+          lines.push(`- Acceptance provenance: ${candidate.acceptance.provenance}; resolution: ${inlineCode(candidate.acceptance.resolutionId)}`);
           lines.push(...quote(candidate.acceptance.reason));
         } else {
           lines.push(`- Worker exit: ${describeExit(candidate.exit)}`);
@@ -104,7 +104,7 @@ export function renderWorklog(value: WorkflowRunDocumentV1, options: { readonly 
   if (run.resolutions.length > 0) {
     lines.push("## Global decision log", "");
     for (const resolution of run.resolutions) {
-      lines.push(`- ${resolution.resolvedAt}: ${resolution.action} (${inlineCode(resolution.resolutionId)})`);
+      lines.push(`- ${resolution.resolvedAt}: ${resolution.action} (${inlineCode(resolution.resolutionId)}; ${resolution.provenance})`);
       lines.push(...quote(resolution.reason));
     }
   }

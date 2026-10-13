@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
@@ -100,4 +100,31 @@ describe("retained process evidence", () => {
     expect(one.stdoutPath).not.toBe(two.stdoutPath);
     expect(one.resultsPath).toBe("/project/.workshop/runs/run-id/results.md");
   });
+});
+
+test("old verifier cleanup cannot delete a replacement verifier capture", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "workshop-verifier-captures-"));
+  try {
+    const runDirectory = join(directory, "runs", "run-id");
+    const identity = { role: "validator" as const, nodeId: "work", attemptNumber: 1, incarnationNumber: 1, executionId: "old" };
+    const old = locateProcessFiles(runDirectory, identity);
+    const replacement = locateProcessFiles(runDirectory, { ...identity, executionId: "new" });
+    mkdirSync(old.directory, { recursive: true });
+    mkdirSync(replacement.directory, { recursive: true });
+    writeFileSync(old.stdoutPath, "old");
+    writeFileSync(old.stderrPath, "diagnostic");
+    const captures = await captureProcessRecords({ ...old, streamCapBytes: 256 }, { stdout: stats(3), stderr: stats(10) });
+    writeFileSync(replacement.stdoutPath, "replacement evidence");
+    const at = "2026-10-13T00:00:00.000Z";
+    const process = processIncarnationSchema.parse({
+      executionId: "old", incarnationId: "incarnation", incarnationNumber: 1, role: "validator", status: "exited",
+      replay: "safe", commandHash: hash(Buffer.from("command")), launchIntentAt: at, startedAt: at, finishedAt: at,
+      deadlineAt: null, identity: { pid: 123, pgid: 123, startIdentity: "identity", serviceBootId: "boot" },
+      exit: { kind: "code", code: 127 }, cleanupState: "confirmed_dead", captures,
+    });
+    removeProcessCaptures(process, true);
+    expect(existsSync(old.stdoutPath)).toBe(false);
+    expect(readFileSync(replacement.stdoutPath, "utf8")).toBe("replacement evidence");
+    expect(old.stdoutPath).not.toBe(replacement.stdoutPath);
+  } finally { rmSync(directory, { recursive: true, force: true }); }
 });

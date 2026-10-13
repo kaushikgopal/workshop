@@ -101,10 +101,10 @@ export function defineNodeAttemptTask(
           return;
         }
         const attempt = requireAttempt(run, input.nodeId, input.attemptId);
-        if (attempt.result.kind === "candidate_committed") {
+        if (attempt.result.kind === "candidate_committed" || attempt.result.kind === "worker_failure_committed") {
           if (attempt.workerExecutionId === null || attempt.validatorExecutionId !== null) {
             const block = blockInfo("integrity_failed", "operator candidate acceptance does not match process history", input.runId, input.nodeId, input.attemptId, timestamp(runtime.now()));
-            await settleAttempt(task, runtime, input, { kind: "blocked", block, candidate: attempt.result.candidate, validator: null }, "interrupted", context);
+            await settleAttempt(task, runtime, input, { kind: "blocked", block, candidate: attempt.result.kind === "candidate_committed" ? attempt.result.candidate : null, validator: null }, "interrupted", context);
             return;
           }
           await runtime.commit(() => ({ status: "running", checkpoint: {
