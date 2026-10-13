@@ -3,6 +3,7 @@ import type { Context } from "@earendil-works/chord";
 import { defineTask, type ConversationId, type Task, type TaskId, type TaskRuntime, type Tx } from "@earendil-works/pi-durable";
 import { z } from "zod";
 import { canonicalHash } from "../../definition/hash-canonical-json.js";
+import { resolveRetryLimit } from "../../definition/resolve-retry-limit.js";
 import type { ResolvedPreflightSettings } from "../../definition/schema-resolved.js";
 import { nodeIdSchema, workflowIdSchema } from "../../definition/schema.js";
 import { parseModel } from "../../definition/parse-model.js";
@@ -1330,7 +1331,8 @@ function failureJudgmentAllowedActions(
 ): ("retry" | "block" | "fail")[] {
   const repeatSafe = settings.run.replay === "safe"
     && (settings.validator === null || settings.validator.replay === "safe");
-  return repeatSafe && attempt.number < settings.maxAttempts
+  const retryLimit = resolveRetryLimit(settings);
+  return repeatSafe && (retryLimit === "unlimited" || attempt.number <= retryLimit)
     ? ["retry", "block", "fail"]
     : ["block", "fail"];
 }
@@ -1362,10 +1364,11 @@ function renderFailureJudgmentPrompt(
     : outcome.validator.kind === "operator"
       ? { kind: outcome.validator.kind, passed: outcome.validator.verdict.passed, reasonExcerpt: untrustedFailureExcerpt(outcome.validator.verdict.reason), resultBytesHash: outcome.validator.resultBytesHash }
       : { kind: outcome.validator.kind, exit: outcome.validator.exit, stdoutHash: outcome.validator.stdoutHash, stderrHash: outcome.validator.stderrHash };
+  const retryLimit = resolveRetryLimit(settings);
   const evidence = {
     workflowPolicy: {
-      maxAttempts: settings.maxAttempts,
-      attemptsRemaining: Math.max(0, settings.maxAttempts - attempt.number),
+      retries: retryLimit,
+      retriesRemaining: retryLimit === "unlimited" ? "unlimited" : Math.max(0, retryLimit + 1 - attempt.number),
       worker: { kind: settings.run.kind, replay: settings.run.replay },
       validator: settings.validator === null ? null : { kind: settings.validator.kind, replay: settings.validator.replay },
     },

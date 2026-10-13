@@ -1,9 +1,10 @@
+version: 4
 description: Generate an original sentence, check it, and archive one quote file per run.
 schedule:
   every: 10m
   max_runs: 6
 defaults:
-  max_attempts: 2
+  retries: 1
   timeout: 10m
   replay: safe
 environment:
@@ -19,12 +20,13 @@ steps:
         Write the required result JSON to the supplied result path.
         Put only the sentence in output; explain your checks in summary.
         Do not edit archived quotes or Workshop state.
-      check: |
-        Independently compare the candidate with the quote files in the
-        directory named by $WORKSHOP_ARCHIVE. Pass only if it is one original
-        sentence, does not claim Hemingway authorship, and is materially
-        distinct in scene, image, and wording.
-        Write the required passed/reason JSON to your supplied result path.
+      verify:
+        agent: |
+          Independently compare the candidate with the quote files in the
+          directory named by $WORKSHOP_ARCHIVE. Pass only if it is one original
+          sentence, does not claim Hemingway authorship, and is materially
+          distinct in scene, image, and wording.
+          Write the required passed/reason JSON to your supplied result path.
   - publish-quote:
       run: cp "$WORKSHOP_PREVIOUS_OUTPUT_FILE" "$WORKSHOP_ARCHIVE/$WORKSHOP_RUN_ID.md"
-      max_attempts: 1
+      retries: 0

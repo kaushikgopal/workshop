@@ -55,6 +55,10 @@ const StorageReceiptTask = defineTask<Record<string, never>, ReceiptCheckpoint, 
 
 function fixtureRun(conversationId: number, workflowTaskId: number, baseDir: string) {
   const sourceText = [
+    "version: 4",
+    "defaults:",
+    "  retries: 0",
+    "  replay: never",
     "steps:",
     "  - prepare-report: echo prepare",
     "",

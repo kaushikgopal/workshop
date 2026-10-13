@@ -23,11 +23,15 @@ describe("public inspection parity", () => {
     mkdirSync(workflows, { recursive: true });
     writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\n", "utf8");
     writeFileSync(join(workflows, "chain.yaml"), [
+      "version: 4",
+      "defaults:",
+      "  retries: 0",
+      "  replay: never",
       "steps:",
       "  - first:",
       "      run: >-",
       `        printf started > '${firstStarted}'; while [ ! -e '${releaseFirst}' ]; do sleep 0.05; done; printf worker-err >&2; printf first-output`,
-      "      check:",
+      "      verify:",
       "        run: >-",
       "          printf validator-out; printf validator-err >&2",
       "  - second:",
@@ -37,6 +41,10 @@ describe("public inspection parity", () => {
       "",
     ].join("\n"), "utf8");
     writeFileSync(join(workflows, "idle.yaml"), [
+      "version: 4",
+      "defaults:",
+      "  retries: 0",
+      "  replay: never",
       "steps:",
       "  - only: printf idle",
       "",
@@ -127,11 +135,15 @@ describe("public inspection parity", () => {
 describe("retention limits", () => {
   test("resolves stream caps from node override, workflow default, machine default, then the built-in limit", () => {
     const definition = (defaults: string) => checkDefinitionText([
-      ...defaults === "" ? [] : ["defaults:", `  stream_cap: ${defaults}`],
+      "version: 4",
+      "defaults:",
+      "  retries: 0",
+      "  replay: never",
+      ...defaults === "" ? [] : [`  stream_cap: ${defaults}`],
       "steps:",
       "  - inherited:",
       "      run: printf inherited",
-      "      check: printf ok",
+      "      verify: printf ok",
       "  - overridden:",
       "      run: printf overridden",
       "      stream_cap: unlimited",

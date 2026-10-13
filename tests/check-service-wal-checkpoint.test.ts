@@ -26,6 +26,10 @@ test("checkpoints the service WAL after active tasks become idle", async () => {
   mkdirSync(workflows, { recursive: true });
   writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\n", "utf8");
   writeFileSync(join(workflows, "idle.yaml"), [
+    "version: 4",
+    "defaults:",
+    "  retries: 0",
+    "  replay: never",
     "steps:",
     "  - wait:",
     `      run: 'touch \"${launched}\"; while [ ! -e \"${release}\" ]; do sleep 0.01; done; printf done'`,

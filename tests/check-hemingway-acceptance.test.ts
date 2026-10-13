@@ -206,24 +206,23 @@ function createFixture(options: {
 
   const publication = publicationCommand(activityLog);
   const workflowLines = [
+    "version: 4",
     "description: Exercise scheduled Hemingway generation, independent validation, and per-run publication.",
     ...(options.schedule ? ["schedule:", "  every: 50ms", "  max_runs: 6"] : []),
     "defaults:",
-    "  max_attempts: 1",
+    "  retries: 0",
     "  replay: safe",
     "steps:",
     "  - generate:",
     "      agent:",
     "        instructions: Write one distinct original sentence to the supplied result path.",
-    "      check:",
+    "      verify:",
     "        agent:",
     `          harness:\n            command: ${JSON.stringify(validatorCommand)}`,
     "          instructions: Compare the candidate with archived quotes and write a checked verdict.",
-    "        replay: safe",
     "  - publish:",
     "      run: |",
     ...publication.split("\n").map((line) => `        ${line}`),
-    "      max_attempts: 1",
     "      replay: safe",
     "",
   ];

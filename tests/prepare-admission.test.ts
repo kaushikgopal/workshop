@@ -6,8 +6,9 @@ import { resolveWorkflowSettings } from "../src/definition/resolve-workflow-sett
 import { prepareRunAdmission } from "../src/run/prepare-admission.js";
 
 const sourceText = [
+  "version: 4",
   "defaults:",
-  "  max_attempts: 3",
+  "  retries: 2",
   "  timeout: 2m",
   "  stream_cap: 64kb",
   "  replay: safe",
@@ -18,7 +19,7 @@ const sourceText = [
   "steps:",
   "  - prepare-report:",
   "      run: echo prepare",
-  "      check: { run: test -f output, timeout: 30s, replay: safe }",
+  "      verify: { run: test -f output }",
   "",
 ].join("\n");
 const machineConfig = { shell: "/bin/bash", default_timeout: "90s", stream_cap: "128kb" } as const;
@@ -76,8 +77,9 @@ describe("prepareRunAdmission", () => {
       nodes: {
         "prepare-report": {
           run: { kind: "command", timeoutMs: 120_000, streamCapBytes: 64 * 1024, replay: "safe" },
-          validator: { kind: "command", timeoutMs: 30_000, replay: "safe" },
-          maxAttempts: 3,
+          validator: { kind: "command", timeoutMs: 120_000, replay: "safe" },
+          retries: 2,
+          result: "text",
         },
       },
       preflight: { command: "echo preflight", timeoutMs: 5_000 },

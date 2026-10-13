@@ -21,6 +21,10 @@ import { encodeServiceRequestLine, parseServiceResponseLine } from "../src/servi
 import { openDurableStorage } from "../src/storage/durable/open-durable-storage.js";
 
 const sourceText = [
+  "version: 4",
+  "defaults:",
+  "  retries: 0",
+  "  replay: never",
   "steps:",
   "  - prepare-report: echo prepare",
   "",

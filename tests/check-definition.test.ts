@@ -10,8 +10,11 @@ import { resolveWorkflowSettings } from "../src/definition/resolve-workflow-sett
 import {
   machineConfigSchema,
   workflowSchema,
-  type WorkflowDefinition,
+  type MachineConfig,
 } from "../src/definition/schema.js";
+import { resolvedWorkflowSettingsSchema } from "../src/definition/schema-resolved.js";
+import { resolveRetryLimit } from "../src/definition/resolve-retry-limit.js";
+import { checkNoOpenLegacyRuns } from "../src/service/check-legacy-runs.js";
 import { parseStrictYaml } from "../src/definition/parse-yaml.js";
 import { parseByteSize, parseDuration } from "../src/util/parse-units.js";
 
@@ -41,25 +44,14 @@ describe("workflow and machine schemas", () => {
     expect(machineConfigSchema.parse({})).toEqual({});
   });
 
-  test("resolves keep_files from workflow defaults, machine defaults, and the failed default", () => {
-    const definition = workflowSchema.parse(baseDefinition());
-    const machine = machineConfigSchema.parse({});
-    const resolve = (workflow: WorkflowDefinition, config: typeof machine) =>
-      resolveWorkflowSettings({ definition: workflow, machine: config, projectCwd: "/tmp" }).keepFiles;
+  test("resolves keep_files from machine config and the failed default", () => {
+    const definition = workflowSchema.parse(baseDefinition({ defaults: { retries: 0, replay: "never" } }));
+    const resolve = (config: MachineConfig) =>
+      resolveWorkflowSettings({ definition, machine: config, projectCwd: "/tmp" }).keepFiles;
 
-    expect(resolve(definition, machine)).toBe("failed");
-    expect(resolve(definition, machineConfigSchema.parse({ keep_files: "always" }))).toBe("always");
-    expect(resolve(
-      workflowSchema.parse(baseDefinition({ defaults: { keep_files: "always" } })),
-      machine,
-    )).toBe("always");
-    expect(resolve(
-      workflowSchema.parse(baseDefinition({ defaults: { keep_files: "failed" } })),
-      machineConfigSchema.parse({ keep_files: "always" }),
-    )).toBe("failed");
-
+    expect(resolve(machineConfigSchema.parse({}))).toBe("failed");
+    expect(resolve(machineConfigSchema.parse({ keep_files: "always" }))).toBe("always");
     expect(() => machineConfigSchema.parse({ keep_files: "success" })).toThrow();
-    expect(() => workflowSchema.parse(baseDefinition({ defaults: { keep_files: "success" } }))).toThrow();
   });
 
   test("loads the copyable workflow and fixture machine in a temporary installation", () => {
@@ -210,6 +202,10 @@ describe("workflow and machine schemas", () => {
     for (const attempts of [0, -1, 1.5]) {
       expect(() => workflowSchema.parse(baseDefinition({ defaults: { max_attempts: attempts } }))).toThrow();
     }
+    for (const retries of [-1, 1.5, "forever"]) {
+      expect(() => workflowSchema.parse(baseDefinition({ defaults: { retries } }))).toThrow();
+    }
+    expect(workflowSchema.parse(baseDefinition({ defaults: { retries: 0 } })).defaults).toEqual({ retries: 0 });
     expect(() => workflowSchema.parse(baseDefinition({
       defaults: { stream_cap: `${"9".repeat(400)}mb` },
     }))).toThrow(/finite safe-integer byte value/);
@@ -276,117 +272,190 @@ describe("workflow and machine schemas", () => {
   });
 });
 
+const V4 = "version: 4\ndefaults: { retries: 0, replay: never }\n";
+
 describe("authored workflow text", () => {
   test("uses the file name as the workflow id", () => {
-    const checked = checkDefinitionText("steps:\n  - greet: echo hello\n", "/project/.workshop/workflows/greeting.yaml", "greeting");
+    const checked = checkDefinitionText(`${V4}steps:\n  - greet: echo hello\n`, "/project/.workshop/workflows/greeting.yaml", "greeting");
     expect(checked.def.id).toBe("greeting");
     expect(checked.chain.order).toEqual(["greet"]);
   });
 
-  test("allows an omitted version and version 3", () => {
-    const text = "steps:\n  - greet: echo hello\n";
-    expect(checkDefinitionText(text, "clock.yaml", "clock").def.id).toBe("clock");
-    expect(checkDefinitionText(`version: 3\n${text}`, "clock.yaml", "clock").def.id).toBe("clock");
+  test("requires version 4 and names the migration for older files", () => {
+    const steps = "defaults: { retries: 0, replay: never }\nsteps:\n  - greet: echo hello\n";
+    expect(checkDefinitionText(`version: 4\n${steps}`, "clock.yaml", "clock").def.id).toBe("clock");
+    expect(() => checkDefinitionText(steps, "clock.yaml", "clock")).toThrow(/must declare version: 4.*max_attempts: N with retries: N-1/);
+    expect(() => checkDefinitionText(`version: 3\n${steps}`, "clock.yaml", "clock")).toThrow(/version 3 is no longer supported; declare version: 4.*check: with verify:/);
   });
 
-  test("normalizes ordered steps and string checks to same-kind validators", () => {
+  test("normalizes ordered steps and verifiers written like step bodies", () => {
     const checked = checkDefinitionText([
+      "version: 4",
+      "defaults:",
+      "  retries: 0",
+      "  replay: never",
       "steps:",
       "  - command-shortcut: echo shortcut",
       "  - command-step:",
       "      run: echo command",
-      "      check: test -s output.txt",
-      "  - agent-step:",
-      "      agent: Write the result.",
-      "      check: Judge the result.",
-      "",
-    ].join("\n"), "clock.yaml", "clock");
-
-    expect(checked.chain.order).toEqual(["command-shortcut", "command-step", "agent-step"]);
-    expect(checked.chain.prev.get("command-shortcut")).toBeNull();
-    expect(checked.chain.prev.get("agent-step")).toBe("command-step");
-    expect(checked.def.nodes).toMatchObject({
-      "command-shortcut": { run: { command: "echo shortcut" }, next: "command-step" },
-      "command-step": {
-        run: { command: "echo command" },
-        validator: { command: "test -s output.txt" },
-        next: "agent-step",
-      },
-      "agent-step": {
-        run: { agent: { instructions: "Write the result." } },
-        validator: { agent: { instructions: "Judge the result." } },
-        next: null,
-      },
-    });
-  });
-
-  test("normalizes explicit run and agent checks with their limits", () => {
-    const checked = checkDefinitionText([
-      "steps:",
-      "  - command-step:",
+      "      verify: test -s output.txt",
+      "  - run-verified:",
       "      run: echo command",
-      "      check:",
-      "        run: test -s output.txt",
-      "        timeout: 5s",
-      "        replay: safe",
+      "      verify: { run: test -s output.txt }",
       "  - agent-step:",
       "      agent:",
       "        instructions: Write the result.",
       "        model: provider/model:low",
       "        harness: pi",
-      "      check:",
+      "      verify:",
       "        agent:",
       "          instructions: Judge the result.",
       "          model: provider/judge:medium",
-      "        timeout: 10s",
-      "        replay: never",
       "",
     ].join("\n"), "clock.yaml", "clock");
 
+    expect(checked.chain.order).toEqual(["command-shortcut", "command-step", "run-verified", "agent-step"]);
+    expect(checked.chain.prev.get("command-shortcut")).toBeNull();
+    expect(checked.chain.prev.get("agent-step")).toBe("run-verified");
     expect(checked.def.nodes).toMatchObject({
-      "command-step": {
-        validator: { command: "test -s output.txt", timeout: "5s", replay: "safe" },
-        next: "agent-step",
-      },
+      "command-shortcut": { run: { command: "echo shortcut" }, next: "command-step" },
+      "command-step": { validator: { command: "test -s output.txt" }, next: "run-verified" },
+      "run-verified": { validator: { command: "test -s output.txt" }, next: "agent-step" },
       "agent-step": {
         run: { agent: { instructions: "Write the result.", model: "provider/model:low", harness: "pi" } },
-        validator: { agent: { instructions: "Judge the result.", model: "provider/judge:medium" }, timeout: "10s", replay: "never" },
+        validator: { agent: { instructions: "Judge the result.", model: "provider/judge:medium" } },
         next: null,
       },
     });
   });
 
+  test("requires every step to resolve retries and replay, and replay: never to forbid retries", () => {
+    const cases = [
+      ["no retries", "version: 4\ndefaults: { replay: safe }\nsteps:\n  - one: echo hi\n", /step "one": retries is not set/],
+      ["no replay", "version: 4\ndefaults: { retries: 1 }\nsteps:\n  - one: echo hi\n", /step "one": replay is not set/],
+      ["never retries", "version: 4\nsteps:\n  - one: { run: echo hi, retries: 1, replay: never }\n", /replay: never requires retries: 0/],
+      ["never default", "version: 4\ndefaults: { retries: 2, replay: never }\nsteps:\n  - one: echo hi\n", /step "one": replay: never requires retries: 0/],
+      ["negative", "version: 4\nsteps:\n  - one: { run: echo hi, retries: -1, replay: safe }\n", /./],
+      ["empty agent verifier", `${V4}steps:\n  - one:\n      run: echo hi\n      verify: { agent: \"  \" }\n`, /agent verifier needs nonempty instructions/],
+      ["verifier limits", `${V4}steps:\n  - one:\n      run: echo hi\n      verify: { run: echo ok, timeout: 5s }\n`, /./],
+    ] as const;
+    for (const [label, text, message] of cases) {
+      expect(() => checkDefinitionText(text, `${label}.yaml`, "clock"), label).toThrow(message);
+    }
+    const unlimited = checkDefinitionText(
+      "version: 4\nsteps:\n  - one: { run: echo hi, retries: unlimited, replay: safe }\n  - two: { run: echo bye, retries: 0, replay: never }\n",
+      "clock.yaml",
+      "clock",
+    );
+    expect(unlimited.def.nodes.one).toMatchObject({ retries: "unlimited", replay: "safe" });
+  });
+
   test("rejects legacy keys with the replacement named", () => {
     const cases = [
-      ["id", "id: old\nsteps:\n  - one: echo hi\n", /id:.*file name/],
-      ["nodes", "nodes:\n  one:\n    run: { command: echo hi }\n    next: null\n", /nodes:.*steps:/],
-      ["next", "steps:\n  - one:\n      run: echo hi\n      next: two\n", /next:.*steps run in list order/],
-      ["validator", "steps:\n  - one:\n      run: echo hi\n      validator: true\n", /validator:.*check:/],
-      ["run mapping", "steps:\n  - one:\n      run: { command: echo hi }\n", /run: takes a command string/],
-      ["version 2", "version: 2\nsteps:\n  - one: echo hi\n", /version 2.*remove version:.*id:.*steps:/],
+      ["id", `${V4}id: old\nsteps:\n  - one: echo hi\n`, /id:.*file name/],
+      ["nodes", `${V4}nodes:\n  one:\n    run: { command: echo hi }\n    next: null\n`, /nodes:.*steps:/],
+      ["next", `${V4}steps:\n  - one:\n      run: echo hi\n      next: two\n`, /next:.*steps run in list order/],
+      ["validator", `${V4}steps:\n  - one:\n      run: echo hi\n      validator: true\n`, /validator:.*verify:/],
+      ["check", `${V4}steps:\n  - one:\n      run: echo hi\n      check: true\n`, /check: is replaced by verify:/],
+      ["max_attempts", `${V4}steps:\n  - one:\n      run: echo hi\n      max_attempts: 2\n`, /max_attempts: is replaced by retries:.*N-1/],
+      ["defaults max_attempts", "version: 4\ndefaults: { max_attempts: 2, replay: safe }\nsteps:\n  - one: echo hi\n", /defaults.max_attempts: is replaced by defaults.retries:/],
+      ["defaults keep_files", "version: 4\ndefaults: { keep_files: always, retries: 0, replay: never }\nsteps:\n  - one: echo hi\n", /keep_files: is removed/],
+      ["orchestrator", `${V4}orchestrator: { model: p/m:low }\nsteps:\n  - one: echo hi\n`, /orchestrator: is removed/],
+      ["run mapping", `${V4}steps:\n  - one:\n      run: { command: echo hi }\n`, /run: takes a command string/],
+      ["version 2", "version: 2\nsteps:\n  - one: echo hi\n", /version 2.*remove id:.*steps:.*declare version: 4/],
     ] as const;
 
     for (const [label, text, message] of cases) {
-      expect(() => checkDefinitionText(text, `${label}.yaml`, "clock")).toThrow(message);
+      expect(() => checkDefinitionText(text, `${label}.yaml`, "clock"), label).toThrow(message);
     }
   });
 
   test("rejects duplicate step ids, YAML anchors, and duplicate YAML keys", () => {
     expect(() => checkDefinitionText(
-      "steps:\n  - repeat: echo first\n  - repeat: echo second\n",
+      `${V4}steps:\n  - repeat: echo first\n  - repeat: echo second\n`,
       "duplicate-steps.yaml",
       "clock",
     )).toThrow(/step id "repeat" appears more than once/);
     expect(() => checkDefinitionText(
-      "steps:\n  - one: &a { run: echo hi }\n",
+      `${V4}steps:\n  - one: &a { run: echo hi }\n`,
       "anchor.yaml",
       "clock",
     )).toThrow(/anchors are rejected/);
     expect(() => checkDefinitionText(
-      "steps:\n  - one: echo hi\nsteps:\n  - two: echo bye\n",
+      `${V4}steps:\n  - one: echo hi\nsteps:\n  - two: echo bye\n`,
       "duplicate-key.yaml",
       "clock",
     )).toThrow(/duplicate|unique/i);
+  });
+
+  test("bounds workflow instructions at 64 KiB and freezes them with the resolved settings", () => {
+    const text = (instructions: string) => `version: 4\ninstructions: ${JSON.stringify(instructions)}\ndefaults: { retries: 0, replay: never }\nsteps:\n  - one: echo hi\n`;
+    const checked = checkDefinitionText(text("Use plain words."), "clock.yaml", "clock");
+    expect(resolveWorkflowSettings({ definition: checked.def, machine: {}, projectCwd: "/tmp" }).instructions).toBe("Use plain words.");
+    expect(() => checkDefinitionText(text("a".repeat(64 * 1024 + 1)), "clock.yaml", "clock")).toThrow(/64 KiB/);
+  });
+});
+
+describe("format 4 resolved settings", () => {
+  const machine = { shell: "/bin/bash", agent: { model: "machine/model:low" } };
+
+  test("resolves retries, result mode, and verifier policy from the step", () => {
+    const checked = checkDefinitionText([
+      "version: 4",
+      "defaults: { retries: 2, replay: safe, timeout: 2m }",
+      "steps:",
+      "  - shell:",
+      "      run: echo hi",
+      "      timeout: 30s",
+      "      verify: test -n hi",
+      "  - write:",
+      "      agent: Write it.",
+      "      retries: unlimited",
+      "  - publish:",
+      "      run: echo done",
+      "      retries: 0",
+      "      replay: never",
+      "      result: tagged",
+      "",
+    ].join("\n"), "clock.yaml", "clock");
+    const settings = resolveWorkflowSettings({ definition: checked.def, machine, projectCwd: "/tmp" });
+    expect(settings).toMatchObject({ formatVersion: 4, instructions: null });
+    expect(settings.nodes.shell).toMatchObject({
+      retries: 2,
+      result: "text",
+      run: { replay: "safe", timeoutMs: 30_000 },
+      validator: { kind: "command", replay: "safe", timeoutMs: 30_000 },
+    });
+    expect(settings.nodes.write).toMatchObject({ retries: "unlimited", result: "tagged", validator: null });
+    expect(settings.nodes.publish).toMatchObject({ retries: 0, result: "tagged", run: { replay: "never" } });
+  });
+
+  test("keeps format 3 settings readable and converts their attempt limit exactly", () => {
+    const site = { kind: "command", command: "echo", shell: "/bin/bash", cwd: "/tmp", timeoutMs: null, streamCapBytes: 1024, replay: "never" };
+    const legacy = resolvedWorkflowSettingsSchema.parse({
+      keepFiles: "failed",
+      nodes: { one: { run: site, validator: null, maxAttempts: 3 } },
+      preflight: null,
+      orchestrator: { model: null, timeoutMs: null },
+    });
+    expect(resolveRetryLimit(legacy.nodes.one!)).toBe(2);
+    expect(() => resolvedWorkflowSettingsSchema.parse({
+      formatVersion: 4,
+      instructions: null,
+      keepFiles: "failed",
+      nodes: { one: { run: site, validator: null, maxAttempts: 3 } },
+      preflight: null,
+      orchestrator: { model: null, timeoutMs: null },
+    })).toThrow();
+  });
+
+  test("refuses to start while a format 3 run is open", () => {
+    const current = { formatVersion: 4 };
+    expect(() => checkNoOpenLegacyRuns([{ workflowId: "clock", runId: "run-new", resolvedSettings: current }])).not.toThrow();
+    expect(() => checkNoOpenLegacyRuns([
+      { workflowId: "clock", runId: "run-new", resolvedSettings: current },
+      { workflowId: "quotes", runId: "run-old", resolvedSettings: { keepFiles: "failed" } },
+    ])).toThrow(/workflow format 3.*quotes\/run-old.*previous Workshop build/);
   });
 });
 

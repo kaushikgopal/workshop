@@ -1,6 +1,6 @@
 import { isAbsolute } from "node:path";
 import { z } from "zod";
-import { keepFilesValue, nodeIdSchema } from "./schema.js";
+import { keepFilesValue, nodeIdSchema, resultModeValue, retriesValue } from "./schema.js";
 import { replayPolicySchema } from "../util/schema.js";
 
 const positiveSafeInteger = z.number().int().positive().refine(Number.isSafeInteger);
@@ -34,10 +34,18 @@ export const resolvedExecutionSiteSchema = z.discriminatedUnion("kind", [
   }),
 ]);
 
-export const resolvedNodeSettingsSchema = z.strictObject({
+/** Format 3 runs counted total attempts; they stay readable after an upgrade but never execute. */
+const legacyResolvedNodeSettingsSchema = z.strictObject({
   run: resolvedExecutionSiteSchema,
   validator: resolvedExecutionSiteSchema.nullable(),
   maxAttempts: positiveSafeInteger,
+});
+
+const currentResolvedNodeSettingsSchema = z.strictObject({
+  run: resolvedExecutionSiteSchema,
+  validator: resolvedExecutionSiteSchema.nullable(),
+  retries: retriesValue,
+  result: resultModeValue,
 });
 
 export const resolvedPreflightSettingsSchema = z.strictObject({
@@ -54,14 +62,33 @@ export const resolvedOrchestratorSettingsSchema = z.strictObject({
 });
 
 /** Frozen policy for every node, preflight, and the optional internal judge. */
-export const resolvedWorkflowSettingsSchema = z.strictObject({
+export const currentResolvedWorkflowSettingsSchema = z.strictObject({
+  formatVersion: z.literal(4),
+  instructions: z.string().nullable(),
   keepFiles: keepFilesValue,
-  nodes: z.record(nodeIdSchema, resolvedNodeSettingsSchema),
+  nodes: z.record(nodeIdSchema, currentResolvedNodeSettingsSchema),
   preflight: resolvedPreflightSettingsSchema.nullable(),
   orchestrator: resolvedOrchestratorSettingsSchema,
 });
 
+const legacyResolvedWorkflowSettingsSchema = z.strictObject({
+  keepFiles: keepFilesValue,
+  nodes: z.record(nodeIdSchema, legacyResolvedNodeSettingsSchema),
+  preflight: resolvedPreflightSettingsSchema.nullable(),
+  orchestrator: resolvedOrchestratorSettingsSchema,
+});
+
+/** Either node shape; readers that only display settings accept both formats. */
+export const resolvedNodeSettingsSchema = z.union([currentResolvedNodeSettingsSchema, legacyResolvedNodeSettingsSchema]);
+
+export const resolvedWorkflowSettingsSchema = z.union([
+  currentResolvedWorkflowSettingsSchema,
+  legacyResolvedWorkflowSettingsSchema,
+]);
+
 export type ResolvedExecutionSite = z.infer<typeof resolvedExecutionSiteSchema>;
-export type ResolvedNodeSettings = z.infer<typeof resolvedNodeSettingsSchema>;
+export type ResolvedNodeSettings =
+  | z.infer<typeof currentResolvedNodeSettingsSchema>
+  | z.infer<typeof legacyResolvedNodeSettingsSchema>;
 export type ResolvedPreflightSettings = z.infer<typeof resolvedPreflightSettingsSchema>;
 

@@ -35,15 +35,18 @@ type ReadyRun = Extract<ReturnType<typeof workflowRunDocumentV1Schema.parse>, { 
 
 function judgedWorkflowSource(workflowId: string): string {
   return [
+    "version: 4",
+    "defaults:",
+    "  retries: 0",
+    "  replay: never",
     "steps:",
     "  - verify:",
+    "      retries: 1",
     "      replay: safe",
-    "      max_attempts: 2",
     "      run: \"printf 'candidate'\"",
-    "      check:",
+    "      verify:",
     "        run: >-",
     "          if [ -f .validator-failed-once ]; then exit 0; else touch .validator-failed-once; exit 7; fi",
-    "        replay: safe",
     "",
   ].join("\n");
 }

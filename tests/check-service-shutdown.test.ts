@@ -31,8 +31,12 @@ describe("Durable service shutdown", () => {
     const processMarker = join(root, "holder-events.txt");
     const scheduledMarker = join(root, "scheduled-launches.txt");
     mkdirSync(workflows, { recursive: true });
-    writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\nmax_concurrent_runs: 2\n", "utf8");
+    writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\nmax_concurrent_runs: 2\norchestrator:\n  model: faux/failure-judge:low\n  timeout: 10s\n", "utf8");
     writeFileSync(join(workflows, "holder.yaml"), [
+      "version: 4",
+      "defaults:",
+      "  retries: 0",
+      "  replay: never",
       "steps:",
       "  - hold:",
       "      run: >-",
@@ -40,15 +44,16 @@ describe("Durable service shutdown", () => {
       "",
     ].join("\n"), "utf8");
     writeFileSync(join(workflows, "scheduled.yaml"), [
+      "version: 4",
+      "defaults:",
+      "  retries: 0",
+      "  replay: never",
       "schedule:",
       "  every: 2s",
       "  max_runs: 3",
       "steps:",
       "  - tick:",
       `      run: 'printf x >> ${scheduledMarker}'`,
-      "orchestrator:",
-      "  model: faux/failure-judge:low",
-      "  timeout: 10s",
       "",
     ].join("\n"), "utf8");
 
@@ -199,8 +204,12 @@ describe("Durable service shutdown", () => {
     const validatorMarker = join(root, "judgment-validator.txt");
     const preparedMarker = join(root, "prepared-worker.txt");
     mkdirSync(workflows, { recursive: true });
-    writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\nmax_concurrent_runs: 3\n", "utf8");
+    writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\nmax_concurrent_runs: 3\norchestrator:\n  model: faux/failure-judge:low\n  timeout: 10s\n", "utf8");
     writeFileSync(join(workflows, "holder.yaml"), [
+      "version: 4",
+      "defaults:",
+      "  retries: 0",
+      "  replay: never",
       "steps:",
       "  - hold:",
       "      run: >-",
@@ -208,19 +217,24 @@ describe("Durable service shutdown", () => {
       "",
     ].join("\n"), "utf8");
     writeFileSync(join(workflows, "judged.yaml"), [
+      "version: 4",
+      "defaults:",
+      "  retries: 0",
+      "  replay: never",
       "steps:",
       "  - verify:",
       "      run: >-",
       `        printf w >> '${workerMarker}'; printf candidate`,
-      "      check:",
+      "      verify:",
       "        run: >-",
       `          printf v >> '${validatorMarker}'; exit 7`,
-      "orchestrator:",
-      "  model: faux/failure-judge:low",
-      "  timeout: 10s",
       "",
     ].join("\n"), "utf8");
     writeFileSync(join(workflows, "prepared.yaml"), [
+      "version: 4",
+      "defaults:",
+      "  retries: 0",
+      "  replay: never",
       "steps:",
       "  - work:",
       "      run: >-",

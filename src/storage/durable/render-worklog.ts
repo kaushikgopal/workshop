@@ -1,4 +1,5 @@
 import type { ResolvedExecutionSite } from "../../definition/schema-resolved.js";
+import { resolveRetryLimit } from "../../definition/resolve-retry-limit.js";
 import type { WorkflowRunDocumentV1, PersistedNodeAttempt } from "../../run/records.js";
 import type { NodeResult, ValidatorOutcome } from "../../run/schema.js";
 import type { ProcessExit } from "../../process/schema.js";
@@ -36,7 +37,7 @@ export function renderWorklog(value: WorkflowRunDocumentV1, options: { readonly 
     if (settings !== undefined) {
       lines.push(`- Worker: ${describeSite(settings.run)}`);
       if (settings.validator !== null) lines.push(`- Validator: ${describeSite(settings.validator)}`);
-      lines.push(`- Maximum attempts: ${settings.maxAttempts}`);
+      lines.push(`- Retries: ${resolveRetryLimit(settings)}`);
     }
     if (node.attempts.length === 0) {
       lines.push("- No attempt has started.", "");

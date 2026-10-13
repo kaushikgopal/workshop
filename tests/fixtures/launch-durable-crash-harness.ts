@@ -15,8 +15,8 @@ import { createWorkflowRunTaskInput, defineWorkshopTasks, parseWorkflowRunTaskIn
 import { openDurableStorage } from "../../src/storage/durable/open-durable-storage.js";
 
 const [mode, directory, databasePath, readyPath, metadataPath] = process.argv.slice(2);
-if (mode !== "worker" && mode !== "validator" && mode !== "identity" && mode !== "safe-worker" && mode !== "safe-validator" && mode !== "preflight") {
-  throw new Error("mode must be worker, validator, identity, safe-worker, safe-validator, or preflight");
+if (mode !== "worker" && mode !== "identity" && mode !== "safe-worker" && mode !== "safe-validator" && mode !== "preflight") {
+  throw new Error("mode must be worker, identity, safe-worker, safe-validator, or preflight");
 }
 if (directory === undefined || databasePath === undefined || readyPath === undefined || metadataPath === undefined) {
   throw new Error("crash harness requires directory, database, ready, and metadata paths");
@@ -24,7 +24,8 @@ if (directory === undefined || databasePath === undefined || readyPath === undef
 
 const safeReplay = mode === "safe-worker" || mode === "safe-validator";
 const preflightMode = mode === "preflight";
-const validatorMode = mode === "validator" || mode === "safe-validator";
+// Verifiers always replay after a crash, so only the replaying validator mode remains.
+const validatorMode = mode === "safe-validator";
 const workerMarker = `'${join(directory, "workers.txt")}'`;
 const validatorMarker = `'${join(directory, "validators.txt")}'`;
 const processGroupMarker = `'${join(directory, "process-group.txt")}'`;
@@ -37,7 +38,8 @@ const validatorCommand = safeReplay && validatorMode
   ? `printf v >> ${validatorMarker}; if [ "$(wc -c < ${validatorMarker})" -eq 1 ]; then printf '%s' "$$" > ${processGroupMarker}; (/bin/sleep 60) & wait; else printf validator-passed; fi`
   : `printf v >> ${validatorMarker}; printf '%s' "$$" > ${processGroupMarker}; (/bin/sleep 60) & wait`;
 const preflightCommand = `printf p >> ${preflightMarker}; if [ "$(wc -c < ${preflightMarker})" -eq 1 ]; then printf '%s' "$$" > ${processGroupMarker}; (/bin/sleep 60) & wait; else printf preflight-ready; fi`;
-const source = (preflightMode ? [
+const header = ["version: 4", "defaults:", "  retries: 0", "  replay: never"];
+const source = [...header, ...(preflightMode ? [
   "environment:",
   "  preflight:",
   "    timeout: 5s",
@@ -64,16 +66,14 @@ const source = (preflightMode ? [
   "  - first:",
   "      run: >-",
   `        printf w >> ${workerMarker}; printf candidate`,
-  "      check:",
-  "        timeout: 5s",
-  ...(safeReplay ? ["        replay: safe"] : []),
+  "      verify:",
   "        run: >-",
   `          ${validatorCommand}`,
   "  - second:",
   "      run: >-",
   `        printf s >> ${successorMarker}; printf '%s-next' \"$(cat \"$WORKSHOP_PREVIOUS_OUTPUT_FILE\")\"`,
   "",
-]).join("\n");
+])].join("\n");
 
 const machine = {
   shell: "/bin/bash",

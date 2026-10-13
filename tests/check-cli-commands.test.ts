@@ -14,6 +14,10 @@ import { REPO_ROOT } from "./helpers.js";
 const cliPath = join(REPO_ROOT, "src/cli/main.ts");
 
 const CLOCK_WORKFLOW = [
+  "version: 4",
+  "defaults:",
+  "  retries: 0",
+  "  replay: never",
   "steps:",
   "  - tick: printf fixture-output",
   "",
@@ -77,10 +81,10 @@ describe("CLI commands", () => {
     }
   });
 
-  test("rejects obsolete versions, accepts omitted versions, and explains legacy workflow keys", () => {
+  test("rejects obsolete versions, accepts an omitted machine version, and explains legacy workflow keys", () => {
     const oldWorkflow = makeRoot({
       machine: null,
-      workflows: { clock: `version: 1\n${CLOCK_WORKFLOW}` },
+      workflows: { clock: CLOCK_WORKFLOW.replace("version: 4", "version: 1") },
     });
     const oldMachine = makeRoot({ machine: "version: 1\nshell: /bin/bash\n", workflows: { clock: CLOCK_WORKFLOW } });
     const unversionedMachine = makeRoot({ machine: "shell: /bin/bash\n", workflows: { clock: CLOCK_WORKFLOW } });
@@ -103,7 +107,7 @@ describe("CLI commands", () => {
     try {
       const workflow = runCli(oldWorkflow, ["validate", "clock"]);
       expect(workflow.status).toBe(64);
-      expect(workflow.stderr).toContain("workflow version 1 is no longer supported; remove version: and id:, and list steps: in order (or declare version: 3)");
+      expect(workflow.stderr).toContain("workflow version 1 is no longer supported; remove id:, list steps: in order, declare version: 4, replace max_attempts: N with retries: N-1");
 
       const machine = runCli(oldMachine, ["validate", "clock"]);
       expect(machine.status).toBe(64);
@@ -224,6 +228,10 @@ describe("CLI commands", () => {
     mkdirSync(workflowsDirectory, { recursive: true });
     writeFileSync(join(workshopDirectory, "workshop.yaml"), "shell: /bin/bash\nkeep_files: always\n", "utf8");
     writeFileSync(join(workflowsDirectory, "clock.yaml"), [
+      "version: 4",
+      "defaults:",
+      "  retries: 0",
+      "  replay: never",
       "description: Public CLI fixture",
       "steps:",
       "  - tick:",
@@ -231,6 +239,10 @@ describe("CLI commands", () => {
       "",
     ].join("\n"), "utf8");
     writeFileSync(join(workflowsDirectory, "big.yaml"), [
+      "version: 4",
+      "defaults:",
+      "  retries: 0",
+      "  replay: never",
       "steps:",
       "  - tick:",
       "      run: >-",
@@ -239,6 +251,10 @@ describe("CLI commands", () => {
       "",
     ].join("\n"), "utf8");
     writeFileSync(join(workflowsDirectory, "unlimited.yaml"), [
+      "version: 4",
+      "defaults:",
+      "  retries: 0",
+      "  replay: never",
       "steps:",
       "  - tick:",
       "      run: printf 'unlimited-output'",
@@ -246,6 +262,10 @@ describe("CLI commands", () => {
       "",
     ].join("\n"), "utf8");
     writeFileSync(join(workflowsDirectory, "oversize.yaml"), [
+      "version: 4",
+      "defaults:",
+      "  retries: 0",
+      "  replay: never",
       "steps:",
       "  - first:",
       "      run: head -c 700000 /dev/zero",

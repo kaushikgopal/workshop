@@ -4,6 +4,7 @@ interface AgentPromptIdentity {
   nodeId: string;
   attemptNumber: number;
   instructions: string;
+  workflowInstructions: string | null;
   worklogPath: string;
   previousOutputPath: string;
   resultPath: string;
@@ -17,7 +18,7 @@ Workflow: ${input.workflowId}
 Run: ${input.runId}
 Step: ${input.nodeId}
 Attempt: ${input.attemptNumber}
-
+${renderWorkflowInstructions(input.workflowInstructions)}
 ## Instructions
 
 ${input.instructions}
@@ -47,7 +48,7 @@ Workflow: ${input.workflowId}
 Run: ${input.runId}
 Step: ${input.nodeId}
 Attempt: ${input.attemptNumber}
-
+${renderWorkflowInstructions(input.workflowInstructions)}
 ## Instructions
 
 ${input.instructions}
@@ -66,4 +67,9 @@ Write one strict UTF-8 JSON object to ${input.resultPath} with exactly these key
 
 Your verdict is a proposal. Workshop accepts it only after your process exits with code 0, the whole process group is confirmed dead, and the verdict bytes pass validation. You cannot publish output, create a successor, or change Workshop lifecycle state.
 `;
+}
+
+/** Workflow instructions are shared by every agent in the workflow and precede the site's own instructions. */
+function renderWorkflowInstructions(text: string | null): string {
+  return text === null ? "" : `\n## Workflow instructions\n\n${text}\n`;
 }

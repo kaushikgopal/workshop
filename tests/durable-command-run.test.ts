@@ -33,6 +33,10 @@ import { FAILURE_JUDGMENT_DECISION_TOOL_NAME, FailureJudgmentExtension, failureJ
 import { openDurableStorage } from "../src/storage/durable/open-durable-storage.js";
 
 const sourceText = [
+  "version: 4",
+  "defaults:",
+  "  retries: 0",
+  "  replay: never",
   "steps:",
   "  - first:",
   "      run: \"printf 'alpha'\"",
@@ -42,6 +46,10 @@ const sourceText = [
   "",
 ].join("\n");
 const timeoutSourceText = [
+  "version: 4",
+  "defaults:",
+  "  retries: 0",
+  "  replay: never",
   "steps:",
   "  - first:",
   "      timeout: 1s",
@@ -49,6 +57,10 @@ const timeoutSourceText = [
   "",
 ].join("\n");
 const failureSourceText = [
+  "version: 4",
+  "defaults:",
+  "  retries: 0",
+  "  replay: never",
   "steps:",
   "  - first:",
   "      run: >-",
@@ -56,6 +68,10 @@ const failureSourceText = [
   "",
 ].join("\n");
 const abortSourceText = [
+  "version: 4",
+  "defaults:",
+  "  retries: 0",
+  "  replay: never",
   "steps:",
   "  - first:",
   "      run: exec sleep 30",
@@ -447,15 +463,15 @@ describe("Durable workflow lifecycle", () => {
 
 });
 
-function judgedWorkflowSource(workflowId: string, replay: "safe" | "never", maxAttempts = 2): string {
+function judgedWorkflowSource(workflowId: string, replay: "safe" | "never", retries = replay === "safe" ? 1 : 0): string {
   return [
+    "version: 4",
     "steps:",
     "  - verify:",
     `      replay: ${replay}`,
-    `      max_attempts: ${maxAttempts}`,
+    `      retries: ${retries}`,
     "      run: \"printf 'candidate'\"",
-    "      check:",
-    "        replay: safe",
+    "      verify:",
     "        run: >-",
     "          if [ -f .validator-failed-once ]; then exit 0; else touch .validator-failed-once; exit 7; fi",
     "",
@@ -526,7 +542,7 @@ describe("native Durable failure judgment", () => {
     }), { stopReason: "toolUse" })]);
     const workflowId = "judged-never";
     try {
-      const prepared = prepare(directory, "judgment-policy-request-001", "judged-never-run-001", judgedWorkflowSource(workflowId, "never", 3), {
+      const prepared = prepare(directory, "judgment-policy-request-001", "judged-never-run-001", judgedWorkflowSource(workflowId, "never", 0), {
         ...machineConfig, orchestrator: { model: "faux/failure-judge:low", timeout: "10s" },
       });
       opened = await openCommandHarness(join(directory, "durable.db"), undefined, {}, models);
@@ -562,7 +578,7 @@ describe("native Durable failure judgment", () => {
     }), { stopReason: "toolUse" })]);
     const workflowId = "exhausted-judge";
     try {
-      const prepared = prepare(directory, "judgment-exhausted-request-001", "exhausted-judge-run-001", judgedWorkflowSource(workflowId, "safe", 1), {
+      const prepared = prepare(directory, "judgment-exhausted-request-001", "exhausted-judge-run-001", judgedWorkflowSource(workflowId, "safe", 0), {
         ...machineConfig, orchestrator: { model: "faux/failure-judge:low", timeout: "10s" },
       });
       opened = await openCommandHarness(join(directory, "durable.db"), undefined, {}, models);
@@ -625,21 +641,23 @@ describe("native Durable failure judgment", () => {
     ]);
     const workflowId = "multiple-judgments";
     const source = [
+      "version: 4",
+      "defaults:",
+      "  retries: 0",
+      "  replay: never",
       "steps:",
       "  - first:",
+      "      retries: 1",
       "      replay: safe",
-      "      max_attempts: 2",
       "      run: \"printf 'first'\"",
-      "      check:",
-      "        replay: safe",
+      "      verify:",
       "        run: >-",
       "          if [ -f .first-validator-passed-once ]; then exit 0; else touch .first-validator-passed-once; exit 7; fi",
       "  - second:",
+      "      retries: 1",
       "      replay: safe",
-      "      max_attempts: 2",
       "      run: \"printf 'second'\"",
-      "      check:",
-      "        replay: safe",
+      "      verify:",
       "        run: >-",
       "          if [ -f .second-validator-passed-once ]; then exit 0; else touch .second-validator-passed-once; exit 7; fi",
       "",
@@ -1556,6 +1574,10 @@ describe("required process input file failures", () => {
     let opened: CommandHarness | undefined;
     try {
       const source = [
+        "version: 4",
+        "defaults:",
+        "  retries: 0",
+        "  replay: never",
         "steps:",
         "  - first:",
         "      run: >-",
@@ -1621,11 +1643,15 @@ describe("required process input file failures", () => {
     let opened: CommandHarness | undefined;
     try {
       const source = [
+        "version: 4",
+        "defaults:",
+        "  retries: 0",
+        "  replay: never",
         "steps:",
         "  - first:",
         "      run: >-",
         "        printf w >> $WORKSHOP_TEST_WORKERS; printf candidate",
-        "      check:",
+        "      verify:",
         "        run: >-",
         "          printf v >> $WORKSHOP_TEST_VALIDATORS; exit 0",
         "",
@@ -1691,12 +1717,12 @@ describe("required process input file failures", () => {
   });
 });
 
-async function verifyDurableRestartAfterProcessLaunch(mode: "worker" | "validator" | "identity" | "safe-worker" | "safe-validator" | "preflight"): Promise<void> {
+async function verifyDurableRestartAfterProcessLaunch(mode: "worker" | "identity" | "safe-worker" | "safe-validator" | "preflight"): Promise<void> {
   const directory = mkdtempSync(join(tmpdir(), `workshop-restart-${mode}-`));
   const safeReplay = mode === "safe-worker" || mode === "safe-validator";
   const preflightMode = mode === "preflight";
   const replayedProcess = safeReplay || preflightMode;
-  const validatorMode = mode === "validator" || mode === "safe-validator";
+  const validatorMode = mode === "safe-validator";
   const fakeBin = join(directory, "fake-bin");
   if (mode === "identity") {
     mkdirSync(fakeBin);
@@ -1892,6 +1918,10 @@ describe("Durable process launch startup gate", () => {
     const databasePath = join(directory, "durable.db");
     const markerPath = join(directory, "process-launched.txt");
     const source = [
+      "version: 4",
+      "defaults:",
+      "  retries: 0",
+      "  replay: never",
       "steps:",
       "  - first:",
       `      run: 'echo $$ > ${markerPath}; sleep 0.05; printf gate-opened'`,
@@ -1964,15 +1994,11 @@ describe("Durable restart after process launch", () => {
     await verifyDurableRestartAfterProcessLaunch("worker");
   }, 15_000);
 
-  test("retires a surviving validator group while retaining the candidate and not relaunching the worker", async () => {
-    await verifyDurableRestartAfterProcessLaunch("validator");
-  }, 15_000);
-
   test("replays a safe worker as a new incarnation with the same execution and deadline", async () => {
     await verifyDurableRestartAfterProcessLaunch("safe-worker");
   }, 15_000);
 
-  test("replays a safe validator without regenerating its worker candidate", async () => {
+  test("replays an interrupted validator without regenerating its worker candidate", async () => {
     await verifyDurableRestartAfterProcessLaunch("safe-validator");
   }, 15_000);
 
@@ -1989,12 +2015,16 @@ describe("Durable launch intent without process identity", () => {
 
 
 const headlessChainSourceText = [
+  "version: 4",
+  "defaults:",
+  "  retries: 0",
+  "  replay: never",
   "steps:",
   "  - first:",
   "      stream_cap: \"32\"",
   "      agent:",
   "        instructions: produce a checked candidate",
-  "      check:",
+  "      verify:",
   "        agent:",
   "          instructions: check the candidate",
   "  - second:",
@@ -2323,10 +2353,12 @@ describe("Durable headless validation chain", () => {
     process.env.WORKSHOP_TEST_RESULT_PATHS = markers.resultPaths;
     let opened: CommandHarness | undefined;
     try {
+      // A verifier shares its step's timeout; the fixture worker finishes well inside it.
       const timeoutSource = headlessChainSourceText.replace(
-        ["      check:", "        agent:"].join("\n"),
-        ["      check:", "        timeout: 1s", "        agent:"].join("\n"),
+        ["  - first:", "      stream_cap: \"32\""].join("\n"),
+        ["  - first:", "      timeout: 1s", "      stream_cap: \"32\""].join("\n"),
       );
+      if (timeoutSource === headlessChainSourceText) throw new Error("validator-timeout fixture did not apply");
       const prepared = prepare(
         directory,
         "headless-validator-timeout-request",
@@ -2375,11 +2407,15 @@ describe("Durable headless validation chain", () => {
 
 function commandValidatorChainSource(validatorCommand: string): string {
   return [
+    "version: 4",
+    "defaults:",
+    "  retries: 0",
+    "  replay: never",
     "steps:",
     "  - first:",
     "      stream_cap: \"32\"",
     "      run: \"printf 'command-candidate'\"",
-    "      check:",
+    "      verify:",
     "        run: >-",
     "          " + validatorCommand,
     "  - second:",
@@ -2450,13 +2486,17 @@ describe("Durable command validator chain", () => {
 });
 
 const agentProcessSourceText = [
+  "version: 4",
+  "defaults:",
+  "  retries: 0",
+  "  replay: never",
   "steps:",
   "  - first:",
   "      timeout: 5s",
   "      stream_cap: \"4\"",
   "      agent:",
   "        instructions: worker instructions",
-  "      check:",
+  "      verify:",
   "        agent:",
   "          instructions: validator instructions",
   "",
@@ -2624,6 +2664,10 @@ describe("Durable process execution adapter", () => {
   test("rejects unsafe absolute-deadline arithmetic before dispatch", async () => {
     const directory = mkdtempSync(join(tmpdir(), "workshop-unsafe-deadline-"));
     const unsafeDeadlineSource = [
+      "version: 4",
+      "defaults:",
+      "  retries: 0",
+      "  replay: never",
       "steps:",
       "  - first:",
       "      timeout: 9007199254740991ms",

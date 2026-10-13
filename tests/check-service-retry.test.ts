@@ -18,6 +18,10 @@ describe("service mutation retry", () => {
     mkdirSync(workflows, { recursive: true });
     writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\n", "utf8");
     writeFileSync(join(workflows, "clock.yaml"), [
+      "version: 4",
+      "defaults:",
+      "  retries: 0",
+      "  replay: never",
       "steps:",
       "  - tick:",
       "      run: printf-tick",

@@ -52,7 +52,7 @@ overlap one in the table; if it will recur, add it to the table.
   important noun. A function named `runChain` or a file named `run-paths.ts`
   forces the reader to guess which meaning you meant. Use `execute`, `advance`,
   `launch`, or a more specific verb.
-- **Never use "validate" for two things.** The user-facing step `check` is
+- **Never use "validate" for two things.** The user-facing step `verify` is
   called a validator in code. Code that applies fixed rules says `check`, and
   code that invokes a validator says `judge`.
 - **Steps are nodes in code.** Authors write `steps:`; the frozen definition,
@@ -207,6 +207,7 @@ src/
 │  ├─ serve-service-process.ts    process entry: lock, open, serve, shut down
 │  ├─ serve-workshop-service.ts   socket server and request dispatch
 │  ├─ open-service-runtime.ts     Durable Harness, task registry, reconciliation
+│  ├─ check-legacy-runs.ts        refuses to open while a format 3 run is open
 │  ├─ project-service-reads.ts    status, run pages, and logs
 │  ├─ launch-service-process.ts   reuse a healthy service or spawn one
 │  ├─ stop-service-process.ts     verified SIGTERM and bounded wait
@@ -232,6 +233,7 @@ src/
 │  ├─ parse-yaml.ts               strict YAML: no duplicate keys or anchors
 │  ├─ schema.ts, check-definition.ts, check-chain.ts
 │  ├─ resolve-agent-settings.ts, resolve-workflow-settings.ts
+│  ├─ resolve-retry-limit.ts      retries allowed, for format 4 and format 3 runs
 │  └─ schema-resolved.ts, parse-model.ts, hash-canonical-json.ts
 ├─ installation/                  find .workshop/, load workshop.yaml and workflows/
 ├─ run/                           run records, outcomes, admission, schedule math;

@@ -43,6 +43,10 @@ describe("Durable service runtime", () => {
     mkdirSync(workflows, { recursive: true });
     writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\nkeep_files: always\n", "utf8");
     writeFileSync(join(workflows, "clock.yaml"), [
+      "version: 4",
+      "defaults:",
+      "  retries: 0",
+      "  replay: never",
       "description: Durable service fixture",
       "steps:",
       "  - tick:",
@@ -192,21 +196,21 @@ describe("Durable service runtime", () => {
     const validatorLaunches = join(root, "validator-launches.txt");
     const validatorFirstFailure = join(root, "validator-first-failure.txt");
     mkdirSync(workflows, { recursive: true });
-    writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\n", "utf8");
+    writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\norchestrator:\n  model: faux/failure-judge:low\n  timeout: 20s\n", "utf8");
     writeFileSync(join(workflows, "judgment-repair.yaml"), [
+      "version: 4",
+      "defaults:",
+      "  retries: 0",
+      "  replay: never",
       "steps:",
       "  - verify:",
+      "      retries: 1",
       "      replay: safe",
-      "      max_attempts: 2",
       "      run: >-",
       `        printf w >> '${workerLaunches}'; printf candidate`,
-      "      check:",
-      "        replay: safe",
+      "      verify:",
       "        run: >-",
       `          printf v >> '${validatorLaunches}'; if [ ! -e '${validatorFirstFailure}' ]; then touch '${validatorFirstFailure}'; exit 7; fi; exit 0`,
-      "orchestrator:",
-      "  model: faux/failure-judge:low",
-      "  timeout: 20s",
       "",
     ].join("\n"), "utf8");
     const installation = loadInstallation(root);
@@ -303,6 +307,10 @@ case "$WORKSHOP_STEP_ID" in
 esac`;
     writeFileSync(join(config, "workshop.yaml"), `shell: /bin/bash\nkeep_files: always\nagent:\n  model: fixture/mock-model:medium\n  harness:\n    command: |\n${harnessCommand.split("\n").map((line) => `      ${line}`).join("\n")}\n`, "utf8");
     writeFileSync(join(workflows, "capture-text.yaml"), [
+      "version: 4",
+      "defaults:",
+      "  retries: 0",
+      "  replay: never",
       "steps:",
       "  - bom:",
       "      agent: Return the fixture result.",
@@ -390,10 +398,14 @@ esac`;
       "",
     ].join("\n"), "utf8");
     writeFileSync(join(workflows, "long-artifact.yaml"), [
+      "version: 4",
+      "defaults:",
+      "  retries: 0",
+      "  replay: never",
       "steps:",
       "  - worker:",
       "      agent: Return the fixture result.",
-      "      check:",
+      "      verify:",
       "        run: 'printf launched > ${validatorLaunch}'",
       "  - successor:",
       "      run: 'printf launched > ${successorLaunch}'",
@@ -464,6 +476,10 @@ printf '\342\202\254'
 head -c 18874368 /dev/zero | tr '\000' x`;
     writeFileSync(join(config, "workshop.yaml"), `shell: /bin/bash\nkeep_files: always\nstream_cap: unlimited\nagent:\n  model: fixture/mock-model:medium\n  harness:\n    command: |\n${harnessCommand.split("\n").map((line) => `      ${line}`).join("\n")}\n`, "utf8");
     writeFileSync(join(workflows, "large-capture.yaml"), [
+      "version: 4",
+      "defaults:",
+      "  retries: 0",
+      "  replay: never",
       "steps:",
       "  - large:",
       "      agent: Return the fixture result.",
@@ -516,7 +532,7 @@ printf '{"version":1,"output":"candidate","summary":"%s","artifacts":[]}' "$summ
       `  - ${nodeId}:`,
       "      agent: Return the fixture result.",
     ]);
-    writeFileSync(join(workflows, "large-worklog.yaml"), ["steps:", ...stepLines, ""].join("\n"), "utf8");
+    writeFileSync(join(workflows, "large-worklog.yaml"), ["version: 4", "defaults: { retries: 0, replay: never }", "steps:", ...stepLines, ""].join("\n"), "utf8");
     const installation = loadInstallation(root);
     let owner: Awaited<ReturnType<typeof startWorkshopService>> | undefined;
     try {
@@ -568,6 +584,10 @@ printf '{"version":1,"output":"candidate","summary":"%s","artifacts":[]}' "$summ
     mkdirSync(workflows, { recursive: true });
     writeFileSync(join(config, "workshop.yaml"), "shell: /bin/sh\nkeep_files: always\n", "utf8");
     writeFileSync(join(workflows, "progress.yaml"), [
+      "version: 4",
+      "defaults:",
+      "  retries: 0",
+      "  replay: never",
       "steps:",
       "  - first:",
       `      run: 'while [ ! -e "${releaseFirst}" ]; do sleep 0.01; done; printf first'`,
@@ -634,6 +654,10 @@ printf '{"version":1,"output":"candidate","summary":"%s","artifacts":[]}' "$summ
 head -c 12000 /dev/zero | tr '\000' r`;
     writeFileSync(join(config, "workshop.yaml"), `shell: /bin/bash\nkeep_files: always\nstream_cap: 1kb\nagent:\n  model: fixture/mock-model:medium\n  harness:\n    command: |\n${harnessCommand.split("\n").map((line) => `      ${line}`).join("\n")}\n`, "utf8");
     writeFileSync(join(workflows, "retained.yaml"), [
+      "version: 4",
+      "defaults:",
+      "  retries: 0",
+      "  replay: never",
       "steps:",
       "  - capture:",
       "      agent: Return the fixture result.",

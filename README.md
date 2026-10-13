@@ -97,12 +97,14 @@ keep theirs. `workshop logs` renders the run's story from the database. When
     decision.
 - **The definition freezes when the run is admitted.** Editing the YAML
   mid-run changes nothing; the next run picks it up.
-- **Replay is opt-in per step.** After a crash, a step marked `replay: safe`
-  reruns. Anything else blocks, because the service cannot prove the process
-  had no side effects yet.
-- **A retry needs more than `max_attempts`.** The judge may choose retry only
-  when the step, and its check if there is one, are both `replay: safe`
-  and attempts remain. Otherwise it can only block or fail.
+- **Every step states its retry and replay policy.** Set `retries` and
+  `replay` on each step or in `defaults:`; Workshop has no built-in default.
+  After a crash, a `replay: safe` step reruns, and a `replay: never` step
+  blocks, because the service cannot prove the process had no side effects
+  yet. A `replay: never` step must also set `retries: 0`.
+- **A retry needs a retry left.** `retries: 2` allows up to three attempts.
+  The judge may choose retry only when the step is `replay: safe` and retries
+  remain. Otherwise it can only block or fail. Verifiers always replay.
 - **The service owns the state.** Every command, `watch` included, asks the
   service instead of reading files. `status --json` is the stable,
   machine-readable view.
@@ -125,27 +127,30 @@ Save it as `.workshop/workflows/hemingway-clock.yaml`; the file name is the
 workflow id.
 
 ```yaml
+version: 4                              # required
 schedule: { every: 10m, max_runs: 6 }   # omit for a one-shot workflow
 defaults:
-  max_attempts: 2
-  replay: safe                          # steps rerun after a crash; the default is never
+  retries: 1                            # retries after the first attempt
+  replay: safe                          # steps rerun after a crash
 
 steps:
   - timestamp: date -u +%FT%TZ          # 1. shell command
   - generate-line:                      # 2. AI agent, checked by a second agent
       agent: Generate one original Hemingway-inspired sentence …
-      check: Pass only if it is one original sentence …
+      verify:
+        agent: Pass only if it is one original sentence …
   - publish-quote:                      # 3. shell command, consumes step 2's output
       run: cp "$WORKSHOP_PREVIOUS_OUTPUT_FILE" "$WORKSHOP_ARCHIVE/$WORKSHOP_RUN_ID.md"
-      max_attempts: 1
+      retries: 0
 ```
 
 A step is a command string, `run: <command>`, or `agent: <instructions>` (or
-`agent: { instructions, model, harness }`), plus optional `check`,
-`max_attempts`, `timeout`, `stream_cap`, and `replay`. A string `check` is the
-same kind as its step; write `check: { run: … }` or `check: { agent: … }` to
-mix kinds, with optional `timeout` and `replay`. An agent check uses the
-workflow and machine agent settings, not its step's.
+`agent: { instructions, model, harness }`), plus optional `retries`,
+`replay`, `verify`, `result`, `timeout`, and `stream_cap`. A `verify` is written
+like a step body: a command string, `run: <command>`, or `agent: …`. It
+shares its step's timeout and stream cap. An agent verifier uses the workflow
+and machine agent settings, not its step's. `instructions:` at the top of the
+file holds text shared by the workflow's agents.
 
 Commands produce their output on stdout. Agents get their prompt in
 `WORKSHOP_PROMPT_FILE` and must write checked JSON to `WORKSHOP_RESULT_FILE`;

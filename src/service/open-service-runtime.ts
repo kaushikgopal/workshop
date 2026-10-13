@@ -6,6 +6,8 @@ import type { Models } from "@earendil-works/pi-ai/models";
 import { createWorkshopModels } from "../model/create-workshop-models.js";
 import { createRegistry, Harness, type ConversationId, type TaskGraph, type TaskGraphWatch, type TaskId, type Tx } from "@earendil-works/pi-durable";
 import { canonicalHash } from "../definition/hash-canonical-json.js";
+import { resolveRetryLimit } from "../definition/resolve-retry-limit.js";
+import { checkInstallationHasNoOpenLegacyRuns } from "./check-legacy-runs.js";
 import { loadCheckedWorkflow, type CheckedWorkflow, type Installation } from "../installation/load-installation.js";
 import {
   activationIndexSchema,
@@ -105,6 +107,7 @@ async function openServiceRuntime(
       },
     }, BACKGROUND_CONTEXT);
     await ensureInstallationReady(harness, installation);
+    await checkInstallationHasNoOpenLegacyRuns(harness, BACKGROUND_CONTEXT);
     await reconcileStartupProcessTasks(harness, tasks, Date.now() + STARTUP_RECONCILIATION_MS);
     await assertNoUnreconciledProcessEvidence(harness, Date.now() + STARTUP_RECONCILIATION_MS, metadata.bootId);
     tasks.openStartupLaunchGate();
@@ -661,8 +664,9 @@ async function resolveBlockedWorkflow(
       : attemptProcesses(attemptLocation.attempt, checkedProcesses);
     const needsRepeat = !judgmentRetry && (source.kind === "external_outcome_unknown"
       || sourceProcesses.some((entry) => entry.process.replay === "never"));
+    const retryLimit = attemptLocation === null ? 0 : resolveRetryLimit(selectedRun.resolvedSettings.nodes[attemptLocation.node.nodeId]!);
     const needsExtraAttempt = !judgmentRetry && attemptLocation !== null
-      && attemptLocation.attempt.number >= selectedRun.resolvedSettings.nodes[attemptLocation.node.nodeId]!.maxAttempts;
+      && retryLimit !== "unlimited" && attemptLocation.attempt.number > retryLimit;
     if (judgmentRetry) assertJudgmentRetrySource(selectedRun, source, attemptLocation);
     if (request.action === "retry" && !judgmentRetry
       && ((request.allowRepeat ?? false) !== needsRepeat

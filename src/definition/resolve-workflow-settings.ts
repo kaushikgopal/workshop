@@ -3,7 +3,7 @@ import { DEFAULT_STREAM_CAP_BYTES, parseByteSize, parseDuration } from "../util/
 import { parseModel } from "./parse-model.js";
 import { resolveAgent } from "./resolve-agent-settings.js";
 import type { AgentDefaults, MachineConfig, NodeDefinition, WorkflowDefinition } from "./schema.js";
-import { resolvedWorkflowSettingsSchema, type ResolvedExecutionSite, type ResolvedNodeSettings } from "./schema-resolved.js";
+import { currentResolvedWorkflowSettingsSchema, type ResolvedExecutionSite } from "./schema-resolved.js";
 
 /** Resolve every execution setting once, before admission, from checked workflow and machine inputs. */
 export function resolveWorkflowSettings(input: {
@@ -16,16 +16,21 @@ export function resolveWorkflowSettings(input: {
     throw new Error("project working directory must be an absolute path without NUL");
   }
   const shell = machine.shell ?? "/bin/bash";
-  const nodes: Record<string, ResolvedNodeSettings> = {};
+  const nodes: Record<string, unknown> = {};
 
   for (const [nodeId, node] of Object.entries(definition.nodes)) {
     const timeout = node.timeout ?? definition.defaults?.timeout ?? machine.default_timeout ?? "10m";
     const streamCap = node.stream_cap ?? definition.defaults?.stream_cap ?? machine.stream_cap;
+    const retries = node.retries ?? definition.defaults?.retries;
+    const replay = node.replay ?? definition.defaults?.replay;
+    if (retries === undefined || replay === undefined) {
+      throw new Error(`step "${nodeId}" has no retries or replay policy; check the definition before resolving it`);
+    }
     const run = resolveExecutionSite({
       site: node.run,
       timeout,
       streamCap,
-      replay: node.replay ?? definition.defaults?.replay ?? "never",
+      replay,
       shell,
       cwd: input.projectCwd,
       workflowDefault: definition.defaults?.agent,
@@ -35,9 +40,10 @@ export function resolveWorkflowSettings(input: {
       ? null
       : resolveExecutionSite({
           site: node.validator,
-          timeout: node.validator.timeout ?? definition.defaults?.timeout ?? machine.default_timeout ?? "10m",
+          timeout,
           streamCap,
-          replay: node.validator.replay ?? definition.defaults?.replay ?? "never",
+          // Verifiers judge a committed candidate without external effects, so a crash always replays them.
+          replay: "safe",
           shell,
           cwd: input.projectCwd,
           workflowDefault: definition.defaults?.agent,
@@ -46,7 +52,8 @@ export function resolveWorkflowSettings(input: {
     nodes[nodeId] = {
       run,
       validator,
-      maxAttempts: node.max_attempts ?? definition.defaults?.max_attempts ?? 2,
+      retries,
+      result: node.result ?? ("agent" in node.run ? "tagged" : "text"),
     };
   }
 
@@ -58,16 +65,18 @@ export function resolveWorkflowSettings(input: {
         cwd: input.projectCwd,
         timeoutMs: parseTimeout(definition.environment.preflight.timeout ?? "30s"),
       };
-  const orchestratorModel = definition.orchestrator?.model ?? machine.orchestrator?.model ?? null;
+  const orchestratorModel = machine.orchestrator?.model ?? null;
   const orchestrator = {
     model: orchestratorModel === null ? null : parseModel(orchestratorModel).full,
     timeoutMs: orchestratorModel === null
       ? null
-      : parseTimeout(definition.orchestrator?.timeout ?? machine.orchestrator?.timeout ?? "5m"),
+      : parseTimeout(machine.orchestrator?.timeout ?? "5m"),
   };
 
-  return resolvedWorkflowSettingsSchema.parse({
-    keepFiles: definition.defaults?.keep_files ?? machine.keep_files ?? "failed",
+  return currentResolvedWorkflowSettingsSchema.parse({
+    formatVersion: 4,
+    instructions: definition.instructions ?? null,
+    keepFiles: machine.keep_files ?? "failed",
     nodes,
     preflight,
     orchestrator,

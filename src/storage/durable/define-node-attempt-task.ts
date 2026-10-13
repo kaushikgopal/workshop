@@ -744,6 +744,7 @@ function writeLaunchFiles(
       nodeId: processInput.nodeId,
       attemptNumber,
       instructions: site.instructions,
+      workflowInstructions: "instructions" in run.resolvedSettings ? run.resolvedSettings.instructions : null,
       worklogPath: files.worklogPath,
       previousOutputPath: files.previousOutputPath,
       resultPath: files.resultPath,

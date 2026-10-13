@@ -50,12 +50,16 @@ describe("public service restart", () => {
       "",
     ].join("\n"), "utf8");
     writeFileSync(join(workflows, "hemingway.yaml"), [
+      "version: 4",
+      "defaults:",
+      "  retries: 0",
+      "  replay: never",
       "description: Run the deterministic Hemingway worker mock.",
       "steps:",
       "  - generate:",
       "      agent:",
       "        instructions: Write one original sentence to the supplied result path.",
-      "      check:",
+      "      verify:",
       "        run: 'printf mock-validator-passed; test -s \"$WORKSHOP_STEP_OUTPUT_FILE\"'",
       "",
     ].join("\n"), "utf8");
@@ -130,6 +134,10 @@ describe("public service restart", () => {
     mkdirSync(workflows, { recursive: true });
     writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\nkeep_files: always\n", "utf8");
     writeFileSync(join(workflows, "harness-parity.yaml"), [
+      "version: 4",
+      "defaults:",
+      "  retries: 0",
+      "  replay: never",
       "steps:",
       "  - argv-harness:",
       "      agent:",
@@ -212,6 +220,10 @@ describe("public service restart", () => {
     mkdirSync(workflows, { recursive: true });
     writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\nmax_concurrent_runs: 1\n", "utf8");
     const workflow = (workerCommand: string) => [
+      "version: 4",
+      "defaults:",
+      "  retries: 0",
+      "  replay: never",
       "environment:",
       "  preflight:",
       "    command: >-",
@@ -277,6 +289,10 @@ describe("public service restart", () => {
     mkdirSync(workflows, { recursive: true });
     writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\n", "utf8");
     writeFileSync(join(workflows, "preflight-stop.yaml"), [
+      "version: 4",
+      "defaults:",
+      "  retries: 0",
+      "  replay: never",
       "environment:",
       "  preflight:",
       "    command: >-",
@@ -319,6 +335,10 @@ describe("public service restart", () => {
     mkdirSync(workflows, { recursive: true });
     writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\n", "utf8");
     writeFileSync(join(workflows, "disconnect.yaml"), [
+      "version: 4",
+      "defaults:",
+      "  retries: 0",
+      "  replay: never",
       "steps:",
       "  - wait:",
       `      run: 'printf started > ${workerStarted}; sleep 0.5; printf client-disconnected'`,
@@ -354,11 +374,15 @@ describe("public service restart", () => {
     mkdirSync(workflows, { recursive: true });
     writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\nmax_concurrent_runs: 1\n", "utf8");
     writeFileSync(join(workflows, "pause-chain.yaml"), [
+      "version: 4",
+      "defaults:",
+      "  retries: 0",
+      "  replay: never",
       "steps:",
       "  - first:",
       "      run: >-",
       `        printf started > '${workerStarted}'; sleep 1; printf first-result`,
-      "      check:",
+      "      verify:",
       "        run: >-",
       `          sleep 0.2; test -s \"$WORKSHOP_STEP_OUTPUT_FILE\" && printf done > '${validatorFinished}'`,
       "  - second:",
@@ -367,6 +391,10 @@ describe("public service restart", () => {
       "",
     ].join("\n"), "utf8");
     writeFileSync(join(workflows, "other.yaml"), [
+      "version: 4",
+      "defaults:",
+      "  retries: 0",
+      "  replay: never",
       "steps:",
       "  - mark:",
       `      run: 'printf started > ${otherStarted}; sleep 1; printf other-result'`,
@@ -462,18 +490,26 @@ describe("public service restart", () => {
     mkdirSync(workflows, { recursive: true });
     writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\nmax_concurrent_runs: 1\n", "utf8");
     writeFileSync(join(workflows, "safe-replay.yaml"), [
+      "version: 4",
+      "defaults:",
+      "  retries: 0",
+      "  replay: never",
       "steps:",
       "  - work:",
+      "      retries: 1",
       "      replay: safe",
       "      run: >-",
       `        printf w >> '${workerLaunches}'; printf candidate-output`,
-      "      check:",
-      "        replay: safe",
+      "      verify:",
       "        run: >-",
       `          printf v >> '${validatorLaunches}'; if [ "$(wc -c < '${validatorLaunches}')" -eq 1 ]; then printf '%s' "$$" > '${validatorPgidPath}'; sleep 60; else printf validator-replayed; fi`,
       "",
     ].join("\n"), "utf8");
     writeFileSync(join(workflows, "holder.yaml"), [
+      "version: 4",
+      "defaults:",
+      "  retries: 0",
+      "  replay: never",
       "steps:",
       "  - hold:",
       "      run: >-",
@@ -668,40 +704,6 @@ describe("public service restart", () => {
       rmSync(acceptRoot, { recursive: true, force: true });
     }
 
-    const validatorRoot = mkdtempSync(join(tmpdir(), "workshop-resolve-validator-"));
-    const workerMarker = join(validatorRoot, "worker-launches.txt");
-    const validatorMarker = join(validatorRoot, "validator-launches.txt");
-    try {
-      const blocked = await startBlockedCommandRun(
-        validatorRoot,
-        "acceptable-validator",
-        `printf w >> '${workerMarker}'; printf candidate`,
-        { validatorCommand: `printf v >> '${validatorMarker}'; sleep 60`, launchMarker: validatorMarker },
-      );
-      const resultFile = join(validatorRoot, "accepted-verdict.json");
-      writeFileSync(resultFile, JSON.stringify({ version: 1, passed: true, reason: "the committed candidate passed operator review" }), "utf8");
-      const accepted = runCli(validatorRoot, ["resolve", "acceptable-validator", "--action", "accept", "--reason", "the validator process group is confirmed dead", "--result-file", resultFile, "--acknowledge-effects"]);
-      expect(accepted.status).toBe(0);
-      const acceptedRun = await waitForRun(validatorRoot, "acceptable-validator", blocked.runId);
-      expect(acceptedRun.status).toBe("completed");
-      expect(acceptedRun.terminalOutput).toBe("candidate");
-      expect(readFileSync(workerMarker, "utf8")).toBe("w");
-      expect(readFileSync(validatorMarker, "utf8")).toBe("v");
-      const nodeResult = runCli(validatorRoot, ["step", "describe", "acceptable-validator", "work", "--run", blocked.runId, "--json"]);
-      expect(nodeResult.status).toBe(0);
-      const acceptedAttempt = nodeDescriptionDtoSchema.parse(JSON.parse(nodeResult.stdout)).node.attempts[0];
-      expect(acceptedAttempt?.verdict?.kind).toBe("verdict");
-      const acceptance = acceptedAttempt?.operatorAcceptances[0];
-      if (acceptance === undefined) throw new Error("validator acceptance audit was not retained");
-      expect(acceptance.target).toBe("validator");
-      expect(acceptance.acknowledgedEffects).toBe(true);
-      expect(acceptance.processGroupsConfirmedDead).toBe(true);
-    } finally {
-      await stopService(validatorRoot);
-      rmSync(validatorRoot, { recursive: true, force: true });
-    }
-
-
     const failRoot = mkdtempSync(join(tmpdir(), "workshop-resolve-fail-"));
     const failMarker = join(failRoot, "worker-launches.txt");
     try {
@@ -750,6 +752,10 @@ describe("public service restart", () => {
     mkdirSync(workflows, { recursive: true });
     writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\nmax_concurrent_runs: 1\n", "utf8");
     writeFileSync(join(workflows, "waiter.yaml"), [
+      "version: 4",
+      "defaults:",
+      "  retries: 0",
+      "  replay: never",
       "steps:",
       "  - first:",
       "      run: >-",
@@ -760,6 +766,10 @@ describe("public service restart", () => {
       "",
     ].join("\n"), "utf8");
     writeFileSync(join(workflows, "holder.yaml"), [
+      "version: 4",
+      "defaults:",
+      "  retries: 0",
+      "  replay: never",
       "steps:",
       "  - hold:",
       "      run: >-",
@@ -826,6 +836,10 @@ describe("public service restart", () => {
     mkdirSync(workflows, { recursive: true });
     writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\n", "utf8");
     writeFileSync(join(workflows, "paused-failure.yaml"), [
+      "version: 4",
+      "defaults:",
+      "  retries: 0",
+      "  replay: never",
       "steps:",
       "  - fail:",
       "      run: >-",
@@ -869,6 +883,10 @@ describe("public service restart", () => {
     mkdirSync(workflows, { recursive: true });
     writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\nmax_concurrent_runs: 1\n", "utf8");
     writeFileSync(join(workflows, "safe-stop.yaml"), [
+      "version: 4",
+      "defaults:",
+      "  retries: 0",
+      "  replay: never",
       "steps:",
       "  - first:",
       "      run: >-",
@@ -878,6 +896,10 @@ describe("public service restart", () => {
       "",
     ].join("\n"), "utf8");
     writeFileSync(join(workflows, "active-stop.yaml"), [
+      "version: 4",
+      "defaults:",
+      "  retries: 0",
+      "  replay: never",
       "steps:",
       "  - wait:",
       "      run: >-",
@@ -887,6 +909,10 @@ describe("public service restart", () => {
       "",
     ].join("\n"), "utf8");
     writeFileSync(join(workflows, "after-stop.yaml"), [
+      "version: 4",
+      "defaults:",
+      "  retries: 0",
+      "  replay: never",
       "steps:",
       "  - mark:",
       `      run: 'printf started > ${afterStopStarted}; printf released-slot'`,
@@ -965,10 +991,14 @@ describe("public service restart", () => {
     mkdirSync(workflows, { recursive: true });
     writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\n", "utf8");
     writeFileSync(join(workflows, "validator-stop.yaml"), [
+      "version: 4",
+      "defaults:",
+      "  retries: 0",
+      "  replay: never",
       "steps:",
       "  - validate:",
       "      run: \"printf candidate\"",
-      "      check:",
+      "      verify:",
       "        run: >-",
       `          echo $$ > '${validatorGroupPath}';`,
       "          (sleep 60) &",
@@ -1022,6 +1052,10 @@ describe("public service restart", () => {
     mkdirSync(workflows, { recursive: true });
     writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\n", "utf8");
     writeFileSync(join(workflows, "long-process.yaml"), [
+      "version: 4",
+      "defaults:",
+      "  retries: 0",
+      "  replay: never",
       "steps:",
       "  - wait:",
       `      run: 'echo $$ > ${pidPath}; sleep 20'`,
@@ -1087,14 +1121,15 @@ describe("public service restart", () => {
       "",
     ].join("\n"), "utf8");
     writeFileSync(join(workflows, "capture-recovery.yaml"), [
+      "version: 4",
       "defaults:",
-      "  max_attempts: 1",
+      "  retries: 0",
       "  replay: never",
       "steps:",
       "  - capture:",
       "      agent:",
       "        instructions: Write one original sentence to the supplied result path.",
-      "      check:",
+      "      verify:",
       "        run: |",
       `          printf validator >> '${validatorLaunches}'`,
       `          head -c ${totalBytes} /dev/zero | tr '\\000' x`,
@@ -1185,6 +1220,10 @@ describe("public service restart", () => {
     mkdirSync(workflows, { recursive: true });
     writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\nmax_concurrent_runs: 2\n", "utf8");
     writeFileSync(join(workflows, "long-process.yaml"), [
+      "version: 4",
+      "defaults:",
+      "  retries: 0",
+      "  replay: never",
       "steps:",
       "  - wait:",
       "      run: >-",
@@ -1194,6 +1233,10 @@ describe("public service restart", () => {
       "",
     ].join("\n"), "utf8");
     writeFileSync(join(workflows, "queued-clean.yaml"), [
+      "version: 4",
+      "defaults:",
+      "  retries: 0",
+      "  replay: never",
       "steps:",
       "  - mark:",
       `      run: 'echo started > ${queuedStartPath}; sleep 0.2; echo queued-finished'`,
@@ -1285,6 +1328,10 @@ describe("public service restart", () => {
       expect(secondNode.node.successfulOutput).toBe("frozen-first");
 
       writeFileSync(workflowPath, [
+        "version: 4",
+        "defaults:",
+        "  retries: 0",
+        "  replay: never",
         "steps:",
         "  - replacement:",
         "      run: 'printf replacement-output'",
@@ -1322,6 +1369,10 @@ describe("public service restart", () => {
     mkdirSync(workflows, { recursive: true });
     writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\n", "utf8");
     writeFileSync(join(workflows, "scheduled.yaml"), [
+      "version: 4",
+      "defaults:",
+      "  retries: 0",
+      "  replay: never",
       "schedule:",
       "  every: 1s",
       "  max_runs: 2",
@@ -1338,6 +1389,10 @@ describe("public service restart", () => {
       const firstRun = await waitForRun(root, "scheduled", firstRunId);
       expect(firstRun.status).toBe("completed");
       writeFileSync(join(workflows, "scheduled.yaml"), [
+        "version: 4",
+        "defaults:",
+        "  retries: 0",
+        "  replay: never",
         "schedule:",
         "  every: 1s",
         "  max_runs: 2",
@@ -1407,6 +1462,10 @@ describe("public service restart", () => {
     mkdirSync(workflows, { recursive: true });
     writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\n", "utf8");
     writeFileSync(workflowPath, [
+      "version: 4",
+      "defaults:",
+      "  retries: 0",
+      "  replay: never",
       "schedule:",
       "  every: 1s",
       "  max_runs: 5",
@@ -1452,6 +1511,10 @@ describe("public service restart", () => {
     mkdirSync(workflows, { recursive: true });
     writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\n", "utf8");
     writeFileSync(join(workflows, "scheduled.yaml"), [
+      "version: 4",
+      "defaults:",
+      "  retries: 0",
+      "  replay: never",
       "schedule:",
       "  every: 1s",
       "  max_runs: 2",
@@ -1500,12 +1563,20 @@ describe("public service restart", () => {
     mkdirSync(workflows, { recursive: true });
     writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\nmax_concurrent_runs: 1\n", "utf8");
     writeFileSync(join(workflows, "holder.yaml"), [
+      "version: 4",
+      "defaults:",
+      "  retries: 0",
+      "  replay: never",
       "steps:",
       "  - hold:",
       `      run: 'touch ${holderStarted}; sleep 2; printf held'`,
       "",
     ].join("\n"), "utf8");
     writeFileSync(join(workflows, "scheduled.yaml"), [
+      "version: 4",
+      "defaults:",
+      "  retries: 0",
+      "  replay: never",
       "schedule:",
       "  every: 1s",
       "  max_runs: 2",
@@ -1543,6 +1614,10 @@ describe("public service restart", () => {
     mkdirSync(workflows, { recursive: true });
     writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\n", "utf8");
     writeFileSync(join(workflows, "scheduled.yaml"), [
+      "version: 4",
+      "defaults:",
+      "  retries: 0",
+      "  replay: never",
       "schedule:",
       "  every: 1s",
       "  max_runs: 2",
@@ -1601,6 +1676,10 @@ describe("public service restart", () => {
     mkdirSync(workflows, { recursive: true });
     writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\n", "utf8");
     writeFileSync(join(workflows, "scheduled.yaml"), [
+      "version: 4",
+      "defaults:",
+      "  retries: 0",
+      "  replay: never",
       "schedule:",
       "  every: 2s",
       "  max_runs: 4",
@@ -1689,12 +1768,20 @@ describe("public service restart", () => {
     mkdirSync(workflows, { recursive: true });
     writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\nmax_concurrent_runs: 1\n", "utf8");
     writeFileSync(join(workflows, "holder.yaml"), [
+      "version: 4",
+      "defaults:",
+      "  retries: 0",
+      "  replay: never",
       "steps:",
       "  - hold:",
       `      run: 'echo launch >> ${holderLaunches}; echo $$ > ${holderPidPath}; sleep 20'`,
       "",
     ].join("\n"), "utf8");
     writeFileSync(join(workflows, "scheduled.yaml"), [
+      "version: 4",
+      "defaults:",
+      "  retries: 0",
+      "  replay: never",
       "schedule:",
       "  every: 1s",
       "  max_runs: 2",
@@ -1782,6 +1869,10 @@ describe("public service restart", () => {
 
 function frozenWorkflow(firstCommand: string, secondCommand: string): string {
   return [
+    "version: 4",
+    "defaults:",
+    "  retries: 0",
+    "  replay: never",
     "steps:",
     "  - first:",
     "      run: >-",
@@ -1892,20 +1983,23 @@ async function startBlockedCommandRun(
   root: string,
   workflowId: string,
   command: string,
-  options: { readonly validatorCommand?: string; readonly launchMarker?: string } = {},
+  options: { readonly validatorCommand?: string } = {},
 ): Promise<{ runId: ReturnType<typeof runIdSchema.parse> }> {
   const config = join(root, ".workshop");
   const workflows = join(config, "workflows");
-  const launchMarker = options.launchMarker ?? join(root, "worker-launches.txt");
+  const launchMarker = join(root, "worker-launches.txt");
   mkdirSync(workflows, { recursive: true });
   writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\nmax_concurrent_runs: 1\n", "utf8");
   writeFileSync(join(workflows, `${workflowId}.yaml`), [
+    "version: 4",
+    "defaults:",
+    "  retries: 0",
+    "  replay: never",
     "steps:",
     "  - work:",
     "      replay: never",
-    "      max_attempts: 1",
     ...(options.validatorCommand === undefined ? [] : [
-      "      check:",
+      "      verify:",
       "        run: >-",
       `          ${options.validatorCommand}`,
     ]),
