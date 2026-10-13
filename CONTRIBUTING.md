@@ -122,7 +122,8 @@ flowchart TD
   PE --> P[pi / command process]
   WR -->|on failure| FJ[FailureJudgment]
   FJ -->|retry / block / fail| WR
-  PE --> V[run folder: captures]
+  PE --> V[state/captures: temporary bytes]
+  SVC --> RF[runs: results.md + execution.log]
 ```
 
 ### One run
@@ -143,7 +144,7 @@ WorkflowRun                                define-workshop-tasks.ts
         retry → new NodeAttempt (needs replay: safe and attempts left)
         block → wait for `workshop resolve`
         fail  → the run ends
-  on completion: delete the run folder (unless keep_files: always)
+  retain evidence; regenerate results.md and execution.log after every outcome
 ```
 
 When the service is already running its limit of concurrent runs, a new run
@@ -208,7 +209,8 @@ src/
 │  ├─ serve-workshop-service.ts   socket server and request dispatch
 │  ├─ open-service-runtime.ts     Durable Harness, task registry, reconciliation
 │  ├─ check-legacy-runs.ts        refuses to open while a format 3 run is open
-│  ├─ project-service-reads.ts    status, run pages, and logs
+│  ├─ project-service-reads.ts    status, run pages, and retained-byte logs
+│  ├─ project-run-files.ts        serialized, atomic readable-file projections
 │  ├─ launch-service-process.ts   reuse a healthy service or spawn one
 │  ├─ stop-service-process.ts     verified SIGTERM and bounded wait
 │  ├─ acquire-service-lock.ts     kernel lock with process identity
@@ -235,16 +237,18 @@ src/
 │  ├─ resolve-retry-limit.ts      retries allowed, for format 4 and format 3 runs
 │  └─ schema-resolved.ts, parse-model.ts, hash-canonical-json.ts
 ├─ installation/                  find .workshop/, load workshop.yaml and workflows/
-├─ run/                           run records, outcomes, admission, schedule math;
-│                                 locate-run-files.ts names each process's files
+├─ run/                           run records, outcomes, admission, schedule math
+│  ├─ locate-run-files.ts         readable paths and temporary capture identity
+│  └─ render-run-files.ts         results blocks and labeled execution evidence
 ├─ attempt/                       result parsing and agent prompts
 │  ├─ parse-result.ts             historical JSON result contracts
 │  ├─ parse-tagged-result.ts      text and tagged stdout result parsing
 │  ├─ build-process-stdin.ts      committed role inputs, UTF-8 bytes, and hashes
 │  └─ render-agent-prompt.ts      format 4 worker and verifier prompts
 ├─ model/                         models.json → pi-ai providers for the judge
-├─ process/                       launch, identify, and kill process groups
-├─ storage/disk/                  stream caps and run folder removal
+├─ process/                       launch, identify, and kill process groups;
+│                                 read-retained-capture.ts preserves invalid UTF-8
+├─ storage/disk/                  stream caps and checked process-capture removal
 ├─ views/                         versioned JSON contracts and terminal text
 ├─ tui/                           the `watch` viewer (OpenTUI), loaded lazily;
 │                                 data-source.ts is the contract it renders

@@ -46,8 +46,9 @@ import { workflowRunDocumentV1Schema, workshopEventV1Schema, workshopProcessV1Sc
 import { WorkshopEventEntry, WorkshopInstallationDoc, WorkshopRunDoc, WorkshopServiceReceiptsDoc } from "../storage/durable/define-workshop-records.js";
 import { checkpointDurableWal } from "../storage/durable/checkpoint-durable-wal.js";
 import { openDurableStorage } from "../storage/durable/open-durable-storage.js";
-import { removeRunFiles } from "../storage/disk/remove-run-files.js";
-import { readInstallation, readRun, projectServiceRead } from "./project-service-reads.js";
+import { createRunFileWriter } from "./project-run-files.js";
+import { removeProcessCaptures } from "../storage/disk/remove-process-captures.js";
+import { readRunEvidenceSnapshot, readInstallation, readRun, projectServiceRead } from "./project-service-reads.js";
 import { ServiceRequestError, ServiceShutdownError, serveWorkshopService, type WorkshopServiceRuntime } from "./serve-workshop-service.js";
 import type { ServiceMetadataV1, ServiceRequestV1 } from "./schema.js";
 
@@ -79,9 +80,23 @@ async function openServiceRuntime(
   let shuttingDown = false;
   const openCleanupErrors: unknown[] = [];
   let opening = true;
+  let projectionWriter: ReturnType<typeof createRunFileWriter> | undefined;
+  let projectionRefresh = Promise.resolve();
+  let projectionTimer: ReturnType<typeof setTimeout> | undefined;
 
   try {
-    tasks = defineWorkshopTasks(metadata.bootId, { startupLaunchGate: "closed" });
+    tasks = defineWorkshopTasks(metadata.bootId, {
+      startupLaunchGate: "closed",
+      beforeLaunch: async (conversationId, signal) => {
+        if (projectionWriter === undefined) throw new Error("projection writer is not initialized");
+        while (!signal.aborted) {
+          const result = await projectionWriter.project(conversationId);
+          if (result.available) return;
+          await waitForProjectionRetry(signal);
+        }
+        throw signal.reason ?? new Error("projection wait was aborted");
+      },
+    });
     const scheduleWakeupTask = defineScheduleWakeupTask({
       installation,
       workflowRunTask: tasks.WorkflowRunTask,
@@ -110,15 +125,92 @@ async function openServiceRuntime(
     await checkInstallationHasNoOpenLegacyRuns(harness, BACKGROUND_CONTEXT);
     await reconcileStartupProcessTasks(harness, tasks, Date.now() + STARTUP_RECONCILIATION_MS);
     await assertNoUnreconciledProcessEvidence(harness, Date.now() + STARTUP_RECONCILIATION_MS, metadata.bootId);
+    const writerHarness = harness;
+    const diagnosticKeys = new Set<string>();
+    projectionWriter = createRunFileWriter({
+      load: async (conversationId) => {
+        const index = await readInstallation(writerHarness);
+        const owner = Object.entries(index.workflows).find(([, workflow]) => workflow.runs.some((run) => run.conversationId === Number(conversationId)));
+        const reference = owner?.[1].runs.find((run) => run.conversationId === Number(conversationId));
+        if (reference === undefined || owner === undefined) throw new Error("projection run reference is unavailable");
+        const snapshot = await readRunEvidenceSnapshot(writerHarness, reference, owner[0]);
+        for (const event of snapshot.events) {
+          if (event.type === "view_projection_failed") diagnosticKeys.add(Number(conversationId) + ":" + event.nodeId + ":" + event.message);
+        }
+        return snapshot;
+      },
+      diagnostic: async (conversationId, message, nodeId) => {
+        const boundedMessage = message.slice(0, 4096);
+        const key = Number(conversationId) + ":" + nodeId + ":" + boundedMessage;
+        if (diagnosticKeys.has(key)) return;
+        console.error(boundedMessage);
+        await writerHarness.commit(async (tx) => {
+          const run = workflowRunDocumentV1Schema.parse(await tx.doc(WorkshopRunDoc, conversationId));
+          if (run.state !== "ready") return;
+          await tx.appendEntry(WorkshopEventEntry, conversationId, { data: workshopEventV1Schema.parse({
+            version: 1, eventId: randomUUID(), type: "view_projection_failed", runId: run.runId,
+            nodeId, message: boundedMessage, occurredAt: new Date().toISOString(),
+          }) });
+        }, BACKGROUND_CONTEXT);
+        diagnosticKeys.add(key);
+      },
+      settled: async (snapshot) => {
+        for (const record of snapshot.processEvidence) {
+          const process = record.process;
+          const task = await writerHarness.getTask(record.taskId as TaskId, BACKGROUND_CONTEXT);
+          const superseded = snapshot.processEvidence.some((other) => other.process.executionId === process.executionId
+            && other.process.incarnationNumber > process.incarnationNumber);
+          const settled = task?.state.status === "terminal" && (process.status === "exited" || superseded
+            || ["completed", "failed", "cancelled"].includes(snapshot.run.status));
+          removeProcessCaptures(process, settled);
+        }
+      },
+    });
+    const activeWriter = projectionWriter;
+    let refreshing = false;
+    let refreshAgain = false;
+    let projectionGraph = "";
+    const refreshProjections = (): Promise<void> => {
+      if (shuttingDown) return projectionRefresh;
+      if (refreshing) { refreshAgain = true; return projectionRefresh; }
+      refreshing = true;
+      projectionRefresh = (async () => {
+        let unavailable = false;
+        try {
+          do {
+            refreshAgain = false;
+            const index = await readInstallation(writerHarness);
+            for (const reference of Object.values(index.workflows).flatMap((workflow) => workflow.runs)) {
+              // History is retained but never reinterpreted or executed by the format 4 engine.
+              const run = await readRun(writerHarness, reference);
+              if (!("formatVersion" in run.resolvedSettings) || run.resolvedSettings.formatVersion !== 4) continue;
+              const result = await activeWriter.project(reference.conversationId as ConversationId);
+              if (!result.available) unavailable = true;
+            }
+          } while (refreshAgain && !shuttingDown);
+        } catch (error) {
+          unavailable = true;
+          console.error("unavailable view: " + errorText(error));
+        } finally {
+          refreshing = false;
+          if (unavailable && !shuttingDown && projectionTimer === undefined) {
+            projectionTimer = setTimeout(() => { projectionTimer = undefined; void refreshProjections(); }, 250);
+          }
+        }
+      })();
+      return projectionRefresh;
+    };
+    await refreshProjections();
     tasks.openStartupLaunchGate();
     harness.resume();
-    await removeLeftoverCompletedRunFiles(harness, installation.runsDirectory);
 
     const activeHarness = harness;
     const activeTasks = tasks;
     const schedulerWakeupKind = scheduleWakeupTask.definition.name;
     const checkpointIfTaskGraphIdle = async (graph: TaskGraph): Promise<void> => {
       if (shuttingDown) return;
+      const nextGraph = JSON.stringify(graph);
+      if (nextGraph !== projectionGraph) { projectionGraph = nextGraph; void refreshProjections(); }
       // The scheduler's durable timer is not active workflow work and must not keep an idle WAL alive.
       const hasRunnableWork = Object.values(graph.tasks).some((task) =>
         task.kind !== schedulerWakeupKind && task.state.status !== "waiting",
@@ -158,12 +250,25 @@ async function openServiceRuntime(
     return {
       async handleRequest(request) {
         if (closed) throw new Error("service runtime is closed");
+        await refreshProjections();
         switch (request.method) {
-          case "start": return await startWorkflow(activeHarness, activeTasks, scheduleWakeupTask, installation, request);
+          case "start": {
+            const result = await startWorkflow(activeHarness, activeTasks, scheduleWakeupTask, installation, request);
+            await refreshProjections();
+            return result;
+          }
           case "pause":
           case "resume":
-          case "stop": return await controlWorkflow(activeHarness, activeTasks, request);
-          case "resolve": return await resolveBlockedWorkflow(activeHarness, activeTasks, installation, request);
+          case "stop": {
+            const result = await controlWorkflow(activeHarness, activeTasks, request);
+            await refreshProjections();
+            return result;
+          }
+          case "resolve": {
+            const result = await resolveBlockedWorkflow(activeHarness, activeTasks, installation, request);
+            await refreshProjections();
+            return result;
+          }
           case "status":
           case "runs":
           case "logs.page":
@@ -178,6 +283,7 @@ async function openServiceRuntime(
         if (closed) return;
         shuttingDown = true;
         activeTasks.stopLaunching();
+        if (projectionTimer !== undefined) { clearTimeout(projectionTimer); projectionTimer = undefined; }
         if (idleRetryTimer !== undefined) {
           clearTimeout(idleRetryTimer);
           idleRetryTimer = undefined;
@@ -187,6 +293,8 @@ async function openServiceRuntime(
           taskGraphWatch = undefined;
         }
         await beforeDeadline(idleCheckpoint, deadlineMs, "idle WAL checkpoint");
+        await beforeDeadline(projectionRefresh, deadlineMs, "run projections");
+        await beforeDeadline(activeWriter.drain(), deadlineMs, "projection writer");
         await reconcileLiveProcessTasks(activeHarness, activeTasks, deadlineMs);
         await assertNoUnreconciledProcessEvidence(activeHarness, deadlineMs);
         try {
@@ -202,6 +310,7 @@ async function openServiceRuntime(
     opening = false;
     shuttingDown = true;
     tasks?.stopLaunching();
+    if (projectionTimer !== undefined) { clearTimeout(projectionTimer); projectionTimer = undefined; }
     if (idleRetryTimer !== undefined) {
       clearTimeout(idleRetryTimer);
       idleRetryTimer = undefined;
@@ -220,6 +329,8 @@ async function openServiceRuntime(
       try {
         if (tasks !== undefined) await reconcileLiveProcessTasks(harness, tasks, Date.now() + STARTUP_RECONCILIATION_MS, true);
         await assertNoUnreconciledProcessEvidence(harness, Date.now() + STARTUP_RECONCILIATION_MS);
+        await projectionRefresh;
+        await projectionWriter?.drain();
         await beforeDeadline(harness.close(BACKGROUND_CONTEXT), Date.now() + STARTUP_RECONCILIATION_MS, "partial Harness close");
       } catch (cleanupError) {
         cleanupErrors.push(cleanupError);
@@ -237,17 +348,6 @@ async function openServiceRuntime(
       });
     }
     throw error;
-  }
-}
-
-/** Finishes a completed run's folder cleanup that a crash interrupted. */
-async function removeLeftoverCompletedRunFiles(harness: Harness, runsDirectory: string): Promise<void> {
-  const installation = await readInstallation(harness);
-  for (const workflow of Object.values(installation.workflows)) {
-    for (const reference of workflow.runs) {
-      if (reference.status !== "completed" || !existsSync(join(runsDirectory, reference.runId))) continue;
-      removeRunFiles(await readRun(harness, reference));
-    }
   }
 }
 
@@ -1330,4 +1430,13 @@ function checkedTaskId(value: number): TaskId {
 
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+async function waitForProjectionRetry(signal: AbortSignal): Promise<void> {
+  if (signal.aborted) throw signal.reason ?? new Error("projection wait was aborted");
+  await new Promise<void>((resolve, reject) => {
+    const onAbort = () => { clearTimeout(timer); signal.removeEventListener("abort", onAbort); reject(signal.reason); };
+    const timer = setTimeout(() => { signal.removeEventListener("abort", onAbort); resolve(); }, 250);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
 }

@@ -501,7 +501,18 @@ const scheduleSlotsSkippedEventV1Schema = z.strictObject({
   occurredAt: utcTimestampSchema,
 });
 
+const viewProjectionFailedEventV1Schema = z.strictObject({
+  version: z.literal(1),
+  eventId: evidenceIdSchema,
+  type: z.literal("view_projection_failed"),
+  runId: runIdSchema,
+  nodeId: nodeIdSchema.nullable(),
+  message: z.string().min(1).max(4096),
+  occurredAt: utcTimestampSchema,
+});
+
 export const workshopEventV1Schema = z.discriminatedUnion("type", [
+  viewProjectionFailedEventV1Schema,
   runAdmittedEventV1Schema,
   runStateChangedEventV1Schema,
   runControlEventV1Schema,

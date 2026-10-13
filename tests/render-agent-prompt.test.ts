@@ -85,7 +85,7 @@ describe("format 4 agent prompts", () => {
       previousOutput: { stepId: "draft", output: "a".repeat(65_535) + "é" + "discarded-tail" },
     });
     const excerpt = "a".repeat(65_535);
-    const note = "[Truncated after the first 64 KiB. Find the complete earlier result by its tag: result-draft-" + runTag + ".]";
+    const note = "[Truncated after the first 64 KiB. Find the complete earlier result in WORKSHOP_RESULTS_PATH (results.md) by its tag: result-draft-" + runTag + ".]";
     expect(prompt).toContain(excerpt + "\n\n" + note);
     expect(prompt).not.toContain("discarded-tail");
     expect(new TextEncoder().encode(excerpt).byteLength).toBe(65_535);

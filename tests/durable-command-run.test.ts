@@ -2208,7 +2208,7 @@ describe("Durable headless validation chain", () => {
       const prompt = readFileSync(promptPath, "utf8");
       const runTag = hash(prepared.runId).slice(7, 15);
       expect(prompt).toContain("x\nx\n");
-      expect(prompt).toContain("[Truncated after the first 64 KiB. Find the complete earlier result by its tag: result-first-" + runTag + ".]");
+      expect(prompt).toContain("[Truncated after the first 64 KiB. Find the complete earlier result in WORKSHOP_RESULTS_PATH (results.md) by its tag: result-first-" + runTag + ".]");
     } finally {
       if (opened !== undefined) await opened.harness.close(BACKGROUND_CONTEXT);
       if (previousPrompt === undefined) delete process.env.WORKSHOP_TEST_AGENT_PROMPT;
@@ -2998,7 +2998,7 @@ function createAdapterAgentProcessInput(args: {
   const deadlineAt = args.site.timeoutMs === null
     ? null
     : iso(Date.parse(args.launchIntentAt) + args.site.timeoutMs);
-  const paths = processExecutionFiles({ role: args.role, nodeId: args.nodeId, incarnationNumber: 1 }, args.run.paths.runDirectory, 1);
+  const paths = processExecutionFiles({ role: args.role, nodeId: args.nodeId, incarnationNumber: 1, executionId: args.executionId }, args.run.paths.runDirectory, 1);
   const stdin = reconstructProcessStdin({
     role: args.role,
     nodeId: args.nodeId,

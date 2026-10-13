@@ -385,22 +385,22 @@ describe("CLI commands", () => {
       expect(bigLogsResult.status).toBe(0);
       const bigLogs = logsDtoSchema.parse(JSON.parse(bigLogsResult.stdout));
       expect(bigLogs.runId).toBe(bigRunId);
-      const truncatedCapture = bigLogs.sections.find((section) => section.kind === "capture");
-      if (truncatedCapture?.kind !== "capture") throw new Error("truncated worker capture is missing");
-      expect(truncatedCapture.capture).toMatchObject({
+      const retainedCapture = bigLogs.sections.find((section) => section.kind === "capture");
+      if (retainedCapture?.kind !== "capture") throw new Error("truncated worker capture is missing");
+      expect(retainedCapture.capture).toMatchObject({
         totalBytes: 700_000,
-        retainedBytes: 1024,
-        truncatedBytes: 698_976,
-        keptHeadBytes: 683,
-        keptTailBytes: 341,
-        complete: false,
+        retainedBytes: 700_000,
+        truncatedBytes: 0,
+        keptHeadBytes: 700_000,
+        keptTailBytes: 0,
+        complete: true,
       });
-      expect(truncatedCapture.content?.length).toBe(1024);
-      expect(truncatedCapture.content?.startsWith("HEAD")).toBe(true);
-      expect(truncatedCapture.content?.endsWith("TAIL")).toBe(true);
+      expect(retainedCapture.content?.length).toBe(700_000);
+      expect(retainedCapture.content?.startsWith("HEAD")).toBe(true);
+      expect(retainedCapture.content?.endsWith("TAIL")).toBe(true);
       const bigLogsText = runCli(directory, ["logs", "big", "--run", bigRunId]);
       expect(bigLogsText.status).toBe(0);
-      expect(bigLogsText.stdout).toMatch(/700000 bytes total; 1024 retained \(683 head \+ 341 tail\), 698976 omitted/);
+      expect(bigLogsText.stdout).toMatch(/700000 bytes total; 700000 retained \(700000 head \+ 0 tail\)/);
       const unlimitedStart = runCli(directory, ["start", "unlimited"]);
       expect(unlimitedStart.status).toBe(0);
       const unlimitedRunId = runIdSchema.parse(unlimitedStart.stdout.match(/Started run (\S+)/)?.[1]);

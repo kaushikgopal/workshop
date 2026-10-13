@@ -168,7 +168,7 @@ describe("bounded subprocess capture", () => {
       const stderrPath = join(directory, "stderr");
       child = spawnTracked({
         shell: "/bin/bash",
-        command: "printf 'HEAD'; head -c 992 /dev/zero | tr '\\000' x; printf 'TAIL'",
+        command: "{ printf 'HEAD'; head -c 992 /dev/zero | tr '\\000' x; printf 'TAIL'; } >&2",
         cwd: directory,
         env: { BASH_ENV: "/dev/null", HOME: directory },
         stdoutFile: stdoutPath,
@@ -189,13 +189,13 @@ describe("bounded subprocess capture", () => {
         },
       });
       await hashStarted;
-      expect(statSync(stdoutPath).size).toBe(100);
+      expect(statSync(stderrPath).size).toBe(100);
       const abortCaptures = await captureProcessRecords(input, finished.captures, { bestEffort: true });
       resumeHash();
       const monitorCaptures = await monitorCapture;
 
       const expected = {
-        stream: "stdout",
+        stream: "stderr",
         totalBytes: 1000,
         retainedBytes: 100,
         truncatedBytes: 900,
@@ -203,13 +203,13 @@ describe("bounded subprocess capture", () => {
         keptTailBytes: 33,
         complete: false,
       };
-      expect(abortCaptures[0]).toMatchObject(expected);
-      expect(monitorCaptures[0]).toMatchObject(expected);
+      expect(abortCaptures[1]).toMatchObject(expected);
+      expect(monitorCaptures[1]).toMatchObject(expected);
 
       const reopenedCaptures = await recoverProcessCaptureRecords(input);
-      expect(reopenedCaptures[0]).toMatchObject(expected);
-      expect(readFileSync(stdoutPath, "utf8")).toBe(`HEAD${"x".repeat(92)}TAIL`);
-      expect(reopenedCaptures[0]?.sha256).toBe(`sha256:${createHash("sha256").update(readFileSync(stdoutPath)).digest("hex")}`);
+      expect(reopenedCaptures[1]).toMatchObject(expected);
+      expect(readFileSync(stderrPath, "utf8")).toBe(`HEAD${"x".repeat(92)}TAIL`);
+      expect(reopenedCaptures[1]?.sha256).toBe(`sha256:${createHash("sha256").update(readFileSync(stderrPath)).digest("hex")}`);
     } finally {
       resumeHash();
       if (child !== undefined) {

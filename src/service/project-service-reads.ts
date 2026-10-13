@@ -11,6 +11,7 @@ import {
 } from "../installation/schema.js";
 import { loadCheckedWorkflow, type Installation } from "../installation/load-installation.js";
 import { runIdSchema } from "../run/schema.js";
+import { readRetainedCapture } from "../process/read-retained-capture.js";
 import type { ProcessCapture } from "../process/schema.js";
 import { workshopEventV1Schema, workshopProcessV1Schema, workflowRunDocumentV1Schema } from "../run/records.js";
 import type { PersistedNodeAttempt, PersistedNode, WorkflowRunDocumentV1, WorkshopEventV1 } from "../run/records.js";
@@ -62,12 +63,12 @@ type LogsCursor = z.infer<typeof logsCursorSchema>;
 type ReadyInstallation = Extract<z.infer<typeof installationDocumentV1Schema>, { state: "ready" }>;
 type ReadyRun = Extract<WorkflowRunDocumentV1, { state: "ready" }>;
 type ProcessEvidenceRecord = ReturnType<typeof workshopProcessV1Schema.parse>;
-type RunEvidenceSnapshot = {
+export type RunEvidenceSnapshot = {
   readonly run: ReadyRun;
   readonly processEvidence: readonly ProcessEvidenceRecord[];
   readonly events: readonly WorkshopEventV1[];
 };
-type ProcessCaptureLogMetadata = Omit<ProcessCapture, "content">;
+type ProcessCaptureLogMetadata = Omit<ProcessCapture, "retained">;
 type LogSnapshotSection =
   | {
       readonly kind: "worklog";
@@ -326,7 +327,7 @@ async function buildDiagramDto(
 }
 
 
-async function readRunEvidenceSnapshot(
+export async function readRunEvidenceSnapshot(
   harness: Harness,
   reference: RunReference,
   workflowId: string,
@@ -696,16 +697,18 @@ async function buildLogsSectionPage(
 
 function createLogSnapshot(snapshot: RunEvidenceSnapshot, verbose: boolean): LogSnapshot {
   const { run, processEvidence } = snapshot;
-  const worklog = renderWorklog(run, { verbose });
+  const diagnostics = snapshot.events.filter((event) => event.type === "view_projection_failed")
+    .map((event) => "[view] " + event.message);
+  const worklog = renderWorklog(run, { verbose }) + (diagnostics.length === 0 ? "" : "\n" + diagnostics.join("\n"));
   const sections: LogSnapshotSection[] = [{
     kind: "worklog", sectionId: "worklog", order: 0, label: "worklog",
     content: worklog, contentBytes: Buffer.byteLength(worklog, "utf8"),
   }];
   for (const record of processEvidence) {
     for (const capture of record.process.captures) {
-      // Completed runs delete their folder by default; their captures have nothing left to show.
-      if (capture.totalBytes === 0 || !existsSync(capture.path)) continue;
-      const content = readVerifiedCapture(capture);
+      if (capture.totalBytes === 0) continue;
+      const content = readRetainedCapture(capture);
+      const { retained: _retained, ...metadata } = capture;
       sections.push({
         kind: "capture",
         sectionId: `${record.process.executionId}-${record.process.incarnationId}-${capture.stream}`,
@@ -713,7 +716,7 @@ function createLogSnapshot(snapshot: RunEvidenceSnapshot, verbose: boolean): Log
         label: `${record.nodeId ?? "preflight"} ${record.process.role} ${capture.stream}`,
         executionId: record.process.executionId,
         incarnationNumber: record.process.incarnationNumber,
-        capture,
+        capture: metadata,
         content,
         contentBytes: content === null ? 0 : Buffer.byteLength(content, "utf8"),
       });
@@ -723,19 +726,6 @@ function createLogSnapshot(snapshot: RunEvidenceSnapshot, verbose: boolean): Log
     snapshotId: randomUUID(), workflowId: run.workflowId, runId: run.runId,
     expiresAt: Date.now() + LOG_SNAPSHOT_TTL_MS, sections,
   };
-}
-
-/** Reads a kept capture file; deleted, changed, or non-UTF-8 files show as unavailable content. */
-function readVerifiedCapture(capture: ProcessCapture): string | null {
-  if (capture.sha256 === null) return null;
-  try {
-    const bytes = readFileSync(capture.path);
-    if (bytes.byteLength !== capture.retainedBytes) return null;
-    if (`sha256:${createHash("sha256").update(bytes).digest("hex")}` !== capture.sha256) return null;
-    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
-  } catch {
-    return null;
-  }
 }
 
 function rememberLogSnapshot(snapshot: LogSnapshot): void {

@@ -371,7 +371,7 @@ esac`;
       expect(bom.content).toBe("\uFEFFraw-bom");
       expect(unavailable?.kind).toBe("capture");
       if (unavailable?.kind !== "capture") throw new Error("unavailable capture section is missing");
-      expect(unavailable.content).toBeNull();
+      expect(unavailable.content).toBe("[invalid UTF-8; base64 bytes]\n/3Jhdy1pbnZhbGlk");
       expect(readable?.kind).toBe("capture");
       if (readable?.kind !== "capture") throw new Error("readable capture section is missing");
       expect(readable.content).toBe("other sections remain readable");
@@ -394,7 +394,7 @@ esac`;
         cursor = page.nextCursor ?? undefined;
       } while (cursor !== undefined);
       expect(pages.map((section) => section.sectionId)).toEqual(logs.sections.map((section) => section.sectionId));
-      expect(pages.find((section) => section.kind === "capture" && section.label === "invalid worker stderr")?.content).toBeNull();
+      expect(pages.find((section) => section.kind === "capture" && section.label === "invalid worker stderr")?.content).toContain("base64 bytes");
     } finally {
       if (owner !== undefined) await owner.shutdown();
       rmSync(root, { recursive: true, force: true });

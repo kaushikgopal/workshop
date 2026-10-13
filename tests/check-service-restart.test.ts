@@ -346,7 +346,10 @@ describe("public service restart", () => {
       const disconnected = await client.completion;
       expect(disconnected.status).not.toBe(0);
 
-      const runId = runIdSchema.parse(disconnected.stdout.match(/Started run (\S+)/)?.[1]);
+      // A killed client can disappear before the admission response reaches stdout.
+      const history = runsDtoSchema.parse(JSON.parse(runCli(root, ["runs", "disconnect", "--json"]).stdout));
+      expect(history.runs).toHaveLength(1);
+      const runId = history.runs[0]!.runId;
       const completed = await waitForRun(root, "disconnect", runId);
       expect(completed.status).toBe("completed");
       expect(completed.terminalOutput).toBe("client-disconnected");
@@ -1124,7 +1127,7 @@ describe("public service restart", () => {
       expect(started.status).toBe(0);
       const runId = runIdSchema.parse(started.stdout.match(/Started run (\S+)/)?.[1]);
       const oldService = JSON.parse(readFileSync(join(state, "service.json"), "utf8")) as { pid: number; bootId: string };
-      const retainedPath = await waitForRetainedCapture(join(state, "runs", runId, "capture.1"), capBytes);
+      const retainedPath = await waitForRetainedCapture(join(state, "captures", runId, "capture.1"), capBytes);
       const receipt: unknown = JSON.parse(readFileSync(`${retainedPath}.retention.json`, "utf8"));
       const retained = readFileSync(retainedPath);
       expect(retained.byteLength).toBe(capBytes);

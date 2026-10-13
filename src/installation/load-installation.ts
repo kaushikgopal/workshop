@@ -63,7 +63,7 @@ export function loadInstallation(root: string): Installation {
     workflowsDirectory,
     archiveDirectory: join(workshopDirectory, "archive"),
     stateDirectory,
-    runsDirectory: join(stateDirectory, "runs"),
+    runsDirectory: join(workshopDirectory, "runs"),
     databasePath: join(stateDirectory, "durable.db"),
     machine,
     projectCwd,

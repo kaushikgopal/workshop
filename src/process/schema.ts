@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { isAbsolute } from "node:path";
 import { z } from "zod";
 import { byteCountSchema, replayPolicySchema, sha256Schema, utcTimestampSchema } from "../util/schema.js";
@@ -35,7 +36,22 @@ export const processCaptureSchema = z.strictObject({
   keptTailBytes: byteCountSchema.optional(),
   sha256: sha256Schema.nullable(),
   complete: z.boolean(),
+  retained: z.strictObject({
+    version: z.literal(1),
+    encoding: z.literal("base64"),
+    bytes: z.string(),
+  }).optional(),
 }).superRefine((capture, context) => {
+  if (capture.retained !== undefined) {
+    const bytes = Buffer.from(capture.retained.bytes, "base64");
+    const digest = "sha256:" + createHash("sha256").update(bytes).digest("hex");
+    if (capture.stream === "stdout" && (bytes.byteLength > 1024 * 1024 || (capture.keptTailBytes ?? 0) !== 0)) {
+      context.addIssue({ code: "custom", path: ["retained"], message: "stdout retains its envelope or first 1 MiB, never a tail window" });
+    }
+    if (bytes.toString("base64") !== capture.retained.bytes || bytes.byteLength !== capture.retainedBytes || digest !== capture.sha256) {
+      context.addIssue({ code: "custom", path: ["retained"], message: "retained bytes must match their length and SHA-256" });
+    }
+  }
   if (capture.retainedBytes > capture.totalBytes) {
     context.addIssue({ code: "custom", path: ["retainedBytes"], message: "retained bytes cannot exceed total bytes" });
   }

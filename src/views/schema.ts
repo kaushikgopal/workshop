@@ -478,10 +478,12 @@ export const attemptDetailDtoSchema = z.strictObject({
   }
 
   checkProcessIncarnations(attempt.processes, report, ["processes"]);
-  if (attempt.workerExecutionId !== null && !attempt.processes.some((process) => process.role === "worker")) {
+  if (attempt.workerExecutionId !== null && !attempt.processes.some((process) => process.role === "worker")
+    && !(attempt.status === "executing" && attempt.phase === "awaitWorker" && attempt.candidate === null)) {
     report(["processes"], "worker execution IDs require process-incarnation evidence");
   }
-  if (attempt.validatorExecutionId !== null && !attempt.processes.some((process) => process.role === "validator")) {
+  if (attempt.validatorExecutionId !== null && !attempt.processes.some((process) => process.role === "validator")
+    && !(attempt.status === "validating" && attempt.phase === "awaitValidator" && attempt.verdict === null)) {
     report(["processes"], "validator execution IDs require process-incarnation evidence");
   }
   const workerProcesses = attempt.processes.filter((process) => process.role === "worker");

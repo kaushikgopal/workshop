@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { createReadStream, existsSync, mkdirSync, readFileSync, rmSync, statSync } from "node:fs";
+import { closeSync, createReadStream, existsSync, openSync, readSync, mkdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { dirname, isAbsolute } from "node:path";
 import type { Context } from "@earendil-works/chord";
 import { defineTask, type ConversationId, type Task, type TaskRuntime, type Tx } from "@earendil-works/pi-durable";
@@ -35,6 +35,7 @@ import { sha256Schema, utcTimestampSchema } from "../../util/schema.js";
 import { DEFAULT_STREAM_CAP_BYTES } from "../../util/parse-units.js";
 import { locateProcessFiles, type ProcessFiles } from "../../run/locate-run-files.js";
 import { readVerifiedRetentionWindow, retainStreamWindow } from "../disk/cap-streams.js";
+import { removeProcessCaptures } from "../disk/remove-process-captures.js";
 import { reconstructProcessStdin } from "../../attempt/build-process-stdin.js";
 
 const positive = z.number().int().positive().refine(Number.isSafeInteger);
@@ -78,11 +79,11 @@ export type ProcessExecutionTaskEnvironmentInput = Omit<ProcessExecutionTaskInpu
 
 /** Locates the files of one process from its task input. */
 export function processExecutionFiles(
-  input: Pick<ProcessExecutionTaskInput, "role" | "nodeId" | "incarnationNumber">,
+  input: Pick<ProcessExecutionTaskInput, "role" | "nodeId" | "incarnationNumber" | "executionId">,
   runDirectory: string,
   attemptNumber: number | null,
 ): ProcessFiles {
-  return locateProcessFiles(runDirectory, { role: input.role, nodeId: input.nodeId, attemptNumber, incarnationNumber: input.incarnationNumber });
+  return locateProcessFiles(runDirectory, { role: input.role, nodeId: input.nodeId, attemptNumber, incarnationNumber: input.incarnationNumber, executionId: input.executionId });
 }
 
 export function buildProcessExecutionEnvironment(
@@ -210,7 +211,7 @@ export type ProcessExecutionTaskDefinition = Task<ProcessExecutionTaskInput, Pro
 /** Owns OS-process lifecycle and capture evidence for every Durable execution role. */
 export function defineProcessExecutionTask(
   serviceBootId: string = randomUUID(),
-  options: { readonly startupLaunchGate?: "open" | "closed" } = {},
+  options: { readonly startupLaunchGate?: "open" | "closed"; readonly beforeLaunch?: (conversationId: ConversationId, signal: AbortSignal) => Promise<void> } = {},
 ): {
   readonly serviceBootId: string;
   readonly task: ProcessExecutionTaskDefinition;
@@ -241,6 +242,7 @@ export function defineProcessExecutionTask(
         const input = parseProcessInput(task.input);
         const run = await snapshotRun(runtime, context);
 
+        await options.beforeLaunch?.(runtime.conversationId, runtime.signal);
         const at = timestamp(runtime.now());
         const process = processIncarnationSchema.parse({
           executionId: input.executionId,
@@ -355,6 +357,8 @@ export function defineProcessExecutionTask(
             cwd: input.cwd,
             env: processSpawnEnvironment(input, run),
             inputBytes: stdin.bytes,
+            stdoutLogCapBytes: MAX_SEMANTIC_OUTPUT_BYTES,
+            semanticStdoutLimitBytes: MAX_SEMANTIC_OUTPUT_BYTES,
             stdoutFile: input.stdoutPath,
             stderrFile: input.stderrPath,
           });
@@ -475,7 +479,9 @@ export function defineProcessExecutionTask(
         await child.streamsClosed;
         const stats = child.captures();
         const finishedAt = timestamp(runtime.now());
-        const semantic = readSemanticStdout(input.stdoutPath);
+        const semantic = stats.stdout.totalBytes > MAX_SEMANTIC_OUTPUT_BYTES
+          ? { kind: "too_large" as const, byteCount: stats.stdout.totalBytes }
+          : readSemanticStdout(input.stdoutPath);
         const captures = await captureProcessRecords(input, stats);
         const stdoutCapture = captures.find((capture) => capture.stream === "stdout");
         const stderrCapture = captures.find((capture) => capture.stream === "stderr");
@@ -519,7 +525,7 @@ export function defineProcessExecutionTask(
           await appendProcess(tx, runtime.conversationId, input, Number(runtime.taskId), exited, finishedAt);
           return { status: "terminal", outcome: { status: "completed", result } };
         }, context);
-        removeEmptyCaptures(captures);
+        removeProcessCaptures(exited, true);
         trackedProcesses.delete(input.executionId);
       },
     },
@@ -602,7 +608,7 @@ export function defineProcessExecutionTask(
             await appendProcess(tx, runtime.conversationId, input, Number(runtime.taskId), retired, completedAt);
             return { status: "terminal", outcome: { status: "completed", result } };
           }, context);
-          removeEmptyCaptures(captures);
+          removeProcessCaptures(retired, true);
           trackedProcesses.delete(input.executionId);
           return;
         }
@@ -627,7 +633,6 @@ export function defineProcessExecutionTask(
         await appendProcess(tx, runtime.conversationId, input, Number(runtime.taskId), blocked, timestamp(runtime.now()));
         return { status: "terminal", outcome: { status: "aborted", reason: dead ? "process stopped without a checked operator-stop receipt" : block.reason } };
       }, context);
-      if (dead && confirmedIdentity) removeEmptyCaptures(captures);
       trackedProcesses.delete(input.executionId);
     },
   });
@@ -676,7 +681,6 @@ async function blockProcess(
     await appendProcess(tx, runtime.conversationId, input, Number(runtime.taskId), blocked, timestamp(runtime.now()));
     return { status: "terminal", outcome: { status: "completed", result: { kind: "blocked", block } } };
   }, context);
-  if (cleanup === "confirmed_dead") removeEmptyCaptures(captures);
 }
 
 async function settleRecoveredProcess(
@@ -1070,15 +1074,21 @@ export async function captureProcessRecords(
     let retention: ReturnType<typeof retainStreamWindow> | undefined;
     let retentionFailed = false;
     let sha256: string | null = null;
+    let retained: ReturnType<typeof retainedBytesRecord> | undefined;
     if (item.stats.error === null) {
-      try { retention = retainStreamWindow(item.path, input.streamCapBytes); }
+      try { retention = item.stream === "stdout" ? stdoutWindow(item.path, item.stats.totalBytes) : retainStreamWindow(item.path, input.streamCapBytes); }
       catch (error) {
         if (!options.bestEffort) throw error;
         retentionFailed = true;
       }
       if (!retentionFailed) {
-        try { sha256 = await hashFile(item.path); }
-        catch (error) { if (!options.bestEffort) throw error; }
+        try {
+          sha256 = item.stream === "stdout" ? sha256Prefix(item.path) : await hashFile(item.path);
+          retained = retainedBytesRecord(item.path, item.stream);
+        } catch (error) {
+          if (!options.bestEffort) throw error;
+          sha256 = null;
+        }
       }
     }
     const currentBytes = captureFileSize(item.path);
@@ -1096,6 +1106,7 @@ export async function captureProcessRecords(
         keptTailBytes: retention.keptTailBytes,
       }),
       sha256,
+      ...(retained === undefined ? {} : { retained }),
       complete: item.stats.error === null && !retentionFailed && retention !== undefined
         && truncatedBytes === 0 && sha256 !== null,
     }));
@@ -1112,13 +1123,14 @@ export async function recoverProcessCaptureRecords(input: ProcessCaptureFiles) {
   ]) {
     if (!existsSync(item.path)) continue;
     try {
-      const retention = retainStreamWindow(item.path, input.streamCapBytes);
-      const sha256 = await sha256File(item.path);
+      const retention = item.stream === "stdout" ? stdoutWindow(item.path, captureFileSize(item.path)) : retainStreamWindow(item.path, input.streamCapBytes);
+      const sha256 = item.stream === "stdout" ? sha256Prefix(item.path) : await sha256File(item.path);
       captures.push(processCaptureSchema.parse({
         stream: item.stream,
         path: item.path,
         ...retention,
         sha256,
+        retained: retainedBytesRecord(item.path, item.stream),
         complete: false,
       }));
     } catch {
@@ -1143,18 +1155,11 @@ export async function recoverRetainedProcessCaptureRecords(input: ProcessCapture
       path: item.path,
       ...window,
       sha256: retainedSha256,
+      retained: retainedBytesRecord(item.path, item.stream),
       complete: false,
     }));
   }
   return captures;
-}
-
-/** Empty streams carry no evidence beyond their committed zero-byte record. */
-function removeEmptyCaptures(captures: readonly z.infer<typeof processCaptureSchema>[]): void {
-  for (const capture of captures) {
-    if (capture.totalBytes !== 0) continue;
-    try { rmSync(capture.path, { force: true }); } catch { /* The committed record stays authoritative. */ }
-  }
 }
 
 function captureFileSize(path: string): number {
@@ -1165,4 +1170,31 @@ async function sha256File(path: string): Promise<string> {
   const hash = createHash("sha256");
   for await (const chunk of createReadStream(path)) hash.update(chunk);
   return `sha256:${hash.digest("hex")}`;
+}
+
+function stdoutPrefix(path: string): Buffer {
+  const fd = openSync(path, "r");
+  try {
+    const bytes = Buffer.alloc(Math.min(captureFileSize(path), MAX_SEMANTIC_OUTPUT_BYTES));
+    let offset = 0;
+    while (offset < bytes.length) {
+      const read = readSync(fd, bytes, offset, bytes.length - offset, offset);
+      if (read === 0) throw new Error("stdout changed during durable import");
+      offset += read;
+    }
+    return bytes;
+  } finally { closeSync(fd); }
+}
+
+function stdoutWindow(path: string, observedBytes: number) {
+  const retainedBytes = Math.min(captureFileSize(path), MAX_SEMANTIC_OUTPUT_BYTES);
+  const totalBytes = Math.max(observedBytes, captureFileSize(path));
+  return { totalBytes, retainedBytes, truncatedBytes: totalBytes - retainedBytes, keptHeadBytes: retainedBytes, keptTailBytes: 0 };
+}
+
+function sha256Prefix(path: string): string { return sha256(stdoutPrefix(path)); }
+
+function retainedBytesRecord(path: string, stream: "stdout" | "stderr") {
+  const bytes = stream === "stdout" ? stdoutPrefix(path) : readFileSync(path);
+  return { version: 1 as const, encoding: "base64" as const, bytes: bytes.toString("base64") };
 }

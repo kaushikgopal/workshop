@@ -542,7 +542,7 @@ function createProcessInput(args: {
   deadlineAt: string | null;
 }): ProcessExecutionTaskInput {
   const files = processExecutionFiles(
-    { role: args.role, nodeId: args.input.nodeId, incarnationNumber: args.incarnationNumber ?? 1 },
+    { role: args.role, nodeId: args.input.nodeId, incarnationNumber: args.incarnationNumber ?? 1, executionId: args.executionId },
     args.run.paths.runDirectory,
     args.input.attemptNumber,
   );

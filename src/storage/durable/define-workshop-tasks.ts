@@ -63,7 +63,6 @@ import {
 } from "./define-process-execution-task.js";
 import { defineNodeAttemptTask, nodeAttemptTaskInputSchema, type NodeAttemptTaskDefinition } from "./define-node-attempt-task.js";
 import { utcTimestampSchema } from "../../util/schema.js";
-import { removeRunFiles } from "../disk/remove-run-files.js";
 import { DEFAULT_STREAM_CAP_BYTES } from "../../util/parse-units.js";
 
 const positive = z.number().int().positive().refine(Number.isSafeInteger);
@@ -148,6 +147,7 @@ export function defineWorkshopTasks(
   serviceBootId?: string,
   options: {
     readonly startupLaunchGate?: "open" | "closed";
+    readonly beforeLaunch?: (conversationId: ConversationId, signal: AbortSignal) => Promise<void>;
     /** Must be the Harness clock; the judge decision tool checks its absolute deadline with it. */
     readonly now?: () => number;
   } = {},
@@ -912,7 +912,7 @@ function createPreflightProcessInput(args: {
   launchIntentAt: string;
   deadlineAt: string | null;
 }): ProcessExecutionTaskInput {
-  const files = processExecutionFiles({ role: "preflight", nodeId: null, incarnationNumber: args.incarnationNumber ?? 1 }, args.run.paths.runDirectory, null);
+  const files = processExecutionFiles({ role: "preflight", nodeId: null, incarnationNumber: args.incarnationNumber ?? 1, executionId: args.executionId }, args.run.paths.runDirectory, null);
   const stdin = reconstructProcessStdin({ role: "preflight", nodeId: null, attemptId: null, executionId: args.executionId }, args.run);
   const base: ProcessExecutionTaskEnvironmentInput = {
     ioVersion: 1,
@@ -1695,7 +1695,6 @@ async function completeRun(
     });
     return { status: "terminal", outcome: { status: "completed", result: { kind: "completed", terminalOutput: candidate.output } } };
   }, context);
-  if (completed !== undefined) removeRunFiles(completed);
 }
 
 async function setInstallationStatus(

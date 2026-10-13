@@ -136,7 +136,7 @@ function renderPreviousOutput(previous: AgentPromptIdentity["previousOutput"], r
   const truncated = bytes.byteLength > 64 * 1024;
   const tag = "result-" + previous.stepId + "-" + runTag;
   return truncated
-    ? excerpt + "\n\n[Truncated after the first 64 KiB. Find the complete earlier result by its tag: " + tag + ".]"
+    ? excerpt + "\n\n[Truncated after the first 64 KiB. Find the complete earlier result in WORKSHOP_RESULTS_PATH (results.md) by its tag: " + tag + ".]"
     : excerpt;
 }
 

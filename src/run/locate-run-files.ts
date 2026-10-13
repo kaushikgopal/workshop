@@ -1,11 +1,12 @@
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
-/** Identifies one process incarnation's files inside its run folder. */
+/** Identifies one process incarnation's temporary capture files. */
 export interface ProcessFileIdentity {
   readonly role: "preflight" | "worker" | "validator";
   readonly nodeId: string | null;
   readonly attemptNumber: number | null;
   readonly incarnationNumber: number;
+  readonly executionId: string;
 }
 
 /** Capture paths are process-scoped; readable projections are run-scoped. */
@@ -19,9 +20,10 @@ export interface ProcessFiles {
 
 /** Locate capture paths without creating files. */
 export function locateProcessFiles(runDirectory: string, identity: ProcessFileIdentity): ProcessFiles {
+  const captureDirectory = join(dirname(dirname(runDirectory)), "state", "captures", basename(runDirectory));
   const directory = identity.role === "preflight"
-    ? join(runDirectory, "preflight")
-    : join(runDirectory, `${requireValue(identity.nodeId)}.${requireValue(identity.attemptNumber)}`);
+    ? join(captureDirectory, "preflight", identity.executionId)
+    : join(captureDirectory, `${requireValue(identity.nodeId)}.${requireValue(identity.attemptNumber)}`);
   const stem = identity.incarnationNumber === 1 ? identity.role : `${identity.role}.${identity.incarnationNumber}`;
   return {
     directory,
