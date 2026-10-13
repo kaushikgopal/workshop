@@ -13,8 +13,7 @@ export interface ResultFileSlot {
   readonly stepId: string;
   readonly status: string;
   readonly output: string | null;
-  /** WP7 supplies committed answers. Until then this slot stays empty. */
-  readonly answer: null;
+  readonly answer: { readonly action: "continue" | "reject"; readonly text: string } | null;
   readonly skipped: boolean;
 }
 
@@ -35,6 +34,14 @@ export function renderResultsFile(workflowId: string, runId: string, slots: read
     const output = collision ? "unavailable: delimiter collision" : slot.output;
     if (collision) diagnostics.push({ stepId: slot.stepId, message: "unavailable: delimiter collision" });
     blocks.push("<" + tag + ' status="' + slot.status + '">\n' + output + "\n" + closing);
+    if (slot.answer !== null) {
+      const answerTag = "answer-" + slot.stepId + "-" + runTag;
+      const answerClosing = "</" + answerTag + ">";
+      const collision = slot.answer.text.split(/\r?\n/u).includes(answerClosing);
+      if (collision) diagnostics.push({ stepId: slot.stepId, message: "unavailable: answer delimiter collision" });
+      const text = collision ? "unavailable: delimiter collision" : slot.answer.text;
+      blocks[blocks.length - 1] += "\n<" + answerTag + ' action="' + slot.answer.action + '">\n' + text + "\n" + answerClosing;
+    }
   }
   return { text: "# Results: " + workflowId + " run " + runId + "\n\n" + blocks.join("\n\n") + (blocks.length === 0 ? "" : "\n"), diagnostics };
 }
@@ -43,11 +50,15 @@ export function renderResultsFile(workflowId: string, runId: string, slots: read
 export function renderRunFiles(snapshot: RunFileSnapshot) {
   const { run } = snapshot;
   const slots: ResultFileSlot[] = run.nodes.map((node) => {
-    const attempt = node.attempts.find((value) => value.attemptId === node.successfulAttemptId);
+    const wait = run.waits?.find((value) => value.nodeId === node.nodeId);
+    const attemptId = node.successfulAttemptId ?? wait?.attemptId;
+    const attempt = node.attempts.find((value) => value.attemptId === attemptId);
     const candidate = attempt?.result.kind === "settled" && attempt.result.outcome.kind === "succeeded"
       ? attempt.result.outcome.candidate : null;
+    const reply = wait?.settlement.kind === "replied" ? wait.settlement : null;
     return { stepId: node.nodeId, status: candidate?.version === 2 ? candidate.stdioResult.status : "succeeded",
-      output: candidate?.output ?? null, answer: null, skipped: node.status === "skipped" };
+      output: candidate?.output ?? null, answer: reply === null ? null : { action: reply.action, text: reply.answer },
+      skipped: node.status === "skipped" };
   });
   const results = renderResultsFile(run.workflowId, run.runId, slots);
   const sections = ["# Execution: " + run.workflowId + " run " + run.runId];
@@ -61,6 +72,10 @@ export function renderRunFiles(snapshot: RunFileSnapshot) {
     for (const attempt of node.attempts) {
       if (attempt.feedback !== undefined) sections.push(label(node.nodeId, attempt.number, "engine", "retry feedback") + "\n" + attempt.feedback.text);
     }
+  }
+  for (const wait of run.waits ?? []) {
+    const attempt = run.nodes.find((node) => node.nodeId === wait.nodeId)?.attempts.find((value) => value.attemptId === wait.attemptId);
+    sections.push(label(wait.nodeId, attempt?.number ?? null, "engine", "human wait " + wait.waitId) + "\n" + JSON.stringify(wait));
   }
   for (const record of snapshot.processEvidence) {
     const process = record.process;

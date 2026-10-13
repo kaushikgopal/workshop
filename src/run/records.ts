@@ -22,6 +22,8 @@ import {
   desiredStateSchema,
   activationIdSchema,
   nodeResultSchema,
+  humanWaitSchema,
+  waitIdSchema,
   validatorOutcomeSchema,
 } from "./schema.js";
 import {
@@ -211,7 +213,7 @@ export const persistedNodeAttemptSchema = z.strictObject({
 
 export const persistedNodeSchema = z.strictObject({
   nodeId: nodeIdSchema,
-  status: z.enum(["pending", "running", "succeeded", "failed", "blocked", "cancelled", "skipped"]),
+  status: z.enum(["pending", "running", "succeeded", "failed", "blocked", "cancelled", "skipped", "waiting"]),
   successfulAttemptId: attemptIdSchema.nullable(),
   attempts: z.array(persistedNodeAttemptSchema),
 }).superRefine((node, context) => {
@@ -273,6 +275,7 @@ const admittedRunDocumentV1Schema = z.strictObject({
     conversationId: positiveSafeInteger,
     workflowTaskId: positiveSafeInteger,
     capacityGateTaskId: positiveSafeInteger.nullable().optional(),
+    continuationPending: z.boolean().optional(),
   }),
   status: runStatusSchema,
   desiredState: desiredStateSchema,
@@ -285,6 +288,7 @@ const admittedRunDocumentV1Schema = z.strictObject({
   preflight: preflightStateSchema,
   nodes: z.array(persistedNodeSchema).min(1),
   resolutions: z.array(operatorResolutionSchema),
+  waits: z.array(humanWaitSchema).optional(),
   terminalOutput: z.string().nullable(),
 }).superRefine((run, context) => {
   if (run.sourceHash !== hashSourceText(run.sourceText)) {
@@ -322,6 +326,44 @@ const admittedRunDocumentV1Schema = z.strictObject({
       context.addIssue({ code: "custom", path: ["resolutions", index, "resolutionId"], message: "resolution IDs are unique within the run" });
     }
     resolutionIds.add(resolution.resolutionId);
+  }
+  const waits = run.waits ?? [];
+  const pendingWaits = waits.filter((wait) => wait.settlement.kind === "pending");
+  if ((run.status === "waiting") !== (pendingWaits.length === 1) || pendingWaits.length > 1) {
+    context.addIssue({ code: "custom", path: ["waits"], message: "waiting runs have exactly one unresolved wait" });
+  }
+  const waitIds = new Set<string>();
+  for (const [index, wait] of waits.entries()) {
+    const node = run.nodes.find((value) => value.nodeId === wait.nodeId);
+    const attempt = node?.attempts.find((value) => value.attemptId === wait.attemptId);
+    const candidate = attempt?.result.kind === "settled" && attempt.result.outcome.kind === "succeeded"
+      ? attempt.result.outcome.candidate : null;
+    if (waitIds.has(wait.waitId) || wait.runId !== run.runId || candidate?.version !== 2
+      || candidate.stdioResult.status !== "needs_input" || candidate.output !== wait.output
+      || candidate.stdioResult.question !== wait.question || Date.parse(wait.createdAt) < Date.parse(attempt?.finishedAt ?? wait.createdAt)) {
+      context.addIssue({ code: "custom", path: ["waits", index], message: "wait identity and immutable proposal match its accepted attempt" });
+    }
+    waitIds.add(wait.waitId);
+    if (wait.settlement.kind === "pending" && (node?.status !== "waiting"
+      || run.currentNodeId !== wait.nodeId || run.currentAttemptId !== wait.attemptId)) {
+      context.addIssue({ code: "custom", path: ["waits", index], message: "unresolved wait owns the current waiting node and attempt" });
+    }
+    if (wait.settlement.kind === "replied") {
+      const response = wait.settlement.response;
+      if (response.runId !== run.runId || response.workflowId !== run.workflowId || response.waitId !== wait.waitId
+        || Date.parse(response.resolvedAt) < Date.parse(wait.createdAt)
+        || (wait.settlement.action === "continue" ? node?.status !== "succeeded" : node?.status !== "cancelled")) {
+        context.addIssue({ code: "custom", path: ["waits", index], message: "human reply matches its wait and node transition" });
+      }
+    }
+  }
+  if (run.nodes.some((node) => node.status === "waiting" && !pendingWaits.some((wait) => wait.nodeId === node.nodeId))) {
+    context.addIssue({ code: "custom", path: ["nodes"], message: "waiting nodes require an unresolved wait" });
+  }
+  if (run.durable.continuationPending && (run.status !== "paused" || run.desiredState !== "paused" || run.currentAttemptId !== null
+    || run.nodes.find((node) => node.nodeId === run.currentNodeId)?.status !== "pending"
+    || run.durable.capacityGateTaskId != null)) {
+    context.addIssue({ code: "custom", path: ["durable"], message: "taskless continuation is paused at a pending successor without capacity" });
   }
   if (run.workflowId !== run.canonicalDefinition.id) {
     context.addIssue({ code: "custom", path: ["workflowId"], message: "run identity matches its frozen definition" });
@@ -369,7 +411,7 @@ const admittedRunDocumentV1Schema = z.strictObject({
   const waitingForCapacity = run.durable.capacityGateTaskId !== null && run.durable.capacityGateTaskId !== undefined;
   if ((run.status === "queued" && run.startedAt !== null && !waitingForCapacity)
     || (waitingForCapacity && run.status !== "queued")
-    || (["running", "completed", "failed"].includes(run.status) && run.startedAt === null)) {
+    || (["running", "waiting", "completed", "failed"].includes(run.status) && run.startedAt === null)) {
     context.addIssue({ code: "custom", path: ["startedAt"], message: "run start time matches its lifecycle state" });
   }
   if ((run.status === "blocked") !== (run.block !== null)) {
@@ -514,6 +556,7 @@ const runSettledEventV1Schema = z.strictObject({
     z.strictObject({ kind: z.literal("completed"), terminalOutput: z.string() }),
     z.strictObject({ kind: z.literal("failed"), failure: runFailureInfoSchema }),
     z.strictObject({ kind: z.literal("blocked"), block: blockInfoSchema }),
+    z.strictObject({ kind: z.literal("waiting"), waitId: waitIdSchema }),
     z.strictObject({ kind: z.literal("cancelled") }),
   ]),
   occurredAt: utcTimestampSchema,

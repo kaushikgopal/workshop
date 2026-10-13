@@ -16,6 +16,7 @@ import {
   operatorAcceptanceSchema,
   runIdSchema,
   runStatusSchema,
+  humanWaitSchema,
   runFailureInfoSchema,
 } from "../run/schema.js";
 import {
@@ -145,6 +146,7 @@ export const runSummaryDtoSchema = z.strictObject({
   status: runStatusSchema,
   desiredState: desiredStateSchema,
   waitingForCapacity: z.boolean(),
+  wait: humanWaitSchema.nullable().optional(),
   admittedAt: utcTimestampSchema,
   startedAt: utcTimestampSchema.nullable(),
   finishedAt: utcTimestampSchema.nullable(),
@@ -576,7 +578,7 @@ export const attemptDetailDtoSchema = z.strictObject({
   }
 });
 
-const nodeStatusDtoSchema = z.enum(["pending", "running", "succeeded", "failed", "blocked", "cancelled", "skipped"]);
+const nodeStatusDtoSchema = z.enum(["pending", "running", "succeeded", "failed", "blocked", "cancelled", "skipped", "waiting"]);
 
 export const nodeDetailDtoSchema = z.strictObject({
   nodeId: nodeIdSchema,
@@ -588,6 +590,7 @@ export const nodeDetailDtoSchema = z.strictObject({
   resolvedSettings: resolvedNodeSettingsSchema,
   successfulOutput: boundedText(1024 * 1024).nullable(),
   attempts: z.array(attemptDetailDtoSchema),
+  wait: humanWaitSchema.nullable().optional(),
 }).superRefine((node, context) => {
   const report: ReportIssue = (path, message) => context.addIssue({ code: "custom", path, message });
   if ((node.status === "succeeded") !== (node.successfulOutput !== null)) {
@@ -604,7 +607,7 @@ export const nodeDetailDtoSchema = z.strictObject({
   if ((node.status === "pending" || node.status === "skipped") && node.attempts.length > 0) {
     report(["attempts"], "pending and skipped nodes have no semantic attempts");
   }
-  if (node.status === "cancelled" && lastAttempt !== undefined && lastAttempt.status !== "cancelled") {
+  if (node.status === "cancelled" && node.wait == null && lastAttempt !== undefined && lastAttempt.status !== "cancelled") {
     report(["attempts"], "cancelled nodes end with a cancelled attempt");
   }
   if (node.status === "blocked" && lastAttempt !== undefined
@@ -763,8 +766,8 @@ export const nodeDescriptionDtoSchema = z.strictObject({
   if (node.status === "blocked" && runStatus !== "blocked") {
     report(["node", "status"], "a blocked node belongs to a blocked run");
   }
-  if (runStatus === "queued" && node.status !== "pending") {
-    report(["node", "status"], "queued runs contain only pending nodes");
+  if (runStatus === "queued" && !["pending", "succeeded"].includes(node.status)) {
+    report(["node", "status"], "queued continuations contain only pending or succeeded nodes");
   }
   if (runStatus === "completed" && node.status !== "succeeded" && node.status !== "skipped") {
     report(["node", "status"], "completed runs contain only succeeded or skipped nodes");

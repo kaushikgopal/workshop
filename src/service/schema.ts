@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { nodeIdSchema, workflowIdSchema } from "../definition/schema.js";
-import { runIdSchema } from "../run/schema.js";
+import { runIdSchema, waitIdSchema, humanAnswerSchema, humanReplyResultSchema } from "../run/schema.js";
 import { logSectionDtoSchema, runSummaryDtoSchema } from "../views/schema.js";
 
 export const serviceStatusV1Schema = z.enum([
@@ -46,6 +46,8 @@ export const serviceRequestV1Schema = z.discriminatedUnion("method", [
   z.strictObject({ ...mutationBase, method: z.literal("pause") }),
   z.strictObject({ ...mutationBase, method: z.literal("resume") }),
   z.strictObject({ ...mutationBase, method: z.literal("stop") }),
+  z.strictObject({ ...mutationBase, method: z.literal("human.reply"), runId: runIdSchema,
+    waitId: waitIdSchema, action: z.enum(["continue", "reject"]), answer: humanAnswerSchema }),
   z.strictObject({
     ...mutationBase,
     method: z.literal("resolve"),
@@ -173,6 +175,8 @@ export const serviceResolveResultV1Schema = z.strictObject({
   desiredState: z.enum(["running", "paused", "stopped"]),
   resolutionId: z.string().min(1),
 });
+
+export const serviceReplyResultV1Schema = humanReplyResultSchema;
 
 const serviceErrorV1Schema = z.strictObject({
   code: z.string().min(1).max(128),

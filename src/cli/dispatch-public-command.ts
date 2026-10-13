@@ -4,7 +4,7 @@ import { loadCheckedWorkflow, findInstallation } from "../installation/load-inst
 import type { Installation } from "../installation/load-installation.js";
 import { launchServiceProcess } from "../service/launch-service-process.js";
 import { readServiceWorklog, sendServiceRequest, streamServiceLogChunks, ServiceConnectionError } from "../service/send-service-request.js";
-import { runIdSchema } from "../run/schema.js";
+import { runIdSchema, humanAnswerSchema } from "../run/schema.js";
 import { glyph, localClock } from "../views/format-for-terminal.js";
 import {
   diagramDtoSchema,
@@ -17,6 +17,7 @@ import {
   serviceRunsPageV1Schema,
   serviceStartResultV1Schema,
   serviceResolveResultV1Schema,
+  serviceReplyResultV1Schema,
   type ServiceLogSectionPageV1,
   type ServiceRequestV1,
 } from "../service/schema.js";
@@ -25,7 +26,7 @@ import { errorText } from "./errors.js";
 const CLI_PATH = fileURLToPath(new URL("./main.ts", import.meta.url));
 const SERVICE_START_TIMEOUT_MS = 10_000;
 
-type PublicCommand = "start" | "pause" | "resume" | "stop" | "resolve" | "status" | "runs" | "logs" | "diagram" | "watch" | "step.describe";
+type PublicCommand = "reply" | "start" | "pause" | "resume" | "stop" | "resolve" | "status" | "runs" | "logs" | "diagram" | "watch" | "step.describe";
 
 export async function dispatchPublicCommand(command: PublicCommand, args: readonly string[]): Promise<void> {
   try {
@@ -34,6 +35,7 @@ export async function dispatchPublicCommand(command: PublicCommand, args: readon
       case "pause":
       case "resume":
       case "stop": await controlCommand(command, args); return;
+      case "reply": await replyCommand(args); return;
       case "resolve": await resolveCommand(args); return;
       case "status": await statusCommand(args); return;
       case "runs": await runsCommand(args); return;
@@ -101,6 +103,43 @@ async function controlCommand(command: "pause" | "resume" | "stop", args: readon
   if (result.status === "blocked") process.exitCode = 2;
 }
 
+
+async function replyCommand(args: readonly string[]): Promise<void> {
+  let action: "continue" | "reject" | undefined;
+  let answer: string | undefined;
+  const positional: string[] = [];
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index];
+    if (argument === "--continue" || argument === "--reject") {
+      if (action !== undefined) return usage("supply exactly one of --continue or --reject");
+      action = argument === "--continue" ? "continue" : "reject";
+    } else if (argument === "--answer") {
+      if (answer !== undefined || args[index + 1] === undefined) return usage("--answer requires one text value");
+      answer = args[++index];
+    } else if (argument?.startsWith("-")) {
+      return usage("unsupported reply option: " + argument);
+    } else if (argument !== undefined) positional.push(argument);
+  }
+  if (positional.length !== 1 || action === undefined || answer === undefined) {
+    return usage("usage: workshop reply <workflow> --continue|--reject --answer TEXT");
+  }
+  const checkedAnswer = humanAnswerSchema.safeParse(answer);
+  if (!checkedAnswer.success) return usage("--answer requires nonempty text, at most 64 KiB in UTF-8");
+  const workflowId = positional[0];
+  if (workflowId === undefined) return usage("reply requires a workflow");
+  const socketPath = await ensureService(loadInstallationForCommand());
+  const statusResponse = await request(socketPath, { version: 1, method: "status", workflowId });
+  if (!statusResponse.ok) throw new Error(statusResponse.error.code + ": " + statusResponse.error.message);
+  const run = statusDtoSchema.parse(statusResponse.result).workflows.find((value) => value.workflowId === workflowId)?.unresolvedRun;
+  if (run?.status !== "waiting" || run.wait == null) throw new Error("workflow has no unresolved human wait");
+  const response = await request(socketPath, {
+    version: 1, method: "human.reply", requestId: randomUUID(), workflowId,
+    runId: run.runId, waitId: run.wait.waitId, action, answer: checkedAnswer.data,
+  });
+  if (!response.ok) throw new Error(response.error.code + ": " + response.error.message);
+  const replied = serviceReplyResultV1Schema.parse(response.result);
+  process.stdout.write("replied " + workflowId + " " + replied.waitId + ": " + replied.status + "\n");
+}
 
 async function resolveCommand(args: readonly string[]): Promise<void> {
   let action: "retry" | "accept" | "fail" | undefined;
@@ -220,8 +259,10 @@ async function statusCommand(args: readonly string[]): Promise<void> {
   else {
     for (const workflow of status.workflows) {
       const activation = workflow.activation === null ? "inactive" : `${workflow.activation.state} (${workflow.activation.admittedCount}/${workflow.activation.maxRuns})`;
-      const run = workflow.unresolvedRun === null ? "no unresolved run" : `${workflow.unresolvedRun.status} ${workflow.unresolvedRun.runId}`;
-      process.stdout.write(`${workflow.workflowId}: ${activation}; ${run}\n`);
+      const run = workflow.unresolvedRun === null ? "no unresolved run" : `${(workflow.unresolvedRun.status === "waiting" ? "Needs input" : workflow.unresolvedRun.status)} ${workflow.unresolvedRun.runId}`;
+      process.stdout.write(workflow.workflowId + ": " + activation + "; " + run + "\n");
+      const wait = workflow.unresolvedRun?.wait;
+      if (wait != null) process.stdout.write("  waitId=" + wait.waitId + "\n  Question: " + wait.question + "\n");
       if (workflow.configurationError !== null) process.stdout.write(`  configuration error: ${workflow.configurationError}\n`);
     }
   }
@@ -656,7 +697,7 @@ async function waitForRun(socketPath: string, workflowId: string, runId: string)
       cursor = page.nextCursor;
     } while (true);
     if (found === undefined) throw new Error(`service no longer lists admitted run ${runId}`);
-    if (["completed", "failed", "blocked", "cancelled", "paused"].includes(found.status)) return found;
+    if (["completed", "failed", "blocked", "cancelled", "paused", "waiting"].includes(found.status)) return found;
     await new Promise((resolveDelay) => setTimeout(resolveDelay, 200));
   }
 }

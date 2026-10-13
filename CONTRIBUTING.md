@@ -145,6 +145,9 @@ WorkflowRun                                define-workshop-tasks.ts
         identical consecutive failures → repeated_failure block
         exhausted retry → terminal failure
     accepted success_and_complete → finish; mark successors skipped
+    accepted needs_input → save wait; settle WorkflowRun and release capacity
+      human.reply continue → capacity gate and successor in a new WorkflowRun
+      human.reply reject → cancel this occurrence without disabling its schedule
   retain evidence; regenerate results.md and execution.log after every outcome
 ```
 
@@ -206,6 +209,7 @@ src/
 │  ├─ serve-service-process.ts    process entry: lock, open, serve, shut down
 │  ├─ serve-workshop-service.ts   socket server and request dispatch
 │  ├─ open-service-runtime.ts     Durable Harness, task registry, reconciliation
+│  ├─ reply-human-wait.ts         checked human replies and atomic wait settlement
 │  ├─ check-legacy-runs.ts        refuses to open while a format 3 run is open
 │  ├─ project-service-reads.ts    status, run pages, and retained-byte logs
 │  ├─ project-run-files.ts        serialized, atomic readable-file projections
@@ -219,6 +223,7 @@ src/
 │  ├─ define-scheduler-wakeup-task.ts fixed-rate schedule; admits runs
 │  ├─ admit-run.ts                atomic, idempotent run admission
 │  ├─ define-capacity-gate-task.ts waits for a free run slot
+│  ├─ create-workflow-continuation.ts atomic successor task and capacity gate
 │  ├─ define-workshop-tasks.ts    WorkflowRun: preflight, chain, retry decisions
 │  ├─ define-node-attempt-task.ts NodeAttempt: worker, result check, validator
 │  ├─ define-process-execution-task.ts ProcessExecution: spawn, capture, replay

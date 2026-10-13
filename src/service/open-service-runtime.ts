@@ -6,6 +6,7 @@ import { createModels } from "@earendil-works/pi-ai/models";
 import { createRegistry, Harness, type ConversationId, type TaskGraph, type TaskGraphWatch, type TaskId, type Tx } from "@earendil-works/pi-durable";
 import { canonicalHash } from "../definition/hash-canonical-json.js";
 import { resolveRetryLimit } from "../definition/resolve-retry-limit.js";
+import { replyHumanWait } from "./reply-human-wait.js";
 import { checkInstallationHasNoOpenLegacyRuns } from "./check-legacy-runs.js";
 import { loadCheckedWorkflow, type CheckedWorkflow, type Installation } from "../installation/load-installation.js";
 import {
@@ -31,6 +32,7 @@ import { parseTextResult, parseTaggedWorkerResult } from "../attempt/parse-tagge
 import { prepareRunAdmission } from "../run/prepare-admission.js";
 import { firstFixedRateDeadline } from "../run/decide-fixed-rate-schedule.js";
 import { parseDuration } from "../util/parse-units.js";
+import { createWorkflowContinuation } from "../storage/durable/create-workflow-continuation.js";
 import { admitPreparedRun } from "../storage/durable/admit-run.js";
 import { commitServiceMutation, findServiceMutationReceipt } from "../storage/durable/commit-service-mutation.js";
 import { defineWorkshopTasks, createWorkflowRunTaskInput, parseWorkflowRunTaskInput } from "../storage/durable/define-workshop-tasks.js";
@@ -259,6 +261,11 @@ async function openServiceRuntime(
           case "resume":
           case "stop": {
             const result = await controlWorkflow(activeHarness, activeTasks, request);
+            await refreshProjections();
+            return result;
+          }
+          case "human.reply": {
+            const result = await replyHumanWait(activeHarness, activeTasks, request);
             await refreshProjections();
             return result;
           }
@@ -527,9 +534,11 @@ async function controlWorkflow(
         }
 
         const desiredState = action === "pause" ? "paused" : action === "stop" ? "stopped" : "running";
-        const cancelCapacityWait = action === "stop" && run.status === "queued"
+        const cancelTasklessWait = action === "stop" && (run.status === "waiting" || run.durable.continuationPending === true);
+        const resumeContinuation = action === "resume" && run.durable.continuationPending === true;
+        const cancelCapacityWait = cancelTasklessWait || (action === "stop" && run.status === "queued"
           && run.currentAttemptId === null && run.durable.capacityGateTaskId !== null
-          && run.durable.capacityGateTaskId !== undefined;
+          && run.durable.capacityGateTaskId !== undefined);
         const status = cancelCapacityWait ? "cancelled" : restartingFailedPreflight ? "queued"
           : action === "resume" && run.status === "paused" ? "queued" : run.status;
         if ((action === "pause" && (run.status === "queued" || run.status === "paused"))
@@ -554,12 +563,22 @@ async function controlWorkflow(
               failure: null,
               terminalOutput: null,
               currentAttemptId: null,
-              durable: { ...run.durable, capacityGateTaskId: null },
+              durable: { ...run.durable, capacityGateTaskId: null, continuationPending: false },
+              waits: run.waits?.map((wait) => wait.settlement.kind === "pending"
+                ? { ...wait, settlement: { kind: "stopped" as const, resolvedAt: at } } : wait),
               nodes: run.currentNodeId === null ? run.nodes : run.nodes.map((node) =>
-                node.nodeId === run.currentNodeId && node.status === "pending" ? { ...node, status: "cancelled" } : node),
+                node.nodeId === run.currentNodeId && (node.status === "pending" || node.status === "waiting")
+                  ? { ...node, status: "cancelled" } : node),
             };
             workflow.openRunId = null;
             workflow.capacityReservations = workflow.capacityReservations.filter((runId) => runId !== run.runId);
+          }
+          if (resumeContinuation) {
+            const durable = await createWorkflowContinuation(tx, tasks, run, conversationId);
+            workflowTaskId = durable.workflowTaskId;
+            capacityGateTaskId = durable.capacityGateTaskId ?? null;
+            nextRun = { ...nextRun, durable };
+            reference.workflowTaskId = workflowTaskId;
           }
           if (restartingFailedPreflight) {
             if (run.preflight.kind !== "failed") throw new Error("failed preflight state changed before resume");

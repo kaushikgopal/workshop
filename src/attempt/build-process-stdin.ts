@@ -81,6 +81,7 @@ export function reconstructProcessStdin(input: ProcessStdinIdentity, runDocument
       logPath: join(parsed.paths.runDirectory, "execution.log"),
       previousOutput,
       resultMode: nodeSettings.result,
+      answer: committedHumanAnswer(parsed, input.nodeId),
       feedback: workerFeedback(parsed, input.nodeId, attempt),
     };
     return buildProcessStdin({ role: "worker", kind: "agent", prompt });
@@ -110,6 +111,7 @@ export function reconstructProcessStdin(input: ProcessStdinIdentity, runDocument
     logPath: join(parsed.paths.runDirectory, "execution.log"),
     previousOutput,
     candidateOutput: candidate?.output ?? "",
+    answer: committedHumanAnswer(parsed, input.nodeId),
     failureEvidence: candidate === null ? attempt.feedback?.text ?? "Failure evidence unavailable." : null,
     feedback: earlierFeedback(node.attempts, attempt.number),
     candidateStatus,
@@ -147,4 +149,11 @@ function workerFeedback(run: ReadyRun, nodeId: string, attempt: PersistedNodeAtt
   const failureFeedback = earlierFeedback(node?.attempts ?? [], attempt.number);
   if (botResolution === undefined) return failureFeedback;
   return buildFailureFeedback("Bot resolution: " + botResolution.reason + (failureFeedback === null ? "" : "\n\n" + failureFeedback));
+}
+
+/** A reply is input only for the immediate successor of its immutable proposal. */
+export function committedHumanAnswer(run: ReadyRun, nodeId: string): string | null {
+  const predecessorId = run.chain.predecessors[nodeId];
+  const wait = run.waits?.find((value) => value.nodeId === predecessorId && value.settlement.kind === "replied");
+  return wait?.settlement.kind === "replied" && wait.settlement.action === "continue" ? wait.settlement.answer : null;
 }

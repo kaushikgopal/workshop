@@ -326,8 +326,8 @@ for (const status of ["success_and_complete", "needs_input"] as const) {
       await fixture.resolve({ action: "accept", resultFile, acknowledgeEffects: true });
       await fixture.harness.waitForIdle(BACKGROUND_CONTEXT);
       const run = await fixture.read();
-      expect(run.status).toBe(status === "needs_input" ? "blocked" : "completed");
-      if (status === "needs_input") expect(run.block?.kind).toBe("runtime_incompatible");
+      expect(run.status).toBe(status === "needs_input" ? "waiting" : "completed");
+      if (status === "needs_input") expect(run.waits?.[0]).toMatchObject({ question: "Approve?", output: "human proposal" });
       else {
         expect(run.terminalOutput).toBe("human proposal");
         expect(run.nodes[1]?.status).toBe("skipped");

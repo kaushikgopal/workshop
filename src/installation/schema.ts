@@ -10,7 +10,7 @@ import { sha256Schema, utcTimestampSchema } from "../util/schema.js";
 
 const nonnegativeSafeInteger = z.number().int().nonnegative().refine(Number.isSafeInteger);
 const positiveSafeInteger = z.number().int().positive().refine(Number.isSafeInteger);
-const unresolvedRunStatuses = new Set(["queued", "running", "paused", "blocked"]);
+const unresolvedRunStatuses = new Set(["queued", "running", "paused", "blocked", "waiting"]);
 
 export const activationIndexSchema = z.strictObject({
   activationId: activationIdSchema,
@@ -165,7 +165,7 @@ export const installationDocumentV1Schema = z.discriminatedUnion("state", [
 
 export const serviceMutationReceiptV1Schema = z.strictObject({
   requestId: z.string().min(1).max(128).refine((value) => !/[\x00-\x1f\x7f]/.test(value)),
-  method: z.enum(["start", "pause", "resume", "stop", "resolve"]),
+  method: z.enum(["start", "pause", "resume", "stop", "resolve", "human.reply"]),
   requestHash: sha256Schema,
   retention: z.discriminatedUnion("kind", [
     z.strictObject({ kind: z.literal("service") }),

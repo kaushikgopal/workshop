@@ -20,6 +20,7 @@ const supportedMethods = new Set([
   "resume",
   "stop",
   "resolve",
+  "human.reply",
   "status",
   "runs",
   "logs.page",

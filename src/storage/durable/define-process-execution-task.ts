@@ -36,7 +36,7 @@ import { DEFAULT_STREAM_CAP_BYTES } from "../../util/parse-units.js";
 import { locateProcessFiles, type ProcessFiles } from "../../run/locate-run-files.js";
 import { readVerifiedRetentionWindow, retainStreamWindow } from "../disk/cap-streams.js";
 import { removeProcessCaptures } from "../disk/remove-process-captures.js";
-import { reconstructProcessStdin } from "../../attempt/build-process-stdin.js";
+import { reconstructProcessStdin, committedHumanAnswer } from "../../attempt/build-process-stdin.js";
 
 const positive = z.number().int().positive().refine(Number.isSafeInteger);
 const nonnegative = z.number().int().nonnegative().refine(Number.isSafeInteger);
@@ -119,6 +119,8 @@ export function buildProcessExecutionEnvironment(
     WORKSHOP_STEP_ID: input.nodeId,
     WORKSHOP_ATTEMPT: String(attemptNumber),
   };
+  const answer = committedHumanAnswer(run, input.nodeId);
+  if (answer !== null) env.WORKSHOP_ANSWER = answer;
   if (input.role === "validator" && site.kind === "command") {
     const attempt = requireAttempt(run, input.nodeId, input.attemptId);
     if (attempt.result.kind !== "candidate_committed" && attempt.result.kind !== "validation_committed") {
@@ -754,7 +756,7 @@ export function decideProcessReplay(input: {
   readonly replayPolicy: "safe" | "never";
   readonly recordedReplayPolicy: "safe" | "never";
   readonly incarnationNumber: number;
-  readonly runStatus: "queued" | "running" | "paused" | "blocked" | "failed" | "completed" | "cancelled";
+  readonly runStatus: "waiting" | "queued" | "running" | "paused" | "blocked" | "failed" | "completed" | "cancelled";
   readonly desiredState: "running" | "paused" | "stopped";
   readonly deadlineAt: string | null;
   readonly confirmedDead: boolean;
@@ -829,8 +831,9 @@ function processSpawnEnvironment(input: ProcessExecutionTaskInput, run: ReadyRun
   const removed = [
     "WORKSHOP_PROMPT_FILE", "WORKSHOP_RESULT_FILE", "WORKSHOP_PREVIOUS_OUTPUT_FILE",
     "WORKSHOP_STEP_OUTPUT_FILE", "WORKSHOP_WORKLOG_FILE", "WORKSHOP_STDOUT_FILE",
-    "WORKSHOP_STDERR_FILE", "WORKSHOP_BIN", "WORKSHOP_ANSWER",
+    "WORKSHOP_STDERR_FILE", "WORKSHOP_BIN",
   ];
+  if (input.nodeId === null || committedHumanAnswer(run, input.nodeId) === null) removed.push("WORKSHOP_ANSWER");
   if (input.role !== "validator" || site?.kind !== "command") {
     removed.push("WORKSHOP_CANDIDATE_STATUS", "WORKSHOP_RETRIES_LEFT");
   }

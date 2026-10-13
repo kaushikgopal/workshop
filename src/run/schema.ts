@@ -14,8 +14,43 @@ export const evidenceIdSchema = z.string().min(1).brand<"EvidenceId">();
 export const blockIdSchema = z.string().min(1).brand<"BlockId">();
 export const resolutionIdSchema = z.string().min(1).brand<"ResolutionId">();
 
-export const runStatusSchema = z.enum(["queued", "running", "paused", "blocked", "completed", "failed", "cancelled"]);
+export const runStatusSchema = z.enum(["queued", "running", "paused", "blocked", "waiting", "completed", "failed", "cancelled"]);
+export const waitIdSchema = z.string().uuid();
+export const humanAnswerSchema = z.string().min(1)
+  .refine((value) => value.trim().length > 0 && value.isWellFormed(), "answer must contain well-formed non-whitespace text")
+  .refine((value) => Buffer.byteLength(value, "utf8") <= 64 * 1024, "answer must be at most 64 KiB in UTF-8");
+
 export const desiredStateSchema = z.enum(["running", "paused", "stopped"]);
+export const humanReplyResultSchema = z.strictObject({
+  workflowId: z.string().min(1),
+  runId: runIdSchema,
+  waitId: waitIdSchema,
+  status: runStatusSchema,
+  desiredState: desiredStateSchema,
+  resolvedAt: utcTimestampSchema,
+});
+
+export const humanWaitSchema = z.strictObject({
+  waitId: waitIdSchema,
+  runId: runIdSchema,
+  nodeId: nodeIdSchema,
+  attemptId: attemptIdSchema,
+  question: humanAnswerSchema,
+  output: z.string().min(1),
+  createdAt: utcTimestampSchema,
+  settlement: z.discriminatedUnion("kind", [
+    z.strictObject({ kind: z.literal("pending") }),
+    z.strictObject({ kind: z.literal("stopped"), resolvedAt: utcTimestampSchema }),
+    z.strictObject({
+      kind: z.literal("replied"),
+      provenance: z.literal("human"),
+      action: z.enum(["continue", "reject"]),
+      answer: humanAnswerSchema,
+      response: humanReplyResultSchema,
+    }),
+  ]),
+});
+
 export const attemptStatusSchema = z.enum(["prepared", "executing", "validating", "succeeded", "failed", "interrupted", "cancelled"]);
 export const attemptPhaseSchema = z.enum(["prepare", "awaitWorker", "captureCandidate", "awaitValidator", "finish"]);
 
@@ -392,6 +427,7 @@ export const runOutcomeSchema = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("completed"), terminalOutput: boundedCandidateText(1024 * 1024) }),
   z.strictObject({ kind: z.literal("failed"), failure: runFailureInfoSchema }),
   z.strictObject({ kind: z.literal("blocked"), block: blockInfoSchema }),
+  z.strictObject({ kind: z.literal("waiting"), waitId: waitIdSchema }),
   z.strictObject({ kind: z.literal("cancelled") }),
 ]);
 

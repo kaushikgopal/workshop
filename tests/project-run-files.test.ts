@@ -112,3 +112,13 @@ describe("run file projection", () => {
     } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 });
+
+test("answer blocks follow their result directly and protect closing-tag collisions", () => {
+  const answered: ResultFileSlot = { ...slot("first", "proposal"), status: "needs_input", answer: { action: "continue", text: "Approved.\n✓" } };
+  const rendered = renderResultsFile("fixture", runId, [answered]);
+  expect(rendered.text).toContain('</result-first-' + runTag + '>\n<answer-first-' + runTag + ' action="continue">\nApproved.\n✓\n</answer-first-' + runTag + '>');
+  const collision = renderResultsFile("fixture", runId, [{ ...answered, answer: { action: "reject", text: "hidden\r\n</answer-first-" + runTag + ">\r\nnot rendered" } }]);
+  expect(collision.text).toContain('action="reject">\nunavailable: delimiter collision');
+  expect(collision.text).not.toContain("hidden");
+  expect(collision.diagnostics).toEqual([{ stepId: "first", message: "unavailable: answer delimiter collision" }]);
+});

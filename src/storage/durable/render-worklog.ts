@@ -109,6 +109,13 @@ export function renderWorklog(value: WorkflowRunDocumentV1, options: { readonly 
     }
   }
 
+  for (const wait of run.waits ?? []) {
+    lines.push("", "## Human wait", "", "- Wait ID: " + wait.waitId, "- Step: " + wait.nodeId,
+      "- Question:", ...quote(wait.question), "- Proposal:", ...quote(wait.output));
+    if (wait.settlement.kind === "replied") lines.push("- Human reply: " + wait.settlement.action,
+      "- Answer:", ...quote(wait.settlement.answer));
+    else lines.push("- Wait: " + wait.settlement.kind);
+  }
   lines.push("", "## Run outcome", "", `- Status: ${run.status}`, `- Desired state: ${run.desiredState}`);
   if (run.finishedAt !== null) lines.push(`- Finished: ${run.finishedAt}`);
   if (run.terminalOutput !== null) lines.push(`- Terminal output: ${Buffer.byteLength(run.terminalOutput, "utf8")} bytes from the final step`);
@@ -228,6 +235,12 @@ function renderCompactWorklog(run: Extract<WorkflowRunDocumentV1, { state: "read
     for (const resolution of run.resolutions) {
       lines.push(`- ${resolution.resolvedAt}: ${resolution.action} — ${compactText(resolution.reason)}`);
     }
+  }
+  for (const wait of run.waits ?? []) {
+    lines.push("", (wait.settlement.kind === "pending" ? "Needs input: " : "Human wait: ") + wait.nodeId + " · waitId=" + wait.waitId,
+      "Question:", ...quote(wait.question));
+    if (wait.settlement.kind === "replied") lines.push("Human reply: " + wait.settlement.action, ...quote(wait.settlement.answer));
+    else if (wait.settlement.kind === "stopped") lines.push("Wait stopped.");
   }
   return `${lines.join("\n")}\n`;
 }

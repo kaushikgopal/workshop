@@ -484,8 +484,7 @@ async function commitWorkerCandidate(
       candidate: checkedCandidate,
       occurredAt: timestamp(runtime.now()),
     });
-    const gatedWorkerResult = workerResultRequiresRuntimeGate(checkedCandidate);
-    return { status: "running", checkpoint: { phase: gatedWorkerResult ? "finish" : hasValidator ? "launchValidator" : "finish" } };
+    return { status: "running", checkpoint: { phase: hasValidator ? "launchValidator" : "finish" } };
   }, context);
 }
 
@@ -832,11 +831,6 @@ export function resolveWorkerArtifacts(
   });
 }
 
-function workerResultRequiresRuntimeGate(candidate: NodeResult): boolean {
-  return candidate.version === 2
-    && candidate.stdioResult.status === "needs_input";
-}
-
 function validatorFailureReason(validator: ValidatorOutcome): string {
   if (validator.kind === "command") {
     return validator.exit.kind === "code"
@@ -948,11 +942,9 @@ async function finishNodeAttempt(
     : null;
   if (candidate === null) throw new Error("attempt has no committed candidate to settle");
   const validator = attempt.result.kind === "validation_committed" ? attempt.result.validator : null;
-  const gatedStatus = workerResultRequiresRuntimeGate(candidate) && (validator === null || validatorOutcomePasses(validator));
-  const gatedVerdict = validator?.kind === "agent" && validator.verdict.version === 2 && validator.verdict.decision === "block";
-  if (gatedStatus || gatedVerdict) {
-    const reason = gatedStatus ? "worker status requires a later runtime package" : validator === null ? "verifier blocked" : validatorFailureReason(validator);
-    const block = blockInfo(gatedStatus ? "runtime_incompatible" : "verifier_block", reason, input.runId, input.nodeId, input.attemptId, timestamp(runtime.now()));
+  if (validator?.kind === "agent" && validator.verdict.version === 2 && validator.verdict.decision === "block") {
+    const reason = validator.verdict.reason;
+    const block = blockInfo("verifier_block", reason, input.runId, input.nodeId, input.attemptId, timestamp(runtime.now()));
     await settleAttempt(null, runtime, input, { kind: "blocked", block, candidate, validator }, "interrupted", context);
     return;
   }

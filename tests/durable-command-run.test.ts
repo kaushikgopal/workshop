@@ -672,13 +672,13 @@ describe("canonical worker output views", () => {
 });
 
 describe("format 4 tagged stdout outcomes", () => {
-  test("completes success_and_complete and retains runtime and verifier blocks", async () => {
+  test("completes early results, waits for human input, and retains verifier blocks", async () => {
     const cases = [
       {
         status: "success_and_complete" as const,
         output: ["<status>success_and_complete</status>", "<reason>workflow is complete</reason>", "<output>final proposal</output>"].join("\n"),
         verifierOutput: acceptedVerifierOutput,
-        gatedRole: "worker" as const,
+        outputRole: "worker" as const,
         runStatus: "completed" as const,
         blockKind: null,
       },
@@ -686,15 +686,15 @@ describe("format 4 tagged stdout outcomes", () => {
         status: "needs_input" as const,
         output: ["<status>needs_input</status>", "<reason>required detail is missing</reason>", "<question>Which location should I use?</question>", "<output>pending proposal</output>"].join("\n"),
         verifierOutput: acceptedVerifierOutput,
-        gatedRole: "worker" as const,
-        runStatus: "blocked" as const,
-        blockKind: "runtime_incompatible",
+        outputRole: "worker" as const,
+        runStatus: "waiting" as const,
+        blockKind: null,
       },
       {
         status: "verifier_block" as const,
         output: taggedWorkerOutput,
         verifierOutput: ["<decision>block</decision>", "<reason>candidate needs an unsupported action</reason>"].join("\n"),
-        gatedRole: "validator" as const,
+        outputRole: "validator" as const,
         runStatus: "blocked" as const,
         blockKind: "verifier_block",
       },
@@ -716,7 +716,7 @@ describe("format 4 tagged stdout outcomes", () => {
       process.env.WORKSHOP_TEST_VALIDATOR_INPUT = markers.validatorInput;
       let opened: CommandHarness | undefined;
       try {
-        const workerCommand = fixture.gatedRole === "worker" ? "printf '%s' '" + fixture.output + "'" : undefined;
+        const workerCommand = fixture.outputRole === "worker" ? "printf '%s' '" + fixture.output + "'" : undefined;
         const machine = headlessChainMachineConfig(fixture.verifierOutput, workerCommand);
         const prepared = prepare(directory, "stdio-gate-request-" + index, "command-chain-stdio-gate-run-" + index, headlessChainSourceText, machine);
         opened = await openCommandHarness(join(directory, "durable.db"));
@@ -751,9 +751,13 @@ describe("format 4 tagged stdout outcomes", () => {
           if (result.outcome.kind !== "succeeded") throw new Error("success_and_complete did not succeed");
           expect(candidate.stdioResult.status).toBe("success_and_complete");
           expect(stored.terminalOutput).toBe("final proposal");
+        } else if (fixture.status === "needs_input") {
+          expect(outcome.kind).toBe("waiting");
+          expect(result.outcome.kind).toBe("succeeded");
+          expect(stored.waits?.[0]).toMatchObject({ output: "pending proposal", question: "Which location should I use?" });
         } else {
           expect(outcome.kind).toBe("blocked");
-          if (outcome.kind !== "blocked") throw new Error("tagged status bypassed its runtime block");
+          if (outcome.kind !== "blocked") throw new Error("verifier block did not settle as blocked");
           expect(String(outcome.block.kind)).toBe(fixture.blockKind);
           expect(result.outcome.kind).toBe("blocked");
           if (result.outcome.kind !== "blocked") throw new Error("tagged status lacks a checked block");
@@ -761,7 +765,7 @@ describe("format 4 tagged stdout outcomes", () => {
         }
         if (fixture.status !== "verifier_block") {
           expect(candidate.stdioResult.status).toBe(fixture.status);
-          expect(existsSync(markers.validators)).toBe(fixture.status === "success_and_complete");
+          expect(existsSync(markers.validators)).toBe(true);
         } else {
           expect(readFileSync(markers.validators, "utf8")).toBe("v");
           expect(result.outcome.kind).toBe("blocked");

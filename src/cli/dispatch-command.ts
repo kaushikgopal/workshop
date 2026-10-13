@@ -24,6 +24,8 @@ Commands:
       accept requires --result-file <path> --acknowledge-effects for external_outcome_unknown.
       Supply UTF-8 text or tagged worker output in the step result mode.
       Format 4 does not support --extra-attempt or --target judgment.
+  reply <workflow> --continue|--reject --answer TEXT
+      Reply to the current human wait with an explicit decision.
   status [<workflow>] [--json]
       Read service-backed workflow state.
   runs <workflow> [--json] [--all]
@@ -64,7 +66,7 @@ export async function dispatchCommand(args: readonly string[]): Promise<void> {
     return;
   }
 
-  if (command === "start" || command === "pause" || command === "resume" || command === "stop" || command === "resolve" || command === "status" || command === "runs" || command === "logs" || command === "diagram" || command === "watch" || (command === "step" && rest[0] === "describe")) {
+  if (command === "start" || command === "pause" || command === "resume" || command === "stop" || command === "resolve" || command === "reply" || command === "status" || command === "runs" || command === "logs" || command === "diagram" || command === "watch" || (command === "step" && rest[0] === "describe")) {
     const { dispatchPublicCommand } = await import("./dispatch-public-command.js");
     return dispatchPublicCommand(command === "step" ? "step.describe" : command, command === "step" ? rest.slice(1) : rest);
   }
