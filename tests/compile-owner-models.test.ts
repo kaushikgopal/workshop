@@ -12,7 +12,7 @@ const model = {
   maxTokens: 4_000,
   input: ["text"],
   reasoning: true,
-  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+  cost: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4 },
 };
 
 function writeModelsFile(providers: Record<string, unknown>): { directory: string; path: string } {
@@ -43,10 +43,31 @@ test("compiles supported owner providers without retaining credentials in public
       provider: "bot-gateway",
       id: "bot-fixture",
       baseUrl: TALLY_BASE_URL_BY_API["openai-completions"],
+      cost: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4 },
     });
     expect(models.getModel("external-provider", "bot-fixture")).toBeUndefined();
     expect(JSON.stringify(models.getProviders())).not.toContain("fixture-only-secret");
     expect(JSON.stringify(models.getProviders())).not.toContain("fixture-user");
+  } finally {
+    rmSync(file.directory, { recursive: true, force: true });
+  }
+});
+
+test("compiles owner models without cost at Pi's zero-cost default", () => {
+  const file = writeModelsFile({
+    "bot-gateway": {
+      api: "openai-completions",
+      baseUrl: TALLY_BASE_URL_BY_API["openai-completions"],
+      models: [{ ...model, cost: undefined }],
+    },
+  });
+  try {
+    const models = createWorkshopModels({ modelsFile: file.path });
+    expect(models.getModel("bot-gateway", "bot-fixture")).toMatchObject({
+      provider: "bot-gateway",
+      id: "bot-fixture",
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    });
   } finally {
     rmSync(file.directory, { recursive: true, force: true });
   }

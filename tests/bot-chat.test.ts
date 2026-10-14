@@ -47,7 +47,7 @@ test("configured shared bot completes a chat round trip with a fake model", asyn
 });
 
 
-test("loads an owner provider for the bot and reports only its model identity", async () => {
+test("loads an owner model without cost for the bot and reports its identity", async () => {
   const directory = mkdtempSync(join(tmpdir(), "workshop-bot-owner-models-"));
   const workshopDirectory = join(directory, ".workshop");
   const agentDirectory = join(directory, "pi-agent");
@@ -61,7 +61,6 @@ test("loads an owner provider for the bot and reports only its model identity", 
       models: [{
         id: "custom-bot", name: "Custom bot fixture", contextWindow: 32_000, maxTokens: 4_000,
         input: ["text"], reasoning: false,
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       }],
     },
   } }), "utf8");

@@ -93,7 +93,6 @@ function compileModels(
   for (const descriptor of descriptors) {
     if (ids.has(descriptor.id)) return undefined;
     ids.add(descriptor.id);
-    if (descriptor.cost === undefined) continue;
     const model = compileModel(providerId, api, descriptor);
     if (model === undefined) return undefined;
     models.push(model);
@@ -102,7 +101,6 @@ function compileModels(
 }
 
 function compileModel(providerId: string, api: OwnerModelApi, descriptor: OwnerModelDescriptor): Model<OwnerModelApi> | undefined {
-  if (descriptor.cost === undefined) return undefined;
   const common = {
     id: descriptor.id,
     name: descriptor.name,
@@ -112,7 +110,7 @@ function compileModel(providerId: string, api: OwnerModelApi, descriptor: OwnerM
     reasoning: descriptor.reasoning,
     contextWindow: descriptor.contextWindow,
     maxTokens: descriptor.maxTokens,
-    cost: descriptor.cost,
+    cost: descriptor.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     ...(descriptor.thinkingLevelMap === undefined ? {} : { thinkingLevelMap: descriptor.thinkingLevelMap }),
   };
 
