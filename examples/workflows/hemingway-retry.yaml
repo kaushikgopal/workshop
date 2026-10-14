@@ -1,0 +1,41 @@
+version: 4
+description: Like hemingway-clock, but a command verifier rejects attempt 1 to demonstrate a configured retry.
+schedule:
+  every: 10m
+  max_runs: 1
+defaults:
+  retries: 1
+  timeout: 10m
+  replay: safe
+environment:
+  preflight:
+    command: 'command -v pi >/dev/null'
+steps:
+  - timestamp:
+      run: date -u +%FT%TZ
+      # Attempt 1 fails verification; attempt 2 passes without a model call.
+      verify: |
+        if [ "$WORKSHOP_ATTEMPT" -lt 2 ]; then
+          echo "transient gate: attempt $WORKSHOP_ATTEMPT is rejected; the configured retry will pass" >&2
+          exit 1
+        fi
+  - generate-line:
+      agent: |
+        Generate one original Hemingway-inspired sentence, not a quotation.
+        Read the earlier quote files in the directory named by $WORKSHOP_ARCHIVE.
+        Avoid repeating their scenes, images, or wording.
+        Emit the tagged worker result on stdout with status succeeded.
+        Put only the sentence in output. Put any explanation in reason.
+        Do not edit archived quotes or Workshop files.
+      verify:
+        agent: |
+          Independently compare the candidate with the quote files in the
+          directory named by $WORKSHOP_ARCHIVE. Accept only one original
+          sentence that does not claim Hemingway authorship and is materially
+          distinct in scene, image, and wording.
+          Emit the tagged verifier decision and reason on stdout.
+          Do not edit archived quotes or Workshop files.
+  - publish-quote:
+      run: cat > "$WORKSHOP_ARCHIVE/$WORKSHOP_RUN_ID.md"
+      retries: 0
+      replay: never

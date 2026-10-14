@@ -1,7 +1,7 @@
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
@@ -194,6 +194,65 @@ describe("Durable service runtime", () => {
       } finally {
         reclaimedLock.release();
       }
+    } finally {
+      if (owner !== undefined) await owner.shutdown();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps terminal projections stable during reads and new work, but repairs edited or deleted files", async () => {
+    const root = mkdtempSync(join(tmpdir(), "workshop-stable-history-"));
+    const config = join(root, ".workshop");
+    const workflows = join(config, "workflows");
+    mkdirSync(workflows, { recursive: true });
+    writeFileSync(join(config, "workshop.yaml"), "shell: /bin/sh\n");
+    writeFileSync(join(workflows, "clock.yaml"), [
+      "version: 4", "defaults: { retries: 0, replay: never }", "steps:",
+      "  - tick: echo launch >> launches; printf fixture-output", "",
+    ].join("\n"));
+    const installation = loadInstallation(root);
+    let owner: Awaited<ReturnType<typeof startWorkshopService>> | undefined;
+    try {
+      owner = await startWorkshopService(installation);
+      const socketPath = owner.metadata.socketPath;
+      const start = async (requestId: string) => {
+        const response = await sendServiceRequest(socketPath, { version: 1, method: "start", workflowId: "clock", requestId });
+        if (!response.ok) throw new Error(response.error.message);
+        const run = serviceStartResultV1Schema.parse(response.result);
+        await waitForCompletedRun(socketPath, "clock", run.runId);
+        return run.runId;
+      };
+      const runId = await start("stable-history-1");
+      const readStatus = async () => {
+        const response = await sendServiceRequest(socketPath, { version: 1, method: "status" });
+        if (!response.ok) throw new Error(response.error.message);
+        return statusDtoSchema.parse(response.result);
+      };
+      await readStatus();
+      const paths = ["results.md", "execution.log"].map(name => join(installation.runsDirectory, runId, name));
+      const original = paths.map(path => ({ content: readFileSync(path, "utf8"), ino: statSync(path).ino }));
+      await readStatus();
+      await streamServiceLogChunks(socketPath, "clock", runId, () => {});
+      await start("stable-history-2");
+      await readStatus();
+      expect(paths.map(path => statSync(path).ino)).toEqual(original.map(file => file.ino));
+      for (const path of paths) writeFileSync(path, "not committed state");
+      await readStatus();
+      expect(paths.map(path => readFileSync(path, "utf8"))).toEqual(original.map(file => file.content));
+      for (const path of paths) rmSync(path);
+      const status = await readStatus();
+      expect(paths.map(path => readFileSync(path, "utf8"))).toEqual(original.map(file => file.content));
+      expect(status.workflows[0]?.latestRun?.status).toBe("completed");
+      expect(readFileSync(join(root, "launches"), "utf8")).toBe("launch\nlaunch\n");
+      await owner.shutdown();
+      owner = undefined;
+      // Startup regenerates existing files too, without repeating settled workers.
+      const resultsPath = paths[0];
+      if (resultsPath === undefined) throw new Error("results path is missing");
+      writeFileSync(resultsPath, "not committed state");
+      owner = await startWorkshopService(installation);
+      expect(paths.map(path => readFileSync(path, "utf8"))).toEqual(original.map(file => file.content));
+      expect(readFileSync(join(root, "launches"), "utf8")).toBe("launch\nlaunch\n");
     } finally {
       if (owner !== undefined) await owner.shutdown();
       rmSync(root, { recursive: true, force: true });

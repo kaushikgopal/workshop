@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, lstatSync } from "node:fs";
 import { join, resolve as resolvePath } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
@@ -127,6 +127,7 @@ async function openServiceRuntime(
     await assertNoUnreconciledProcessEvidence(harness, Date.now() + STARTUP_RECONCILIATION_MS, metadata.bootId);
     const writerHarness = harness;
     const diagnosticKeys = new Set<string>();
+    const pendingCaptureCleanup = new Set<number>();
     projectionWriter = createRunFileWriter({
       load: async (conversationId) => {
         const index = await readInstallation(writerHarness);
@@ -164,12 +165,29 @@ async function openServiceRuntime(
             || ["completed", "failed", "cancelled"].includes(snapshot.run.status));
           removeProcessCaptures(process, settled);
         }
+        // A failed disk removal must remain retryable even when the run is terminal.
+        const pending = snapshot.processEvidence.some(record => record.process.captures.some(capture =>
+          [capture.path, capture.path + ".retention.json", capture.path + ".retention-tmp"].some(path => existsSync(path))));
+        if (pending) pendingCaptureCleanup.add(snapshot.run.durable.conversationId);
+        else pendingCaptureCleanup.delete(snapshot.run.durable.conversationId);
       },
     });
     const activeWriter = projectionWriter;
     let refreshing = false;
     let refreshAgain = false;
     let projectionGraph = "";
+    const projectedTerminalRuns = new Map<number, { directory: string; identity: string }>();
+    const readProjectionIdentity = (directory: string): string | null => {
+      try {
+        const identities: string[] = [];
+        for (const name of ["results.md", "execution.log"]) {
+          const stat = lstatSync(join(directory, name));
+          if (!stat.isFile()) return null;
+          identities.push([stat.dev, stat.ino, stat.size, stat.mtimeMs, stat.ctimeMs].join(":"));
+        }
+        return identities.join("|");
+      } catch { return null; }
+    };
     const refreshProjections = (): Promise<void> => {
       if (shuttingDown) return projectionRefresh;
       if (refreshing) { refreshAgain = true; return projectionRefresh; }
@@ -181,11 +199,20 @@ async function openServiceRuntime(
             refreshAgain = false;
             const index = await readInstallation(writerHarness);
             for (const reference of Object.values(index.workflows).flatMap((workflow) => workflow.runs)) {
+              // Terminal evidence is immutable. Polling and log pages must not rewrite all history.
+              const projected = projectedTerminalRuns.get(reference.conversationId);
+              if (projected !== undefined && !pendingCaptureCleanup.has(reference.conversationId)
+                && readProjectionIdentity(projected.directory) === projected.identity) continue;
               // History is retained but never reinterpreted or executed by the format 4 engine.
               const run = await readRun(writerHarness, reference);
               if (!("formatVersion" in run.resolvedSettings) || run.resolvedSettings.formatVersion !== 4) continue;
               const result = await activeWriter.project(reference.conversationId as ConversationId);
               if (!result.available) unavailable = true;
+              else if (["completed", "failed", "cancelled"].includes(run.status)) {
+                const directory = run.paths.runDirectory;
+                const identity = readProjectionIdentity(directory);
+                if (identity !== null) projectedTerminalRuns.set(reference.conversationId, { directory, identity });
+              }
             }
           } while (refreshAgain && !shuttingDown);
         } catch (error) {

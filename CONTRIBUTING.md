@@ -199,66 +199,91 @@ Folders and filenames follow [Naming files](#naming-files).
 
 ```text
 src/
-├─ cli/
-│  ├─ main.ts                     entry point: hands argv to the dispatcher
-│  ├─ dispatch-command.ts         help, offline validate, command routing
-│  ├─ dispatch-public-command.ts  socket client for every other command
-│  ├─ service.ts                  service start | status | stop
-│  └─ watch.ts                    status/watch routing and selected-run service reads
+├─ cli/                           argv, offline validation, socket clients
+│  ├─ main.ts                     entry point
+│  ├─ dispatch-command.ts         help, validate, public command routing
+│  ├─ dispatch-public-command.ts  controls, paged inspection, run following
+│  ├─ errors.ts                   error text at the CLI boundary
+│  ├─ service.ts                  service start | serve | status | stop
+│  └─ watch.ts                    TTY routing and selected-run viewer reads
 ├─ service/                       one owner process per installation
-│  ├─ serve-service-process.ts    process entry: lock, open, serve, shut down
-│  ├─ serve-workshop-service.ts   socket server and request dispatch
-│  ├─ open-service-runtime.ts     Durable Harness, task registry, reconciliation
-│  ├─ reply-human-wait.ts         checked human replies and atomic wait settlement
-│  ├─ check-legacy-runs.ts        refuses to open while a format 3 run is open
-│  ├─ project-service-reads.ts    latest status, node previews, run pages, retained logs
-│  ├─ project-run-files.ts        serialized, atomic readable-file projections
-│  ├─ launch-service-process.ts   reuse a healthy service or spawn one
+│  ├─ serve-service-process.ts    process entry and signal shutdown
+│  ├─ serve-workshop-service.ts   socket server, ownership, request dispatch
+│  ├─ open-service-runtime.ts     Harness, registry, recovery, controls
+│  ├─ reply-human-wait.ts         checked replies and atomic wait settlement
+│  ├─ check-legacy-runs.ts        startup drain guard for open format 3 runs
+│  ├─ project-service-reads.ts    status, node previews, run pages, retained logs
+│  ├─ project-run-files.ts        serialized atomic readable-file projections
+│  ├─ launch-service-process.ts   reuse or spawn the service
 │  ├─ stop-service-process.ts     verified SIGTERM and bounded wait
-│  ├─ acquire-service-lock.ts     kernel lock with process identity
-│  ├─ probe-service-health.ts     checks metadata against the live socket
+│  ├─ acquire-service-lock.ts     kernel lock and process identity
+│  ├─ probe-service-health.ts     metadata and live socket checks
 │  ├─ locate-service-socket.ts    short private socket path
-│  └─ schema.ts, parse-service-protocol.ts, send-service-request.ts
-├─ storage/durable/               the run engine: Durable tasks and records
-│  ├─ define-scheduler-wakeup-task.ts fixed-rate schedule; admits runs
-│  ├─ admit-run.ts                atomic, idempotent run admission
-│  ├─ define-capacity-gate-task.ts waits for a free run slot
-│  ├─ create-workflow-continuation.ts atomic successor task and capacity gate
-│  ├─ define-workshop-tasks.ts    WorkflowRun: preflight, chain, retry decisions
-│  ├─ define-node-attempt-task.ts NodeAttempt: worker, result check, validator
-│  ├─ define-process-execution-task.ts ProcessExecution: spawn, capture, replay
-│  ├─ define-workshop-records.ts  versioned documents and immutable entries
-│  ├─ commit-service-mutation.ts  receipts that make controls idempotent
-│  ├─ render-worklog.ts           compact or verbose worklog from the committed run
-│  ├─ checkpoint-durable-wal.ts   truncates the WAL when the service is idle
-│  └─ open-durable-storage.ts     SQLite with FULL synchronization
-├─ definition/                    YAML → checked, resolved definition
-│  ├─ parse-yaml.ts               strict YAML: no duplicate keys or anchors
-│  ├─ schema.ts, check-definition.ts, check-chain.ts
-│  ├─ resolve-agent-settings.ts, resolve-workflow-settings.ts
-│  ├─ resolve-retry-limit.ts      retries allowed, for format 4 and format 3 runs
-│  └─ schema-resolved.ts, parse-model.ts, hash-canonical-json.ts
-├─ installation/                  find .workshop/, load workshop.yaml and workflows/
-├─ run/                           run records, outcomes, admission, schedule math
-│  ├─ check-block-resolution.ts   format 4 action and resolver authority table
-│  ├─ locate-run-files.ts         readable paths and temporary capture identity
-│  └─ render-run-files.ts         results blocks and labeled execution evidence
-├─ attempt/                       result parsing and agent prompts
+│  ├─ schema.ts                   request, response, metadata contracts
+│  ├─ parse-service-protocol.ts   checked frames and fragmented responses
+│  └─ send-service-request.ts     socket client and paged log reads
+├─ storage/
+│  ├─ durable/                    checkpointed tasks and records
+│  │  ├─ define-scheduler-wakeup-task.ts fixed-rate schedule admission
+│  │  ├─ admit-run.ts             atomic idempotent admission
+│  │  ├─ define-capacity-gate-task.ts waits for a run slot
+│  │  ├─ create-workflow-continuation.ts successor task and capacity gate
+│  │  ├─ define-workshop-tasks.ts WorkflowRun and fixed outcome decisions
+│  │  ├─ define-node-attempt-task.ts worker, result parsing, verifier
+│  │  ├─ define-process-execution-task.ts spawn, capture, crash replay
+│  │  ├─ define-workshop-records.ts documents and immutable entries
+│  │  ├─ commit-service-mutation.ts idempotent control receipts
+│  │  ├─ render-worklog.ts        compact or verbose committed worklog
+│  │  ├─ checkpoint-durable-wal.ts idle WAL truncation
+│  │  └─ open-durable-storage.ts SQLite with FULL synchronization
+│  └─ disk/
+│     ├─ cap-streams.ts           bounded stream capture and retention metadata
+│     └─ remove-process-captures.ts checked capture removal
+├─ definition/                    strict YAML and resolved frozen settings
+│  ├─ parse-yaml.ts               reject duplicate keys and anchors
+│  ├─ check-definition.ts         format 4 authoring and migration checks
+│  ├─ check-chain.ts              linear chain invariants
+│  ├─ resolve-agent-settings.ts   model, harness, obsolete-variable guard
+│  ├─ resolve-workflow-settings.ts frozen execution settings
+│  ├─ resolve-retry-limit.ts      format 4 and historical retry counts
+│  ├─ parse-model.ts              provider/model/thinking strings
+│  ├─ hash-canonical-json.ts      stable definition hashes
+│  ├─ schema.ts                   authored, machine, historical definitions
+│  └─ schema-resolved.ts          current and historical frozen settings
+├─ installation/
+│  ├─ load-installation.ts        find .workshop and load checked workflows
+│  └─ schema.ts                   installation index, activations, receipts
+├─ run/
+│  ├─ check-block-resolution.ts   action and resolver authority table
+│  ├─ decide-fixed-rate-schedule.ts due slots and catch-up decisions
+│  ├─ locate-run-files.ts         readable paths and capture identity
+│  ├─ prepare-admission.ts        frozen admission input and initial run
+│  ├─ render-run-files.ts         results.md and execution.log text
+│  ├─ records.ts                  persisted run and evidence contracts
+│  └─ schema.ts                   lifecycle, outcomes, blocks, waits
+├─ attempt/
 │  ├─ parse-result.ts             historical JSON result contracts
-│  ├─ parse-tagged-result.ts      text and tagged stdout result parsing
-│  ├─ build-process-stdin.ts      committed role inputs, UTF-8 bytes, and hashes
-│  ├─ build-failure-feedback.ts   bounded feedback and raw failure-evidence hashes
+│  ├─ parse-tagged-result.ts      text and tagged stdout results
+│  ├─ build-process-stdin.ts      committed role input bytes and hashes
+│  ├─ build-failure-feedback.ts   bounded feedback and raw evidence hashes
 │  └─ render-agent-prompt.ts      format 4 worker and verifier prompts
-├─ process/                       launch, identify, and kill process groups;
-│                                 read-retained-capture.ts preserves invalid UTF-8
-├─ storage/disk/                  stream caps and checked process-capture removal
-├─ views/                         versioned JSON contracts and terminal text
-│  └─ render-status.ts            three-column snapshots and state-based previews
-├─ tui/                           status/watch viewer (OpenTUI), loaded lazily
-│  ├─ data-source.ts              public service snapshot contract
-│  ├─ build-panes.ts              overview and selected frozen-chain screen models
-│  └─ mount-viewer.ts             persistent scrolling, navigation, serial refresh
-└─ util/                          units, shared schemas
+├─ process/
+│  ├─ launch-process.ts           supervised process group and stdin writer
+│  ├─ identify-process.ts         PID, group, and start identity checks
+│  ├─ kill-process-tree.ts        group retirement with confirmed death
+│  ├─ read-retained-capture.ts    exact UTF-8 or labeled base64 evidence
+│  └─ schema.ts                   process, capture, stdin evidence contracts
+├─ views/
+│  ├─ schema.ts                   versioned public JSON projections
+│  ├─ format-for-terminal.ts      local times and lifecycle glyphs
+│  └─ render-status.ts            three-column snapshots and state previews
+├─ tui/                           lazily loaded OpenTUI viewer
+│  ├─ data-source.ts              service-backed snapshot contract
+│  ├─ build-panes.ts              overview and frozen-chain screen models
+│  └─ mount-viewer.ts             scroll, navigation, serial refresh
+└─ util/
+   ├─ parse-units.ts              duration and byte-size parsing
+   └─ schema.ts                   shared primitive contracts
 ```
 
 Three boundaries hold. `tests/check-parity-gaps.test.ts` and
@@ -276,5 +301,5 @@ runs the Hemingway workflow with a mock agent through the real CLI and service,
 restarts the service, and checks the same Durable run. The only real-model
 check is the README's [Watch it work](README.md#watch-it-work) walkthrough.
 
-- Spec: `.agents/dox/workshop-spec-v4.md`
-- Execution plan and evidence: `.agents/dox/2026-10-05-workshop-v4-execution.md`
+- Spec: `.agents/dox/workshop-spec-v4-ii.md`
+- Decision logs and evidence: `.agents/dox/plan-wp*.md`

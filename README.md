@@ -1,202 +1,315 @@
 # Workshop
 
-Workshop runs agent workflows on your machine, once or on a schedule, and
-survives crashes while it does.
+Workshop runs local workflows, once or on a schedule, and records progress so
+runs survive service restarts.
 
-A workflow is a YAML file that lists a **chain of steps**. Each step runs
-either a shell command or a headless AI agent (Pi, Claude Code, OpenCode, …).
-Each step's output feeds the next step, and an optional check validates each
-result before the chain moves on. Normal progress never needs a model. A
-built-in judge model is asked only when an attempt fails.
+A workflow is a YAML **chain of steps**. Each step starts a shell command or a
+headless agent. Its accepted output feeds the next step. An optional verifier
+checks the result before the chain advances. Normal progress needs no model;
+only agent workers and agent verifiers make model calls.
 
 ## Quick start
 
-Workshop keeps its config and state in a `.workshop/` directory inside whatever
-project you run it from.
+Workshop keeps configuration and state in a project's `.workshop/` directory.
+Run these commands from this repository in fish:
 
-```bash
-alias workshop="bun $PWD/src/cli/main.ts"   # run from this repo after `bun install`
-
-mkdir -p ~/scratch/hemingway/.workshop/workflows && cd ~/scratch/hemingway
-cp $OLDPWD/examples/workshop.yaml .workshop/
-cp $OLDPWD/examples/workflows/hemingway-*.yaml .workshop/workflows/
+```fish
+bun install
+set -g workshop_repo $PWD
+function workshop
+    bun "$workshop_repo/src/cli/main.ts" $argv
+end
+mkdir -p ~/scratch/hemingway/.workshop/workflows
+cp "$workshop_repo/examples/workshop.yaml" ~/scratch/hemingway/.workshop/
+cp "$workshop_repo"/examples/workflows/*.yaml ~/scratch/hemingway/.workshop/workflows/
+cd ~/scratch/hemingway
 ```
 
-Edit `.workshop/workshop.yaml` before the first run. Its models are
-placeholders: set `agent.model` to a model your Pi installation can use, and
-`orchestrator.model` to a priced model from `~/.pi/agent/models.json` (see
-[The failure judge](#the-failure-judge)).
+Set `agent.model` in `.workshop/workshop.yaml` to a model your Pi installation
+can use. The example model is a placeholder.
+
+WARNING: Workflows use your permissions. Review commands and agent instructions
+before starting a workflow. The Pi preset approves tool use without asking.
 
 ### Watch it work
 
-`hemingway-judge` is the most instructive example. Its first attempt at the
-timestamp step is rigged to fail, so you see the judge decide a retry. One run
-makes about three agent calls and one judge call.
+`hemingway-retry` rejects the timestamp's first attempt with a command verifier.
+Its second attempt passes. An agent then writes a sentence, an agent verifier
+checks it, and a command archives it. A successful first agent attempt makes
+two model calls.
 
-```bash
-workshop validate hemingway-judge          # offline YAML and settings check
-workshop start hemingway-judge --detach    # starts the service, prints the run id
-workshop watch hemingway-judge             # live viewer; q quits
+```fish
+workshop validate hemingway-retry
+workshop start hemingway-retry --detach
+workshop watch hemingway-retry
 ```
 
-When the run finishes, inspect what happened:
+Press `q` to close the viewer. Inspect the completed run:
 
-```bash
-workshop status                                     # every workflow and its schedule
-workshop diagram hemingway-judge                    # the chain with step status
-workshop step describe hemingway-judge timestamp    # attempt 1 rejected, judge said retry
-workshop logs hemingway-judge                       # worklog plus every kept process capture
-cat .workshop/archive/hemingway-judge/*.md          # the published sentence
+```fish
+workshop status
+workshop diagram hemingway-retry
+workshop step describe hemingway-retry timestamp --json
+workshop logs hemingway-retry
+cat .workshop/archive/hemingway-retry/*.md
 workshop service stop
 ```
 
-To see crash recovery, run `workshop start hemingway-clock --detach`. While
-`generate-line` is running, find the service pid with
-`workshop service status` and `kill -9` it. The next `workshop status` starts a
-new service, which retires the orphaned process group before doing anything
-else. That step says `replay: safe`, so it then runs again on its own. A step
-without `replay: safe` would block until you decide with `workshop resolve`.
-The example schedules six runs ten minutes apart; `workshop stop
-hemingway-clock` ends the schedule.
+The other example, `hemingway-clock`, schedules six runs ten minutes apart.
+`workshop stop hemingway-clock` disables its schedule and cancels its open run
+after safe process cleanup. `service stop` shuts down the service, not the
+saved schedule.
 
 ## How it works
 
-You drive Workshop through its CLI. Behind it, one background service per
-project owns all state and runs your schedules. It keeps going after `start`
-returns, until `workshop service stop`. The service records each step before it
-takes the next action, so after a crash or reboot a run resumes where it stopped.
+One background service per installation owns the database and schedules. The
+CLI uses a private Unix socket. The service commits progress before taking the
+next action. It retires leftover process groups before recovery can repeat work.
 
-A run walks the chain one step at a time:
+Every process uses the same channels:
 
-```mermaid
-flowchart TD
-  S[start or schedule] --> PF[preflight, optional]
-  PF --> W[step worker]
-  W --> R{result accepted?}
-  R -->|yes| V{check passes?}
-  V -->|yes| N[next step, or done]
-  R -->|no| J[failure judge]
-  V -->|no| J
-  J -->|retry| W
-  J -->|block| B[wait for workshop resolve]
-  J -->|fail| F[run fails]
-```
+| Channel | Contents |
+| --- | --- |
+| stdin | Input: previous output for command workers, a prompt for agents, the candidate output for command verifiers |
+| stdout | Result, parsed after exit |
+| stderr | Progress and diagnostics, available as live previews and retained evidence |
 
-Each process gets a folder with its inputs, prompt, result, and any stdout or
-stderr. A completed run deletes its folder; failed, blocked, and stopped runs
-keep theirs. `workshop logs` renders the run's story from the database. When
-`max_concurrent_runs` runs are already going, a new run waits for a slot.
+Exit zero is necessary for success. Nonzero exit fails even when stdout claims
+success. A process may ignore stdin or close it early; early closure is evidence,
+not a failure by itself.
+
+Each attempt starts a worker, parses its stdout, and checks a configured verifier.
+Accepted results advance the chain, complete it early, or create a human wait.
+Failures follow fixed retry rules. Blocks require an explicit resolution.
+When the concurrent-run limit is full, new work waits for capacity.
 
 ### Things that are easy to get wrong
 
-- **There are two kinds of model call.**
-  - Workers and agent checks run a harness command (`pi --print …` by
-    default) as ordinary subprocesses, so any headless agent can replace `pi`.
-  - Only the failure judge is a direct model call. Its model comes from
-    `~/.pi/agent/models.json` through Tally, and it can only record one
-    decision.
-- **The definition freezes when the run is admitted.** Editing the YAML
-  mid-run changes nothing; the next run picks it up.
-- **Every step states its retry and replay policy.** Set `retries` and
-  `replay` on each step or in `defaults:`; Workshop has no built-in default.
-  After a crash, a `replay: safe` step reruns, and a `replay: never` step
-  blocks, because the service cannot prove the process had no side effects
-  yet. A `replay: never` step must also set `retries: 0`.
-- **A retry needs a retry left.** `retries: 2` allows up to three attempts.
-  The judge may choose retry only when the step is `replay: safe` and retries
-  remain. Otherwise it can only block or fail. Verifiers always replay.
-- **The service owns the state.** Every command, `watch` included, asks the
-  service instead of reading files. `status --json` is the stable,
-  machine-readable view.
-- **Agent stdout is not the output.** An agent step succeeds only by writing
-  checked JSON to `WORKSHOP_RESULT_FILE`. For command steps, stdout is the
-  output.
-- **A blocked run stalls its schedule.** Slots that come due while a run is
-  unresolved are skipped. After service downtime, only the latest missed slot
-  runs.
+- **Admission freezes the definition and settings.** YAML edits affect new runs only.
+- **Retries and crash replay differ.** `retries: 2` permits three attempts.
+  Crash replay does not consume retries; each process execution permits at most
+  two crash relaunches.
+- **Every step needs an explicit policy.** Set `retries` and `replay` on
+  the step or in workflow `defaults`. Workshop supplies neither default.
+- **Repeating work needs permission.** `replay: safe` permits configured retries
+  and automatic crash replay. `replay: never` requires `retries: 0`;
+  an unknown external outcome blocks instead of repeating automatically.
+- **Verifiers must not mutate external state.** They always replay safely after
+  a crash. Workshop repeats a verifier on saved evidence, not its successful worker.
+- **Retry exhaustion fails the run.** Two identical consecutive failures block
+  as `repeated_failure` instead. A broken verifier blocks as `verifier_failed`.
+- **Open runs suppress overlapping scheduled occurrences.** Blocks and human
+  waits keep a run open. Terminal failures release capacity and allow the schedule
+  to continue. After downtime, only the latest missed slot runs.
 
-To see how the code is structured, see
-[CONTRIBUTING](CONTRIBUTING.md#how-the-code-works).
+WARNING: `retries: unlimited` can incur continuing model and tool costs.
+The repeated-failure guard stops only identical consecutive failures.
+
+See [CONTRIBUTING](CONTRIBUTING.md#how-the-code-works) for the architecture.
 
 ## A workflow
 
-The bundled example, trimmed
-([full file](examples/workflows/hemingway-clock.yaml)):
-
-Save it as `.workshop/workflows/hemingway-clock.yaml`; the file name is the
-workflow id.
+Save this as `.workshop/workflows/hemingway-clock.yaml`. The filename is the
+workflow ID. The [full example](examples/workflows/hemingway-clock.yaml) also
+checks for Pi and compares archived sentences.
 
 ```yaml
-version: 4                              # required
-schedule: { every: 10m, max_runs: 6 }   # omit for a one-shot workflow
+version: 4
+schedule: { every: 10m, max_runs: 6 }
 defaults:
-  retries: 1                            # retries after the first attempt
-  replay: safe                          # steps rerun after a crash
-
+  retries: 1
+  replay: safe
+instructions: Keep the sentence original. Do not edit Workshop files.
 steps:
-  - timestamp: date -u +%FT%TZ          # 1. shell command
-  - generate-line:                      # 2. AI agent, checked by a second agent
-      agent: Generate one original Hemingway-inspired sentence …
+  - timestamp: date -u +%FT%TZ
+  - generate-line:
+      agent: Generate one original Hemingway-inspired sentence, not a quotation.
       verify:
-        agent: Pass only if it is one original sentence …
-  - publish-quote:                      # 3. shell command, consumes step 2's output
-      run: cp "$WORKSHOP_PREVIOUS_OUTPUT_FILE" "$WORKSHOP_ARCHIVE/$WORKSHOP_RUN_ID.md"
+        agent: Accept only one original sentence that does not claim Hemingway authorship.
+  - publish-quote:
+      run: cat > "$WORKSHOP_ARCHIVE/$WORKSHOP_RUN_ID.md"
       retries: 0
+      replay: never
 ```
 
-A step is a command string, `run: <command>`, or `agent: <instructions>` (or
-`agent: { instructions, model, harness }`), plus optional `retries`,
-`replay`, `verify`, `result`, `timeout`, and `stream_cap`. A `verify` is written
-like a step body: a command string, `run: <command>`, or `agent: …`. It
-shares its step's timeout and stream cap. An agent verifier uses the workflow
-and machine agent settings, not its step's. `instructions:` at the top of the
-file holds text shared by the workflow's agents.
+A step body is a command string, `run: <command>`, or `agent: <instructions>`.
+An agent also accepts `{ instructions, model, harness }`. Step options are
+`retries`, `replay`, `verify`, `result`, `timeout`, and `stream_cap`.
 
-Commands produce their output on stdout. Agents get their prompt in
-`WORKSHOP_PROMPT_FILE` and must write checked JSON to `WORKSHOP_RESULT_FILE`;
-their stdout is diagnostic only. Every process also sees:
+`verify` accepts a command string, `run: <command>`, or `agent: …`, with
+no other fields. It inherits the step's timeout and stream cap. Agent verifier
+settings resolve from the verifier, workflow defaults, and machine defaults,
+not from the worker's agent settings.
 
-| Variable | Holds |
+Top-level `instructions` adds shared text to all worker and verifier prompts.
+Workflow, worker, and verifier instructions each permit at most 64 KiB in UTF-8.
+An optional `environment.preflight` object takes `command` and optional
+`timeout`. It runs before the first step with empty stdin.
+
+### Result formats
+
+`result: text` is the default for commands. The complete stdout becomes the
+output without trimming. `result: tagged` is the default for agents and is
+also available to commands. Either mode can be set on any worker.
+
+A tagged worker writes these blocks to stdout in this order:
+
+```text
+<status>success_and_complete</status>
+<reason>No new findings.</reason>
+<output>
+Nothing requires action.
+</output>
+```
+
+- `status` is required: `succeeded`, `success_and_complete`, or `needs_input`.
+- `reason` is optional explanatory text.
+- `question` follows `reason` when present. It is required only for
+  `needs_input` and forbidden for the other statuses.
+- `output` is required. It may be empty except with `needs_input`.
+
+Accepted `success_and_complete` completes the run immediately and marks
+unexecuted successors `skipped`. It never bypasses a configured verifier.
+
+An agent verifier writes:
+
+```text
+<decision>retry</decision>
+<reason>The parser accepts malformed input.</reason>
+<corrections>
+Reject malformed input and add a regression test.
+</corrections>
+```
+
+`decision` is `accept`, `retry`, or `block`. A nonempty `reason` is
+required. Optional `corrections` is allowed only with `retry`. Command
+verifiers accept by exiting zero; their stdout is evidence, not a verdict.
+
+Blocks are flat, without attributes or escaping. Workshop ignores preamble and
+trailer text but retains both as evidence. Opening `status` or `decision`
+must start a line. Blocks follow the declared order with only whitespace between
+them. The last block ends at its last closing tag, so output can contain its own
+closing-tag text. Workshop removes one boundary newline, not all whitespace.
+
+Workshop rejects invalid UTF-8, duplicate or unknown blocks, and stdout over
+1 MiB. Each `reason`, `question`, and `corrections` permits at most 64 KiB.
+When present, these fields must contain non-whitespace text.
+A tagged status is only a proposal until verification accepts it.
+
+### Verification and feedback
+
+Command verifiers receive the candidate output on stdin. They run only on valid
+candidates. Agent verifiers receive a prompt with candidate status, output,
+retry state, and earlier feedback. When a worker fails and retries remain,
+an agent verifier can inspect failure evidence and request `retry` or `block`,
+never `accept`.
+
+A rejection retries only when retries remain and `replay: safe` permits it.
+Otherwise the run fails. A verifier always checks a valid candidate, even with
+`retries: 0`. Verifier launch errors, timeout, invalid verdicts, and exit
+126/127 block rather than repeating worker effects. A nonzero agent verifier exit
+also blocks; other nonzero command verifier exits reject the candidate.
+
+Workshop saves bounded feedback before a retry. Agent workers receive it in
+the next prompt. Command workers receive the same stdin without feedback.
+Feedback cannot grant replay permission or human approval.
+
+### Human waits
+
+A tagged worker can request a decision:
+
+```text
+<status>needs_input</status>
+<question>Submit this proposal?</question>
+<output>
+Submit request R-42 for 120 USD to the fake service.
+</output>
+```
+
+After verification, Workshop saves the exact proposal and question with a wait
+ID. The worker exits; the wait holds no capacity slot. Read the proposal with
+`workshop status <workflow>` or `workshop step describe <workflow> <step> --json`.
+Reply explicitly:
+
+```fish
+workshop reply submission --continue --answer 'Approved.'
+# Or reject the proposal:
+workshop reply submission --reject --answer 'The amount is too high.'
+```
+
+Here `submission` is the workflow that requested the wait. Continue accepts
+the saved output and starts only the successor after capacity is available.
+The successor receives the proposal on stdin and `WORKSHOP_ANSWER` for a
+command, or the answer in an agent prompt. Reject cancels this occurrence without
+disabling its schedule. A conflicting or stale reply cannot advance the run.
+
+Continue while paused saves the next position; Resume starts it exactly once.
+Final-step Continue completes even while paused. Stop cancels a waiting run.
+
+### Process environment
+
+| Variable | Contents |
 | --- | --- |
-| `WORKSHOP_RUN_ID`, `WORKSHOP_WORKFLOW_ID` | the run and workflow |
-| `WORKSHOP_STEP_ID`, `WORKSHOP_ATTEMPT` | the step and its attempt number |
-| `WORKSHOP_PREVIOUS_OUTPUT_FILE` | the previous step's output |
-| `WORKSHOP_STEP_OUTPUT_FILE` | the candidate output, for a check |
-| `WORKSHOP_WORKLOG_FILE` | the compact run log at launch |
+| `WORKSHOP_RUN_ID`, `WORKSHOP_WORKFLOW_ID` | Run and workflow identity |
+| `WORKSHOP_STEP_ID`, `WORKSHOP_ATTEMPT` | Step and attempt number; preflight uses empty step and attempt 0 |
+| `WORKSHOP_EXECUTION_ID` | Process execution identity |
+| `WORKSHOP_RESULTS_PATH`, `WORKSHOP_LOG_PATH` | Read-only views: `results.md` and `execution.log` |
 | `WORKSHOP_ARCHIVE` | `.workshop/archive/<workflow>/`, kept across runs |
-
-An optional `environment.preflight` command runs before the first step and
-sees the run, workflow, and archive variables.
+| `WORKSHOP_CANDIDATE_STATUS`, `WORKSHOP_RETRIES_LEFT` | Command verifier candidate status and retries left (`n` or `unlimited`) |
+| `WORKSHOP_ANSWER` | Committed answer for an answered wait's immediate successor and its verifier |
+| `WORKSHOP_PROVIDER`, `WORKSHOP_MODEL_ID`, `WORKSHOP_MODEL` | Agent provider, bare model ID, and provider/model |
+| `WORKSHOP_THINKING`, `WORKSHOP_MODEL_WITH_THINKING` | Agent thinking level and full model string |
 
 ## Commands
 
 | Command | Does |
 | --- | --- |
-| `validate <id>` | check YAML and resolved settings, offline |
-| `start <id> [--detach]` | admit a run (and enable its schedule); wait unless detached |
-| `pause` / `resume` / `stop <id>` | control the open run and its schedule |
-| `resolve <id> --action retry\|accept\|fail --reason <text>` | decide a blocked run |
-| `status [<id>] [--json]` | workflows, activations, and each unresolved run |
-| `runs <id> [--json] [--all]` | run history, newest first |
-| `logs <id> [--run <id>] [--follow \| --all] [--json \| --verbose]` | worklog and kept process captures; `--verbose` adds hashes and settings |
-| `watch [<id>]` | live TUI: `j`/`k` history, `f` follow, `a` all logs, `q` quit |
-| `diagram <id> [--run <id>] [--mermaid]` | the chain with run status |
-| `step describe <id> <step> [--run <id>] [--json]` | frozen settings and attempt evidence |
-| `service start` | start the detached service; does nothing if it is running |
-| `service serve` | run the service in the foreground |
-| `service status [--json]` | health, PID, and boot ID; exit 3 when not running |
-| `service stop` | graceful shutdown; does nothing if it is not running |
+| `validate <workflow>` | Check YAML and resolved settings offline |
+| `start <workflow> [--detach]` | Admit a run and enable its schedule; wait unless detached |
+| `pause <workflow>` | Stop new dispatch; let the active step finish |
+| `resume <workflow>` | Resume paused work |
+| `stop <workflow>` | Disable the schedule and cancel the open run after cleanup |
+| `resolve <workflow> --action retry\|accept\|fail --reason <text> [options]` | Resolve a permitted block action |
+| `reply <workflow> --continue\|--reject --answer TEXT` | Answer the current human wait |
+| `status [<workflow>] [--json]` | Open the viewer on a TTY; otherwise print a snapshot |
+| `watch [<workflow>] [--json]` | Alias for status |
+| `runs <workflow> [--json] [--all]` | Run history, newest first; default page is byte-bounded |
+| `logs <workflow> [--run <run-id>] [--follow \| --all] [--json \| --verbose]` | Worklog and retained process captures |
+| `diagram <workflow> [--run <run-id>] [--mermaid]` | Chain with run status |
+| `step describe <workflow> <step> [--run <run-id>] [--json]` | Frozen settings and attempt evidence |
+| `service start` | Start or reuse the detached service |
+| `service serve` | Serve in the foreground |
+| `service status [--json]` | Service health, PID, and boot ID; exit 3 if not running |
+| `service stop` | Graceful, idempotent service shutdown |
 
-Run any of them as `bun src/cli/main.ts <command>`; `help` lists them. Any
-command that needs the service starts it. The service keeps running schedules
-after `start` returns, until `service stop`.
+`bun src/cli/main.ts help` lists commands. Except for help and validation,
+commands use the service. Public workflow commands start it when needed.
 
-Exit codes: 0 success, 1 failed or cancelled run, 2 blocked run, 3 service
-unavailable, 64 usage or configuration error.
+Exit codes: 0 success or a saved human wait; 1 failed or cancelled run; 2 blocked
+run; 3 service unavailable; 64 usage or configuration error.
 
-`service stop` signals only a process it can verify as this project's service,
-then waits up to 15 s for it to exit. If it cannot verify the process, it exits
-3 without signaling anything.
+`service stop` signals only a verified service owner. It waits up to 15 seconds.
+If it cannot verify the owner, it exits 3 without signaling another process.
+
+### Blocks and resolution
+
+The service enforces actions by block kind. The CLI acts with human authority:
+
+| Block kind | Allowed actions |
+| --- | --- |
+| `verifier_block`, `repeated_failure`, `preflight_failed` | `retry` or `fail` |
+| `verifier_failed` | `retry` the verifier on saved evidence, or `fail` |
+| `external_outcome_unknown` | `retry --allow-repeat`, `accept --result-file … --acknowledge-effects`, or `fail` |
+| `process_death_unconfirmed` | `retry --allow-repeat` or `fail`; cleanup must still be confirmed |
+| `integrity_failed`, `runtime_incompatible` | `fail` only |
+
+All actions require `--action` and a nonempty `--reason`. Optional `--run`
+pins the current blocked run. A block retry grants one dispatch outside the
+configured retry count. Acceptance supplies UTF-8 worker output in the frozen
+text or tagged mode; it cannot fabricate a verifier pass.
+
+WARNING: `--allow-repeat` permits repeated external effects. Confirm the
+outside outcome before choosing it. Workshop provides no exactly-once guarantee.
 
 ## Configuration
 
@@ -207,123 +320,135 @@ then waits up to 15 s for it to exit. If it cannot verify the process, it exits
 shell: /bin/bash
 max_concurrent_runs: 1
 default_timeout: 10m
-stream_cap: 256kb     # per captured stream: bytes | kb | mb | unlimited
-keep_files: failed    # failed: delete a completed run's folder | always: keep it
+stream_cap: 256kb
 agent:
-  model: "example/pi-model:medium"
-orchestrator:
-  model: "example/judge-model:low"
+  model: example/pi-model:medium
 ```
 
-Agent settings resolve field by field: step, then workflow `defaults`, then
-machine. Models take the form `<provider>/<model-id>:<thinking-level>`; there
-is no default model. The harness defaults to `pi`, the first template below.
-`project_dir` resolves relative to `.workshop/`.
+Machine `version` is optional; when present it must be `3`. Workflows must
+declare `version: 4`. `project_dir` resolves relative to `.workshop/`.
 
-Neither file needs a `version`. If one is present it must be `3`; older
-formats fail with a message naming the change.
+NOTE: Machine `orchestrator` and `keep_files` keys remain accepted but are ignored.
+
+Agent fields resolve independently: worker or verifier, then workflow
+`defaults.agent`, then machine `agent`. A model must resolve; there is no
+default model. Model strings use `<provider>/<model-id>:<thinking-level>`.
+Timeout resolves from step, workflow defaults, machine `default_timeout`,
+then 10 minutes. Stream cap resolves the same way, then 256 KiB.
+Durations accept `ms`, `s`, `m`, `h`, `d`, or `w`. Timeout and stream
+cap also accept `unlimited`. Byte caps use strings such as `"1024"`,
+`256kb`, or `1mb`.
 
 ### Headless-agent command templates
 
-Set `harness: pi` (the default) or `harness: { command: … }` for each agent; Workshop uses the same supervised process and strict result-file contract for every harness. The model names below are syntax examples, not available provider claims. Workshop passes the rendered prompt through `WORKSHOP_PROMPT_FILE` and names `WORKSHOP_RESULT_FILE` in that prompt. The harness must write the checked JSON result there; stdout remains diagnostic output.
+`harness: pi` is the default. It expands to:
 
-```yaml
-pi:
-  model: example/pi-model:medium
-  model_env: [WORKSHOP_MODEL_WITH_THINKING]
-  prompt_env: WORKSHOP_PROMPT_FILE
-  result_env: WORKSHOP_RESULT_FILE
-  command: 'pi --print --approve --no-session --no-extensions --no-skills --no-context-files --no-mcp --model "$WORKSHOP_MODEL_WITH_THINKING" -- "$(cat "$WORKSHOP_PROMPT_FILE")"'
-opencode:
-  model: example/opencode-model:medium
-  model_env: [WORKSHOP_MODEL, WORKSHOP_THINKING]
-  prompt_env: WORKSHOP_PROMPT_FILE
-  result_env: WORKSHOP_RESULT_FILE
-  command: 'opencode run --format json --auto --model "$WORKSHOP_MODEL" --variant "$WORKSHOP_THINKING" -- "$(cat "$WORKSHOP_PROMPT_FILE")"'
-claude-code:
-  model: example/claude-model:medium
-  model_env: [WORKSHOP_MODEL_ID, WORKSHOP_THINKING]
-  prompt_env: WORKSHOP_PROMPT_FILE
-  result_env: WORKSHOP_RESULT_FILE
-  command: 'claude --print --output-format text --permission-mode auto --no-session-persistence --model "$WORKSHOP_MODEL_ID" --effort "$WORKSHOP_THINKING" -- "$(cat "$WORKSHOP_PROMPT_FILE")"'
+```sh
+pi --print --approve --no-session --no-extensions --no-skills --no-context-files --no-mcp --model "$WORKSHOP_MODEL_WITH_THINKING"
 ```
 
-The Pi template ran against Pi 1.1.0 in a live smoke test. The OpenCode and
-Claude Code flags have not been checked against installed binaries; confirm
-them before use. Approval and auto modes can grant broad project access, so
-run them only on a trusted machine.
+Pi reads the prompt on stdin and writes the final assistant text to stdout.
+Worker results follow the step's result mode. Agent verifiers always emit tagged
+decisions. Pi text mode does not stream tool activity; an empty live preview is
+normal. Every verifier starts a fresh harness session.
 
-### The failure judge
+Use a custom command for another harness or a local adapter:
 
-The judge does not go through a harness. Workshop calls `orchestrator.model`
-directly, using its Tally-backed entry in `~/.pi/agent/models.json` (or
-`PI_CODING_AGENT_DIR/models.json`). The entry needs explicit pricing;
-entries without rates are left out rather than assigned zero cost. Credentials
-and Tally attribution headers are read from the owner file at request time and
-never stored. Command credentials, custom auth headers, and non-Tally endpoints
-are rejected.
+```yaml
+agent:
+  model: example/custom-model:medium
+  harness:
+    command: './scripts/headless-agent --model "$WORKSHOP_MODEL" --thinking "$WORKSHOP_THINKING"'
+```
+
+The script is supplied by you. It must read the full prompt from stdin, write
+only the declared result to stdout, and send diagnostics to stderr. Adapt
+structured harness event streams to final text before Workshop receives them.
+The same contract applies to custom worker and verifier harnesses. No per-process
+prompt or result files exist. Admission rejects custom commands that reference
+obsolete file-channel variables.
 
 ### Worker processes
 
-Workers, checks, and preflight run as `<shell> -lc '<command>'` in their
-own process group. The login flag sources your shell profile, so anything the
-profile prints to stderr shows up in every process's stderr capture.
+Workers, verifiers, and preflight use `<shell> -lc '<command>'` in separate
+process groups. Login shells can print profile diagnostics; keep those on stderr.
+Stdout retains at most 1 MiB independently of `stream_cap`. Stderr retains a
+head-and-tail window under the cap. Logs report retained and omitted bytes.
 
-Raw stdout and stderr keep a UTF-8-safe head and tail window of `stream_cap`
-bytes each; `logs` reports total, retained, and omitted byte counts. A command
-step's output is saved before the cap applies.
+Separate preparation from hard-to-undo actions. Verify the exact proposal,
+request a human wait when approval is required, and submit the approved stdin
+unchanged. Action commands must enforce limits and prevent duplicates themselves.
 
 ## What lands on disk
 
 ```text
-.workshop/                          machine-local, gitignored
-├─ workshop.yaml                    machine defaults, optional
-├─ workflows/<id>.yaml              your workflows
-├─ archive/<workflow>/              WORKSHOP_ARCHIVE, kept across runs
+.workshop/
+├─ workshop.yaml                    optional machine defaults
+├─ workflows/<workflow>.yaml        workflow definitions
+├─ archive/<workflow>/              workflow-owned files, kept across runs
+├─ runs/<run-id>/
+│  ├─ results.md                    accepted results and human answers
+│  └─ execution.log                 labeled execution evidence
 └─ state/
-   ├─ durable.db                    run database, owned by the service
-   ├─ service.json  service.lock  service.sock
-   └─ runs/<workflow>-<uuid>/       deleted on completion unless keep_files: always
-      ├─ preflight/                 preflight.stdout, preflight.stderr
-      └─ <step>.<attempt>/
-         ├─ previous-output.txt     predecessor output, empty for the first step
-         ├─ candidate-output.txt    the worker's candidate, for the check
-         ├─ worklog.md              compact run log at launch
-         └─ <role>.prompt.md  <role>.result.json  <role>.stdout  <role>.stderr
+   ├─ durable.db                    service-owned database
+   ├─ service.json  service.lock    service identity and ownership
+   └─ captures/<run-id>/            temporary stdout and stderr captures
 ```
 
-`<role>` is `worker` or `validator` (the check). A safe replay adds the incarnation
-number, as in `worker.2.stdout`. Empty stdout and stderr files are removed.
+The private socket may live outside `state/` to meet Unix socket path limits.
+Ignore `.workshop/` in Git.
 
-Workflows may write anywhere. The Hemingway examples publish one
-`<run-id>.md` per run to their archive.
+`results.md` contains accepted outputs in chain order. Its tag names are
+`result-<step-id>-<run-tag>`; the run tag is the first eight lowercase hex
+characters of SHA-256 of the run ID. Answered waits add an `answer-…` block.
+Skipped steps add an empty `skipped-…` line. Closing-tag collisions produce an
+unavailable marker instead of ambiguous content. Agent prompts explain tag lookup.
+
+`execution.log` contains engine events, stderr, invalid stdout, preamble,
+trailer, feedback, and resolutions, labeled by step, attempt, and role.
+The database retains raw evidence; `workshop logs` exposes it through the service.
+Stdout and stderr remain separate, without reconstructed interleaving.
+
+These files are read-only views of committed state, not process channels.
+Deleting them permits regeneration without repeating work. Editing them changes
+neither accepted output nor run state. Workshop retains both after every outcome.
+Temporary captures are removed only after evidence import and confirmed cleanup.
+
+CAUTION: Workshop adds no automatic expiration or database purging. Evidence
+grows with each attempt, including unlimited retries.
 
 ## Status and limitations
 
-Workshop is a proof of concept for trusted, local workflows. It runs with your
-permissions and has no sandbox, no untrusted input, no branching graphs, and
-no budgets. Starting a workflow authorizes every command and agent in it.
+On a TTY, `status` opens two screens. The overview has three columns:
+**Title**, **Status**, and **Next run**. Arrow keys or `j`/`k` select a workflow;
+Enter opens its detail screen. Next-run times use the machine's local time.
 
-| Stage | Proves | Status |
-| --- | --- | --- |
-| POC-A | runtime: durable chain, worklog, SQLite, checks, recovery | done |
-| POC-B | status viewer over the CLI projections | done |
-| Service | background service on Pi Durable with crash recovery | done |
-| POC-C | `$build-workflow` authoring skill | next |
-| POC-D | notification channels | later |
+The detail screen shows the chain vertically. Running steps preview live stderr;
+succeeded steps show accepted output; failed or blocked steps show failure evidence.
+Skipped steps have no preview. Previews show 40 lines; `e` expands the selected
+step. Escape or Backspace returns to the overview. `q` quits.
 
-Known limitations:
+`status <workflow>` opens detail directly. `watch` is an alias. JSON output
+and non-TTY output remain snapshots. Reads use only service projections, without
+model calls. The shared bot and chat client are planned, not available.
 
-- Tested on macOS only. The service loads a native SQLite binding and refuses
-  to start if that binding cannot load; Linux (glibc and musl) is untested.
-- No upgrade migration. Each run records the task versions it started with.
-  If a later release changes a task version incompatibly, the old run blocks
-  instead of guessing. Finish or stop runs before upgrading.
-- `service start` discards the service's stdout and stderr, so a failed
-  startup shows only the CLI error. Run `workshop service serve` to see the
-  cause.
+Workshop is for trusted local workflows. It has no sandbox, branching, rollback,
+or exactly-once external effects. Tested on macOS; Linux is untested. The service
+requires its native SQLite binding. Use `service serve` to diagnose startup errors;
+detached startup discards service stdout and stderr.
+
+### Upgrade
+
+Drain runs before upgrading. Finish or stop open runs with the previous build.
+The new service refuses startup if an open run uses a workflow format older
+than 4. Settled history stays readable. Incompatible task definitions block as
+`runtime_incompatible` instead of continuing under different code.
+
+Migrate workflow files to `version: 4`. Replace `max_attempts: N` with
+`retries: N-1`. Replace `check` with `verify`. Remove workflow `orchestrator`
+and `keep_files` settings. Declare `retries` and `replay` for every step
+or in `defaults`. Update harnesses to the stdin/stdout/stderr contract.
 
 ## Contributing
 
-See [CONTRIBUTING](CONTRIBUTING.md) for conventions, checks, and how the code
-works.
+See [CONTRIBUTING](CONTRIBUTING.md) for conventions, checks, and the code map.

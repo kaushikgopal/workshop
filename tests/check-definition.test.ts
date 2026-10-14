@@ -86,60 +86,30 @@ describe("workflow and machine schemas", () => {
     }
   });
 
-  test("rejects legacy README harness templates with stdin/stdout/stderr migration guidance", () => {
+  test("checks every README YAML snippet against the shipped format and harness contract", () => {
     const readme = readFileSync(join(import.meta.dir, "..", "README.md"), "utf8");
-    const heading = "### Headless-agent command templates";
-    const start = readme.indexOf(heading);
-    if (start < 0) throw new Error("README is missing the harness-template section");
-    const yaml = /\x60{3}yaml\n([\s\S]*?)\n\x60{3}/u.exec(readme.slice(start))?.[1];
-    if (yaml === undefined) throw new Error("README harness templates are missing their YAML mapping");
-
-    const templateSchema = z.strictObject({
-      pi: z.strictObject({
-        model: z.string(), model_env: z.array(z.string()).min(1),
-        prompt_env: z.literal("WORKSHOP_PROMPT_FILE"), result_env: z.literal("WORKSHOP_RESULT_FILE"),
-        command: z.string().min(1),
-      }),
-      opencode: z.strictObject({
-        model: z.string(), model_env: z.array(z.string()).min(1),
-        prompt_env: z.literal("WORKSHOP_PROMPT_FILE"), result_env: z.literal("WORKSHOP_RESULT_FILE"),
-        command: z.string().min(1),
-      }),
-      "claude-code": z.strictObject({
-        model: z.string(), model_env: z.array(z.string()).min(1),
-        prompt_env: z.literal("WORKSHOP_PROMPT_FILE"), result_env: z.literal("WORKSHOP_RESULT_FILE"),
-        command: z.string().min(1),
-      }),
-    });
-    const templates = templateSchema.parse(parseStrictYaml(yaml, "README.md harness templates"));
-    expect(templates.pi.model_env).toEqual(["WORKSHOP_MODEL_WITH_THINKING"]);
-    expect(templates.opencode.model_env).toEqual(["WORKSHOP_MODEL", "WORKSHOP_THINKING"]);
-    expect(templates["claude-code"].model_env).toEqual(["WORKSHOP_MODEL_ID", "WORKSHOP_THINKING"]);
-
-    for (const [name, template] of Object.entries(templates)) {
-      const stepId = "node-" + name;
-      const definition = workflowSchema.parse({
-        id: "harness-templates",
-        defaults: { retries: 0, replay: "never" },
-        nodes: {
-          [stepId]: {
-            run: {
-              agent: {
-                model: template.model,
-                harness: { command: template.command },
-                instructions: "Write the declared result.",
-              },
-            },
-            next: null,
-          },
-        },
-      });
-      expect(template.command).toContain("\"$" + template.prompt_env + "\"");
-      for (const modelEnv of template.model_env) expect(template.command).toContain("\"$" + modelEnv + "\"");
-      expect(() => resolveWorkflowSettings({ definition, machine: {}, projectCwd: "/tmp" }))
-        .toThrow(new RegExp("step \"" + stepId + "\" worker harness command references removed variable WORKSHOP_PROMPT_FILE; migrate the harness to read input from stdin, write the declared result to stdout, and send diagnostics to stderr"));
+    const snippets = [...readme.matchAll(/\x60{3}yaml\n([\s\S]*?)\n\x60{3}/gu)];
+    expect(snippets).toHaveLength(3);
+    for (const [index, snippet] of snippets.entries()) {
+      const yaml = snippet[1];
+      if (yaml === undefined) throw new Error("README YAML snippet is missing");
+      const label = "README.md YAML snippet " + (index + 1);
+      if (yaml.startsWith("version: 4")) {
+        const checked = checkDefinitionText(yaml, label, "readme-example");
+        const settings = resolveWorkflowSettings({ definition: checked.def,
+          machine: { agent: { model: "example/pi-model:medium" } }, projectCwd: "/tmp" });
+        expect(settings.nodes["publish-quote"]?.run.replay).toBe("never");
+      } else {
+        const machine = machineConfigSchema.parse(parseStrictYaml(yaml, label));
+        const agent = resolveAgent({ machine: machine.agent });
+        expect(agent.model).not.toBeNull();
+        if (typeof machine.agent?.harness === "object") {
+          expect(agent.harnessCommand).toBe(machine.agent.harness.command);
+        } else expect(agent.harnessCommand).toBe(PI_HARNESS_COMMAND);
+      }
     }
-    expect(readme.slice(start)).toContain("Claude Code flags have not been checked against installed binaries");
+    expect(readme).toContain(PI_HARNESS_COMMAND);
+    expect(readme).not.toMatch(/WORKSHOP_\w*_FILE|failure judge|result helper/u);
   });
 
   test("rejects unknown keys at every internal schema depth and prohibits instructions in defaults", () => {

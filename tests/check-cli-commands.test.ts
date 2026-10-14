@@ -1,6 +1,6 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
@@ -62,19 +62,21 @@ describe("CLI commands", () => {
     }
   });
 
-  test("validates the shipped example without creating state", () => {
+  test("validates every shipped workflow example without creating state", () => {
     const root = makeRoot({ machine: null, workflows: {} });
     try {
       copyFileSync(join(REPO_ROOT, "examples", "workshop.yaml"), join(root, ".workshop", "workshop.yaml"));
-      copyFileSync(
-        join(REPO_ROOT, "examples", "workflows", "hemingway-clock.yaml"),
-        join(root, ".workshop", "workflows", "hemingway-clock.yaml"),
-      );
-
-      const result = runCli(root, ["validate", "hemingway-clock"]);
-      expect(result.stderr).toBe("");
-      expect(result.status).toBe(0);
-      expect(result.stdout).toBe('valid workflow "hemingway-clock" (3 steps)\n');
+      const examples = join(REPO_ROOT, "examples", "workflows");
+      const files = readdirSync(examples).filter(file => file.endsWith(".yaml"));
+      expect(files.length).toBeGreaterThan(0);
+      for (const file of files) {
+        copyFileSync(join(examples, file), join(root, ".workshop", "workflows", file));
+        const workflowId = file.slice(0, -5);
+        const result = runCli(root, ["validate", workflowId]);
+        expect(result.stderr).toBe("");
+        expect(result.status).toBe(0);
+        expect(result.stdout).toStartWith('valid workflow "' + workflowId + '" (');
+      }
       expect(existsSync(join(root, ".workshop", "state"))).toBe(false);
     } finally {
       rmSync(root, { recursive: true, force: true });

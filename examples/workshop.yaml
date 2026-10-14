@@ -1,14 +1,9 @@
 # Machine defaults. Copy to .workshop/workshop.yaml.
-# The models are placeholders: replace them with ones your Pi installation can
-# use. `harness: pi` is the default and may be omitted.
+# Replace the placeholder model with one your Pi installation can use.
 shell: /bin/bash
 max_concurrent_runs: 1
 default_timeout: 10m
 stream_cap: 256kb
-keep_files: failed
 agent:
   harness: pi
   model: "example/pi-model:medium"
-orchestrator:
-  model: "example/judge-model:low"
-  timeout: 5m

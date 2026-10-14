@@ -666,7 +666,8 @@ async function waitForRun(socketPath: string, workflowId: string, runId: string)
         version: 1,
         method: "runs",
         workflowId,
-        limit: 100,
+        // New runs are newest first; page history only if another occurrence overtook this one.
+        limit: 1,
         ...(cursor === undefined ? {} : { cursor }),
       });
       if (!response.ok) throw new Error(`${response.error.code}: ${response.error.message}`);
