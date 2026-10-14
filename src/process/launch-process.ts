@@ -74,7 +74,7 @@ export function spawnTracked(input: {
   const stderr = openSync(input.stderrFile, "w");
   let closeAfterStreams = false;
   try {
-    const child = spawn(input.shell, ["-lc", input.command], {
+    const child = spawn(input.shell, ["-c", input.command], {
       cwd: input.cwd,
       env: { ...process.env, ...input.env },
       stdio: ["pipe", "pipe", "pipe"],

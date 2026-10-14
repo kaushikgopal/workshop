@@ -371,8 +371,8 @@ obsolete file-channel variables.
 
 ### Worker processes
 
-Workers, verifiers, and preflight use `<shell> -lc '<command>'` in separate
-process groups. Login shells can print profile diagnostics; keep those on stderr.
+Workers, verifiers, and preflight use `<shell> -c '<command>'` in separate
+process groups. This has "sh -c"-style semantics, not login-shell semantics. Login dotfiles are not sourced.
 Stdout retains at most 1 MiB independently of `stream_cap`. Stderr retains a
 head-and-tail window under the cap. Logs report retained and omitted bytes.
 

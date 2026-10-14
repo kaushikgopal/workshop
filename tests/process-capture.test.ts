@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
@@ -38,6 +38,43 @@ async function settle(process: TrackedProcess) {
 }
 
 describe("bounded subprocess capture", () => {
+  test("does not source login dotfiles and resolves commands from its configured PATH", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "workshop-process-shell-startup-"));
+    let child: TrackedProcess | undefined;
+    try {
+      const home = join(directory, "home");
+      const bin = join(directory, "bin");
+      const profileBin = join(directory, "profile-bin");
+      const marker = join(directory, "profile-sourced");
+      const stdoutPath = join(directory, "stdout");
+      const stderrPath = join(directory, "stderr");
+      mkdirSync(home);
+      mkdirSync(bin);
+      mkdirSync(profileBin);
+      writeFileSync(join(home, ".bash_profile"), "printf sourced > '" + marker + "'; printf 'profile stderr\n' >&2; export PATH='" + profileBin + "'\n");
+      writeFileSync(join(home, ".profile"), "printf sourced > '" + marker + "'\n");
+      writeFileSync(join(bin, "path-probe"), "#!/bin/sh\nprintf path-ok\n");
+      chmodSync(join(bin, "path-probe"), 0o755);
+
+      child = spawnTracked({
+        shell: "/bin/bash",
+        command: "path-probe",
+        cwd: directory,
+        env: { HOME: home, PATH: bin, BASH_ENV: "" },
+        stdoutFile: stdoutPath,
+        stderrFile: stderrPath,
+      });
+      const result = await settle(child);
+      expect(result.exit.code).toBe(0);
+      expect(readFileSync(stdoutPath, "utf8")).toBe("path-ok");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      expect(existsSync(marker)).toBe(false);
+    } finally {
+      if (child !== undefined) await child.kill();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   test("retains the stdout prefix, records overflow, and retires the process group", async () => {
     const directory = mkdtempSync(join(tmpdir(), "workshop-process-stdout-"));
     let child: TrackedProcess | undefined;
