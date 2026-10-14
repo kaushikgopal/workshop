@@ -135,6 +135,7 @@ const serviceMetadataDtoSchema = z.strictObject({
   startedAt: utcTimestampSchema.nullable(),
   socketPath: absolutePath.nullable(),
   error: boundedText(64 * 1024).nullable(),
+  bot: z.strictObject({ providerId: z.string().min(1), modelId: z.string().min(1) }).nullable().default(null),
 });
 
 export const runSummaryDtoSchema = z.strictObject({

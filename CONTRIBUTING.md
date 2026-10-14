@@ -173,7 +173,7 @@ and validators are not Durable work: they are harness subprocesses launched by
 | Entries (`defineEntry`) | Append-only `workshop.event`, `workshop.process`, and `workshop.judgment` evidence for each run. `logs` reads the process and event entries. |
 | `runtime.commit` | The only way state changes. Document edits, new entries, new child tasks, and the task's own checkpoint land in one SQLite transaction. |
 | `runtime.sleep` | The scheduler waits for its next slot. The deadline lives in the checkpoint, so the wait survives restarts. |
-| `models` option (`pi-ai`) | The Harness has no model providers. Agent workers and verifiers use supervised harness subprocesses. |
+| `models` option (`pi-ai`) | The Harness registry serves the shared bot. Agent workers and verifiers use supervised harness subprocesses. |
 | `snapshot`, `inspect`, `abortTask`, `close` | Status and log reads, startup compatibility checks, stop intent, and graceful shutdown. |
 
 Durable leaves some work to its caller, and Workshop fills each gap:
@@ -254,7 +254,13 @@ src/
 │  ├─ parse-model.ts              provider/model/thinking strings
 │  ├─ hash-canonical-json.ts      stable definition hashes
 │  ├─ schema.ts                   authored, machine, historical definitions
-│  └─ schema-resolved.ts          current and historical frozen settings
+│  ├─ schema-resolved.ts          current and historical frozen settings
+├─ model/                          owner Pi provider catalog and request-time auth
+│  ├─ create-workshop-models.ts    built-in plus checked owner Tally providers
+│  ├─ load-owner-models.ts         private catalog file read
+│  ├─ parse-owner-models.ts        checked public provider and model metadata
+│  ├─ resolve-owner-provider-auth.ts request-time credential lookup
+│  └─ schema-owner-models.ts       owner provider catalog and credential shapes
 ├─ installation/
 │  ├─ load-installation.ts        find .workshop and load checked workflows
 │  └─ schema.ts                   installation index, activations, receipts

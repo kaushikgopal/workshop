@@ -3,11 +3,11 @@ import { Buffer } from "node:buffer";
 import { existsSync, lstatSync } from "node:fs";
 import { join, resolve as resolvePath } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { createModels } from "@earendil-works/pi-ai/models";
 import type { Models } from "@earendil-works/pi-ai";
 import { createRegistry, Harness, type Conversation, type ConversationId, type TaskGraph, type TaskGraphWatch, type TaskId, type Tx } from "@earendil-works/pi-durable";
 import { canonicalHash } from "../definition/hash-canonical-json.js";
 import { parseModel } from "../definition/parse-model.js";
+import { createWorkshopModels } from "../model/create-workshop-models.js";
 import { createBotExtension, BOT_INSTRUCTIONS } from "../bot/create-bot-tools.js";
 import { initializeBotEventCursors, scanCommittedBotEvents, type BotRunCursorTarget } from "../bot/scan-bot-events.js";
 import { buildBotChatEntries, decodeBotChatCursor, encodeBotChatCursor, pendingDecisionActions } from "../bot/build-bot-feed.js";
@@ -66,7 +66,7 @@ import { serviceLogSectionPageV1Schema, type ServiceMetadataV1, type ServiceRequ
 const TASK_VERSIONS = { workflowRun: 10, nodeAttempt: 4, processExecution: 4, capacityGate: 1, scheduleWakeup: 1 } as const;
 const STARTUP_RECONCILIATION_MS = 10_000;
 
-export function startWorkshopService(installation: Installation, models: Models = createModels()) {
+export function startWorkshopService(installation: Installation, models: Models = createWorkshopModels()) {
   return serveWorkshopService({
     stateDirectory: installation.stateDirectory,
     openRuntime: (metadata) => openServiceRuntime(installation, metadata, models),
@@ -78,6 +78,7 @@ async function openServiceRuntime(
   metadata: ServiceMetadataV1,
   models: Models,
 ): Promise<WorkshopServiceRuntime> {
+  const botModel = installation.machine.bot === undefined ? undefined : resolveBotModel(installation.machine.bot.model, models);
   const opened = await openDurableStorage(installation.databasePath);
   if (!opened.ok) throw new Error(`${opened.failure.message}: ${String(opened.failure.cause)}`);
   const storage = opened.storage;
@@ -152,8 +153,8 @@ async function openServiceRuntime(
     await assertNoUnreconciledProcessEvidence(harness, Date.now() + STARTUP_RECONCILIATION_MS, metadata.bootId);
     const runtimeHarness = harness;
     let botConversation: Conversation | undefined;
-    if (installation.machine.bot !== undefined) {
-      botConversation = await ensureBotConversation(runtimeHarness, botExtension, installation.machine.bot.model);
+    if (botModel !== undefined) {
+      botConversation = await ensureBotConversation(runtimeHarness, botExtension, botModel.full);
       const index = await readInstallation(runtimeHarness);
       await initializeBotEventCursors(runtimeHarness, botRunTargets(index));
     } else {
@@ -368,15 +369,14 @@ async function openServiceRuntime(
             return result;
           }
           case "chat.submit": {
-            if (installation.machine.bot === undefined || botConversation === undefined) {
+            if (botModel === undefined || botConversation === undefined) {
               throw new ServiceRequestError("bot_not_configured", "Bot not configured; set bot.model in machine configuration");
             }
             const submission = await botConversation.submit({ type: "input", requestId: request.requestId, content: request.text }, BACKGROUND_CONTEXT);
             return { submitted: true, submissionId: String(submission.id) };
           }
           case "chat.view": {
-            return await readBotChat(activeHarness, installation, botConversation, request.cursor, request.limit ?? 50,
-              installation.machine.bot !== undefined);
+            return await readBotChat(activeHarness, installation, botConversation, request.cursor, request.limit ?? 50, botModel);
           }
           case "status":
           case "runs":
@@ -461,6 +461,17 @@ async function openServiceRuntime(
   }
 }
 
+function resolveBotModel(modelText: string, models: Models): ReturnType<typeof parseModel> {
+  const model = parseModel(modelText);
+  if (models.getProvider(model.provider) === undefined) {
+    throw new Error("bot.model provider " + JSON.stringify(model.provider) + " is not available in the model registry");
+  }
+  if (models.getModel(model.provider, model.modelId) === undefined) {
+    throw new Error("bot.model " + JSON.stringify(model.full) + " is not available from provider " + JSON.stringify(model.provider));
+  }
+  return model;
+}
+
 async function ensureBotConversation(harness: Harness, extension: ReturnType<typeof createBotExtension>, modelText: string): Promise<Conversation> {
   await harness.commit(async tx => {
     const raw = await tx.doc(WorkshopBotDoc);
@@ -496,7 +507,7 @@ async function readBotChat(
   conversation: Conversation | undefined,
   encodedCursor: string | undefined,
   limit: number,
-  configured: boolean,
+  botModel: ReturnType<typeof parseModel> | undefined,
 ): Promise<unknown> {
   const cursor = decodeBotChatCursor(encodedCursor);
   let page: Awaited<ReturnType<Conversation["entries"]>> | undefined;
@@ -517,7 +528,8 @@ async function readBotChat(
     }
   }
   return botChatViewV1Schema.parse({
-    configured,
+    configured: botModel !== undefined,
+    bot: botModel === undefined ? null : { providerId: botModel.provider, modelId: botModel.modelId },
     entries: page === undefined ? [] : buildBotChatEntries(page.items),
     nextCursor: encodeBotChatCursor(page?.next),
     pending: pending.slice(0, 100),

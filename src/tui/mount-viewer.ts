@@ -169,7 +169,7 @@ export function createViewerRefresh(input: {
       if (requestGeneration !== generation) return;
       const empty: ViewerSnapshot = {
         status: { version: 2, generatedAt: new Date(0).toISOString(), installationId: "unavailable",
-          service: { state: "unavailable", pid: null, bootId: null, startedAt: null, socketPath: null, error: null }, workflows: [] },
+          service: { state: "unavailable", pid: null, bootId: null, startedAt: null, socketPath: null, error: null, bot: null }, workflows: [] },
         detail: null,
       };
       const frame = lastFrame?.header === (selection.workflowId ?? "Workflows") ? lastFrame

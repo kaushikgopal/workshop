@@ -5,6 +5,7 @@ import type { ConversationId, Cursor, EntryRecord, Harness } from "@earendil-wor
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { z } from "zod";
 import { workflowIdSchema } from "../definition/schema.js";
+import { parseModel } from "../definition/parse-model.js";
 import {
   installationDocumentV1Schema,
   type RunReference,
@@ -199,9 +200,16 @@ async function buildStatusDto(
       startedAt: metadata.startedAt,
       socketPath: metadata.socketPath,
       error: null,
+      bot: configuredBotIdentity(installation),
     },
     workflows,
   });
+}
+
+function configuredBotIdentity(installation: Installation): { providerId: string; modelId: string } | null {
+  if (installation.machine.bot === undefined) return null;
+  const model = parseModel(installation.machine.bot.model);
+  return { providerId: model.provider, modelId: model.modelId };
 }
 
 async function buildNodeDescriptionDto(

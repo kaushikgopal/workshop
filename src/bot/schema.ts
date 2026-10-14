@@ -40,6 +40,7 @@ export type BotPendingDecisionV1 = z.infer<typeof botPendingDecisionV1Schema>;
 
 export const botChatViewV1Schema = z.strictObject({
   configured: z.boolean(),
+  bot: z.strictObject({ providerId: z.string().min(1), modelId: z.string().min(1) }).nullable().default(null),
   entries: z.array(botChatEntryV1Schema).max(100),
   nextCursor: z.string().max(4096).nullable(),
   pending: z.array(botPendingDecisionV1Schema).max(1000),

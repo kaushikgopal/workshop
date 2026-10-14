@@ -428,7 +428,12 @@ bot:
 ```
 
 The bot has no default model. Without `bot.model`, Workshop shows `Bot not configured`
-and makes no bot model calls. The bot reads status, runs, and logs. It can start
+and makes no bot model calls. At service startup, Workshop resolves `bot.model`
+against built-in Pi providers and supported providers in `~/.pi/agent/models.json`.
+Set `PI_CODING_AGENT_DIR` to use another Pi agent directory. Startup fails with a
+configuration error when the provider or model is unavailable. Service status and
+`chat.view` show the resolved provider ID and model ID. They never show credentials.
+The bot reads status, runs, and logs. It can start
 workflows and resolve only the block kinds that section 7 permits. Its block resolution
 uses the same checked service path as the CLI. The service limits the bot to one
 resolution per node in each run.
