@@ -21,6 +21,8 @@ const supportedMethods = new Set([
   "stop",
   "resolve",
   "human.reply",
+  "chat.submit",
+  "chat.view",
   "status",
   "runs",
   "logs.page",

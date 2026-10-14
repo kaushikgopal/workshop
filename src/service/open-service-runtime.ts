@@ -1,10 +1,17 @@
 import { randomUUID } from "node:crypto";
+import { Buffer } from "node:buffer";
 import { existsSync, lstatSync } from "node:fs";
 import { join, resolve as resolvePath } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
-import { createRegistry, Harness, type ConversationId, type TaskGraph, type TaskGraphWatch, type TaskId, type Tx } from "@earendil-works/pi-durable";
+import type { Models } from "@earendil-works/pi-ai";
+import { createRegistry, Harness, type Conversation, type ConversationId, type TaskGraph, type TaskGraphWatch, type TaskId, type Tx } from "@earendil-works/pi-durable";
 import { canonicalHash } from "../definition/hash-canonical-json.js";
+import { parseModel } from "../definition/parse-model.js";
+import { createBotExtension, BOT_INSTRUCTIONS } from "../bot/create-bot-tools.js";
+import { initializeBotEventCursors, scanCommittedBotEvents, type BotRunCursorTarget } from "../bot/scan-bot-events.js";
+import { buildBotChatEntries, decodeBotChatCursor, encodeBotChatCursor, pendingDecisionActions } from "../bot/build-bot-feed.js";
+import { botDocumentV1Schema, botChatViewV1Schema } from "../bot/schema.js";
 import { resolveRetryLimit } from "../definition/resolve-retry-limit.js";
 import { replyHumanWait } from "./reply-human-wait.js";
 import { checkInstallationHasNoOpenLegacyRuns } from "./check-legacy-runs.js";
@@ -18,6 +25,7 @@ import {
 } from "../installation/schema.js";
 import {
   activationIdSchema,
+  runIdSchema,
   nodeAttemptOutcomeSchema,
   nodeResultSchema,
   operatorAcceptanceSchema,
@@ -46,28 +54,29 @@ import {
 import { resolveWorkerArtifacts } from "../storage/durable/define-node-attempt-task.js";
 import { parseValidatorVerdictFile, parseWorkerResultFile, readResultFileBytes } from "../attempt/parse-result.js";
 import { workflowRunDocumentV1Schema, workshopEventV1Schema, workshopProcessV1Schema } from "../run/records.js";
-import { WorkshopEventEntry, WorkshopInstallationDoc, WorkshopRunDoc, WorkshopServiceReceiptsDoc } from "../storage/durable/define-workshop-records.js";
+import { WorkshopBotDoc, WorkshopEventEntry, WorkshopInstallationDoc, WorkshopRunDoc, WorkshopServiceReceiptsDoc } from "../storage/durable/define-workshop-records.js";
 import { checkpointDurableWal } from "../storage/durable/checkpoint-durable-wal.js";
 import { openDurableStorage } from "../storage/durable/open-durable-storage.js";
 import { createRunFileWriter } from "./project-run-files.js";
 import { removeProcessCaptures } from "../storage/disk/remove-process-captures.js";
 import { readRunEvidenceSnapshot, readInstallation, readRun, projectServiceRead } from "./project-service-reads.js";
 import { ServiceRequestError, ServiceShutdownError, serveWorkshopService, type WorkshopServiceRuntime } from "./serve-workshop-service.js";
-import type { ServiceMetadataV1, ServiceRequestV1 } from "./schema.js";
+import { serviceLogSectionPageV1Schema, type ServiceMetadataV1, type ServiceRequestV1 } from "./schema.js";
 
 const TASK_VERSIONS = { workflowRun: 10, nodeAttempt: 4, processExecution: 4, capacityGate: 1, scheduleWakeup: 1 } as const;
 const STARTUP_RECONCILIATION_MS = 10_000;
 
-export function startWorkshopService(installation: Installation) {
+export function startWorkshopService(installation: Installation, models: Models = createModels()) {
   return serveWorkshopService({
     stateDirectory: installation.stateDirectory,
-    openRuntime: (metadata) => openServiceRuntime(installation, metadata),
+    openRuntime: (metadata) => openServiceRuntime(installation, metadata, models),
   });
 }
 
 async function openServiceRuntime(
   installation: Installation,
   metadata: ServiceMetadataV1,
+  models: Models,
 ): Promise<WorkshopServiceRuntime> {
   const opened = await openDurableStorage(installation.databasePath);
   if (!opened.ok) throw new Error(`${opened.failure.message}: ${String(opened.failure.cause)}`);
@@ -84,6 +93,14 @@ async function openServiceRuntime(
   let projectionWriter: ReturnType<typeof createRunFileWriter> | undefined;
   let projectionRefresh = Promise.resolve();
   let projectionTimer: ReturnType<typeof setTimeout> | undefined;
+  const requireHarness = (): Harness => {
+    if (harness === undefined) throw new Error("Durable Harness is unavailable");
+    return harness;
+  };
+  const requireTasks = (): ReturnType<typeof defineWorkshopTasks> => {
+    if (tasks === undefined) throw new Error("Workshop tasks are unavailable");
+    return tasks;
+  };
 
   try {
     tasks = defineWorkshopTasks(metadata.bootId, {
@@ -113,8 +130,16 @@ async function openServiceRuntime(
       name: "workshop-service-runtime",
       tasks: [tasks.WorkflowRunTask, tasks.NodeAttemptTask, tasks.ProcessExecutionTask, tasks.CapacityGateTask, scheduleWakeupTask],
     });
+    const botExtension = createBotExtension({
+      readStatus: async workflowId => await projectServiceRead(requireHarness(), installation, metadata, { version: 1, method: "status", ...(workflowId === undefined ? {} : { workflowId }) }),
+      readRun: async (workflowId, runId) => await projectServiceRead(requireHarness(), installation, metadata, { version: 1, method: "diagram", workflowId, ...(runId === undefined ? {} : { runId: runIdSchema.parse(runId) }) }),
+      readLogs: async (workflowId, runId) => await readBotLogs(requireHarness(), installation, metadata, workflowId, runId),
+      startWorkflow: async workflowId => await startWorkflow(requireHarness(), requireTasks(), scheduleWakeupTask, installation, { version: 1, method: "start", requestId: randomUUID(), workflowId }),
+      resolveBlock: async ({ runId, ...request }) => await resolveBlockedWorkflow(requireHarness(), requireTasks(), installation, { version: 1, method: "resolve", requestId: randomUUID(), ...request, ...(runId === undefined ? {} : { runId: runIdSchema.parse(runId) }), resolver: "bot" }),
+    });
+    registry.install(botExtension);
     harness = await Harness.open(storage, {
-      models: createModels(),
+      models,
       registry,
       onReport(error) {
         if (opening) openCleanupErrors.push(error);
@@ -125,6 +150,20 @@ async function openServiceRuntime(
     await checkInstallationHasNoOpenLegacyRuns(harness, BACKGROUND_CONTEXT);
     await reconcileStartupProcessTasks(harness, tasks, Date.now() + STARTUP_RECONCILIATION_MS);
     await assertNoUnreconciledProcessEvidence(harness, Date.now() + STARTUP_RECONCILIATION_MS, metadata.bootId);
+    const runtimeHarness = harness;
+    let botConversation: Conversation | undefined;
+    if (installation.machine.bot !== undefined) {
+      botConversation = await ensureBotConversation(runtimeHarness, botExtension, installation.machine.bot.model);
+      const index = await readInstallation(runtimeHarness);
+      await initializeBotEventCursors(runtimeHarness, botRunTargets(index));
+    } else {
+      const botState = botDocumentV1Schema.parse(await runtimeHarness.snapshot(WorkshopBotDoc, BACKGROUND_CONTEXT)
+        ?? { state: "ready", conversationId: null, cursorInitialized: false, eventCursors: {} });
+      if (botState.conversationId !== null) {
+        botConversation = await runtimeHarness.conversation(botState.conversationId as ConversationId, BACKGROUND_CONTEXT);
+        await botConversation?.configure({ model: null }, BACKGROUND_CONTEXT);
+      }
+    }
     const writerHarness = harness;
     const diagnosticKeys = new Set<string>();
     const pendingCaptureCleanup = new Set<number>();
@@ -234,10 +273,32 @@ async function openServiceRuntime(
     const activeHarness = harness;
     const activeTasks = tasks;
     const schedulerWakeupKind = scheduleWakeupTask.definition.name;
+    let botScanPromise: Promise<void> | undefined;
+    let botScanAgain = false;
+    const kickBot = (): void => {
+      if (shuttingDown || installation.machine.bot === undefined || botConversation === undefined) return;
+      if (botScanPromise !== undefined) { botScanAgain = true; return; }
+      botScanPromise = (async () => {
+        do {
+          botScanAgain = false;
+          try {
+            const index = await readInstallation(activeHarness);
+            await scanCommittedBotEvents({
+              harness: activeHarness,
+              botConversation: botConversation!,
+              targets: botRunTargets(index),
+              submit: async (requestId, message) => await botConversation!.submit({ type: "input", requestId, content: message }, BACKGROUND_CONTEXT),
+            });
+          } catch (error) {
+            console.error("shared bot event scan failed: " + errorText(error));
+          }
+        } while (botScanAgain && !shuttingDown);
+      })().finally(() => { botScanPromise = undefined; });
+    };
     const checkpointIfTaskGraphIdle = async (graph: TaskGraph): Promise<void> => {
       if (shuttingDown) return;
       const nextGraph = JSON.stringify(graph);
-      if (nextGraph !== projectionGraph) { projectionGraph = nextGraph; void refreshProjections(); }
+      if (nextGraph !== projectionGraph) { projectionGraph = nextGraph; void refreshProjections(); kickBot(); }
       // The scheduler's durable timer is not active workflow work and must not keep an idle WAL alive.
       const hasRunnableWork = Object.values(graph.tasks).some((task) =>
         task.kind !== schedulerWakeupKind && task.state.status !== "waiting",
@@ -270,6 +331,7 @@ async function openServiceRuntime(
     };
     taskGraphWatch = await activeHarness.watchTaskGraph(BACKGROUND_CONTEXT);
     taskGraphWatch.start(checkpointIfTaskGraphIdle);
+    kickBot();
     void checkpointIfTaskGraphIdle(taskGraphWatch.value);
     opening = false;
 
@@ -282,6 +344,7 @@ async function openServiceRuntime(
           case "start": {
             const result = await startWorkflow(activeHarness, activeTasks, scheduleWakeupTask, installation, request);
             await refreshProjections();
+            kickBot();
             return result;
           }
           case "pause":
@@ -289,17 +352,31 @@ async function openServiceRuntime(
           case "stop": {
             const result = await controlWorkflow(activeHarness, activeTasks, request);
             await refreshProjections();
+            kickBot();
             return result;
           }
           case "human.reply": {
             const result = await replyHumanWait(activeHarness, activeTasks, request);
             await refreshProjections();
+            kickBot();
             return result;
           }
           case "resolve": {
             const result = await resolveBlockedWorkflow(activeHarness, activeTasks, installation, request);
             await refreshProjections();
+            kickBot();
             return result;
+          }
+          case "chat.submit": {
+            if (installation.machine.bot === undefined || botConversation === undefined) {
+              throw new ServiceRequestError("bot_not_configured", "Bot not configured; set bot.model in machine configuration");
+            }
+            const submission = await botConversation.submit({ type: "input", requestId: request.requestId, content: request.text }, BACKGROUND_CONTEXT);
+            return { submitted: true, submissionId: String(submission.id) };
+          }
+          case "chat.view": {
+            return await readBotChat(activeHarness, installation, botConversation, request.cursor, request.limit ?? 50,
+              installation.machine.bot !== undefined);
           }
           case "status":
           case "runs":
@@ -315,6 +392,7 @@ async function openServiceRuntime(
         if (closed) return;
         shuttingDown = true;
         activeTasks.stopLaunching();
+        if (botScanPromise !== undefined) await beforeDeadline(botScanPromise, deadlineMs, "shared bot event scan");
         if (projectionTimer !== undefined) { clearTimeout(projectionTimer); projectionTimer = undefined; }
         if (idleRetryTimer !== undefined) {
           clearTimeout(idleRetryTimer);
@@ -381,6 +459,97 @@ async function openServiceRuntime(
     }
     throw error;
   }
+}
+
+async function ensureBotConversation(harness: Harness, extension: ReturnType<typeof createBotExtension>, modelText: string): Promise<Conversation> {
+  await harness.commit(async tx => {
+    const raw = await tx.doc(WorkshopBotDoc);
+    const draft = botDocumentV1Schema.parse(raw);
+    if (draft.conversationId !== null) return;
+    const conversation = await tx.createConversation({ ownership: { kind: "ownerless" } });
+    Object.assign(raw, { ...draft, conversationId: Number(conversation.id) });
+  }, BACKGROUND_CONTEXT);
+  const botState = botDocumentV1Schema.parse(await harness.snapshot(WorkshopBotDoc, BACKGROUND_CONTEXT));
+  if (botState.conversationId === null) throw new Error("shared bot conversation was not persisted");
+  const conversation = await harness.conversation(botState.conversationId as ConversationId, BACKGROUND_CONTEXT);
+  if (conversation === undefined) throw new Error("shared bot conversation is unavailable");
+  const model = parseModel(modelText);
+  await conversation.configure({
+    model: { provider: model.provider, modelId: model.modelId },
+    thinkingLevel: model.thinking,
+    extensions: [extension],
+    tools: null,
+    instructions: BOT_INSTRUCTIONS,
+  }, BACKGROUND_CONTEXT);
+  return conversation;
+}
+
+function botRunTargets(installation: Awaited<ReturnType<typeof readInstallation>>): BotRunCursorTarget[] {
+  return Object.entries(installation.workflows).flatMap(([workflowId, workflow]) => workflow.runs.map(reference => ({
+    workflowId, runId: reference.runId, conversationId: reference.conversationId,
+  })));
+}
+
+async function readBotChat(
+  harness: Harness,
+  installation: Installation,
+  conversation: Conversation | undefined,
+  encodedCursor: string | undefined,
+  limit: number,
+  configured: boolean,
+): Promise<unknown> {
+  const cursor = decodeBotChatCursor(encodedCursor);
+  let page: Awaited<ReturnType<Conversation["entries"]>> | undefined;
+  if (conversation !== undefined) page = await conversation.entries({}, limit, cursor, BACKGROUND_CONTEXT);
+  const index = await readInstallation(harness);
+  const pending: unknown[] = [];
+  const botPermitted = new Set(["verifier_block", "verifier_failed", "repeated_failure", "preflight_failed"]);
+  for (const [workflowId, workflow] of Object.entries(index.workflows)) {
+    const reference = workflow.openRunId === null ? undefined : workflow.runs.find(run => run.runId === workflow.openRunId);
+    if (reference === undefined || (reference.status !== "waiting" && reference.status !== "blocked")) continue;
+    const run = await readRun(harness, reference);
+    if (run.status === "waiting") {
+      const wait = run.waits?.find(entry => entry.settlement.kind === "pending");
+      if (wait !== undefined) pending.push({ kind: "wait", workflowId, runId: run.runId, waitId: wait.waitId, question: wait.question, proposal: wait.output });
+    } else if (run.status === "blocked" && run.block !== null && !botPermitted.has(run.block.kind)) {
+      pending.push({ kind: "block", workflowId, runId: run.runId, blockId: run.block.blockId, blockKind: run.block.kind,
+        reason: run.block.reason, actions: pendingDecisionActions(run.block.kind) });
+    }
+  }
+  return botChatViewV1Schema.parse({
+    configured,
+    entries: page === undefined ? [] : buildBotChatEntries(page.items),
+    nextCursor: encodeBotChatCursor(page?.next),
+    pending: pending.slice(0, 100),
+  });
+}
+
+async function readBotLogs(
+  harness: Harness,
+  installation: Installation,
+  metadata: ServiceMetadataV1,
+  workflowId: string,
+  runId: string | undefined,
+): Promise<string> {
+  let cursor: string | undefined;
+  let size = 0;
+  const chunks: string[] = [];
+  do {
+    const page = serviceLogSectionPageV1Schema.parse(await projectServiceRead(harness, installation, metadata, {
+      version: 1, method: "logs.page", workflowId, ...(runId === undefined ? {} : { runId: runIdSchema.parse(runId) }),
+      ...(cursor === undefined ? {} : { cursor }), verbose: true,
+    }));
+    if (page.section.kind === "worklog" && page.section.content !== null && size < 16 * 1024) {
+      const text = page.section.content;
+      const remaining = 16 * 1024 - size;
+      const bytes = Buffer.from(text, "utf8");
+      const piece = bytes.byteLength <= remaining ? text : bytes.subarray(0, remaining).toString("utf8");
+      chunks.push(piece);
+      size += Buffer.byteLength(piece, "utf8");
+    }
+    cursor = page.nextCursor ?? undefined;
+  } while (cursor !== undefined && size < 16 * 1024);
+  return chunks.join("") || "No retained worklog text is available.";
 }
 
 async function ensureInstallationReady(harness: Harness, installation: Installation): Promise<void> {

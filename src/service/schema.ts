@@ -2,6 +2,7 @@ import { z } from "zod";
 import { nodeIdSchema, workflowIdSchema } from "../definition/schema.js";
 import { runIdSchema, waitIdSchema, humanAnswerSchema, humanReplyResultSchema } from "../run/schema.js";
 import { logSectionDtoSchema, runSummaryDtoSchema } from "../views/schema.js";
+import { botChatViewV1Schema, chatTextV1Schema } from "../bot/schema.js";
 
 export const serviceStatusV1Schema = z.enum([
   "starting",
@@ -48,6 +49,8 @@ export const serviceRequestV1Schema = z.discriminatedUnion("method", [
   z.strictObject({ ...mutationBase, method: z.literal("stop") }),
   z.strictObject({ ...mutationBase, method: z.literal("human.reply"), runId: runIdSchema,
     waitId: waitIdSchema, action: z.enum(["continue", "reject"]), answer: humanAnswerSchema }),
+  z.strictObject({ ...requestBase, method: z.literal("chat.submit"), requestId: serviceRequestIdV1Schema, text: chatTextV1Schema }),
+  z.strictObject({ ...requestBase, method: z.literal("chat.view"), cursor: z.string().min(1).max(4096).optional(), limit: z.number().int().min(1).max(100).optional() }),
   z.strictObject({
     ...mutationBase,
     method: z.literal("resolve"),
@@ -177,6 +180,8 @@ export const serviceResolveResultV1Schema = z.strictObject({
 });
 
 export const serviceReplyResultV1Schema = humanReplyResultSchema;
+export const serviceChatViewV1Schema = botChatViewV1Schema;
+export const serviceChatSubmitResultV1Schema = z.strictObject({ submitted: z.literal(true), submissionId: z.string().min(1) });
 
 const serviceErrorV1Schema = z.strictObject({
   code: z.string().min(1).max(128),

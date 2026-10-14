@@ -64,15 +64,15 @@ describe("TUI boundary — the folder says what a file is for", () => {
 
   test("the TUI files are exactly the ones meant to be there", () => {
     // If this list changes, the boundary changed: say so deliberately.
-    expect(tui.map(relative).sort()).toEqual(["src/tui/build-panes.ts", "src/tui/data-source.ts", "src/tui/mount-viewer.ts"]);
+    expect(tui.map(relative).sort()).toEqual(["src/tui/build-panes.ts", "src/tui/data-source.ts", "src/tui/mount-chat.ts", "src/tui/mount-viewer.ts"]);
   });
 
   test("the runtime does not import the viewer, except its lazy entry point", () => {
     const importers = rest.filter((file) =>
       allImports(readFileSync(file, "utf8")).some(isTuiSpec),
     );
-    // Status and watch load the same viewer on demand.
-    expect(importers.map(relative)).toEqual(["src/cli/watch.ts"]);
+    // The CLI loads each TUI client on demand.
+    expect(importers.map(relative).sort()).toEqual(["src/cli/dispatch-public-command.ts", "src/cli/watch.ts"]);
 
     const cli = readFileSync(join(REPO_ROOT, "src/cli/watch.ts"), "utf8");
     const { typeOnly, value, dynamic } = importsOf(cli);
@@ -84,6 +84,11 @@ describe("TUI boundary — the folder says what a file is for", () => {
     // A static value import would pull OpenTUI into every invocation, including
     // `validate` and `status`.
     expect(cli).toContain('await import("../tui/mount-viewer.js")');
+    const chatCli = readFileSync(join(REPO_ROOT, "src/cli/dispatch-public-command.ts"), "utf8");
+    const chatImports = importsOf(chatCli);
+    expect(chatImports.value.filter(isTuiSpec)).toEqual([]);
+    expect(chatImports.dynamic.filter(isTuiSpec)).toEqual(["../tui/mount-chat.js"]);
+    expect(chatCli).toContain('await import("../tui/mount-chat.js")');
   });
 
   test("the viewer never reaches past the CLI contract, transitively", () => {

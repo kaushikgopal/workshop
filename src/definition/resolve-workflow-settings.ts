@@ -69,13 +69,7 @@ export function resolveWorkflowSettings(input: {
         cwd: input.projectCwd,
         timeoutMs: parseTimeout(definition.environment.preflight.timeout ?? "30s"),
       };
-  const orchestratorModel = machine.orchestrator?.model ?? null;
-  const orchestrator = {
-    model: orchestratorModel === null ? null : parseModel(orchestratorModel).full,
-    timeoutMs: orchestratorModel === null
-      ? null
-      : parseTimeout(machine.orchestrator?.timeout ?? "5m"),
-  };
+  const orchestrator = { model: null, timeoutMs: null };
 
   return currentResolvedWorkflowSettingsSchema.parse({
     formatVersion: 4,

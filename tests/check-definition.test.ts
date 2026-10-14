@@ -39,8 +39,9 @@ describe("workflow and machine schemas", () => {
       version: 3,
       shell: "/bin/bash",
       agent: { harness: { command: "mock-agent" }, model: "provider/model:low" },
-      orchestrator: { model: "provider/judge:medium", timeout: "5m" },
-    })).toMatchObject({ version: 3, shell: "/bin/bash" });
+      bot: { model: "provider/bot:medium" },
+    })).toMatchObject({ version: 3, shell: "/bin/bash", bot: { model: "provider/bot:medium" } });
+    expect(() => machineConfigSchema.parse({ orchestrator: { model: "provider/judge:medium" } })).toThrow();
     expect(machineConfigSchema.parse({})).toEqual({});
   });
 
@@ -89,7 +90,7 @@ describe("workflow and machine schemas", () => {
   test("checks every README YAML snippet against the shipped format and harness contract", () => {
     const readme = readFileSync(join(import.meta.dir, "..", "README.md"), "utf8");
     const snippets = [...readme.matchAll(/\x60{3}yaml\n([\s\S]*?)\n\x60{3}/gu)];
-    expect(snippets).toHaveLength(3);
+    expect(snippets).toHaveLength(4);
     for (const [index, snippet] of snippets.entries()) {
       const yaml = snippet[1];
       if (yaml === undefined) throw new Error("README YAML snippet is missing");
@@ -101,6 +102,10 @@ describe("workflow and machine schemas", () => {
         expect(settings.nodes["publish-quote"]?.run.replay).toBe("never");
       } else {
         const machine = machineConfigSchema.parse(parseStrictYaml(yaml, label));
+        if (machine.bot !== undefined) {
+          expect(machine.bot.model).toBe("example/pi-model:medium");
+          continue;
+        }
         const agent = resolveAgent({ machine: machine.agent });
         expect(agent.model).not.toBeNull();
         if (typeof machine.agent?.harness === "object") {

@@ -1,5 +1,6 @@
 import { defineDoc, defineEntry } from "@earendil-works/pi-durable";
 import type { InstallationDocumentV1, ServiceMutationReceiptsDocumentV1 } from "../../installation/schema.js";
+import type { BotDocumentV1 } from "../../bot/schema.js";
 import type {
   WorkflowRunDocumentV1,
   WorkshopEventV1,
@@ -40,4 +41,12 @@ export const WorkshopServiceReceiptsDoc = defineDoc<ServiceMutationReceiptsDocum
   version: 1,
   scope: "session",
   initial: () => ({ state: "ready", receipts: [] }),
+});
+
+/** Session-scoped shared bot identity and committed run-event scan cursors. */
+export const WorkshopBotDoc = defineDoc<BotDocumentV1>({
+  kind: "workshop.bot",
+  version: 1,
+  scope: "session",
+  initial: () => ({ state: "ready", conversationId: null, cursorInitialized: false, eventCursors: {} }),
 });

@@ -168,7 +168,7 @@ and validators are not Durable work: they are harness subprocesses launched by
 | `Harness` and `Registry` | `service/open-service-runtime.ts` opens one Harness on `state/durable.db`, registers five task definitions, reconciles leftover processes, then calls `harness.resume()`. |
 | Tasks (`defineTask`) | `WorkflowRun`, `NodeAttempt`, `ProcessExecution`, `CapacityGate`, `ScheduleWakeup` (registered as `workshop.workflow-run` and so on). Each task is a set of named phases. A phase ends by committing its next checkpoint, waiting on children, or settling as completed or failed. |
 | Child tasks | A parent creates children with `tx.createTask` and waits for them with `allSettled`. A failed child comes back as data the parent classifies; it does not crash the parent. |
-| Conversations | Admission gives every run its own conversation. The run's tasks and records attach to it, so its history outlives the tasks. Historical judgments remain readable. |
+| Conversations | Admission gives every run its own conversation. The run's tasks and records attach to it, so its history outlives the tasks. The shared bot has one ownerless conversation whose identity and committed event cursors live in a session document. |
 | Documents (`defineDoc`) | `workshop.run` holds a run's current state, scoped to its conversation. `workshop.installation` (workflows, activations) and `workshop.service-receipts` (idempotent controls) are session-scoped. |
 | Entries (`defineEntry`) | Append-only `workshop.event`, `workshop.process`, and `workshop.judgment` evidence for each run. `logs` reads the process and event entries. |
 | `runtime.commit` | The only way state changes. Document edits, new entries, new child tasks, and the task's own checkpoint land in one SQLite transaction. |
@@ -199,17 +199,22 @@ Folders and filenames follow [Naming files](#naming-files).
 
 ```text
 src/
+├─ bot/                           shared bot tools, event cursor, and chat projection
+│  ├─ schema.ts                   bot state, chat entries, and pending-decision contracts
+│  ├─ create-bot-tools.ts         restricted status, log, start, and resolve tools
+│  ├─ scan-bot-events.ts          committed event delivery and restart-safe cursors
+│  └─ build-bot-feed.ts           chat transcript and viewer feed lines
 ├─ cli/                           argv, offline validation, socket clients
 │  ├─ main.ts                     entry point
 │  ├─ dispatch-command.ts         help, validate, public command routing
-│  ├─ dispatch-public-command.ts  controls, paged inspection, run following
+│  ├─ dispatch-public-command.ts  chat, controls, and paged inspection
 │  ├─ errors.ts                   error text at the CLI boundary
 │  ├─ service.ts                  service start | serve | status | stop
-│  └─ watch.ts                    TTY routing and selected-run viewer reads
+│  └─ watch.ts                    TTY routing, bot feed, and selected-run viewer reads
 ├─ service/                       one owner process per installation
 │  ├─ serve-service-process.ts    process entry and signal shutdown
 │  ├─ serve-workshop-service.ts   socket server, ownership, request dispatch
-│  ├─ open-service-runtime.ts     Harness, registry, recovery, controls
+│  ├─ open-service-runtime.ts     Harness, recovery, bot, and service controls
 │  ├─ reply-human-wait.ts         checked replies and atomic wait settlement
 │  ├─ check-legacy-runs.ts        startup drain guard for open format 3 runs
 │  ├─ project-service-reads.ts    status, node previews, run pages, retained logs
@@ -231,7 +236,7 @@ src/
 │  │  ├─ define-workshop-tasks.ts WorkflowRun and fixed outcome decisions
 │  │  ├─ define-node-attempt-task.ts worker, result parsing, verifier
 │  │  ├─ define-process-execution-task.ts spawn, capture, crash replay
-│  │  ├─ define-workshop-records.ts documents and immutable entries
+│  │  ├─ define-workshop-records.ts installation, run, bot documents and evidence
 │  │  ├─ commit-service-mutation.ts idempotent control receipts
 │  │  ├─ render-worklog.ts        compact or verbose committed worklog
 │  │  ├─ checkpoint-durable-wal.ts idle WAL truncation
@@ -277,10 +282,11 @@ src/
 │  ├─ schema.ts                   versioned public JSON projections
 │  ├─ format-for-terminal.ts      local times and lifecycle glyphs
 │  └─ render-status.ts            three-column snapshots and state previews
-├─ tui/                           lazily loaded OpenTUI viewer
+├─ tui/                           lazily loaded OpenTUI clients
 │  ├─ data-source.ts              service-backed snapshot contract
 │  ├─ build-panes.ts              overview and frozen-chain screen models
-│  └─ mount-viewer.ts             scroll, navigation, serial refresh
+│  ├─ mount-viewer.ts             scroll, navigation, serial refresh
+│  └─ mount-chat.ts               shared conversation and pending decisions
 └─ util/
    ├─ parse-units.ts              duration and byte-size parsing
    └─ schema.ts                   shared primitive contracts

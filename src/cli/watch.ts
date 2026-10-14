@@ -2,6 +2,7 @@ import { sendServiceRequest, streamServiceLogChunks } from "../service/send-serv
 import type { ServiceRequestV1 } from "../service/schema.js";
 import type { ViewerSource } from "../tui/data-source.js";
 import { diagramDtoSchema, nodeDescriptionDtoSchema, statusDtoSchema } from "../views/schema.js";
+import { botChatViewV1Schema } from "../bot/schema.js";
 import { renderStatusSnapshot } from "../views/render-status.js";
 
 export function statusIsInteractive(json: boolean, stdoutTTY: boolean, stdinTTY: boolean): boolean {
@@ -33,7 +34,10 @@ export function createViewerSource(socketPath: string): ViewerSource {
   return {
     async snapshot(workflowId, expanded = []) {
       const status = statusDtoSchema.parse(await read({ version: 1, method: "status" }));
-      if (workflowId === null) return { status, detail: null };
+      const bot = botChatViewV1Schema.parse(await read({ version: 1, method: "chat.view", limit: 100 }));
+      const botLines = bot.entries.map(entry => (entry.role === "user" ? "You: " : entry.role === "assistant" ? "Bot: " : "Bot activity: ") + entry.text);
+      if (botLines.length === 0) botLines.push(bot.configured ? "No bot activity yet" : "Bot not configured");
+      if (workflowId === null) return { status, detail: null, botLines: botLines.slice(-100) };
       const workflow = status.workflows.find(entry => entry.workflowId === workflowId);
       if (!workflow) throw new Error("No workflow " + JSON.stringify(workflowId));
       const run = workflow.unresolvedRun ?? workflow.latestRun;
@@ -59,7 +63,7 @@ export function createViewerSource(socketPath: string): ViewerSource {
           nodes[index] = { ...node, failureEvidence: ids.map(id => evidence.get(id) ?? "Evidence unavailable").join("\n"), evidenceTruncated: false };
         }
       }
-      return { status, detail: { diagram, nodes } };
+      return { status, detail: { diagram, nodes }, botLines: botLines.slice(-100) };
     },
   };
 }

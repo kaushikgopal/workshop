@@ -134,6 +134,10 @@ const orchestratorSchema = z.strictObject({
   timeout: timeoutValue.optional(),
 });
 
+const botSettingsSchema = z.strictObject({
+  model: modelString,
+});
+
 const workflowSettings = {
   description: z.string().refine(
     (value) => new TextEncoder().encode(value).byteLength <= 4 * 1024,
@@ -238,7 +242,7 @@ export const machineConfigSchema = z.strictObject({
   stream_cap: byteSizeValue.optional(),
   keep_files: keepFilesValue.optional(),
   agent: agentDefaultsSchema.optional(),
-  orchestrator: orchestratorSchema.optional(),
+  bot: botSettingsSchema.optional(),
 });
 
 export type WorkflowDefinition = z.infer<typeof workflowSchema>;

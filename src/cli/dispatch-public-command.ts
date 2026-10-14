@@ -4,7 +4,7 @@ import { loadCheckedWorkflow, findInstallation } from "../installation/load-inst
 import type { Installation } from "../installation/load-installation.js";
 import { launchServiceProcess } from "../service/launch-service-process.js";
 import { readServiceWorklog, sendServiceRequest, streamServiceLogChunks, ServiceConnectionError } from "../service/send-service-request.js";
-import { runIdSchema, humanAnswerSchema } from "../run/schema.js";
+import { runIdSchema, waitIdSchema, humanAnswerSchema } from "../run/schema.js";
 import { glyph, localClock } from "../views/format-for-terminal.js";
 import {
   diagramDtoSchema,
@@ -18,6 +18,8 @@ import {
   serviceStartResultV1Schema,
   serviceResolveResultV1Schema,
   serviceReplyResultV1Schema,
+  serviceChatSubmitResultV1Schema,
+  serviceChatViewV1Schema,
   type ServiceLogSectionPageV1,
   type ServiceRequestV1,
 } from "../service/schema.js";
@@ -26,7 +28,7 @@ import { errorText } from "./errors.js";
 const CLI_PATH = fileURLToPath(new URL("./main.ts", import.meta.url));
 const SERVICE_START_TIMEOUT_MS = 10_000;
 
-type PublicCommand = "reply" | "start" | "pause" | "resume" | "stop" | "resolve" | "status" | "runs" | "logs" | "diagram" | "watch" | "step.describe";
+type PublicCommand = "chat" | "reply" | "start" | "pause" | "resume" | "stop" | "resolve" | "status" | "runs" | "logs" | "diagram" | "watch" | "step.describe";
 
 export async function dispatchPublicCommand(command: PublicCommand, args: readonly string[]): Promise<void> {
   try {
@@ -36,6 +38,7 @@ export async function dispatchPublicCommand(command: PublicCommand, args: readon
       case "resume":
       case "stop": await controlCommand(command, args); return;
       case "reply": await replyCommand(args); return;
+      case "chat": await chatCommand(args); return;
       case "resolve": await resolveCommand(args); return;
       case "status": await statusCommand(args); return;
       case "runs": await runsCommand(args); return;
@@ -139,6 +142,43 @@ async function replyCommand(args: readonly string[]): Promise<void> {
   if (!response.ok) throw new Error(response.error.code + ": " + response.error.message);
   const replied = serviceReplyResultV1Schema.parse(response.result);
   process.stdout.write("replied " + workflowId + " " + replied.waitId + ": " + replied.status + "\n");
+}
+
+async function chatCommand(args: readonly string[]): Promise<void> {
+  if (args.length !== 0) return usage("usage: workshop chat");
+  if (process.stdin.isTTY !== true || process.stdout.isTTY !== true) {
+    throw new CliUsageError("workshop chat requires a TTY");
+  }
+  const socketPath = await ensureService(loadInstallationForCommand());
+  const source = {
+    async view(cursor?: string, limit = 50) {
+      const response = await request(socketPath, { version: 1, method: "chat.view", limit, ...(cursor === undefined ? {} : { cursor }) });
+      if (!response.ok) throw new Error(response.error.code + ": " + response.error.message);
+      return serviceChatViewV1Schema.parse(response.result);
+    },
+    async submit(text: string) {
+      const response = await request(socketPath, { version: 1, method: "chat.submit", requestId: randomUUID(), text });
+      if (!response.ok) throw new Error(response.error.code + ": " + response.error.message);
+      serviceChatSubmitResultV1Schema.parse(response.result);
+    },
+    async reply(input: { workflowId: string; runId: string; waitId: string; action: "continue" | "reject"; answer: string }) {
+      const response = await request(socketPath, { version: 1, method: "human.reply", requestId: randomUUID(), workflowId: input.workflowId,
+        runId: runIdSchema.parse(input.runId), waitId: waitIdSchema.parse(input.waitId), action: input.action,
+        answer: humanAnswerSchema.parse(input.answer) });
+      if (!response.ok) throw new Error(response.error.code + ": " + response.error.message);
+      serviceReplyResultV1Schema.parse(response.result);
+    },
+    async resolve(input: { workflowId: string; runId: string; action: "retry" | "accept" | "fail"; reason: string; allowRepeat?: boolean; resultFile?: string }) {
+      const response = await request(socketPath, { version: 1, method: "resolve", requestId: randomUUID(), workflowId: input.workflowId,
+        runId: runIdSchema.parse(input.runId), action: input.action, reason: input.reason, resolver: "human",
+        ...(input.allowRepeat ? { allowRepeat: true } : {}),
+        ...(input.resultFile === undefined ? {} : { resultFile: input.resultFile, acknowledgeEffects: true }) });
+      if (!response.ok) throw new Error(response.error.code + ": " + response.error.message);
+      serviceResolveResultV1Schema.parse(response.result);
+    },
+  };
+  const { openChat } = await import("../tui/mount-chat.js");
+  await openChat(source);
 }
 
 async function resolveCommand(args: readonly string[]): Promise<void> {

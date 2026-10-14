@@ -271,6 +271,7 @@ Final-step Continue completes even while paused. Stop cancels a waiting run.
 | `stop <workflow>` | Disable the schedule and cancel the open run after cleanup |
 | `resolve <workflow> --action retry\|accept\|fail --reason <text> [options]` | Resolve a permitted block action |
 | `reply <workflow> --continue\|--reject --answer TEXT` | Answer the current human wait |
+| `chat` | Open the shared bot conversation and pending decisions |
 | `status [<workflow>] [--json]` | Open the viewer on a TTY; otherwise print a snapshot |
 | `watch [<workflow>] [--json]` | Alias for status |
 | `runs <workflow> [--json] [--all]` | Run history, newest first; default page is byte-bounded |
@@ -328,7 +329,7 @@ agent:
 Machine `version` is optional; when present it must be `3`. Workflows must
 declare `version: 4`. `project_dir` resolves relative to `.workshop/`.
 
-NOTE: Machine `orchestrator` and `keep_files` keys remain accepted but are ignored.
+NOTE: Machine `keep_files` is accepted but ignored. Machine `orchestrator` is removed. Set `bot.model` to configure the shared bot.
 
 Agent fields resolve independently: worker or verifier, then workflow
 `defaults.agent`, then machine `agent`. A model must resolve; there is no
@@ -417,11 +418,39 @@ Temporary captures are removed only after evidence import and confirmed cleanup.
 CAUTION: Workshop adds no automatic expiration or database purging. Evidence
 grows with each attempt, including unlimited retries.
 
-## Status and limitations
+## Shared bot and chat
+
+Set `bot.model` in `.workshop/workshop.yaml` to enable the one shared service bot:
+
+```yaml
+bot:
+  model: example/pi-model:medium
+```
+
+The bot has no default model. Without `bot.model`, Workshop shows `Bot not configured`
+and makes no bot model calls. The bot reads status, runs, and logs. It can start
+workflows and resolve only the block kinds that section 7 permits. Its block resolution
+uses the same checked service path as the CLI. The service limits the bot to one
+resolution per node in each run.
+
+The service stores the bot conversation and its event cursor in Durable state.
+It submits committed wait, block, and terminal events with their stable event IDs.
+The cursor advances after Durable accepts each submission. A service restart can
+retry a submission without creating a second turn. First-time bot configuration
+starts at current history and does not replay older events.
+
+Run `workshop chat` in a TTY to open the conversation. Enter sends a message.
+The pending area shows open waits and human-only blocks. Select a wait with Tab.
+Enter `/continue ANSWER` or `/reject ANSWER` to submit an explicit human decision.
+Select a block with Tab. Enter `/resolve retry REASON`, `/resolve fail REASON`,
+or `/resolve accept FILE --acknowledge-effects` when its block permits that action.
+A retry for an unknown outside outcome also requires `--allow-repeat` before its reason.
+Ordinary chat text never answers a wait. The bot has no wait-reply tool.
 
 On a TTY, `status` opens two screens. The overview has three columns:
-**Title**, **Status**, and **Next run**. Arrow keys or `j`/`k` select a workflow;
-Enter opens its detail screen. Next-run times use the machine's local time.
+**Title**, **Status**, and **Next run**. The shared bot feed appears below the table.
+Arrow keys or `j`/`k` select a workflow; Enter opens its detail screen.
+Next-run times use the machine's local time.
 
 The detail screen shows the chain vertically. Running steps preview live stderr;
 succeeded steps show accepted output; failed or blocked steps show failure evidence.
@@ -430,7 +459,7 @@ step. Escape or Backspace returns to the overview. `q` quits.
 
 `status <workflow>` opens detail directly. `watch` is an alias. JSON output
 and non-TTY output remain snapshots. Reads use only service projections, without
-model calls. The shared bot and chat client are planned, not available.
+model calls. Bot failures do not stop deterministic workflow chains. Bot model calls require bot.model.
 
 Workshop is for trusted local workflows. It has no sandbox, branching, rollback,
 or exactly-once external effects. Tested on macOS; Linux is untested. The service
@@ -445,8 +474,9 @@ than 4. Settled history stays readable. Incompatible task definitions block as
 `runtime_incompatible` instead of continuing under different code.
 
 Migrate workflow files to `version: 4`. Replace `max_attempts: N` with
-`retries: N-1`. Replace `check` with `verify`. Remove workflow `orchestrator`
-and `keep_files` settings. Declare `retries` and `replay` for every step
+`retries: N-1`. Replace `check` with `verify`. Remove machine and workflow
+`orchestrator` settings and workflow `keep_files` settings. Set `bot.model` only
+when you want the shared bot. Declare `retries` and `replay` for every step
 or in `defaults`. Update harnesses to the stdin/stdout/stderr contract.
 
 ## Contributing

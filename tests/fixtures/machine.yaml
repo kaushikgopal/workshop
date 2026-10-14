@@ -8,6 +8,3 @@ agent:
   harness:
     command: 'bun tests/mock/hemingway-node.ts'
   model: "fixture/mock-model:medium"
-orchestrator:
-  model: "fixture/mock-model:low"
-  timeout: 5m

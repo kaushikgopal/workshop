@@ -116,7 +116,7 @@ test("shared bot feed retains only the last 100 lines without substituting a wor
   expect(model.botLines[0]).toBe("message 30");
   expect(model.botLines.at(-1)).toBe("message 129");
   const absent = buildViewerModel({ snapshot: { ...snapshot, botLines: undefined }, workflowId: null, selectedId: "alpha", selectedStepId: null, expanded: [] });
-  expect(absent.botLines.join(" ")).toContain("Shared bot feed unavailable");
+  expect(absent.botLines.join(" ")).toContain("Bot not configured");
 });
 
 test("historical status projections remain readable and latest results require matching workflow identity", () => {

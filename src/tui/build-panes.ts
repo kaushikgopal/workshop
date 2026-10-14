@@ -35,7 +35,7 @@ export function buildViewerModel(input: {
     rows: statusRows(input.snapshot.status, input.now),
     steps: (input.snapshot.detail?.nodes ?? []).map(node => renderStepPreview(node, input.expanded.includes(node.nodeId))),
     notice,
-    botLines: input.snapshot.botLines?.slice(-100) ?? ["Shared bot feed unavailable until bot support is installed"],
+    botLines: input.snapshot.botLines?.slice(-100) ?? ["Bot not configured"],
     selectedId: input.selectedId,
     selectedStepId: input.selectedStepId,
   };

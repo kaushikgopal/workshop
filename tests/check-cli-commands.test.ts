@@ -44,6 +44,18 @@ describe("CLI commands", () => {
     }
   });
 
+  test("chat refuses a non-TTY without starting the service", () => {
+    const root = makeRoot({ machine: null, workflows: {} });
+    try {
+      const result = runCli(root, ["chat"]);
+      expect(result.status).toBe(64);
+      expect(result.stderr).toContain("workshop chat requires a TTY");
+      expect(existsSync(join(root, ".workshop", "state"))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("rejects unknown commands, including the removed --engine selector", () => {
     const directory = mkdtempSync(join(tmpdir(), "workshop-cli-unknown-"));
     try {

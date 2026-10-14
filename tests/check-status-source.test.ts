@@ -18,7 +18,13 @@ async function fakeService(reply: (request: ServiceRequestV1) => unknown, execut
       if (!parsed.ok) { socket.destroy(); return; }
       requests.push(parsed.request);
       const requestId = "requestId" in parsed.request ? parsed.request.requestId : null;
-      for (const frame of encodeServiceResponseFrames(serviceSuccess(requestId, reply(parsed.request)))) socket.write(frame);
+      let result: unknown;
+      try { result = reply(parsed.request); }
+      catch (error) {
+        if (parsed.request.method !== "chat.view") throw error;
+        result = { configured: false, entries: [], nextCursor: null, pending: [] };
+      }
+      for (const frame of encodeServiceResponseFrames(serviceSuccess(requestId, result))) socket.write(frame);
       socket.end();
     });
   });
@@ -26,6 +32,24 @@ async function fakeService(reply: (request: ServiceRequestV1) => unknown, execut
   try { await execute(path, requests); }
   finally { await new Promise<void>(resolve => server.close(() => resolve())); rmSync(directory, { recursive: true, force: true }); }
 }
+
+
+test("viewer source projects the shared bot transcript into its feed", async () => {
+  const status = buildStatus();
+  const entries = [
+    { id: "user-1", role: "user", text: "Check the latest run." },
+    { id: "assistant-1", role: "assistant", text: "The run is complete." },
+  ];
+  await fakeService(request => {
+    if (request.method === "status") return status;
+    if (request.method === "chat.view") return { configured: true, entries, nextCursor: null, pending: [] };
+    throw new Error("Unexpected request " + request.method);
+  }, async (socket, requests) => {
+    const snapshot = await createViewerSource(socket).snapshot(null);
+    expect(snapshot.botLines).toEqual(["You: Check the latest run.", "Bot: The run is complete."]);
+    expect(requests.map(request => request.method)).toEqual(["status", "chat.view"]);
+  });
+});
 
 test("status adapter reads only the overview and selected open run through a fake service", async () => {
   const status = buildStatus();
@@ -43,10 +67,10 @@ test("status adapter reads only the overview and selected open run through a fak
   }, async (socket, requests) => {
     const source = createViewerSource(socket);
     expect((await source.snapshot(null)).detail).toBeNull();
-    expect(requests.map(request => request.method)).toEqual(["status"]);
+    expect(requests.map(request => request.method)).toEqual(["status", "chat.view"]);
     const snapshot = await source.snapshot("alpha");
     expect(snapshot.detail?.nodes.map(node => node.nodeId)).toEqual(["frozen-first"]);
-    expect(requests.map(request => request.method)).toEqual(["status", "status", "diagram", "node.describe"]);
+    expect(requests.map(request => request.method)).toEqual(["status", "chat.view", "status", "chat.view", "diagram", "node.describe"]);
     const diagramRequest = requests.find(request => request.method === "diagram");
     expect(diagramRequest).toMatchObject({ workflowId: "alpha", runId: workflow.unresolvedRun?.runId });
     expect(requests.some(request => request.method === "runs" || request.method === "logs.page")).toBe(false);
@@ -68,15 +92,15 @@ test("status adapter uses latest frozen run, otherwise the configured chain with
   }, async (socket, requests) => {
     const source = createViewerSource(socket);
     expect((await source.snapshot("alpha")).detail?.diagram.runId).toBe(buildRun().runId);
-    expect(requests[1]).toMatchObject({ method: "diagram", runId: "run-alpha" });
+    expect(requests[2]).toMatchObject({ method: "diagram", runId: "run-alpha" });
     workflow.latestRun = null;
     const configured = await source.snapshot("alpha");
     expect(configured.detail?.diagram.runId).toBeNull();
     expect(configured.detail?.nodes[0]?.successfulOutput).toBeNull();
-    expect(requests[4]).toEqual({ version: 1, method: "diagram", workflowId: "alpha" });
+    expect(requests[6]).toEqual({ version: 1, method: "diagram", workflowId: "alpha" });
     workflow.configurationError = "Invalid configuration";
     expect((await source.snapshot("alpha")).detail).toBeNull();
-    expect(requests.at(-1)?.method).toBe("status");
+    expect(requests.slice(-2).map(request => request.method)).toEqual(["status", "chat.view"]);
   });
 });
 

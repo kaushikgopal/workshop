@@ -75,6 +75,9 @@ function loadMachineConfig(configPath: string): MachineConfig {
   if (!existsSync(configPath)) return machineConfigSchema.parse({});
   const raw = parseStrictYaml(readFileSync(configPath, "utf8"), configPath) ?? {};
   checkFormatVersion(raw, configPath, "machine config");
+  if (typeof raw === "object" && raw !== null && "orchestrator" in raw) {
+    throw new Error("machine orchestrator is removed; configure bot.model instead");
+  }
   return machineConfigSchema.parse(raw);
 }
 
