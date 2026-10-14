@@ -9,7 +9,7 @@ export interface BotToolActions {
   resolveBlock(input: { workflowId: string; runId?: string; action: "retry" | "fail"; reason: string }): Promise<unknown>;
 }
 
-const outputLimit = { maxBytes: 16 * 1024, maxLines: 100 } as const;
+export const BOT_TOOL_OUTPUT_LIMITS = { maxBytes: 16 * 1024, maxLines: 100 } as const;
 
 export function createBotExtension(actions: BotToolActions): Extension<ToolRegistration> {
   const tools: ToolRegistration[] = [
@@ -17,7 +17,7 @@ export function createBotExtension(actions: BotToolActions): Extension<ToolRegis
       name: "workshop_status",
       description: "Read current status for one workflow or the installation.",
       parameters: Type.Object({ workflowId: Type.Optional(Type.String()) }),
-      outputLimits: outputLimit,
+      outputLimits: BOT_TOOL_OUTPUT_LIMITS,
       async execute(args, api) {
         api.output(JSON.stringify(await actions.readStatus(args.workflowId)));
         return {};
@@ -27,7 +27,7 @@ export function createBotExtension(actions: BotToolActions): Extension<ToolRegis
       name: "workshop_run",
       description: "Read a workflow's current or selected run state.",
       parameters: Type.Object({ workflowId: Type.String(), runId: Type.Optional(Type.String()) }),
-      outputLimits: outputLimit,
+      outputLimits: BOT_TOOL_OUTPUT_LIMITS,
       async execute(args, api) {
         api.output(JSON.stringify(await actions.readRun(args.workflowId, args.runId)));
         return {};
@@ -35,9 +35,9 @@ export function createBotExtension(actions: BotToolActions): Extension<ToolRegis
     }),
     defineTool({
       name: "workshop_logs",
-      description: "Read retained worklog text for a workflow run.",
+      description: "Read retained worklog and process capture text for a workflow run.",
       parameters: Type.Object({ workflowId: Type.String(), runId: Type.Optional(Type.String()) }),
-      outputLimits: outputLimit,
+      outputLimits: BOT_TOOL_OUTPUT_LIMITS,
       async execute(args, api) {
         api.output(await actions.readLogs(args.workflowId, args.runId));
         return {};
@@ -47,7 +47,7 @@ export function createBotExtension(actions: BotToolActions): Extension<ToolRegis
       name: "workshop_start",
       description: "Start a workflow through Workshop's service.",
       parameters: Type.Object({ workflowId: Type.String() }),
-      outputLimits: outputLimit,
+      outputLimits: BOT_TOOL_OUTPUT_LIMITS,
       async execute(args, api) {
         api.output(JSON.stringify(await actions.startWorkflow(args.workflowId)));
         return {};
@@ -60,7 +60,7 @@ export function createBotExtension(actions: BotToolActions): Extension<ToolRegis
         workflowId: Type.String(), runId: Type.Optional(Type.String()),
         action: Type.Union([Type.Literal("retry"), Type.Literal("fail")]), reason: Type.String(),
       }),
-      outputLimits: outputLimit,
+      outputLimits: BOT_TOOL_OUTPUT_LIMITS,
       async execute(args, api) {
         api.output(JSON.stringify(await actions.resolveBlock(args)));
         return {};

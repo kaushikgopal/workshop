@@ -8,7 +8,7 @@ import { createRegistry, Harness, type Conversation, type ConversationId, type T
 import { canonicalHash } from "../definition/hash-canonical-json.js";
 import { parseModel } from "../definition/parse-model.js";
 import { createWorkshopModels } from "../model/create-workshop-models.js";
-import { createBotExtension, BOT_INSTRUCTIONS } from "../bot/create-bot-tools.js";
+import { BOT_TOOL_OUTPUT_LIMITS, createBotExtension, BOT_INSTRUCTIONS } from "../bot/create-bot-tools.js";
 import { initializeBotEventCursors, scanCommittedBotEvents, type BotRunCursorTarget } from "../bot/scan-bot-events.js";
 import { buildBotChatEntries, decodeBotChatCursor, encodeBotChatCursor, pendingDecisionActions } from "../bot/build-bot-feed.js";
 import { botDocumentV1Schema, botChatViewV1Schema } from "../bot/schema.js";
@@ -61,7 +61,8 @@ import { createRunFileWriter } from "./project-run-files.js";
 import { removeProcessCaptures } from "../storage/disk/remove-process-captures.js";
 import { readRunEvidenceSnapshot, readInstallation, readRun, projectServiceRead } from "./project-service-reads.js";
 import { ServiceRequestError, ServiceShutdownError, serveWorkshopService, type WorkshopServiceRuntime } from "./serve-workshop-service.js";
-import { serviceLogSectionPageV1Schema, type ServiceMetadataV1, type ServiceRequestV1 } from "./schema.js";
+import { serviceLogSectionPageV1Schema, serviceRunsPageV1Schema, type ServiceMetadataV1, type ServiceRequestV1 } from "./schema.js";
+import { diagramDtoSchema } from "../views/schema.js";
 
 const TASK_VERSIONS = { workflowRun: 10, nodeAttempt: 4, processExecution: 4, capacityGate: 1, scheduleWakeup: 1 } as const;
 const STARTUP_RECONCILIATION_MS = 10_000;
@@ -133,7 +134,7 @@ async function openServiceRuntime(
     });
     const botExtension = createBotExtension({
       readStatus: async workflowId => await projectServiceRead(requireHarness(), installation, metadata, { version: 1, method: "status", ...(workflowId === undefined ? {} : { workflowId }) }),
-      readRun: async (workflowId, runId) => await projectServiceRead(requireHarness(), installation, metadata, { version: 1, method: "diagram", workflowId, ...(runId === undefined ? {} : { runId: runIdSchema.parse(runId) }) }),
+      readRun: async (workflowId, runId) => await readBotRun(requireHarness(), installation, metadata, workflowId, runId),
       readLogs: async (workflowId, runId) => await readBotLogs(requireHarness(), installation, metadata, workflowId, runId),
       startWorkflow: async workflowId => await startWorkflow(requireHarness(), requireTasks(), scheduleWakeupTask, installation, { version: 1, method: "start", requestId: randomUUID(), workflowId }),
       resolveBlock: async ({ runId, ...request }) => await resolveBlockedWorkflow(requireHarness(), requireTasks(), installation, { version: 1, method: "resolve", requestId: randomUUID(), ...request, ...(runId === undefined ? {} : { runId: runIdSchema.parse(runId) }), resolver: "bot" }),
@@ -543,25 +544,85 @@ async function readBotLogs(
   workflowId: string,
   runId: string | undefined,
 ): Promise<string> {
+  const truncationLabel = "[truncated: Workshop bot log output reached its 16 KiB or 100-line limit]";
+  const reservedBytes = Buffer.byteLength(truncationLabel, "utf8") + 1;
+  const maxContentBytes = BOT_TOOL_OUTPUT_LIMITS.maxBytes - reservedBytes;
+  const maxContentLines = BOT_TOOL_OUTPUT_LIMITS.maxLines - 2;
+  const lineBreak = "\n";
   let cursor: string | undefined;
-  let size = 0;
-  const chunks: string[] = [];
+  let output = "";
+  let lastSectionIndex = -1;
+  let truncated = false;
+  let lineCount = 0;
+
+  const append = (value: string): boolean => {
+    let piece = "";
+    let bytes = Buffer.byteLength(output, "utf8");
+    for (const character of value) {
+      const characterBytes = Buffer.byteLength(character, "utf8");
+      if (bytes + characterBytes > maxContentBytes) break;
+      if (character === lineBreak && lineCount + 1 > maxContentLines) break;
+      piece += character;
+      bytes += characterBytes;
+      if (character === lineBreak) lineCount += 1;
+    }
+    output += piece;
+    return piece.length === value.length;
+  };
+
   do {
     const page = serviceLogSectionPageV1Schema.parse(await projectServiceRead(harness, installation, metadata, {
       version: 1, method: "logs.page", workflowId, ...(runId === undefined ? {} : { runId: runIdSchema.parse(runId) }),
       ...(cursor === undefined ? {} : { cursor }), verbose: true,
     }));
-    if (page.section.kind === "worklog" && page.section.content !== null && size < 16 * 1024) {
-      const text = page.section.content;
-      const remaining = 16 * 1024 - size;
-      const bytes = Buffer.from(text, "utf8");
-      const piece = bytes.byteLength <= remaining ? text : bytes.subarray(0, remaining).toString("utf8");
-      chunks.push(piece);
-      size += Buffer.byteLength(piece, "utf8");
+    if (page.sectionIndex !== lastSectionIndex) {
+      const prefix = output.length === 0 ? "" : lineBreak;
+      if (!append(prefix + "--- " + page.section.label + " ---" + lineBreak)) {
+        truncated = true;
+        break;
+      }
+      lastSectionIndex = page.sectionIndex;
+    }
+    const content = page.section.content ?? "[retained capture content is unavailable]";
+    if (!append(content)) {
+      truncated = true;
+      break;
     }
     cursor = page.nextCursor ?? undefined;
-  } while (cursor !== undefined && size < 16 * 1024);
-  return chunks.join("") || "No retained worklog text is available.";
+  } while (cursor !== undefined);
+
+  if (output.length === 0) return "No retained log text is available.";
+  if (truncated || cursor !== undefined) {
+    const separator = output.endsWith(lineBreak) ? "" : lineBreak;
+    return output + separator + truncationLabel;
+  }
+  return output;
+}
+
+async function readBotRun(
+  harness: Harness,
+  installation: Installation,
+  metadata: ServiceMetadataV1,
+  workflowId: string,
+  runId: string | undefined,
+): Promise<unknown> {
+  const diagram = diagramDtoSchema.parse(await projectServiceRead(harness, installation, metadata, {
+    version: 1, method: "diagram", workflowId, ...(runId === undefined ? {} : { runId: runIdSchema.parse(runId) }),
+  }));
+  let cursor: string | undefined;
+  do {
+    const page = serviceRunsPageV1Schema.parse(await projectServiceRead(harness, installation, metadata, {
+      version: 1, method: "runs", workflowId, ...(cursor === undefined ? {} : { cursor }), limit: 100,
+    }));
+    const summary = page.runs.find((run) => run.runId === diagram.runId);
+    if (summary !== undefined) {
+      return { ...diagram, status: summary.status, failure: summary.failure, terminalOutput: summary.terminalOutput };
+    }
+    cursor = page.nextCursor ?? undefined;
+  } while (cursor !== undefined);
+
+  if (diagram.runId === null) return { ...diagram, status: null, failure: null, terminalOutput: null };
+  throw new Error("run " + diagram.runId + " is absent from the run read projection");
 }
 
 async function ensureInstallationReady(harness: Harness, installation: Installation): Promise<void> {

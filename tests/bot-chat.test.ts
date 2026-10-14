@@ -1,9 +1,10 @@
+import { Buffer } from "node:buffer";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
 import { createModels } from "@earendil-works/pi-ai/models";
-import { fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai/providers/faux";
+import { fauxAssistantMessage, fauxProvider, fauxToolCall, type FauxResponseFactory } from "@earendil-works/pi-ai/providers/faux";
 import { loadInstallation } from "../src/installation/load-installation.js";
 import { startWorkshopService } from "../src/service/open-service-runtime.js";
 import { sendServiceRequest } from "../src/service/send-service-request.js";
@@ -11,6 +12,7 @@ import { botChatViewV1Schema } from "../src/bot/schema.js";
 import { statusDtoSchema } from "../src/views/schema.js";
 import { TALLY_BASE_URL_BY_API } from "../src/model/schema-owner-models.js";
 import { createBotExtension } from "../src/bot/create-bot-tools.js";
+import { serviceRunsPageV1Schema, serviceStartResultV1Schema } from "../src/service/schema.js";
 test("configured shared bot completes a chat round trip with a fake model", async () => {
   const directory = mkdtempSync(join(tmpdir(), "workshop-bot-chat-"));
   const workshopDirectory = join(directory, ".workshop");
@@ -169,3 +171,96 @@ test("chat stays model-free when bot.model is absent", async () => {
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+
+test("bot read tools include retained captures and the completed run result", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "workshop-bot-read-tools-"));
+  const workshopDirectory = join(directory, ".workshop");
+  mkdirSync(join(workshopDirectory, "workflows"), { recursive: true });
+  writeFileSync(join(workshopDirectory, "workshop.yaml"), [
+    "shell: /bin/sh",
+    "keep_files: always",
+    "bot:",
+    "  model: fixture/fake:medium",
+    "",
+  ].join("\n"), "utf8");
+  writeFileSync(join(workshopDirectory, "workflows", "capture.yaml"), [
+    "version: 4",
+    "defaults:",
+    "  retries: 0",
+    "  replay: never",
+    "steps:",
+    "  - capture:",
+    "      run: \"printf 'bot-known-stdout-marker'; printf 'bot-known-stderr-marker' >&2; i=0; while [ $i -lt 20000 ]; do printf x >&2; i=$((i+1)); done\"",
+    "",
+  ].join("\n"), "utf8");
+
+  const installation = loadInstallation(directory);
+  const models = createModels();
+  const faux = fauxProvider({ provider: "fixture", models: [{ id: "fake" }] });
+  models.setProvider(faux.provider);
+  const toolOutputs: string[] = [];
+  let owner: Awaited<ReturnType<typeof startWorkshopService>> | undefined;
+  try {
+    owner = await startWorkshopService(installation, models);
+    const socketPath = owner.metadata.socketPath;
+    if (socketPath === null) throw new Error("service socket path is missing");
+    const started = await sendServiceRequest(socketPath, { version: 1, method: "start", requestId: "bot-read-start", workflowId: "capture" });
+    if (!started.ok) throw new Error(started.error.code + ": " + started.error.message);
+    const runId = serviceStartResultV1Schema.parse(started.result).runId;
+
+    const runDeadline = Date.now() + 10_000;
+    let completed = false;
+    while (Date.now() < runDeadline) {
+      const response = await sendServiceRequest(socketPath, { version: 1, method: "runs", workflowId: "capture", limit: 1 });
+      if (!response.ok) throw new Error(response.error.code + ": " + response.error.message);
+      const page = serviceRunsPageV1Schema.parse(response.result);
+      completed = page.runs.some(run => run.runId === runId && run.status === "completed");
+      if (completed) break;
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    expect(completed).toBe(true);
+
+    const collectToolResult = (context: Parameters<FauxResponseFactory>[0]) => {
+      const result = [...context.messages].reverse().find(message => message.role === "toolResult");
+      if (result?.role === "toolResult") {
+        toolOutputs.push(result.content.flatMap(block => block.type === "text" ? [block.text] : []).join(""));
+      }
+      return fauxAssistantMessage("read complete");
+    };
+    faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("workshop_logs", { workflowId: "capture", runId }), { stopReason: "toolUse" }),
+      collectToolResult,
+      fauxAssistantMessage(fauxToolCall("workshop_run", { workflowId: "capture", runId }), { stopReason: "toolUse" }),
+      collectToolResult,
+    ]);
+
+    const submitAndWait = async (requestId: string, expectedReplies: number) => {
+      const submitted = await sendServiceRequest(socketPath, { version: 1, method: "chat.submit", requestId, text: "Read this run." });
+      if (!submitted.ok) throw new Error(submitted.error.code + ": " + submitted.error.message);
+      const deadline = Date.now() + 10_000;
+      while (Date.now() < deadline) {
+        const response = await sendServiceRequest(socketPath, { version: 1, method: "chat.view", limit: 100 });
+        if (!response.ok) throw new Error(response.error.code + ": " + response.error.message);
+        const view = botChatViewV1Schema.parse(response.result);
+        if (view.entries.filter(entry => entry.role === "assistant" && entry.text === "read complete").length >= expectedReplies) return;
+        await new Promise(resolve => setTimeout(resolve, 20));
+      }
+      throw new Error("bot did not complete its read tool call");
+    };
+
+    await submitAndWait("bot-read-logs", 1);
+    expect(toolOutputs[0]).toContain("bot-known-stdout-marker");
+    expect(toolOutputs[0]).toContain("capture worker stdout");
+    expect(toolOutputs[0]).toContain("[truncated: Workshop bot log output");
+    expect(Buffer.byteLength(toolOutputs[0] ?? "", "utf8")).toBeLessThanOrEqual(16 * 1024);
+    expect((toolOutputs[0] ?? "").split("\n").length).toBeLessThanOrEqual(100);
+
+    await submitAndWait("bot-read-run", 2);
+    expect(toolOutputs[1]).toContain('"status":"completed"');
+    expect(toolOutputs[1]).toContain('"terminalOutput":"bot-known-stdout-marker"');
+  } finally {
+    await owner?.shutdown();
+    rmSync(directory, { recursive: true, force: true });
+  }
+}, 30_000);
