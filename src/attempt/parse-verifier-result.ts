@@ -13,7 +13,11 @@ function invalidResult(message: string): VerifierResultParse {
   return { ok: false, failure: { kind: "result_invalid", message } };
 }
 
-/** Parse the strict verifier decision line and its bounded reason. */
+/**
+ * Exactly one exact decision line is deliberate; ignore analysis before it and read the reason after it.
+ * This matches observed model behavior and stays unambiguous. Do not loosen it with case folding, Markdown stripping, or word search.
+ * Do not restore first-line-only behavior without trial evidence.
+ */
 export function parseVerifierResult(bytes: Uint8Array): VerifierResultParse {
   if (bytes.byteLength > MAX_RESULT_BYTES) {
     return { ok: false, failure: { kind: "result_too_large", message: "result exceeds 1 MiB" } };

@@ -82,6 +82,16 @@ function renderWorkshopInstructions(
     + "- Do not concatenate all earlier results or unrelated run history.";
 }
 
+/*
+ * These contracts were tuned in real GLM 5.3 Flash trials. Tagged worker
+ * envelopes failed (<succeeded> instead of <status>succeeded</status>), and
+ * tagged verifier decisions failed. First-line decisions failed because models
+ * wrote analysis first; one exact decision line passed 6 of 6.
+ * Ordinary text-mode workers omit a status line that carried no information.
+ * Do not reword, reorder, or simplify these contracts or examples without
+ * rerunning a real weak-model trial and comparing format-failure counts.
+ * See .agents/dox/research-structured-agent-results.md, “Trial outcomes (2026-10-15)”.
+ */
 function renderWorkerContract(resultMode: "text" | "tagged"): string {
   if (resultMode === "text") {
     return "### Worker stdout contract (text mode)\n\n"
