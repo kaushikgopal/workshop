@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { createConnection, createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -109,6 +109,32 @@ describe("service protocol v1", () => {
     });
   });
 
+  test("logs unexpected request errors to a private service file without exposing credentials", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "workshop-service-diagnostic-"));
+    const stateDirectory = join(directory, "state");
+    let owner: Awaited<ReturnType<typeof serveWorkshopService>> | undefined;
+    try {
+      owner = await serveWorkshopService({
+        stateDirectory,
+        openRuntime: async () => ({
+          async handleRequest() { throw new Error("run record old-v2 is invalid; apiKey=fixture-secret authorization: Bearer token-value"); },
+          async shutdown() {},
+        }),
+      });
+      const response = await sendServiceRequest(owner.metadata.socketPath, { version: 1, method: "status" });
+      expect(response).toMatchObject({ ok: false, error: { code: "request_failed", message: "Service request failed" } });
+      const logPath = join(stateDirectory, "service.log");
+      const diagnostic = readFileSync(logPath, "utf8");
+      expect(diagnostic).toContain("run record old-v2 is invalid");
+      expect(diagnostic).toContain("[REDACTED]");
+      expect(diagnostic).not.toContain("fixture-secret");
+      expect(diagnostic).not.toContain("token-value");
+      expect(statSync(logPath).mode & 0o777).toBe(0o600);
+    } finally {
+      await owner?.shutdown();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
   test("commits mutation receipts with domain changes and replays them after reopen", async () => {
     const directory = mkdtempSync(join(tmpdir(), "workshop-service-receipt-"));
     const databasePath = join(directory, "durable.db");

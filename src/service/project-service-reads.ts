@@ -11,7 +11,7 @@ import {
   type RunReference,
 } from "../installation/schema.js";
 import { loadCheckedWorkflow, type Installation } from "../installation/load-installation.js";
-import { runIdSchema } from "../run/schema.js";
+import { activationIdSchema, blockInfoSchema, desiredStateSchema, occurrenceIdSchema, runFailureInfoSchema, runIdSchema } from "../run/schema.js";
 import { locateProcessFiles } from "../run/locate-run-files.js";
 import { readRetainedCapture } from "../process/read-retained-capture.js";
 import type { ProcessCapture } from "../process/schema.js";
@@ -19,6 +19,7 @@ import { workshopEventV1Schema, workshopProcessV1Schema, workflowRunDocumentV1Sc
 import type { PersistedNodeAttempt, PersistedNode, WorkflowRunDocumentV1, WorkshopEventV1 } from "../run/records.js";
 import { renderWorklog } from "../storage/durable/render-worklog.js";
 import { WorkshopEventEntry, WorkshopInstallationDoc, WorkshopProcessEntry, WorkshopRunDoc } from "../storage/durable/define-workshop-records.js";
+import { sha256Schema, utcTimestampSchema } from "../util/schema.js";
 import {
   diagramDtoSchema,
   nodeDescriptionDtoSchema,
@@ -64,6 +65,31 @@ const logsCursorSchema = z.strictObject({
 type LogsCursor = z.infer<typeof logsCursorSchema>;
 type ReadyInstallation = Extract<z.infer<typeof installationDocumentV1Schema>, { state: "ready" }>;
 type ReadyRun = Extract<WorkflowRunDocumentV1, { state: "ready" }>;
+// V2 definitions predate the current strict run schema; expose only their checked terminal summary fields.
+const historicalV2RunSummarySchema = z.object({
+  state: z.literal("ready"),
+  runId: runIdSchema,
+  workflowId: workflowIdSchema,
+  activationId: activationIdSchema,
+  occurrenceId: occurrenceIdSchema,
+  canonicalHash: sha256Schema,
+  status: z.enum(["completed", "failed", "cancelled"]),
+  desiredState: desiredStateSchema,
+  admittedAt: utcTimestampSchema,
+  startedAt: utcTimestampSchema.nullable(),
+  finishedAt: utcTimestampSchema,
+  currentNodeId: z.null(),
+  currentAttemptId: z.null(),
+  block: blockInfoSchema.nullable(),
+  failure: runFailureInfoSchema.nullable(),
+  terminalOutput: z.string().nullable(),
+  durable: z.object({
+    conversationId: z.number().int().positive().safe(),
+    capacityGateTaskId: z.number().int().positive().safe().nullable().optional(),
+  }).passthrough(),
+  canonicalDefinition: z.object({ version: z.literal(2) }).passthrough(),
+  resolvedSettings: z.object({ formatVersion: z.never().optional() }).passthrough(),
+}).passthrough();
 type ProcessEvidenceRecord = ReturnType<typeof workshopProcessV1Schema.parse>;
 export type RunEvidenceSnapshot = {
   readonly run: ReadyRun;
@@ -127,11 +153,71 @@ export async function readRun(harness: Harness, reference: RunReference): Promis
   // SAFETY: the installation document schema checks this as a positive safe Durable conversation ID.
   const conversationId = reference.conversationId as ConversationId;
   const parsed = workflowRunDocumentV1Schema.safeParse(await harness.snapshot(WorkshopRunDoc, conversationId, BACKGROUND_CONTEXT));
-  if (!parsed.success || parsed.data.state !== "ready") throw new Error(`run record ${reference.runId} is unavailable or invalid`);
+  if (!parsed.success) throw invalidRunRecord(reference, parsed.error.issues);
+  if (parsed.data.state !== "ready") throw new Error("run record " + reference.runId + " is unavailable or invalid");
   if (parsed.data.runId !== reference.runId || parsed.data.durable.conversationId !== reference.conversationId) {
-    throw new Error(`run identity mismatch for ${reference.runId}`);
+    throw new Error("run identity mismatch for " + reference.runId);
   }
   return parsed.data;
+}
+
+async function readRunSummary(harness: Harness, reference: RunReference, workflowId: string): Promise<RunSummaryDto> {
+  // SAFETY: the installation document schema checks this as a positive safe Durable conversation ID.
+  const conversationId = reference.conversationId as ConversationId;
+  const snapshot: unknown = await harness.snapshot(WorkshopRunDoc, conversationId, BACKGROUND_CONTEXT);
+  const current = workflowRunDocumentV1Schema.safeParse(snapshot);
+  if (current.success && current.data.state === "ready") {
+    assertRunReference(current.data, reference, workflowId);
+    return summarizeRun(current.data);
+  }
+
+  const historical = historicalV2RunSummarySchema.safeParse(snapshot);
+  if (!historical.success) {
+    throw invalidRunRecord(reference, current.success ? [] : current.error.issues);
+  }
+  const run = historical.data;
+  if (run.runId !== reference.runId || run.workflowId !== workflowId
+    || run.durable.conversationId !== reference.conversationId
+    || run.activationId !== reference.activationId || run.occurrenceId !== reference.occurrenceId
+    || run.admittedAt !== reference.admittedAt) {
+    throw new Error("run identity mismatch for " + reference.runId);
+  }
+  return runSummaryDtoSchema.parse({
+    runId: run.runId,
+    workflowId: run.workflowId,
+    activationId: run.activationId,
+    occurrenceId: run.occurrenceId,
+    definitionHash: run.canonicalHash,
+    status: run.status,
+    desiredState: run.desiredState,
+    waitingForCapacity: false,
+    wait: null,
+    admittedAt: run.admittedAt,
+    startedAt: run.startedAt,
+    finishedAt: run.finishedAt,
+    currentNodeId: null,
+    currentAttemptNumber: null,
+    block: run.block,
+    failure: run.failure,
+    terminalOutput: run.terminalOutput,
+  });
+}
+
+function assertRunReference(run: ReadyRun, reference: RunReference, workflowId: string): void {
+  if (run.runId !== reference.runId || run.workflowId !== workflowId
+    || run.durable.conversationId !== reference.conversationId
+    || run.activationId !== reference.activationId || run.occurrenceId !== reference.occurrenceId
+    || run.admittedAt !== reference.admittedAt) {
+    throw new Error("run identity mismatch for " + reference.runId);
+  }
+}
+
+function invalidRunRecord(reference: RunReference, issues: readonly z.ZodIssue[]): Error {
+  const detail = issues.slice(0, 5).map((issue) => {
+    const path = issue.path.map((part) => typeof part === "number" ? "[" + part + "]" : part).join(".") || "<root>";
+    return path + ": " + issue.message;
+  }).join("; ").slice(0, 1200);
+  return new Error("run record " + reference.runId + " is unavailable or invalid" + (detail === "" ? "" : ": " + detail));
 }
 
 async function buildStatusDto(
@@ -164,12 +250,12 @@ async function buildStatusDto(
     if (workflowIndex?.openRunId !== null && workflowIndex?.openRunId !== undefined) {
       const reference = workflowIndex.runs.find((run) => run.runId === workflowIndex.openRunId);
       if (reference === undefined) throw new Error(`open run ${workflowIndex.openRunId} is missing from the installation index`);
-      unresolvedRun = summarizeRun(await readRun(harness, reference));
+      unresolvedRun = await readRunSummary(harness, reference, workflowId);
     }
     const latestReference = workflowIndex?.runs.slice().sort(compareRunReferences)[0];
     const latestRun = latestReference === undefined ? null
       : latestReference.runId === unresolvedRun?.runId ? unresolvedRun
-      : summarizeRun(await readRun(harness, latestReference));
+      : await readRunSummary(harness, latestReference, workflowId);
     workflows.push({
       workflowId,
       description: checked?.definition.description ?? null,
@@ -392,9 +478,8 @@ export async function readRunEvidenceSnapshot(
   // Read the run document and its evidence in one Durable transaction.
   return harness.commit(async (tx) => {
     const parsedRun = workflowRunDocumentV1Schema.safeParse(await tx.doc(WorkshopRunDoc, conversationId));
-    if (!parsedRun.success || parsedRun.data.state !== "ready") {
-      throw new Error(`run record ${reference.runId} is unavailable or invalid`);
-    }
+    if (!parsedRun.success) throw invalidRunRecord(reference, parsedRun.error.issues);
+    if (parsedRun.data.state !== "ready") throw new Error("run record " + reference.runId + " is unavailable or invalid");
     const run = parsedRun.data;
     if (run.runId !== reference.runId || run.workflowId !== workflowId || run.durable.conversationId !== reference.conversationId) {
       throw new Error(`run identity mismatch for ${reference.runId}`);
@@ -625,7 +710,7 @@ async function buildRunsPage(
   let lastReference: RunReference | undefined;
   for (let index = position; index < ordered.length && pageRuns.length < limit; index += 1) {
     const reference = ordered[index]!;
-    const summary = summarizeRun(await readRun(harness, reference));
+    const summary = await readRunSummary(harness, reference, workflowId);
     const remaining = index + 1 < ordered.length;
     const candidateCursor = remaining ? encodeRunCursor({
       version: 1,

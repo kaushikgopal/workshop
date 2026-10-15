@@ -1,15 +1,20 @@
 import { Buffer } from "node:buffer";
+import { randomUUID } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
+import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import { createRegistry, Harness } from "@earendil-works/pi-durable";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall, type FauxResponseFactory } from "@earendil-works/pi-ai/providers/faux";
-import { loadInstallation } from "../src/installation/load-installation.js";
+import { loadCheckedWorkflow, loadInstallation } from "../src/installation/load-installation.js";
+import { openDurableStorage } from "../src/storage/durable/open-durable-storage.js";
+import { WorkshopInstallationDoc, WorkshopRunDoc } from "../src/storage/durable/define-workshop-records.js";
 import { startWorkshopService } from "../src/service/open-service-runtime.js";
 import { sendServiceRequest } from "../src/service/send-service-request.js";
 import { botChatViewV1Schema } from "../src/bot/schema.js";
-import { statusDtoSchema } from "../src/views/schema.js";
+import { nodeDescriptionDtoSchema, statusDtoSchema } from "../src/views/schema.js";
 import { TALLY_BASE_URL_BY_API } from "../src/model/schema-owner-models.js";
 import { createBotExtension } from "../src/bot/create-bot-tools.js";
 import { serviceRunsPageV1Schema, serviceStartResultV1Schema } from "../src/service/schema.js";
@@ -264,3 +269,180 @@ test("bot read tools include retained captures and the completed run result", as
     rmSync(directory, { recursive: true, force: true });
   }
 }, 30_000);
+
+
+test("runs and the bot run tool read a retried agent result beside a v2 archive", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "workshop-bot-retried-run-read-"));
+  const workshopDirectory = join(directory, ".workshop");
+  mkdirSync(join(workshopDirectory, "workflows"), { recursive: true });
+  const harnessCommand = [
+    "input=$(cat)",
+    "case \"$input\" in",
+    "  *'Role: verifier'*)",
+    "    if [ \"$WORKSHOP_ATTEMPT\" = 1 ]; then",
+    "      printf '<decision>retry</decision>\\n<reason>Worker output was malformed.</reason>\\n<corrections>Emit a tagged result.</corrections>'",
+    "    else",
+    "      printf '<decision>accept</decision>\\n<reason>The candidate is valid.</reason>'",
+    "    fi",
+    "    ;;",
+    "  *)",
+    "    if [ \"$WORKSHOP_ATTEMPT\" = 1 ]; then",
+    "      printf 'invalid worker result'",
+    "    else",
+    "      printf '<status>succeeded</status>\\n<reason>Valid result.</reason>\\n<output>accepted candidate</output>'",
+    "    fi",
+    "    ;;",
+    "esac",
+    "",
+  ].join("\n");
+  writeFileSync(join(workshopDirectory, "workshop.yaml"), [
+    "shell: /bin/sh",
+    "bot:",
+    "  model: fixture/fake:medium",
+    "agent:",
+    "  model: fixture/fake:medium",
+    "  harness:",
+    "    command: " + JSON.stringify(harnessCommand),
+    "",
+  ].join("\n"), "utf8");
+  writeFileSync(join(workshopDirectory, "workflows", "retry-read.yaml"), [
+    "version: 4",
+    "defaults: { retries: 1, replay: safe }",
+    "steps:",
+    "  - generate:",
+    "      agent: Generate a candidate.",
+    "      verify:",
+    "        agent: Check the candidate.",
+    "",
+  ].join("\n"), "utf8");
+
+  const installation = loadInstallation(directory);
+  await seedHistoricalV2Run(installation, "retry-read");
+  const models = createModels();
+  const faux = fauxProvider({ provider: "fixture", models: [{ id: "fake" }] });
+  models.setProvider(faux.provider);
+  let owner: Awaited<ReturnType<typeof startWorkshopService>> | undefined;
+  try {
+    owner = await startWorkshopService(installation, models);
+    const socketPath = owner.metadata.socketPath;
+    if (socketPath === null) throw new Error("service socket path is missing");
+    const started = await sendServiceRequest(socketPath, {
+      version: 1, method: "start", requestId: "retried-result-start", workflowId: "retry-read",
+    });
+    if (!started.ok) throw new Error(started.error.code + ": " + started.error.message);
+    const runId = serviceStartResultV1Schema.parse(started.result).runId;
+
+    const deadline = Date.now() + 15_000;
+    let page: ReturnType<typeof serviceRunsPageV1Schema.parse> | undefined;
+    while (Date.now() < deadline) {
+      const response = await sendServiceRequest(socketPath, { version: 1, method: "runs", workflowId: "retry-read", limit: 10 });
+      if (!response.ok) throw new Error(response.error.code + ": " + response.error.message);
+      page = serviceRunsPageV1Schema.parse(response.result);
+      if (page.runs.some((run) => run.runId === runId && run.status === "completed")) break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    expect(page?.runs.some((run) => run.runId === "historical-v2-run")).toBe(true);
+    expect(page?.runs.find((run) => run.runId === runId)?.terminalOutput).toBe("accepted candidate");
+    expect(page?.total).toBe(2);
+
+    const descriptionResponse = await sendServiceRequest(socketPath, {
+      version: 1, method: "node.describe", workflowId: "retry-read", runId, nodeId: "generate",
+    });
+    if (!descriptionResponse.ok) throw new Error(descriptionResponse.error.code + ": " + descriptionResponse.error.message);
+    const description = nodeDescriptionDtoSchema.parse(descriptionResponse.result);
+    expect(description.node.attempts.map((attempt) => attempt.status)).toEqual(["failed", "succeeded"]);
+    expect(description.node.attempts[0]?.failure?.kind).toBe("result_invalid");
+
+    const toolOutputs: string[] = [];
+    const collectToolResult = (context: Parameters<FauxResponseFactory>[0]) => {
+      const result = [...context.messages].reverse().find((message) => message.role === "toolResult");
+      if (result?.role === "toolResult") {
+        toolOutputs.push(result.content.flatMap((block) => block.type === "text" ? [block.text] : []).join(""));
+      }
+      return fauxAssistantMessage("read complete");
+    };
+    faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("workshop_run", { workflowId: "retry-read", runId }), { stopReason: "toolUse" }),
+      collectToolResult,
+    ]);
+    const submitted = await sendServiceRequest(socketPath, { version: 1, method: "chat.submit", requestId: "read-retried-run", text: "Read this run." });
+    if (!submitted.ok) throw new Error(submitted.error.code + ": " + submitted.error.message);
+    const chatDeadline = Date.now() + 10_000;
+    while (Date.now() < chatDeadline) {
+      const response = await sendServiceRequest(socketPath, { version: 1, method: "chat.view", limit: 100 });
+      if (!response.ok) throw new Error(response.error.code + ": " + response.error.message);
+      const view = botChatViewV1Schema.parse(response.result);
+      if (view.entries.some((entry) => entry.role === "assistant" && entry.text === "read complete")) break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    expect(toolOutputs[0]).toContain('"status":"completed"');
+    expect(toolOutputs[0]).toContain('"terminalOutput":"accepted candidate"');
+  } finally {
+    await owner?.shutdown();
+    rmSync(directory, { recursive: true, force: true });
+  }
+}, 30_000);
+
+async function seedHistoricalV2Run(installation: ReturnType<typeof loadInstallation>, workflowId: string): Promise<void> {
+  const opened = await openDurableStorage(installation.databasePath);
+  if (!opened.ok) throw new Error(opened.failure.message + ": " + String(opened.failure.cause));
+  const harness = await Harness.open(opened.storage, { models: createModels(), registry: createRegistry() }, BACKGROUND_CONTEXT);
+  const checked = loadCheckedWorkflow(installation, workflowId);
+  const activationId = randomUUID();
+  const occurrenceId = randomUUID();
+  const admittedAt = new Date(Date.now() - 60_000).toISOString();
+  const finishedAt = new Date(Date.now() - 30_000).toISOString();
+  try {
+    await harness.commit(async (tx) => {
+      const conversation = await tx.createConversation({ ownership: { kind: "ownerless" } });
+      const conversationId = Number(conversation.id);
+      Object.assign(await tx.doc(WorkshopRunDoc, conversation.id), {
+        state: "ready",
+        runId: "historical-v2-run",
+        workflowId,
+        activationId,
+        occurrenceId,
+        canonicalHash: checked.canonicalHash,
+        status: "completed",
+        desiredState: "running",
+        admittedAt,
+        startedAt: admittedAt,
+        finishedAt,
+        currentNodeId: null,
+        currentAttemptId: null,
+        block: null,
+        failure: null,
+        terminalOutput: "",
+        durable: { conversationId, workflowTaskId: 1 },
+        canonicalDefinition: { version: 2 },
+        resolvedSettings: { nodes: {} },
+      });
+      Object.assign(await tx.doc(WorkshopInstallationDoc), {
+        state: "ready",
+        installationId: "fixture-installation",
+        maxConcurrentRuns: 1,
+        workflows: {
+          [workflowId]: {
+            definitionHash: checked.canonicalHash,
+            admissionHighWater: 1,
+            openRunId: null,
+            activations: [{
+              activationId, state: "exhausted", admittedCount: 1, maxRuns: 1,
+              activatedAt: admittedAt, nextDueAt: null,
+            }],
+            occurrenceCounters: { [activationId]: 1 },
+            runs: [{
+              runId: "historical-v2-run", activationId, occurrenceId, conversationId,
+              workflowTaskId: 1, admissionSequence: 1, admittedAt, status: "completed", requestId: null,
+            }],
+            requestIndex: {},
+            capacityReservations: [],
+            preflightCache: {},
+          },
+        },
+      });
+    }, BACKGROUND_CONTEXT);
+  } finally {
+    await harness.close(BACKGROUND_CONTEXT);
+  }
+}

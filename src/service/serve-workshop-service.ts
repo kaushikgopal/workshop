@@ -3,6 +3,10 @@ import { randomUUID } from "node:crypto";
 import {
   chmodSync,
   closeSync,
+  constants,
+  fchmodSync,
+  fstatSync,
+  ftruncateSync,
   fsyncSync,
   lstatSync,
   mkdirSync,
@@ -10,6 +14,7 @@ import {
   renameSync,
   rmSync,
   writeFileSync,
+  writeSync,
 } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
 import { join, resolve } from "node:path";
@@ -30,6 +35,7 @@ import {
 } from "./parse-service-protocol.js";
 
 const DEFAULT_SHUTDOWN_TIMEOUT_MS = 10_000;
+const MAX_SERVICE_DIAGNOSTIC_BYTES = 1024 * 1024;
 
 export interface WorkshopServiceRuntime {
   /** Commit mutation effects with their receipts before returning; starts use the atomic admission request index. */
@@ -105,6 +111,7 @@ export async function serveWorkshopService(options: ServeWorkshopServiceOptions)
           if (runtime === undefined) return Promise.reject(new Error("service runtime is unavailable"));
           return runtime.handleRequest(serviceRequest);
         },
+        (method, error) => appendServiceDiagnostic(location.stateDirectory, method, error),
       );
       inFlightRequests.add(request);
       void request.then(
@@ -278,6 +285,7 @@ function handleServiceSocket(
   readMetadata: () => ServiceMetadataV1,
   acceptsRequests: () => boolean,
   handleRequest: (request: Exclude<ServiceRequestV1, { readonly method: "health" }>) => Promise<unknown>,
+  diagnostic: (method: string, error: unknown) => void,
 ): Promise<void> {
   return new Promise((resolveRequest) => {
     let buffer = Buffer.alloc(0);
@@ -334,7 +342,10 @@ function handleServiceSocket(
       clearTimeout(timeout);
       const line = buffer.subarray(0, newline);
       void dispatch(line)
-        .catch(() => send(serviceError(null, "request_failed", "Service request failed")))
+        .catch((error) => {
+          diagnostic("dispatch", error);
+          send(serviceError(null, "request_failed", "Service request failed"));
+        })
         .finally(settle);
     });
     socket.once("end", () => {
@@ -378,10 +389,50 @@ function handleServiceSocket(
         send(serviceSuccess(requestId, result));
       } catch (error) {
         if (error instanceof ServiceRequestError) send(serviceError(requestId, error.code, error.message));
-        else send(serviceError(requestId, "request_failed", "Service request failed"));
+        else {
+          diagnostic(request.method, error);
+          send(serviceError(requestId, "request_failed", "Service request failed"));
+        }
       }
     }
   });
+}
+
+function appendServiceDiagnostic(stateDirectory: string, method: string, error: unknown): void {
+  let descriptor: number | undefined;
+  try {
+    const path = join(stateDirectory, "service.log");
+    descriptor = openSync(path, constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | (constants.O_NOFOLLOW ?? 0), 0o600);
+    const stat = fstatSync(descriptor);
+    if (!stat.isFile() || (typeof process.getuid === "function" && stat.uid !== process.getuid())) {
+      throw new Error("service diagnostic path is not a file owned by this user");
+    }
+    fchmodSync(descriptor, 0o600);
+    const line = Buffer.from(JSON.stringify({ at: new Date().toISOString(), method, error: diagnosticErrorText(error) }) + "\n", "utf8");
+    if (stat.size + line.byteLength > MAX_SERVICE_DIAGNOSTIC_BYTES) ftruncateSync(descriptor, 0);
+    let offset = 0;
+    while (offset < line.byteLength) {
+      const written = writeSync(descriptor, line, offset, line.byteLength - offset);
+      if (written < 1) throw new Error("service diagnostic write made no progress");
+      offset += written;
+    }
+  } catch {
+    console.error("could not write service request diagnostic");
+  } finally {
+    if (descriptor !== undefined) {
+      try { closeSync(descriptor); } catch { /* the diagnostic has already been handled */ }
+    }
+  }
+}
+
+function diagnosticErrorText(error: unknown): string {
+  const detail = error instanceof Error ? error.name + ": " + error.message : "Thrown value of type " + typeof error;
+  return detail
+    .replace(/(["']?(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|token|secret)["']?\s*[:=]\s*)(?:Bearer\s+)?["']?[^\s,"'&}]+/gi, "$1[REDACTED]")
+    .replace(/\bBearer\s+[^\s,;"']+/gi, "Bearer [REDACTED]")
+    .replace(/(https?:\/\/)[^/@\s]+:[^/@\s]+@/gi, "$1[REDACTED]@")
+    .replace(/[\r\n\t]/g, " ")
+    .slice(0, 4096);
 }
 
 async function closeServiceServer(

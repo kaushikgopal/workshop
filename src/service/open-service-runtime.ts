@@ -245,6 +245,8 @@ async function openServiceRuntime(
               if (projected !== undefined && !pendingCaptureCleanup.has(reference.conversationId)
                 && readProjectionIdentity(projected.directory) === projected.identity) continue;
               // History is retained but never reinterpreted or executed by the format 4 engine.
+              const stored: unknown = await writerHarness.snapshot(WorkshopRunDoc, reference.conversationId as ConversationId, BACKGROUND_CONTEXT);
+              if (isArchivedRunSnapshot(stored)) continue;
               const run = await readRun(writerHarness, reference);
               if (!("formatVersion" in run.resolvedSettings) || run.resolvedSettings.formatVersion !== 4) continue;
               const result = await activeWriter.project(reference.conversationId as ConversationId);
@@ -1752,6 +1754,12 @@ function checkedTaskId(value: number): TaskId {
   if (!Number.isSafeInteger(value) || value <= 0) throw new Error("persisted WorkflowRun task ID is invalid");
   // SAFETY: runDocumentV1Schema validates workflowTaskId as a positive safe integer before this boundary.
   return value as TaskId;
+}
+
+function isArchivedRunSnapshot(value: unknown): boolean {
+  if (typeof value !== "object" || value === null || !("resolvedSettings" in value)) return false;
+  const settings = value.resolvedSettings;
+  return typeof settings === "object" && settings !== null && !("formatVersion" in settings);
 }
 
 function errorText(error: unknown): string {
