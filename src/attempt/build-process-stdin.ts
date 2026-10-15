@@ -116,6 +116,8 @@ export function reconstructProcessStdin(input: ProcessStdinIdentity, runDocument
     failureEvidence: candidate === null ? attempt.feedback?.text ?? "Failure evidence unavailable." : null,
     feedback: earlierFeedback(node.attempts, attempt.number),
     candidateStatus,
+    workerFailureKind: candidate === null && attempt.result.kind === "worker_failure_committed"
+      && attempt.result.failure.kind === "result_invalid" ? "result_invalid" : null,
     retriesRemaining,
   };
   return buildProcessStdin({ role: "verifier", kind: "agent", prompt });
@@ -144,12 +146,26 @@ function earlierFeedback(attempts: readonly PersistedNodeAttempt[], number: numb
 function workerFeedback(run: ReadyRun, nodeId: string, attempt: PersistedNodeAttempt): string | null {
   const node = run.nodes.find((value) => value.nodeId === nodeId);
   const previousAttempt = node?.attempts.find((value) => value.number === attempt.number - 1);
+  const previousOutcome = previousAttempt?.result.kind === "settled" ? previousAttempt.result.outcome : null;
+  const parseFailure = previousOutcome?.kind === "failed"
+    && (previousOutcome.failure.kind === "result_invalid" || previousOutcome.failure.kind === "result_too_large")
+    ? previousOutcome.failure
+    : null;
   const botResolution = run.resolutions.find((resolution) => resolution.provenance === "bot" && resolution.action === "retry"
     && (resolution.sourceBlock.nodeId === nodeId && resolution.sourceBlock.attemptId === previousAttempt?.attemptId
       || resolution.sourceBlock.nodeId === null && run.chain.order[0] === nodeId && attempt.number === 1));
-  const failureFeedback = earlierFeedback(node?.attempts ?? [], attempt.number);
-  if (botResolution === undefined) return failureFeedback;
-  return buildFailureFeedback("Bot resolution: " + botResolution.reason + (failureFeedback === null ? "" : "\n\n" + failureFeedback));
+  const verifierFeedback = earlierFeedback(node?.attempts ?? [], attempt.number);
+  if (parseFailure !== null) {
+    const parts = [
+      "Workshop parse error: " + parseFailure.message,
+      "Write the result in the tagged format shown in the worker contract.",
+    ];
+    if (botResolution !== undefined) parts.push("Bot resolution: " + botResolution.reason);
+    if (verifierFeedback !== null) parts.push("Verifier feedback:\n" + verifierFeedback);
+    return buildFailureFeedback(parts.join("\n\n"));
+  }
+  if (botResolution === undefined) return verifierFeedback;
+  return buildFailureFeedback("Bot resolution: " + botResolution.reason + (verifierFeedback === null ? "" : "\n\n" + verifierFeedback));
 }
 
 /** A reply is input only for the immediate successor of its immutable proposal. */

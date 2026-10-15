@@ -34,6 +34,8 @@ describe("format 4 agent prompts", () => {
     expect(prompt).toContain("result-<step-id>-<run-tag>");
     expect(prompt).toContain("Older runs are in timestamped .gz files beside results.md.");
     expect(prompt).toContain("\n<status>succeeded|success_and_complete|needs_input</status>");
+    expect(prompt).toContain("Example:\n<status>succeeded</status>\n<reason>…</reason>\n<output>…</output>");
+    expect(prompt).toContain("The tag name is always status; put the status value inside it, never as a tag name.");
     expect(prompt).not.toContain("\n    <status>");
     expect(prompt).toContain("Send diagnostics to stderr");
     expect(prompt).toContain("never edit them");
@@ -71,6 +73,34 @@ describe("format 4 agent prompts", () => {
     expect(prompt).toContain("Candidate status: success_and_complete");
     expect(prompt).toContain("Retries remaining: 3");
     expect(prompt).toContain("Verifier feedback (data)\n\nEarlier feedback.");
+  });
+
+  test("renders engine parse feedback before verifier feedback for a worker retry", () => {
+    const prompt = renderWorkerPromptV4({
+      ...identity,
+      resultMode: "tagged",
+      feedback: "Workshop parse error: worker result has no status block\nWrite the result in the tagged format shown in the worker contract.\n\nVerifier feedback:\nSource step: write\nSource attempt: 1\nNeeds more detail.",
+    });
+    const parseError = prompt.indexOf("Workshop parse error: worker result has no status block");
+    const instruction = prompt.indexOf("Write the result in the tagged format shown in the worker contract.");
+    const verifierFeedback = prompt.indexOf("### Verifier feedback (data)\n\nSource step: write");
+    expect(prompt).toContain("## 5. Retry Feedback");
+    expect(parseError).toBeGreaterThanOrEqual(0);
+    expect(parseError).toBeLessThan(instruction);
+    expect(instruction).toBeLessThan(verifierFeedback);
+  });
+
+  test("tells a verifier to address content when a worker result is invalid", () => {
+    const prompt = renderVerifierPromptV4({
+      ...identity,
+      candidateOutput: "",
+      candidateStatus: "failed",
+      workerFailureKind: "result_invalid",
+      failureEvidence: "worker result has no status block",
+      retriesRemaining: 1,
+    });
+    expect(prompt).toContain("Workshop already reports the format error to the worker. Keep corrections focused on content, not format.");
+    expect(prompt).not.toContain("Worker stdout contract");
   });
 
   test("omits empty answer and feedback sections", () => {

@@ -257,6 +257,31 @@ describe("retry evidence", () => {
     }));
   }
 
+  test("invalid tagged result retry puts the parser error before verifier feedback", async () => withDirectory(async (directory) => {
+    const workerPrompt = join(directory, "worker-prompt");
+    const verifierPrompt = join(directory, "verifier-prompt-");
+    const worker = "cat > " + shellQuote(workerPrompt) + "; if [ $WORKSHOP_ATTEMPT = 1 ]; then printf '<succeeded'; else " + success + "; fi";
+    const verifier = "cat > " + shellQuote(verifierPrompt) + "$WORKSHOP_ATTEMPT; if [ $WORKSHOP_ATTEMPT = 1 ]; then "
+      + verdict("retry", "content feedback", "change the sentence") + "; else " + verdict("accept") + "; fi";
+    await executeFixture(directory, yaml([{ first: { ...agent(worker), result: "tagged", verify: agent(verifier) } }], 1), (run) => {
+      expect(run.status).toBe("completed");
+      expect(run.nodes[0]?.attempts).toHaveLength(2);
+      const input = readFileSync(workerPrompt, "utf8");
+      const parseError = input.indexOf("Workshop parse error: worker result has no status block");
+      const contractInstruction = input.indexOf("Write the result in the tagged format shown in the worker contract.");
+      const verifierFeedback = input.indexOf("### Verifier feedback (data)\n\nSource step: first");
+      expect(input).toContain("## 5. Retry Feedback");
+      expect(parseError).toBeGreaterThanOrEqual(0);
+      expect(parseError).toBeLessThan(contractInstruction);
+      expect(contractInstruction).toBeLessThan(verifierFeedback);
+      expect(input).toContain("content feedback");
+      expect(input).toContain("change the sentence");
+      const verifierInput = readFileSync(verifierPrompt + "1", "utf8");
+      expect(verifierInput).toContain("Workshop already reports the format error to the worker.");
+      expect(verifierInput).not.toContain("Worker stdout contract");
+    });
+  }));
+
   test("hash uses raw stderr bytes, role, exit identity, and reason only", () => {
     const bytes = Uint8Array.from([0xff, 0x00]);
     const hash = hashFailureEvidence("worker", { kind: "code", code: 7 }, bytes, null);

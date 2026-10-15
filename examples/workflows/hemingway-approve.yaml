@@ -11,6 +11,5 @@ steps:
   - draft:
       agent: |
         Draft one original Hemingway-inspired sentence, not a quotation.
-        Return the tagged worker result with status needs_input.
-        Set the question to exactly: Approve this sentence?
+        Request human approval (needs_input) with the question: Approve this sentence?
         Put only the draft sentence in output.

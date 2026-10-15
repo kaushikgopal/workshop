@@ -108,6 +108,7 @@ describe("tagged worker result parsing", () => {
 
   test("rejects a missing status, unknown status, and opening tags with attributes", () => {
     expectInvalid(parseTaggedWorkerResult(bytes("preface only")));
+    expectInvalid(parseTaggedWorkerResult(bytes("<succeeded>work</succeeded>")));
     expectInvalid(parseTaggedWorkerResult(bytes(worker("waiting"))));
     expectInvalid(parseTaggedWorkerResult(bytes("<status x=1>succeeded</status><output>work</output>")));
   });

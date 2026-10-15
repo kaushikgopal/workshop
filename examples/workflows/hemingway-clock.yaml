@@ -19,7 +19,6 @@ steps:
         sentence in a result-<step-id>-<run-tag> block. Older runs may be in
         timestamped .gz files beside results.md. Avoid repeating their scenes,
         images, or wording.
-        Emit the tagged worker result on stdout with status succeeded.
         Put only the sentence in output. Put any explanation in reason.
         Do not edit Workshop files.
       verify:
@@ -29,5 +28,4 @@ steps:
           may be in timestamped .gz files beside results.md. Accept only one
           original sentence that does not claim Hemingway authorship and is
           materially distinct in scene, image, and wording.
-          Emit the tagged verifier decision and reason on stdout.
           Do not edit Workshop files.
