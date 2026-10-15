@@ -106,8 +106,7 @@ function fixtureRun(conversationId: number, workflowTaskId: number, baseDir: str
     chain: { order: checked.chain.order, predecessors },
     paths: {
       projectCwd: baseDir,
-      runDirectory: join(baseDir, "runs", "run-storage-contract"),
-      archiveDirectory: join(baseDir, "archive", "release"),
+      workflowDirectory: join(baseDir, "state", "release"),
     },
     runtimeManifest: {
       durableVersion: "1.0.2",

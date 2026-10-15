@@ -13,6 +13,7 @@ import { nodeIdSchema, workflowIdSchema } from "../../definition/schema.js";
 import { parseTextResult, parseTaggedWorkerResult, parseTaggedVerifierDecision } from "../../attempt/parse-tagged-result.js";
 import { reconstructProcessStdin } from "../../attempt/build-process-stdin.js";
 import { readCaptureBytes } from "../../process/read-retained-capture.js";
+import { locateWorkflowDirectory } from "../../run/locate-run-files.js";
 import { installationDocumentV1Schema } from "../../installation/schema.js";
 import { executionIdSchema, incarnationIdSchema } from "../../process/schema.js";
 import {
@@ -554,7 +555,8 @@ function createProcessInput(args: {
 }): ProcessExecutionTaskInput {
   const files = processExecutionFiles(
     { role: args.role, nodeId: args.input.nodeId, incarnationNumber: args.incarnationNumber ?? 1, executionId: args.executionId },
-    args.run.paths.runDirectory,
+    locateWorkflowDirectory(args.run),
+    args.run.runId,
     args.input.attemptNumber,
   );
   const stdin = reconstructProcessStdin({ role: args.role, nodeId: args.input.nodeId, attemptId: args.input.attemptId, executionId: args.executionId }, args.run);

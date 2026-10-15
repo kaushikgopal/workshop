@@ -89,7 +89,7 @@ overlap one in the table; if it will recur, add it to the table.
 
 - Domain nouns: **workflow** (the YAML definition), **run** (one occurrence of
   a workflow), **attempt** (one try at one node). These match the stored
-  records and the run-directory layout.
+  records and workflow-owned projection files.
 - The `service` owns runs. A step-local verifier checks results and can request
   a retry or block. Fixed rules decide failure and retry transitions.
 - Checks before review:
@@ -123,7 +123,7 @@ flowchart TD
   WR -->|fixed decision table| D[retry / block / fail]
   D --> WR
   PE --> V[state/captures: temporary bytes]
-  SVC --> RF[runs: results.md + execution.log]
+  SVC --> RF[state/<workflow>: results.md + execution.log]
 ```
 
 ### One run
@@ -148,7 +148,7 @@ WorkflowRun                                define-workshop-tasks.ts
     accepted needs_input → save wait; settle WorkflowRun and release capacity
       human.reply continue → capacity gate and successor in a new WorkflowRun
       human.reply reject → cancel this occurrence without disabling its schedule
-  retain evidence; regenerate results.md and execution.log after every outcome
+  retain evidence; update the newest run section in workflow results.md and execution.log
 ```
 
 When the service is already running its limit of concurrent runs, a new run

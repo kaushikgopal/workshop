@@ -94,21 +94,21 @@ describe("retained process evidence", () => {
 
   test("keeps temporary captures outside the readable folder and separates preflight executions", () => {
     const identity = { role: "preflight" as const, nodeId: null, attemptNumber: null, incarnationNumber: 1, executionId: "one" };
-    const one = locateProcessFiles("/project/.workshop/runs/run-id", identity);
-    const two = locateProcessFiles("/project/.workshop/runs/run-id", { ...identity, executionId: "two" });
+    const one = locateProcessFiles("/project/.workshop/state/workflow", "run-id", identity);
+    const two = locateProcessFiles("/project/.workshop/state/workflow", "run-id", { ...identity, executionId: "two" });
     expect(one.stdoutPath).toBe("/project/.workshop/state/captures/run-id/preflight/one/preflight.stdout");
     expect(one.stdoutPath).not.toBe(two.stdoutPath);
-    expect(one.resultsPath).toBe("/project/.workshop/runs/run-id/results.md");
+    expect(one.resultsPath).toBe("/project/.workshop/state/workflow/results.md");
   });
 });
 
 test("old verifier cleanup cannot delete a replacement verifier capture", async () => {
   const directory = mkdtempSync(join(tmpdir(), "workshop-verifier-captures-"));
   try {
-    const runDirectory = join(directory, "runs", "run-id");
+    const workflowDirectory = join(directory, "state", "workflow");
     const identity = { role: "validator" as const, nodeId: "work", attemptNumber: 1, incarnationNumber: 1, executionId: "old" };
-    const old = locateProcessFiles(runDirectory, identity);
-    const replacement = locateProcessFiles(runDirectory, { ...identity, executionId: "new" });
+    const old = locateProcessFiles(workflowDirectory, "run-id", identity);
+    const replacement = locateProcessFiles(workflowDirectory, "run-id", { ...identity, executionId: "new" });
     mkdirSync(old.directory, { recursive: true });
     mkdirSync(replacement.directory, { recursive: true });
     writeFileSync(old.stdoutPath, "old");

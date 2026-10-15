@@ -1,5 +1,5 @@
 version: 4
-description: Like hemingway-clock, but a command verifier rejects attempt 1 to demonstrate a configured retry.
+description: A command verifier rejects the first attempt before the agent checks earlier accepted results.
 schedule:
   every: 10m
   max_runs: 1
@@ -13,7 +13,7 @@ environment:
 steps:
   - timestamp:
       run: date -u +%FT%TZ
-      # Attempt 1 fails verification; attempt 2 passes without a model call.
+      # Attempt 1 fails verification. Attempt 2 passes without a model call.
       verify: |
         if [ "$WORKSHOP_ATTEMPT" -lt 2 ]; then
           echo "transient gate: attempt $WORKSHOP_ATTEMPT is rejected; the configured retry will pass" >&2
@@ -22,20 +22,19 @@ steps:
   - generate-line:
       agent: |
         Generate one original Hemingway-inspired sentence, not a quotation.
-        Read the earlier quote files in the directory named by $WORKSHOP_ARCHIVE.
-        Avoid repeating their scenes, images, or wording.
+        Read earlier accepted sentences from $WORKSHOP_RESULTS_PATH. Find each
+        sentence in a result-<step-id>-<run-tag> block. Older runs may be in
+        timestamped .gz files beside results.md. Avoid repeating their scenes,
+        images, or wording.
         Emit the tagged worker result on stdout with status succeeded.
         Put only the sentence in output. Put any explanation in reason.
-        Do not edit archived quotes or Workshop files.
+        Do not edit Workshop files.
       verify:
         agent: |
-          Independently compare the candidate with the quote files in the
-          directory named by $WORKSHOP_ARCHIVE. Accept only one original
-          sentence that does not claim Hemingway authorship and is materially
-          distinct in scene, image, and wording.
+          Independently compare the candidate with earlier accepted sentences
+          in $WORKSHOP_RESULTS_PATH. Find them by their result tags. Older runs
+          may be in timestamped .gz files beside results.md. Accept only one
+          original sentence that does not claim Hemingway authorship and is
+          materially distinct in scene, image, and wording.
           Emit the tagged verifier decision and reason on stdout.
-          Do not edit archived quotes or Workshop files.
-  - publish-quote:
-      run: cat > "$WORKSHOP_ARCHIVE/$WORKSHOP_RUN_ID.md"
-      retries: 0
-      replay: never
+          Do not edit Workshop files.

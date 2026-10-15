@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { join } from "node:path";
+import { locateWorkflowDirectory } from "../run/locate-run-files.js";
 import { buildFailureFeedback } from "./build-failure-feedback.js";
 import { workflowRunDocumentV1Schema, type WorkflowRunDocumentV1 } from "../run/records.js";
 import type { persistedNodeAttemptSchema } from "../run/records.js";
@@ -77,8 +78,8 @@ export function reconstructProcessStdin(input: ProcessStdinIdentity, runDocument
       attemptNumber: attempt.number,
       workflowInstructions: settings.instructions,
       stepInstructions: nodeSettings.run.instructions,
-      resultsPath: join(parsed.paths.runDirectory, "results.md"),
-      logPath: join(parsed.paths.runDirectory, "execution.log"),
+      resultsPath: join(locateWorkflowDirectory(parsed), "results.md"),
+      logPath: join(locateWorkflowDirectory(parsed), "execution.log"),
       previousOutput,
       resultMode: nodeSettings.result,
       answer: committedHumanAnswer(parsed, input.nodeId),
@@ -107,8 +108,8 @@ export function reconstructProcessStdin(input: ProcessStdinIdentity, runDocument
     attemptNumber: attempt.number,
     workflowInstructions: settings.instructions,
     stepInstructions: nodeSettings.validator.instructions,
-    resultsPath: join(parsed.paths.runDirectory, "results.md"),
-    logPath: join(parsed.paths.runDirectory, "execution.log"),
+    resultsPath: join(locateWorkflowDirectory(parsed), "results.md"),
+    logPath: join(locateWorkflowDirectory(parsed), "execution.log"),
     previousOutput,
     candidateOutput: candidate?.output ?? "",
     answer: committedHumanAnswer(parsed, input.nodeId),

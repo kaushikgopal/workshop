@@ -24,7 +24,6 @@ const sourceText = [
 ].join("\n");
 const machineConfig = { shell: "/bin/bash", default_timeout: "90s", stream_cap: "128kb" } as const;
 const projectCwd = "/tmp/workshop-project";
-const archiveDirectory = "/tmp/workshop-archive";
 
 function preparedRequest(resolvedSettings = resolveWorkflowSettings({
   definition: checkDefinitionText(sourceText, "release.yaml", "release").def,
@@ -37,9 +36,8 @@ function preparedRequest(resolvedSettings = resolveWorkflowSettings({
     workflowId: "release",
     machineConfig,
     projectCwd,
-    runsDirectory: "/tmp/workshop-state/runs",
+    stateDirectory: "/tmp/workshop-state",
     resolvedSettings,
-    archiveDirectory,
     runtimeManifest: {
       durableVersion: "1.0.2",
       integrationManifestHash: `sha256:${"b".repeat(64)}`,
@@ -86,8 +84,7 @@ describe("prepareRunAdmission", () => {
     });
     expect(result.value.paths).toEqual({
       projectCwd,
-      runDirectory: "/tmp/workshop-state/runs/release-run-001",
-      archiveDirectory: "/tmp/workshop-archive/release",
+      workflowDirectory: "/tmp/workshop-state/release",
     });
   });
 

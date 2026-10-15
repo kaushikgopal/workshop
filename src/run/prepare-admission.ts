@@ -15,6 +15,7 @@ import { utcTimestampSchema } from "../util/schema.js";
 
 const safeRunId = z.string().max(160).regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/);
 const maxSourceBytes = 1024 * 1024;
+const absolutePath = z.string().min(1).refine((path) => isAbsolute(path) && !path.includes("\u0000"));
 
 const admissionRequestSchema = z.strictObject({
   sourceText: z.string().refine(
@@ -24,9 +25,8 @@ const admissionRequestSchema = z.strictObject({
   sourceLabel: z.string().min(1).max(1024),
   workflowId: z.string().min(1).max(80),
   machineConfig: z.unknown(),
-  projectCwd: z.string().min(1).refine((path) => isAbsolute(path) && !path.includes("\u0000")),
-  runsDirectory: z.string().min(1).refine((path) => isAbsolute(path) && !path.includes("\u0000")),
-  archiveDirectory: z.string().min(1).refine((path) => isAbsolute(path) && !path.includes("\u0000")),
+  projectCwd: absolutePath,
+  stateDirectory: absolutePath,
   resolvedSettings: z.unknown(),
   runtimeManifest: z.unknown(),
   runId: safeRunId,
@@ -58,13 +58,10 @@ export type PreparedRunAdmission = {
   readonly requestId: string | null;
   readonly admittedAt: string;
   readonly projectCwd: string;
-  readonly runsDirectory: string;
-  readonly archiveDirectory: string;
-  readonly runDirectory: string;
+  readonly stateDirectory: string;
   readonly paths: {
     readonly projectCwd: string;
-    readonly runDirectory: string;
-    readonly archiveDirectory: string;
+    readonly workflowDirectory: string;
   };
   readonly preflightCacheKey: string | null;
 };
@@ -84,7 +81,7 @@ export type AdmissionPreparation =
   | { readonly ok: true; readonly value: PreparedRunAdmission }
   | { readonly ok: false; readonly failure: AdmissionPreparationFailure };
 
-/** Parse the frozen admission inputs and independently resolve settings before any storage transaction. */
+/** Parse frozen admission inputs and independently resolve settings before persistence. */
 export function prepareRunAdmission(input: unknown): AdmissionPreparation {
   const request = admissionRequestSchema.safeParse(input);
   if (!request.success) {
@@ -115,7 +112,7 @@ export function prepareRunAdmission(input: unknown): AdmissionPreparation {
       },
     };
   }
-  if (!raw.runId.startsWith(`${checked.def.id}-`) || raw.runId.length <= checked.def.id.length + 1) {
+  if (!raw.runId.startsWith(checked.def.id + "-") || raw.runId.length <= checked.def.id.length + 1) {
     return {
       ok: false,
       failure: { kind: "admission_input_invalid", message: "run ID must be path-safe and prefixed by its workflow ID" },
@@ -126,16 +123,12 @@ export function prepareRunAdmission(input: unknown): AdmissionPreparation {
   if (!settings.success) {
     return {
       ok: false,
-      failure: { kind: "resolved_settings_invalid", message: "resolved workflow settings are invalid", cause: settings.error },
+      failure: { kind: "resolved_settings_invalid", message: "resolved settings are invalid", cause: settings.error },
     };
   }
   let expectedSettings: z.infer<typeof resolvedWorkflowSettingsSchema>;
   try {
-    expectedSettings = resolveWorkflowSettings({
-      definition: checked.def,
-      machine: machine.data,
-      projectCwd: raw.projectCwd,
-    });
+    expectedSettings = resolveWorkflowSettings({ definition: checked.def, machine: machine.data, projectCwd: raw.projectCwd });
   } catch (cause) {
     return {
       ok: false,
@@ -162,18 +155,16 @@ export function prepareRunAdmission(input: unknown): AdmissionPreparation {
   }
 
   const projectCwd = resolve(raw.projectCwd);
-  const runsDirectory = resolve(raw.runsDirectory);
-  const runDirectory = join(runsDirectory, raw.runId);
-  const archiveDirectory = resolve(raw.archiveDirectory);
+  const stateDirectory = resolve(raw.stateDirectory);
   const sourceHash = hashSourceText(raw.sourceText);
-  const canonicalDefinitionHash = canonicalHash(checked.def);
+  const definitionHash = canonicalHash(checked.def);
   const predecessors = Object.fromEntries(checked.chain.order.map((nodeId) => [
     nodeId,
     checked.chain.prev.get(nodeId) ?? null,
   ]));
   const preflightCacheKey = settings.data.preflight === null
     ? null
-    : canonicalHash({ definition: canonicalDefinitionHash, preflight: settings.data.preflight, projectCwd });
+    : canonicalHash({ definition: definitionHash, preflight: settings.data.preflight, projectCwd });
 
   return {
     ok: true,
@@ -184,7 +175,7 @@ export function prepareRunAdmission(input: unknown): AdmissionPreparation {
       machineConfig: machine.data,
       sourceHash,
       definition: checked.def,
-      canonicalHash: canonicalDefinitionHash,
+      canonicalHash: definitionHash,
       resolvedSettings: settings.data,
       chain: { order: checked.chain.order, predecessors },
       runtimeManifest: runtimeManifest.data,
@@ -195,14 +186,8 @@ export function prepareRunAdmission(input: unknown): AdmissionPreparation {
       requestId: raw.requestId,
       admittedAt: raw.admittedAt,
       projectCwd,
-      runsDirectory,
-      archiveDirectory,
-      runDirectory,
-      paths: {
-        projectCwd,
-        runDirectory,
-        archiveDirectory: join(archiveDirectory, checked.def.id),
-      },
+      stateDirectory,
+      paths: { projectCwd, workflowDirectory: join(stateDirectory, checked.def.id) },
       preflightCacheKey,
     },
   };

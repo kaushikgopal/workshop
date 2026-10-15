@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, readdirSync, readFileSync } from "node:fs";
+import { appendFileSync, readFileSync } from "node:fs";
 
 const env = process.env;
 const roleValue = env.WORKSHOP_MOCK_ROLE;
@@ -6,7 +6,7 @@ if (roleValue !== "generator" && roleValue !== "validator") throw new Error("rec
 const role = roleValue;
 const runId = requiredEnvironment("WORKSHOP_RUN_ID");
 const launchLog = requiredEnvironment("WORKSHOP_MOCK_LAUNCH_LOG");
-const archiveDirectory = requiredEnvironment("WORKSHOP_MOCK_ARCHIVE_DIR");
+const resultsPath = requiredEnvironment("WORKSHOP_MOCK_RESULTS_PATH");
 const executionId = requiredEnvironment("WORKSHOP_EXECUTION_ID");
 const prompt = readFileSync(0, "utf8");
 const sleepMs = Number(env.WORKSHOP_MOCK_SLEEP_MS ?? "0");
@@ -14,7 +14,7 @@ if (!Number.isSafeInteger(sleepMs) || sleepMs < 0) throw new Error("recurring He
 
 function requiredEnvironment(name: string): string {
   const value = env[name];
-  if (value === undefined) throw new Error(`recurring Hemingway mock: ${name} is missing`);
+  if (value === undefined) throw new Error("recurring Hemingway mock: " + name + " is missing");
   return value;
 }
 
@@ -28,7 +28,7 @@ interface ActivityRecord {
 
 function record(event: string, fields: Record<string, unknown> = {}): void {
   const entry: ActivityRecord = { event, role, runId, pid: process.pid, ...fields };
-  appendFileSync(launchLog, `${JSON.stringify(entry)}\n`, "utf8");
+  appendFileSync(launchLog, JSON.stringify(entry) + "\n", "utf8");
 }
 
 const scenes = [
@@ -40,21 +40,18 @@ const scenes = [
   "The boy counted crabs beneath the moonlit pier before the tide returned.",
 ] as const;
 
-function priorGeneratorCount(): number {
-  if (!existsSync(launchLog)) return 0;
-  return readFileSync(launchLog, "utf8")
-    .split("\n")
-    .filter((line) => line !== "")
-    .map((line) => JSON.parse(line) as ActivityRecord)
-    .filter((entry) => entry.event === "start" && entry.role === "generator")
-    .length;
-}
-
-function archivedQuotes(): string[] {
-  if (!existsSync(archiveDirectory)) return [];
-  return readdirSync(archiveDirectory)
-    .filter((name) => name.endsWith(".md"))
-    .map((name) => readFileSync(`${archiveDirectory}/${name}`, "utf8").trim());
+function earlierSentences(): string[] {
+  const lines = readFileSync(resultsPath, "utf8").split("\n");
+  const sentences: string[] = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const opening = /^<result-generate-([0-9a-f]{8}) status="succeeded">$/u.exec(lines[index] ?? "");
+    if (opening === null) continue;
+    const closing = "</result-generate-" + opening[1] + ">";
+    const content: string[] = [];
+    for (index += 1; index < lines.length && lines[index] !== closing; index += 1) content.push(lines[index]!);
+    if (index < lines.length) sentences.push(content.join("\n").trim());
+  }
+  return sentences;
 }
 
 function contentWords(sentence: string): Set<string> {
@@ -62,12 +59,12 @@ function contentWords(sentence: string): Set<string> {
   return new Set((sentence.toLowerCase().match(/[a-z]+/gu) ?? []).filter((word) => word.length > 2 && !stopWords.has(word)));
 }
 
-function overlapsArchive(candidate: string, quotes: readonly string[]): boolean {
+function overlapsEarlier(candidate: string, earlier: readonly string[]): boolean {
   const words = contentWords(candidate);
-  return quotes.some((quote) => {
-    const archivedWords = contentWords(quote);
+  return earlier.some((sentence) => {
+    const previousWords = contentWords(sentence);
     let shared = 0;
-    for (const word of words) if (archivedWords.has(word)) shared += 1;
+    for (const word of words) if (previousWords.has(word)) shared += 1;
     return shared >= 3;
   });
 }
@@ -83,34 +80,38 @@ function readCandidateFromPrompt(value: string): string {
   return value.slice(contentStart, end);
 }
 
-record("start", { executionId, promptBytes: Buffer.byteLength(prompt) });
+record("start", { executionId, promptBytes: Buffer.byteLength(prompt), resultsPath: env.WORKSHOP_RESULTS_PATH, logPath: env.WORKSHOP_LOG_PATH, archivePresent: env.WORKSHOP_ARCHIVE !== undefined });
 
 try {
   if (sleepMs > 0) await new Promise((resolveDelay) => setTimeout(resolveDelay, sleepMs));
 
+  const earlier = earlierSentences();
   if (role === "generator") {
-    const output = env.WORKSHOP_MOCK_OUTPUT ?? scenes[priorGeneratorCount() % scenes.length]!;
+    const fixedOutput = env.WORKSHOP_MOCK_OUTPUT;
+    const output = fixedOutput ?? scenes.find((scene) => !overlapsEarlier(scene, earlier));
+    if (output === undefined) throw new Error("recurring Hemingway mock: no distinct fixture sentence remains");
     const mode = env.WORKSHOP_MOCK_GENERATOR_RESULT ?? "valid";
     const result = mode === "malformed"
       ? "<status>succeeded</status>\n<output>unfinished"
-      : `<status>succeeded</status>\n<output>${output}</output>`;
+      : env.WORKSHOP_MOCK_NEEDS_INPUT === "1"
+        ? "<status>needs_input</status>\n<question>Approve this sentence?</question>\n<output>" + output + "</output>"
+        : "<status>succeeded</status>\n<output>" + output + "</output>";
     process.stdout.write(result);
     record("result", { executionId, malformed: mode === "malformed", output });
   } else {
     const candidate = readCandidateFromPrompt(prompt).trim();
-    const quotes = archivedQuotes();
-    const distinct = !overlapsArchive(candidate, quotes);
+    const distinct = !overlapsEarlier(candidate, earlier);
     const oneSentence = candidate.length > 0 && (candidate.match(/[.!?]/gu) ?? []).length === 1;
     const passed = env.WORKSHOP_MOCK_VERDICT !== "reject" && distinct && oneSentence
       && !candidate.toLowerCase().includes("hemingway");
     const reason = passed
-      ? `The sentence is original and distinct from ${quotes.length} archived quote(s).`
-      : distinct ? "The candidate failed the deterministic sentence policy." : "The candidate paraphrases an archived scene.";
+      ? "The sentence is original and distinct from " + earlier.length + " earlier accepted sentence(s)."
+      : distinct ? "The candidate failed the deterministic sentence policy." : "The candidate repeats an earlier accepted sentence.";
     const result = passed
-      ? `<decision>accept</decision>\n<reason>${reason}</reason>`
-      : `<decision>retry</decision>\n<reason>${reason}</reason>\n<corrections>Write a distinct one-sentence result.</corrections>`;
+      ? "<decision>accept</decision>\n<reason>" + reason + "</reason>"
+      : "<decision>retry</decision>\n<reason>" + reason + "</reason>\n<corrections>Write a distinct one-sentence result.</corrections>";
     process.stdout.write(result);
-    record("verdict", { executionId, candidate, archiveCount: quotes.length, passed, reason });
+    record("verdict", { executionId, candidate, priorCount: earlier.length, passed, reason });
   }
 } finally {
   record("finish", { executionId });

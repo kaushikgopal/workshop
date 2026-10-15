@@ -200,7 +200,7 @@ describe("Durable service runtime", () => {
     }
   });
 
-  test("keeps terminal projections stable during reads and new work, but repairs edited or deleted files", async () => {
+  test("appends workflow sections and rebuilds them without repeating settled workers", async () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-stable-history-"));
     const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
@@ -229,19 +229,21 @@ describe("Durable service runtime", () => {
         return statusDtoSchema.parse(response.result);
       };
       await readStatus();
-      const paths = ["results.md", "execution.log"].map(name => join(installation.runsDirectory, runId, name));
+      const paths = ["results.md", "execution.log"].map(name => join(installation.stateDirectory, "clock", name));
       const original = paths.map(path => ({ content: readFileSync(path, "utf8"), ino: statSync(path).ino }));
       await readStatus();
       await streamServiceLogChunks(socketPath, "clock", runId, () => {});
       await start("stable-history-2");
       await readStatus();
-      expect(paths.map(path => statSync(path).ino)).toEqual(original.map(file => file.ino));
+      const afterSecond = paths.map(path => readFileSync(path, "utf8"));
+      expect(afterSecond[0]?.startsWith(original[0]?.content ?? "")).toBe(true);
+      expect(afterSecond.map(text => (text.match(/<workshop-run id="/gu) ?? []).length)).toEqual([2, 2]);
       for (const path of paths) writeFileSync(path, "not committed state");
       await readStatus();
-      expect(paths.map(path => readFileSync(path, "utf8"))).toEqual(original.map(file => file.content));
+      expect(paths.map(path => (readFileSync(path, "utf8").match(/<workshop-run id="/gu) ?? []).length)).toEqual([2, 2]);
       for (const path of paths) rmSync(path);
       const status = await readStatus();
-      expect(paths.map(path => readFileSync(path, "utf8"))).toEqual(original.map(file => file.content));
+      expect(paths.map(path => (readFileSync(path, "utf8").match(/<workshop-run id="/gu) ?? []).length)).toEqual([2, 2]);
       expect(status.workflows[0]?.latestRun?.status).toBe("completed");
       expect(readFileSync(join(root, "launches"), "utf8")).toBe("launch\nlaunch\n");
       await owner.shutdown();
@@ -251,7 +253,7 @@ describe("Durable service runtime", () => {
       if (resultsPath === undefined) throw new Error("results path is missing");
       writeFileSync(resultsPath, "not committed state");
       owner = await startWorkshopService(installation);
-      expect(paths.map(path => readFileSync(path, "utf8"))).toEqual(original.map(file => file.content));
+      expect((readFileSync(resultsPath, "utf8").match(/<workshop-run id="/gu) ?? []).length).toBe(2);
       expect(readFileSync(join(root, "launches"), "utf8")).toBe("launch\nlaunch\n");
     } finally {
       if (owner !== undefined) await owner.shutdown();

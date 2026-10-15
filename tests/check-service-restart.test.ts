@@ -1924,8 +1924,7 @@ async function admitQueuedRunOffline(root: string, workflowId: string): Promise<
       workflowId,
       machineConfig: installation.machine,
       projectCwd: installation.projectCwd,
-      runsDirectory: installation.runsDirectory,
-      archiveDirectory: installation.archiveDirectory,
+      stateDirectory: installation.stateDirectory,
       resolvedSettings: checked.resolvedSettings,
       runtimeManifest: {
         durableVersion: "1.0.2",

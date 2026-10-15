@@ -33,7 +33,7 @@ import {
 import { WorkshopProcessEntry, WorkshopRunDoc } from "./define-workshop-records.js";
 import { sha256Schema, utcTimestampSchema } from "../../util/schema.js";
 import { DEFAULT_STREAM_CAP_BYTES } from "../../util/parse-units.js";
-import { locateProcessFiles, type ProcessFiles } from "../../run/locate-run-files.js";
+import { locateProcessFiles, locateWorkflowDirectory, type ProcessFiles } from "../../run/locate-run-files.js";
 import { readVerifiedRetentionWindow, retainStreamWindow } from "../disk/cap-streams.js";
 import { removeProcessCaptures } from "../disk/remove-process-captures.js";
 import { reconstructProcessStdin, committedHumanAnswer } from "../../attempt/build-process-stdin.js";
@@ -80,10 +80,11 @@ export type ProcessExecutionTaskEnvironmentInput = Omit<ProcessExecutionTaskInpu
 /** Locates the files of one process from its task input. */
 export function processExecutionFiles(
   input: Pick<ProcessExecutionTaskInput, "role" | "nodeId" | "incarnationNumber" | "executionId">,
-  runDirectory: string,
+  workflowDirectory: string,
+  runId: string,
   attemptNumber: number | null,
 ): ProcessFiles {
-  return locateProcessFiles(runDirectory, { role: input.role, nodeId: input.nodeId, attemptNumber, incarnationNumber: input.incarnationNumber, executionId: input.executionId });
+  return locateProcessFiles(workflowDirectory, runId, { role: input.role, nodeId: input.nodeId, attemptNumber, incarnationNumber: input.incarnationNumber, executionId: input.executionId });
 }
 
 export function buildProcessExecutionEnvironment(
@@ -93,12 +94,11 @@ export function buildProcessExecutionEnvironment(
 ): Record<string, string> {
   const run = readyRun(runDocument);
   const settings = format4Settings(run);
-  const paths = processExecutionFiles(input, run.paths.runDirectory, attemptNumber);
+  const paths = processExecutionFiles(input, locateWorkflowDirectory(run), run.runId, attemptNumber);
   const common = {
     WORKSHOP_RUN_ID: run.runId,
     WORKSHOP_WORKFLOW_ID: run.workflowId,
     WORKSHOP_EXECUTION_ID: input.executionId,
-    WORKSHOP_ARCHIVE: run.paths.archiveDirectory,
     WORKSHOP_RESULTS_PATH: paths.resultsPath,
     WORKSHOP_LOG_PATH: paths.logPath,
   };
@@ -349,7 +349,6 @@ export function defineProcessExecutionTask(
           return;
         }
         mkdirSync(dirname(input.stdoutPath), { recursive: true });
-        mkdirSync(run.paths.archiveDirectory, { recursive: true });
         const stdin = reconstructProcessStdin(input, run);
         let child: TrackedProcess;
         try {
@@ -915,7 +914,7 @@ function assertProcessIdentity(
   if (input.role === "preflight") {
     const site = format4Settings(run).preflight;
     const expectedEnv = buildProcessExecutionEnvironment(input, run, null);
-    const paths = processExecutionFiles(input, run.paths.runDirectory, null);
+    const paths = processExecutionFiles(input, locateWorkflowDirectory(run), run.runId, null);
     const validDeadline = site !== null && site !== undefined
       && validProcessDeadline(input, site.timeoutMs);
     const authorized = run.preflight.kind === "pending"
@@ -948,7 +947,7 @@ function assertProcessIdentity(
   const hasReference = recordedIncarnationIndex >= 0;
   const expectedIncarnationNumber = hasReference ? recordedIncarnationIndex + 1 : executionIncarnations.length + 1;
   const expectedEnv = buildProcessExecutionEnvironment(input, run, attempt.number);
-  const paths = processExecutionFiles(input, run.paths.runDirectory, attempt.number);
+  const paths = processExecutionFiles(input, locateWorkflowDirectory(run), run.runId, attempt.number);
   const validDeadline = site !== undefined && site !== null
     && validProcessDeadline(input, site.timeoutMs);
   if (input.runId !== run.runId || input.workflowId !== run.workflowId

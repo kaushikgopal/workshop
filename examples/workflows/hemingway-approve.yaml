@@ -1,0 +1,16 @@
+version: 4
+description: Draft a sentence and pause for explicit human approval.
+defaults:
+  retries: 1
+  timeout: 10m
+  replay: safe
+environment:
+  preflight:
+    command: 'command -v pi >/dev/null'
+steps:
+  - draft:
+      agent: |
+        Draft one original Hemingway-inspired sentence, not a quotation.
+        Return the tagged worker result with status needs_input.
+        Set the question to exactly: Approve this sentence?
+        Put only the draft sentence in output.

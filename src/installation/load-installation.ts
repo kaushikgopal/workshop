@@ -10,9 +10,7 @@ export interface Installation {
   readonly root: string;
   readonly workshopDirectory: string;
   readonly workflowsDirectory: string;
-  readonly archiveDirectory: string;
   readonly stateDirectory: string;
-  readonly runsDirectory: string;
   readonly databasePath: string;
   readonly machine: MachineConfig;
   readonly projectCwd: string;
@@ -61,9 +59,7 @@ export function loadInstallation(root: string): Installation {
     root: absoluteRoot,
     workshopDirectory,
     workflowsDirectory,
-    archiveDirectory: join(workshopDirectory, "archive"),
     stateDirectory,
-    runsDirectory: join(workshopDirectory, "runs"),
     databasePath: join(stateDirectory, "durable.db"),
     machine,
     projectCwd,

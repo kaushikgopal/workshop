@@ -3,6 +3,7 @@ import type { Context } from "@earendil-works/chord";
 import { defineTask, type ConversationId, type Cursor, type Task, type TaskId, type TaskRuntime, type Tx } from "@earendil-works/pi-durable";
 import { z } from "zod";
 import { reconstructProcessStdin } from "../../attempt/build-process-stdin.js";
+import { locateWorkflowDirectory } from "../../run/locate-run-files.js";
 import { canonicalHash } from "../../definition/hash-canonical-json.js";
 import { resolveRetryLimit } from "../../definition/resolve-retry-limit.js";
 import type { ResolvedPreflightSettings } from "../../definition/schema-resolved.js";
@@ -812,7 +813,7 @@ function createPreflightProcessInput(args: {
   launchIntentAt: string;
   deadlineAt: string | null;
 }): ProcessExecutionTaskInput {
-  const files = processExecutionFiles({ role: "preflight", nodeId: null, incarnationNumber: args.incarnationNumber ?? 1, executionId: args.executionId }, args.run.paths.runDirectory, null);
+  const files = processExecutionFiles({ role: "preflight", nodeId: null, incarnationNumber: args.incarnationNumber ?? 1, executionId: args.executionId }, locateWorkflowDirectory(args.run), args.run.runId, null);
   const stdin = reconstructProcessStdin({ role: "preflight", nodeId: null, attemptId: null, executionId: args.executionId }, args.run);
   const base: ProcessExecutionTaskEnvironmentInput = {
     ioVersion: 1,

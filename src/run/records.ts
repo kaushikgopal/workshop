@@ -59,11 +59,13 @@ export const runChainSnapshotSchema = z.strictObject({
   }
 });
 
-export const runSnapshotPathsSchema = z.strictObject({
+const currentRunSnapshotPathsSchema = z.strictObject({
   projectCwd: absolutePath,
-  runDirectory: absolutePath,
-  archiveDirectory: absolutePath,
+  workflowDirectory: absolutePath,
 });
+// Accept existing format-4 documents while their old tasks drain after an upgrade.
+const previousRunSnapshotPathsSchema = z.object({ projectCwd: absolutePath, runDirectory: absolutePath }).catchall(z.any());
+export const runSnapshotPathsSchema = z.union([currentRunSnapshotPathsSchema, previousRunSnapshotPathsSchema]);
 
 export const runtimeManifestSchema = z.strictObject({
   durableVersion: z.string().min(1),

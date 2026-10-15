@@ -80,13 +80,14 @@ describe("service run projections", () => {
       writeFileSync(join(root, "release-first"), "");
       const completed = await until(async () => { const value = await node(socket, runId, "second"); return value.runStatus === "completed" ? value : undefined; });
       expect(completed.node.status).toBe("succeeded");
-      const directory = join(configured.runsDirectory, runId);
+      const directory = join(configured.stateDirectory, "projection");
       const resultsPath = join(directory, "results.md");
       const logPath = join(directory, "execution.log");
       const runTag = createHash("sha256").update(runId).digest("hex").slice(0, 8);
       expect(readFileSync(join(root, "successor-results"), "utf8")).toContain("<result-first-" + runTag + ' status="succeeded">\nalpha\n</result-first-' + runTag + ">");
       expect(readFileSync(resultsPath, "utf8")).toContain("alpha-beta");
       expect(readFileSync(logPath, "utf8")).toContain("[step=first attempt=1 role=worker] incarnation 1 stderr\nlive diagnostic\nfirst diagnostic");
+      const committedResults = readFileSync(resultsPath, "utf8");
       const first = await node(socket, runId, "first");
       const captures = first.node.attempts[0]!.processes[0]!.captures;
       expect(captures).toHaveLength(2);
@@ -98,8 +99,10 @@ describe("service run projections", () => {
       writeFileSync(resultsPath, "human result edits");
       writeFileSync(logPath, "human log edits");
       expect(JSON.stringify(await node(socket, runId, "first"))).toBe(before);
-      expect(readFileSync(resultsPath, "utf8")).not.toContain("human result edits");
-      expect(readFileSync(logPath, "utf8")).not.toContain("human log edits");
+      expect(readFileSync(resultsPath, "utf8")).toContain("human result edits");
+      expect(readFileSync(resultsPath, "utf8")).toContain("alpha-beta");
+      expect(readFileSync(logPath, "utf8")).toContain("human log edits");
+      expect(readFileSync(logPath, "utf8")).toContain("attempt_settled");
       let cursor: string | undefined;
       let retainedStdout = "";
       do {
@@ -110,7 +113,7 @@ describe("service run projections", () => {
         cursor = page.nextCursor ?? undefined;
       } while (cursor !== undefined);
       expect(retainedStdout).toBe("alpha");
-      expect(readFileSync(resultsPath, "utf8").match(new RegExp("<result-first-" + runTag + ' status="', "gu"))).toHaveLength(1);
+      expect(committedResults.match(new RegExp("<result-first-" + runTag + ' status="', "gu"))).toHaveLength(1);
     } finally {
       if (owner !== undefined) await owner.shutdown();
       rmSync(root, { recursive: true, force: true });
@@ -128,7 +131,7 @@ describe("service run projections", () => {
       if (!response.ok) throw new Error(response.error.message);
       const { runId } = serviceStartResultV1Schema.parse(response.result);
       await until(async () => existsSync(join(root, "first-started")) ? true : undefined);
-      const directory = join(configured.runsDirectory, runId);
+      const directory = join(configured.stateDirectory, "projection");
       const resultsPath = join(directory, "results.md");
       rmSync(resultsPath, { force: true });
       mkdirSync(resultsPath);
@@ -174,7 +177,7 @@ describe("service run projections", () => {
       if (!response.ok) throw new Error(response.error.message);
       const { runId } = serviceStartResultV1Schema.parse(response.result);
       await until(async () => { const value = await node(socket, runId, "first"); return value.runStatus === "completed" ? value : undefined; });
-      const log = readFileSync(join(configured.runsDirectory, runId, "execution.log"), "utf8");
+      const log = readFileSync(join(configured.stateDirectory, "projection", "execution.log"), "utf8");
       for (const role of ["worker", "validator"]) {
         expect(log).toContain("[step=first attempt=1 role=" + role + "] incarnation 1 stderr\nrole diagnostic");
         expect(log).toContain("[step=first attempt=1 role=" + role + "] incarnation 1 preamble\n");
@@ -199,7 +202,7 @@ describe("service run projections", () => {
       const configured = installation(root);
       const runId = runIdSchema.parse(cli(["start", "projection", "--detach"]).match(/Started run (\S+)/u)?.[1]);
       await until(async () => existsSync(join(root, "first-started")) ? true : undefined);
-      const resultsPath = join(configured.runsDirectory, runId, "results.md");
+      const resultsPath = join(configured.stateDirectory, "projection", "results.md");
       rmSync(resultsPath, { force: true });
       mkdirSync(resultsPath);
       writeFileSync(join(root, "release-first"), "");

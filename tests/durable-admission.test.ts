@@ -74,8 +74,7 @@ function prepare(directory: string, overrides: Record<string, unknown> = {}) {
     workflowId: "release",
     machineConfig,
     projectCwd: directory,
-    runsDirectory: join(directory, "state", "runs"),
-    archiveDirectory: join(directory, "archive"),
+    stateDirectory: join(directory, "state"),
     resolvedSettings,
     runtimeManifest: {
       durableVersion: "1.0.2",

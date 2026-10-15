@@ -73,7 +73,7 @@ describe("workflow and machine schemas", () => {
       copyFileSync(harnessSource, join(harnessDir, "hemingway-node.ts"));
 
       const checked = checkDefinitionText(readFileSync(workflowPath, "utf8"), workflowPath, "hemingway-clock");
-      expect(checked.chain.order).toEqual(["timestamp", "generate-line", "publish-quote"]);
+      expect(checked.chain.order).toEqual(["timestamp", "generate-line"]);
       expect(checked.def.id).toBe("hemingway-clock");
       const machine = machineConfigSchema.parse(
         parseStrictYaml(readFileSync(machinePath, "utf8"), machinePath),
@@ -90,7 +90,7 @@ describe("workflow and machine schemas", () => {
   test("checks every README YAML snippet against the shipped format and harness contract", () => {
     const readme = readFileSync(join(import.meta.dir, "..", "README.md"), "utf8");
     const snippets = [...readme.matchAll(/\x60{3}yaml\n([\s\S]*?)\n\x60{3}/gu)];
-    expect(snippets).toHaveLength(4);
+    expect(snippets).toHaveLength(3);
     for (const [index, snippet] of snippets.entries()) {
       const yaml = snippet[1];
       if (yaml === undefined) throw new Error("README YAML snippet is missing");

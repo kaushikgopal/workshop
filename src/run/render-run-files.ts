@@ -18,7 +18,7 @@ export interface ResultFileSlot {
 }
 
 /** Render the exact result block contract without reading a projection file. */
-export function renderResultsFile(workflowId: string, runId: string, slots: readonly ResultFileSlot[]) {
+export function renderResultsFile(workflowId: string, runId: string, slots: readonly ResultFileSlot[], admittedAt = "unknown", mutable = true, admissionSequence = 1) {
   const runTag = createHash("sha256").update(runId, "utf8").digest("hex").slice(0, 8);
   const blocks: string[] = [];
   const diagnostics: { stepId: string; message: string }[] = [];
@@ -43,7 +43,10 @@ export function renderResultsFile(workflowId: string, runId: string, slots: read
       blocks[blocks.length - 1] += "\n<" + answerTag + ' action="' + slot.answer.action + '">\n' + text + "\n" + answerClosing;
     }
   }
-  return { text: "# Results: " + workflowId + " run " + runId + "\n\n" + blocks.join("\n\n") + (blocks.length === 0 ? "" : "\n"), diagnostics };
+  const body = "# Results: " + workflowId + " run " + runId + "\n"
+    + "Run tag: " + runTag + "\nAdmission time: " + admittedAt + "\n\n"
+    + blocks.join("\n\n") + (blocks.length === 0 ? "" : "\n");
+  return { text: wrapRunSection(runId, runTag, admittedAt, body, mutable, admissionSequence), diagnostics };
 }
 
 /** Derive accepted slots and labeled execution evidence from committed records. */
@@ -60,8 +63,10 @@ export function renderRunFiles(snapshot: RunFileSnapshot) {
       output: candidate?.output ?? null, answer: reply === null ? null : { action: reply.action, text: reply.answer },
       skipped: node.status === "skipped" };
   });
-  const results = renderResultsFile(run.workflowId, run.runId, slots);
-  const sections = ["# Execution: " + run.workflowId + " run " + run.runId];
+  const results = renderResultsFile(run.workflowId, run.runId, slots, run.admittedAt, !["completed", "failed", "cancelled"].includes(run.status), run.admissionSequence);
+  const runTag = createHash("sha256").update(run.runId, "utf8").digest("hex").slice(0, 8);
+  const sections = ["# Execution: " + run.workflowId + " run " + run.runId
+    + "\nRun tag: " + runTag + "\nAdmission time: " + run.admittedAt];
   for (const event of [...snapshot.events].reverse()) {
     const stepId = "nodeId" in event ? event.nodeId : event.type === "run_resolved" ? event.resolution.sourceBlock.nodeId : null;
     const attemptId = "attemptId" in event ? event.attemptId : event.type === "run_resolved" ? event.resolution.sourceBlock.attemptId : null;
@@ -115,9 +120,15 @@ export function renderRunFiles(snapshot: RunFileSnapshot) {
     }
   }
   for (const diagnostic of results.diagnostics) sections.push(label(diagnostic.stepId, null, "engine", "projection") + "\n" + diagnostic.message);
-  return { results: results.text, executionLog: sections.join("\n\n") + "\n", diagnostics: results.diagnostics };
+  return { results: results.text, executionLog: wrapRunSection(run.runId, runTag, run.admittedAt, sections.join("\n\n") + "\n", !["completed", "failed", "cancelled"].includes(run.status), run.admissionSequence), diagnostics: results.diagnostics };
 }
 
 function label(stepId: string | null, attempt: number | null, role: string, detail: string): string {
   return "[step=" + (stepId ?? "run") + " attempt=" + (attempt ?? "-") + " role=" + role + "] " + detail;
+}
+
+function wrapRunSection(runId: string, runTag: string, admittedAt: string, content: string, mutable: boolean, admissionSequence: number): string {
+  const safeContent = content.replace(/^<\/?workshop-run\b.*>$/gmu, (line) => line.replaceAll("<", "&lt;").replaceAll(">", "&gt;"));
+  return '<workshop-run id="' + runId + '" tag="' + runTag + '" admitted-at="' + admittedAt + '" mutable="' + String(mutable) + '" admission-sequence="' + String(admissionSequence) + '">\n'
+    + safeContent + (safeContent.endsWith("\n") ? "" : "\n") + "</workshop-run>\n";
 }

@@ -33,32 +33,46 @@ before starting a workflow. The Pi preset approves tool use without asking.
 
 ### Watch it work
 
-`hemingway-retry` rejects the timestamp's first attempt with a command verifier.
-Its second attempt passes. An agent then writes a sentence, an agent verifier
-checks it, and a command archives it. A successful first agent attempt makes
-two model calls.
+hemingway-retry rejects the timestamp's first attempt with a command verifier.
+The retry passes. An agent writes an original sentence, and an agent verifier
+checks it. Both agents read earlier accepted sentences from the workflow's
+results.md file. There is no publish step. A successful first agent attempt
+makes two model calls.
 
-```fish
+~~~fish
 workshop validate hemingway-retry
 workshop start hemingway-retry --detach
 workshop watch hemingway-retry
-```
+~~~
 
-Press `q` to close the viewer. Inspect the completed run:
+Press q to close the viewer. Inspect the completed run:
 
-```fish
+~~~fish
 workshop status
 workshop diagram hemingway-retry
 workshop step describe hemingway-retry timestamp --json
 workshop logs hemingway-retry
-cat .workshop/archive/hemingway-retry/*.md
+cat .workshop/state/hemingway-retry/results.md
 workshop service stop
-```
+~~~
 
-The other example, `hemingway-clock`, schedules six runs ten minutes apart.
-`workshop stop hemingway-clock` disables its schedule and cancels its open run
-after safe process cleanup. `service stop` shuts down the service, not the
-saved schedule.
+The other example, hemingway-clock, schedules six runs ten minutes apart.
+Each run adds a tagged section to the same results.md and execution.log files.
+workshop stop hemingway-clock disables its schedule and cancels its open run
+after safe process cleanup. service stop shuts down the service, not the saved
+schedule.
+
+Try the human approval example:
+
+~~~fish
+workshop start hemingway-approve --detach
+workshop status hemingway-approve
+workshop reply hemingway-approve --continue --answer 'Approved.'
+cat .workshop/state/hemingway-approve/results.md
+~~~
+
+Continue completes the draft run. The answer appears after its result block.
+The workflow needs no publish step.
 
 ## How it works
 
@@ -110,27 +124,25 @@ See [CONTRIBUTING](CONTRIBUTING.md#how-the-code-works) for the architecture.
 ## A workflow
 
 Save this as `.workshop/workflows/hemingway-clock.yaml`. The filename is the
-workflow ID. The [full example](examples/workflows/hemingway-clock.yaml) also
-checks for Pi and compares archived sentences.
+workflow ID. The full example checks for Pi and compares earlier accepted
+sentences in results.md.
 
-```yaml
+~~~yaml
 version: 4
 schedule: { every: 10m, max_runs: 6 }
 defaults:
   retries: 1
+  timeout: 10m
   replay: safe
-instructions: Keep the sentence original. Do not edit Workshop files.
+environment:
+  preflight: { command: 'command -v pi >/dev/null' }
 steps:
   - timestamp: date -u +%FT%TZ
   - generate-line:
-      agent: Generate one original Hemingway-inspired sentence, not a quotation.
+      agent: Read earlier accepted sentences from $WORKSHOP_RESULTS_PATH. Draft one original sentence.
       verify:
-        agent: Accept only one original sentence that does not claim Hemingway authorship.
-  - publish-quote:
-      run: cat > "$WORKSHOP_ARCHIVE/$WORKSHOP_RUN_ID.md"
-      retries: 0
-      replay: never
-```
+        agent: Compare the candidate with earlier accepted sentences in $WORKSHOP_RESULTS_PATH.
+~~~
 
 A step body is a command string, `run: <command>`, or `agent: <instructions>`.
 An agent also accepts `{ instructions, model, harness }`. Step options are
@@ -253,8 +265,7 @@ Final-step Continue completes even while paused. Stop cancels a waiting run.
 | `WORKSHOP_RUN_ID`, `WORKSHOP_WORKFLOW_ID` | Run and workflow identity |
 | `WORKSHOP_STEP_ID`, `WORKSHOP_ATTEMPT` | Step and attempt number; preflight uses empty step and attempt 0 |
 | `WORKSHOP_EXECUTION_ID` | Process execution identity |
-| `WORKSHOP_RESULTS_PATH`, `WORKSHOP_LOG_PATH` | Read-only views: `results.md` and `execution.log` |
-| `WORKSHOP_ARCHIVE` | `.workshop/archive/<workflow>/`, kept across runs |
+| WORKSHOP_RESULTS_PATH, WORKSHOP_LOG_PATH | The workflow's single live results.md and execution.log files in .workshop/state/<workflow-id>/ |
 | `WORKSHOP_CANDIDATE_STATUS`, `WORKSHOP_RETRIES_LEFT` | Command verifier candidate status and retries left (`n` or `unlimited`) |
 | `WORKSHOP_ANSWER` | Committed answer for an answered wait's immediate successor and its verifier |
 | `WORKSHOP_PROVIDER`, `WORKSHOP_MODEL_ID`, `WORKSHOP_MODEL` | Agent provider, bare model ID, and provider/model |
@@ -382,38 +393,55 @@ unchanged. Action commands must enforce limits and prevent duplicates themselves
 
 ## What lands on disk
 
-```text
+~~~text
 .workshop/
 ├─ workshop.yaml                    optional machine defaults
 ├─ workflows/<workflow>.yaml        workflow definitions
-├─ archive/<workflow>/              workflow-owned files, kept across runs
-├─ runs/<run-id>/
-│  ├─ results.md                    accepted results and human answers
-│  └─ execution.log                 labeled execution evidence
 └─ state/
    ├─ durable.db                    service-owned database
    ├─ service.json  service.lock    service identity and ownership
-   └─ captures/<run-id>/            temporary stdout and stderr captures
-```
+   ├─ captures/<run-id>/            temporary process captures
+   └─ <workflow-id>/
+      ├─ results.md                 accepted outputs and human answers
+      ├─ execution.log              labeled execution evidence
+      ├─ results-<UTC timestamp>-<admission-sequence>-<rotation-id>.md.gz  rotated results
+      └─ execution-<UTC timestamp>-<admission-sequence>-<rotation-id>.log.gz  rotated execution evidence
+~~~
 
-The private socket may live outside `state/` to meet Unix socket path limits.
-Ignore `.workshop/` in Git.
+The private socket may live outside state/ to meet Unix socket path limits.
+Ignore .workshop/ in Git.
 
-`results.md` contains accepted outputs in chain order. Its tag names are
-`result-<step-id>-<run-tag>`; the run tag is the first eight lowercase hex
-characters of SHA-256 of the run ID. Answered waits add an `answer-…` block.
-Skipped steps add an empty `skipped-…` line. Closing-tag collisions produce an
-unavailable marker instead of ambiguous content. Agent prompts explain tag lookup.
+Each workflow has one live results.md and one live execution.log. Each file
+holds whole run sections in admission order. Each wrapper shows the run ID,
+run tag, admission time, admission sequence, and mutable state. The mutable
+state is true while the run is open. It becomes false after terminal settlement. Result tags
+remain result-<step-id>-<run-tag>, answer-<step-id>-<run-tag>, and
+skipped-<step-id>-<run-tag>. Answered waits add an answer block directly after
+the result. Agents search results.md for earlier accepted output by its exact
+tag. Older run sections live in timestamped .gz files beside results.md.
 
-`execution.log` contains engine events, stderr, invalid stdout, preamble,
-trailer, feedback, and resolutions, labeled by step, attempt, and role.
-The database retains raw evidence; `workshop logs` exposes it through the service.
-Stdout and stderr remain separate, without reconstructed interleaving.
+Before adding a run section would push a live file past 10 MiB, Workshop gzips
+the current file and starts a new file. Workshop never splits a run section.
+One oversized run may exceed the cap in a fresh file. Workshop keeps the five
+newest rotations per file kind per workflow. Rotation names include the maximum
+admission sequence and a unique ID. A restart does not restore runs older than
+the oldest retained rotation.
 
-These files are read-only views of committed state, not process channels.
-Deleting them permits regeneration without repeating work. Editing them changes
-neither accepted output nor run state. Workshop retains both after every outcome.
-Temporary captures are removed only after evidence import and confirmed cleanup.
+execution.log contains engine events, stderr, invalid stdout, preamble, trailer,
+feedback, and resolutions. Every section and process record has run and process
+labels. The database retains raw evidence. workshop logs exposes it through the
+service. Stdout and stderr remain separate, without reconstructed interleaving.
+
+The captures/ directory holds temporary stdout and stderr files. The service
+imports retained bytes into Durable state before cleanup, and it keeps unresolved
+captures across restart.
+
+These live files are read-only views of committed state. Deleting them lets the
+service rebuild missing sections without repeating work. Refreshes add missing
+sections, update open sections, and preserve existing finished sections. Editing a
+file changes neither accepted output nor run state. The service never deletes existing
+.workshop/runs/ or .workshop/archive/ directories from older installations; it
+leaves them in place and does not use them.
 
 CAUTION: Workshop adds no automatic expiration or database purging. Evidence
 grows with each attempt, including unlimited retries.
@@ -473,7 +501,7 @@ detached startup discards service stdout and stderr.
 
 ### Upgrade
 
-Drain runs before upgrading. Finish or stop open runs with the previous build.
+Drain runs before upgrading. Finish or stop open runs with the previous build. Existing .workshop/runs/ and .workshop/archive/ folders stay in place. The new service leaves them unused.
 The new service refuses startup if an open run uses a workflow format older
 than 4. Settled history stays readable. Incompatible task definitions block as
 `runtime_incompatible` instead of continuing under different code.
@@ -482,7 +510,7 @@ Migrate workflow files to `version: 4`. Replace `max_attempts: N` with
 `retries: N-1`. Replace `check` with `verify`. Remove machine and workflow
 `orchestrator` settings and workflow `keep_files` settings. Set `bot.model` only
 when you want the shared bot. Declare `retries` and `replay` for every step
-or in `defaults`. Update harnesses to the stdin/stdout/stderr contract.
+or in `defaults`. Update harnesses to the stdin/stdout/stderr contract. Remove custom uses of WORKSHOP_ARCHIVE. WORKSHOP_RESULTS_PATH and WORKSHOP_LOG_PATH now point to workflow-owned files in state/<workflow-id>/.
 
 ## Contributing
 

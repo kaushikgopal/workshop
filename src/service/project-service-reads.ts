@@ -12,7 +12,7 @@ import {
 } from "../installation/schema.js";
 import { loadCheckedWorkflow, type Installation } from "../installation/load-installation.js";
 import { activationIdSchema, blockInfoSchema, desiredStateSchema, occurrenceIdSchema, runFailureInfoSchema, runIdSchema } from "../run/schema.js";
-import { locateProcessFiles } from "../run/locate-run-files.js";
+import { locateProcessFiles, locateWorkflowDirectory } from "../run/locate-run-files.js";
 import { readRetainedCapture } from "../process/read-retained-capture.js";
 import type { ProcessCapture } from "../process/schema.js";
 import { workshopEventV1Schema, workshopProcessV1Schema, workflowRunDocumentV1Schema } from "../run/records.js";
@@ -391,7 +391,7 @@ function projectNodeEvidence(run: ReadyRun, node: PersistedNode, records: readon
   const live = processes.findLast(record => record.process.status === "running" || record.process.status === "launching");
   let liveStderr: string | null = null;
   if (node.status === "running" && live && attempt) {
-    const files = locateProcessFiles(run.paths.runDirectory, { role: live.process.role, nodeId: node.nodeId,
+    const files = locateProcessFiles(locateWorkflowDirectory(run), run.runId, { role: live.process.role, nodeId: node.nodeId,
       attemptNumber: attempt.number, incarnationNumber: live.process.incarnationNumber, executionId: live.process.executionId });
     liveStderr = readLiveTail(files.stderrPath);
   }

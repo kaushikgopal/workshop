@@ -63,7 +63,7 @@ async function withFixture(text: string, action: (fixture: Fixture) => Promise<v
     const prepared = prepareRunAdmission({
       sourceText: text, sourceLabel: "blocks.yaml", workflowId: "blocks", machineConfig: machine,
       resolvedSettings: resolveWorkflowSettings({ definition, machine, projectCwd: directory }),
-      projectCwd: directory, runsDirectory: join(directory, "runs"), archiveDirectory: join(directory, "archive"),
+      projectCwd: directory, stateDirectory: join(directory, "state"),
       runtimeManifest: { durableVersion: "1.0.2", integrationManifestHash: "sha256:" + "1".repeat(64),
         taskVersions: { workflowRun: 10, nodeAttempt: 4, processExecution: 4, capacityGate: 1 } },
       runId: "blocks-" + randomUUID(), eventId: randomUUID(), activationId: "activation", occurrenceId: "occurrence", requestId: randomUUID(), admittedAt: at,

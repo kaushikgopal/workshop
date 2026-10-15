@@ -28,6 +28,7 @@ import {
   type ProcessExecutionTaskEnvironmentInput,
 } from "../src/storage/durable/define-process-execution-task.js";
 import { reconstructProcessStdin } from "../src/attempt/build-process-stdin.js";
+import { locateWorkflowDirectory } from "../src/run/locate-run-files.js";
 import { createWorkflowRunTaskInput, defineWorkshopTasks, parseWorkflowRunTaskInput } from "../src/storage/durable/define-workshop-tasks.js";
 import { openDurableStorage } from "../src/storage/durable/open-durable-storage.js";
 
@@ -125,8 +126,7 @@ function prepare(
     workflowId,
     machineConfig: machine,
     projectCwd: directory,
-    runsDirectory: join(directory, "state", "runs"),
-    archiveDirectory: join(directory, ".workshop", "archive"),
+    stateDirectory: join(directory, ".workshop", "state"),
     resolvedSettings,
     runtimeManifest: {
       durableVersion: "1.0.2",
@@ -396,7 +396,7 @@ describe("Durable workflow lifecycle", () => {
       const task = await opened.harness.waitForTask(admission.value.workflowTaskId as TaskId<ReturnType<typeof runOutcomeSchema.parse>>, BACKGROUND_CONTEXT);
       if (task.state.outcome.status !== "completed") throw new Error("WorkflowRun task did not complete");
       expect(runOutcomeSchema.parse(task.state.outcome.result)).toEqual({ kind: "completed", terminalOutput: "alpha-beta" });
-      expect(existsSync(prepared.paths.runDirectory)).toBe(false);
+      expect(existsSync(join(directory, ".workshop", "runs", prepared.runId))).toBe(false);
     } finally {
       if (opened !== undefined) await opened.harness.close(BACKGROUND_CONTEXT);
       rmSync(directory, { recursive: true, force: true });
@@ -520,7 +520,7 @@ describe("canonical worker output views", () => {
     let opened: CommandHarness | undefined;
     let conversationId: ConversationId | undefined;
     const prepared = prepare(directory, "canonical-output-request-001", "command-chain-run-001");
-    const staleInputPath = join(prepared.paths.runDirectory, "second.1", "legacy-input-poison.txt");
+    const staleInputPath = join(directory, ".workshop", "state", "captures", prepared.runId, "second.1", "legacy-input-poison.txt");
     try {
       const candidate = nodeResultSchema.parse({
         version: 2,
@@ -616,7 +616,7 @@ describe("canonical worker output views", () => {
       await opened.harness.close(BACKGROUND_CONTEXT);
       opened = undefined;
 
-      mkdirSync(join(prepared.paths.runDirectory, "second.1"), { recursive: true });
+      mkdirSync(join(directory, ".workshop", "state", "captures", prepared.runId, "second.1"), { recursive: true });
       writeFileSync(staleInputPath, "stale input from disk", "utf8");
 
       opened = await openCommandHarness(databasePath);
@@ -2205,7 +2205,7 @@ function createAdapterAgentProcessInput(args: {
   const deadlineAt = args.site.timeoutMs === null
     ? null
     : iso(Date.parse(args.launchIntentAt) + args.site.timeoutMs);
-  const paths = processExecutionFiles({ role: args.role, nodeId: args.nodeId, incarnationNumber: 1, executionId: args.executionId }, args.run.paths.runDirectory, 1);
+  const paths = processExecutionFiles({ role: args.role, nodeId: args.nodeId, incarnationNumber: 1, executionId: args.executionId }, locateWorkflowDirectory(args.run), args.run.runId, 1);
   const stdin = reconstructProcessStdin({
     role: args.role,
     nodeId: args.nodeId,

@@ -58,6 +58,7 @@ import { WorkshopBotDoc, WorkshopEventEntry, WorkshopInstallationDoc, WorkshopRu
 import { checkpointDurableWal } from "../storage/durable/checkpoint-durable-wal.js";
 import { openDurableStorage } from "../storage/durable/open-durable-storage.js";
 import { createRunFileWriter } from "./project-run-files.js";
+import { locateWorkflowDirectory } from "../run/locate-run-files.js";
 import { removeProcessCaptures } from "../storage/disk/remove-process-captures.js";
 import { readRunEvidenceSnapshot, readInstallation, readRun, projectServiceRead } from "./project-service-reads.js";
 import { ServiceRequestError, ServiceShutdownError, serveWorkshopService, type WorkshopServiceRuntime } from "./serve-workshop-service.js";
@@ -252,7 +253,7 @@ async function openServiceRuntime(
               const result = await activeWriter.project(reference.conversationId as ConversationId);
               if (!result.available) unavailable = true;
               else if (["completed", "failed", "cancelled"].includes(run.status)) {
-                const directory = run.paths.runDirectory;
+                const directory = locateWorkflowDirectory(run);
                 const identity = readProjectionIdentity(directory);
                 if (identity !== null) projectedTerminalRuns.set(reference.conversationId, { directory, identity });
               }
@@ -697,8 +698,7 @@ async function startWorkflow(
     workflowId: checked.workflowId,
     machineConfig: installation.machine,
     projectCwd: installation.projectCwd,
-    runsDirectory: installation.runsDirectory,
-    archiveDirectory: installation.archiveDirectory,
+    stateDirectory: installation.stateDirectory,
     resolvedSettings: checked.resolvedSettings,
     runtimeManifest: {
       durableVersion: "1.0.2",

@@ -125,8 +125,7 @@ export async function admitPreparedRun<
     workflowId: original.workflowId,
     machineConfig: original.machineConfig,
     projectCwd: original.projectCwd,
-    runsDirectory: original.runsDirectory,
-    archiveDirectory: original.archiveDirectory,
+    stateDirectory: original.stateDirectory,
     resolvedSettings: original.resolvedSettings,
     runtimeManifest: original.runtimeManifest,
     runId: original.runId,
@@ -508,7 +507,7 @@ async function readExistingAdmission<I>(input: {
     && run.canonicalHash === input.prepared.canonicalHash
     && canonicalHash(run.resolvedSettings) === canonicalHash(input.prepared.resolvedSettings)
     && run.paths.projectCwd === input.prepared.projectCwd
-    && run.paths.runDirectory === join(input.prepared.runsDirectory, run.runId)
+    && ("workflowDirectory" in run.paths ? run.paths.workflowDirectory : input.prepared.paths.workflowDirectory) === input.prepared.paths.workflowDirectory
     && run.activationId === input.prepared.activationId
     && run.occurrenceId === input.prepared.occurrenceId;
   if (!sameIdentity || !sameRequest || !samePrepared) {
