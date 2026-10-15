@@ -25,7 +25,7 @@ export function locateWorkflowDirectory(run: {
 }): string {
   if (typeof run.paths.workflowDirectory === "string") return run.paths.workflowDirectory;
   if (typeof run.paths.runDirectory === "string") {
-    return join(dirname(dirname(run.paths.runDirectory)), "state", run.workflowId);
+    return join(dirname(dirname(run.paths.runDirectory)), "state-v5", run.workflowId);
   }
   throw new Error("run has no workflow projection directory");
 }

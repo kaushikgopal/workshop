@@ -5,7 +5,6 @@ import { join } from "node:path";
 import { z } from "zod";
 import { checkDefinitionText } from "../src/definition/check-definition.js";
 import { parseModel } from "../src/definition/parse-model.js";
-import { resolveAgent, PI_HARNESS_COMMAND } from "../src/definition/resolve-agent-settings.js";
 import { resolveWorkflowSettings } from "../src/definition/resolve-workflow-settings.js";
 import {
   machineConfigSchema,
@@ -14,7 +13,6 @@ import {
 } from "../src/definition/schema.js";
 import { resolvedWorkflowSettingsSchema } from "../src/definition/schema-resolved.js";
 import { resolveRetryLimit } from "../src/definition/resolve-retry-limit.js";
-import { checkNoOpenLegacyRuns } from "../src/service/check-legacy-runs.js";
 import { parseStrictYaml } from "../src/definition/parse-yaml.js";
 import { parseByteSize, parseDuration } from "../src/util/parse-units.js";
 
@@ -38,7 +36,7 @@ describe("workflow and machine schemas", () => {
     expect(machineConfigSchema.parse({
       version: 3,
       shell: "/bin/bash",
-      agent: { harness: { command: "mock-agent" }, model: "provider/model:low" },
+      agent: { harness: "pi", model: "provider/model:low" },
       bot: { model: "provider/bot:medium" },
     })).toMatchObject({ version: 3, shell: "/bin/bash", bot: { model: "provider/bot:medium" } });
     expect(() => machineConfigSchema.parse({ orchestrator: { model: "provider/judge:medium" } })).toThrow();
@@ -55,42 +53,35 @@ describe("workflow and machine schemas", () => {
     expect(() => machineConfigSchema.parse({ keep_files: "success" })).toThrow();
   });
 
-  test("loads the copyable workflow and fixture machine in a temporary installation", () => {
+  test("loads the copyable workflow and Pi-only fixture machine in a temporary installation", () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-fixture-"));
     try {
       const workshopDir = join(root, ".workshop");
       const workflowsDir = join(workshopDir, "workflows");
-      const harnessDir = join(root, "tests", "mock");
       mkdirSync(workflowsDir, { recursive: true });
-      mkdirSync(harnessDir, { recursive: true });
       const workflowSource = join(import.meta.dir, "..", "examples", "workflows", "hemingway-clock.yaml");
       const machineSource = join(import.meta.dir, "fixtures", "machine.yaml");
-      const harnessSource = join(import.meta.dir, "mock", "hemingway-node.ts");
       const workflowPath = join(workflowsDir, "hemingway-clock.yaml");
       const machinePath = join(workshopDir, "workshop.yaml");
       copyFileSync(workflowSource, workflowPath);
       copyFileSync(machineSource, machinePath);
-      copyFileSync(harnessSource, join(harnessDir, "hemingway-node.ts"));
 
       const checked = checkDefinitionText(readFileSync(workflowPath, "utf8"), workflowPath, "hemingway-clock");
       expect(checked.chain.order).toEqual(["timestamp", "generate-line"]);
       expect(checked.def.id).toBe("hemingway-clock");
-      const machine = machineConfigSchema.parse(
-        parseStrictYaml(readFileSync(machinePath, "utf8"), machinePath),
-      );
-      expect(resolveAgent({ machine: machine.agent })).toMatchObject({
-        harnessCommand: "bun tests/mock/hemingway-node.ts",
-        model: { full: "fixture/mock-model:medium" },
-      });
+      const machine = machineConfigSchema.parse(parseStrictYaml(readFileSync(machinePath, "utf8"), machinePath));
+      expect(machine.agent).toMatchObject({ harness: "pi", model: "fixture/mock-model:medium" });
+      const settings = resolveWorkflowSettings({ definition: checked.def, machine, projectCwd: root });
+      expect(settings.nodes["generate-line"]?.run).toMatchObject({ kind: "agent", model: "fixture/mock-model:medium" });
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
   });
 
-  test("checks every README YAML snippet against the shipped format and harness contract", () => {
+  test("checks README YAML snippets against native execution settings", () => {
     const readme = readFileSync(join(import.meta.dir, "..", "README.md"), "utf8");
     const snippets = [...readme.matchAll(/\x60{3}yaml\n([\s\S]*?)\n\x60{3}/gu)];
-    expect(snippets).toHaveLength(3);
+    expect(snippets).toHaveLength(2);
     for (const [index, snippet] of snippets.entries()) {
       const yaml = snippet[1];
       if (yaml === undefined) throw new Error("README YAML snippet is missing");
@@ -101,19 +92,20 @@ describe("workflow and machine schemas", () => {
           machine: { agent: { model: "example/pi-model:medium" } }, projectCwd: "/tmp" });
         expect(settings.nodes["publish-quote"]?.run.replay).toBe("never");
       } else {
-        const machine = machineConfigSchema.parse(parseStrictYaml(yaml, label));
+        const raw = parseStrictYaml(yaml, label) as { agent?: { harness?: unknown }; bot?: { model?: string } };
+        if (typeof raw.agent?.harness === "object") {
+          expect(() => machineConfigSchema.parse(raw)).toThrow();
+          continue;
+        }
+        const machine = machineConfigSchema.parse(raw);
         if (machine.bot !== undefined) {
           expect(machine.bot.model).toBe("example/pi-model:medium");
           continue;
         }
-        const agent = resolveAgent({ machine: machine.agent });
-        expect(agent.model).not.toBeNull();
-        if (typeof machine.agent?.harness === "object") {
-          expect(agent.harnessCommand).toBe(machine.agent.harness.command);
-        } else expect(agent.harnessCommand).toBe(PI_HARNESS_COMMAND);
+        expect(machine.agent?.model).toBeDefined();
+        if (machine.agent?.harness !== undefined) expect(machine.agent.harness).toBe("pi");
       }
     }
-    expect(readme).toContain(PI_HARNESS_COMMAND);
     expect(readme).not.toMatch(/WORKSHOP_\w*_FILE|failure judge|result helper/u);
   });
 
@@ -485,139 +477,111 @@ describe("format 4 resolved settings", () => {
     })).toThrow();
   });
 
-  test("refuses to start while a format 3 run is open", () => {
-    const current = { formatVersion: 4 };
-    expect(() => checkNoOpenLegacyRuns([{ workflowId: "clock", runId: "run-new", resolvedSettings: current }])).not.toThrow();
-    expect(() => checkNoOpenLegacyRuns([
-      { workflowId: "clock", runId: "run-new", resolvedSettings: current },
-      { workflowId: "quotes", runId: "run-old", resolvedSettings: { keepFiles: "failed" } },
-    ])).toThrow(/workflow format 3.*quotes\/run-old.*previous Workshop build/);
-  });
 });
 
-describe("field-by-field agent resolution", () => {
-  const machine = { harness: { command: "machine-harness" }, model: "machine/model:low" };
-  const workflowDefault = { harness: { command: "workflow-harness" }, model: "workflow/model:medium" };
-
-  test("rejects removed variables from the selected site, workflow, and machine harness", () => {
-    const customCommand = "custom-agent $WORKSHOP_PROMPT_FILE";
-    const agentRun = { agent: { instructions: "Write the result." } };
-    const definition = (run: Record<string, unknown>, defaults: Record<string, unknown> = {}) => workflowSchema.parse({
+describe("Pi-only agent configuration", () => {
+  test("rejects alternate commands in machine, workflow defaults, workers, and verifiers", () => {
+    const customHarness = { command: "custom-agent" };
+    expect(() => machineConfigSchema.parse({
+      agent: { harness: customHarness, model: "provider/model:low" },
+    })).toThrow(/only harness: pi is supported; custom command harnesses are not supported/);
+    expect(() => workflowSchema.parse({
       id: "clock",
-      defaults: { retries: 0, replay: "never", ...defaults },
-      nodes: { "node-a": { run, next: null } },
-    });
-    const machineModel = { agent: { model: "provider/model:low" } };
-    const layers = [
-      {
-        name: "site",
-        definition: definition({
-          agent: { ...agentRun.agent, harness: { command: customCommand } },
-        }),
-        machine: machineModel,
+      defaults: { retries: 0, replay: "never", agent: { harness: customHarness } },
+      nodes: { "node-a": { run: { command: "echo" }, next: null } },
+    })).toThrow(/only harness: pi is supported; custom command harnesses are not supported/);
+    expect(() => workflowSchema.parse({
+      id: "clock",
+      defaults: { retries: 0, replay: "never" },
+      nodes: {
+        "node-a": {
+          run: { agent: { instructions: "Write the result.", model: "provider/model:low", harness: customHarness } },
+          next: null,
+        },
       },
-      {
-        name: "workflow",
-        definition: definition(agentRun, { agent: { harness: { command: customCommand } } }),
-        machine: machineModel,
-      },
-      {
-        name: "machine",
-        definition: definition(agentRun),
-        machine: { agent: { ...machineModel.agent, harness: { command: customCommand } } },
-      },
-    ];
-
-    for (const layer of layers) {
-      expect(() => resolveWorkflowSettings({
-        definition: layer.definition,
-        machine: layer.machine,
-        projectCwd: "/tmp",
-      }), layer.name).toThrow(/step "node-a" worker harness command references removed variable WORKSHOP_PROMPT_FILE; migrate the harness to read input from stdin, write the declared result to stdout, and send diagnostics to stderr/);
-    }
-  });
-
-  test("rejects WORKSHOP_BIN for a verifier and checks names case-sensitively", () => {
-    const definition = workflowSchema.parse({
+    })).toThrow(/only harness: pi is supported; custom command harnesses are not supported/);
+    expect(() => workflowSchema.parse({
       id: "clock",
       defaults: { retries: 0, replay: "never" },
       nodes: {
         "node-a": {
           run: { command: "echo candidate" },
-          validator: {
-            agent: {
-              instructions: "Judge the result.",
-              model: "provider/model:low",
-              harness: { command: "custom-verifier $WORKSHOP_BIN" },
-            },
-          },
+          validator: { agent: { instructions: "Judge the result.", model: "provider/model:low", harness: customHarness } },
           next: null,
         },
       },
-    });
-    expect(() => resolveWorkflowSettings({ definition, machine: {}, projectCwd: "/tmp" }))
-      .toThrow(/step "node-a" verifier harness command references removed variable WORKSHOP_BIN; migrate the harness to read input from stdin, write the declared result to stdout, and send diagnostics to stderr/);
+    })).toThrow(/only harness: pi is supported; custom command harnesses are not supported/);
+  });
 
-    const lowercase = resolveAgent({
-      site: {
-        model: "provider/model:low",
-        harness: { command: "custom-agent $workshop_prompt_file" },
-      },
+  test("resolves explicit Pi selection with provider, model, and thinking", () => {
+    const checked = checkDefinitionText([
+      "version: 4",
+      "defaults: { retries: 0, replay: never, agent: { model: workflow/model:high } }",
+      "steps:",
+      "  - native-worker:",
+      "      agent:",
+      "        harness: pi",
+      "        instructions: Write the result.",
+      "        model: provider/model:xhigh",
+      "",
+    ].join("\n"), "clock.yaml", "clock");
+    const settings = resolveWorkflowSettings({
+      definition: checked.def,
+      machine: { agent: { harness: "pi", model: "machine/model:medium" } },
+      projectCwd: "/tmp",
     });
-    expect(lowercase.harnessCommand).toBe("custom-agent $workshop_prompt_file");
-
-    for (const variable of [
-      "WORKSHOP_PROMPT_FILE",
-      "WORKSHOP_RESULT_FILE",
-      "WORKSHOP_PREVIOUS_OUTPUT_FILE",
-      "WORKSHOP_STEP_OUTPUT_FILE",
-      "WORKSHOP_WORKLOG_FILE",
-      "WORKSHOP_STDOUT_FILE",
-      "WORKSHOP_STDERR_FILE",
-      "WORKSHOP_BIN",
-    ]) {
-      expect(() => resolveAgent({
-        site: {
-          model: "provider/model:low",
-          harness: { command: "custom-agent $" + variable },
+    const worker = settings.nodes["native-worker"]?.run;
+    expect(worker?.kind).toBe("agent");
+    if (worker?.kind !== "agent") throw new Error("Pi worker settings are missing");
+    expect(parseModel(worker.model)).toEqual({ provider: "provider", modelId: "model", thinking: "xhigh", full: "provider/model:xhigh" });
+    expect(worker).not.toHaveProperty("harnessCommand");
+    expect(() => resolvedWorkflowSettingsSchema.parse({
+      ...settings,
+      nodes: {
+        ...settings.nodes,
+        "native-worker": {
+          ...settings.nodes["native-worker"]!,
+          run: { ...worker, harnessCommand: "custom-agent" },
         },
-        context: { role: "worker", stepId: "node-a" },
-      })).toThrow(new RegExp("step \"node-a\" worker harness command references removed variable " + variable));
-    }
+      },
+    })).toThrow();
   });
 
-  test("a site can override one field while inheriting the other", () => {
-    const modelOnly = resolveAgent({
-      site: { model: "site/model:high" },
-      workflowDefault,
-      machine,
+  test("inherits model settings from workflow defaults and machine config", () => {
+    const workflowSource = [
+      "version: 4",
+      "defaults: { retries: 0, replay: never, agent: { model: workflow/provider:high } }",
+      "steps:",
+      "  - inherited-worker:",
+      "      agent: Write the result.",
+      "",
+    ].join("\n");
+    const workflow = checkDefinitionText(workflowSource, "clock.yaml", "clock");
+    const workflowSettings = resolveWorkflowSettings({
+      definition: workflow.def,
+      machine: { agent: { model: "machine/model:medium" } },
+      projectCwd: "/tmp",
     });
-    expect(modelOnly.harnessCommand).toBe("workflow-harness");
-    expect(modelOnly.model?.full).toBe("site/model:high");
-
-    const harnessOnly = resolveAgent({
-      site: { harness: { command: "site-harness" } },
-      workflowDefault,
-      machine,
+    expect(workflowSettings.nodes["inherited-worker"]?.run).toMatchObject({
+      kind: "agent", model: "workflow/provider:high",
     });
-    expect(harnessOnly.harnessCommand).toBe("site-harness");
-    expect(harnessOnly.model?.full).toBe("workflow/model:medium");
-  });
 
-  test("machine defaults fill only missing fields", () => {
-    const resolved = resolveAgent({ workflowDefault: { model: "workflow/model:low" }, machine });
-    expect(resolved.harnessCommand).toBe("machine-harness");
-    expect(resolved.model?.full).toBe("workflow/model:low");
-  });
-
-  test("the Pi preset is the exact stdin command for an explicit or unset harness", () => {
-    const expected = 'pi --print --approve --no-session --no-extensions --no-skills --no-context-files --no-mcp --model "$WORKSHOP_MODEL_WITH_THINKING"';
-    const explicit = resolveAgent({ site: { harness: "pi", model: "provider/model:low" } });
-    const unset = resolveAgent({ site: { model: "provider/model:low" } });
-    expect(PI_HARNESS_COMMAND).toBe(expected);
-    expect(explicit.harnessCommand).toBe(expected);
-    expect(unset.harnessCommand).toBe(expected);
-    expect(explicit.model?.full).toBe("provider/model:low");
-    expect(unset.model?.full).toBe("provider/model:low");
+    const machineSource = [
+      "version: 4",
+      "defaults: { retries: 0, replay: never }",
+      "steps:",
+      "  - machine-worker:",
+      "      agent: Write the result.",
+      "",
+    ].join("\n");
+    const machine = checkDefinitionText(machineSource, "clock.yaml", "clock");
+    const machineSettings = resolveWorkflowSettings({
+      definition: machine.def,
+      machine: { agent: { model: "machine/model:medium" } },
+      projectCwd: "/tmp",
+    });
+    expect(machineSettings.nodes["machine-worker"]?.run).toMatchObject({
+      kind: "agent", model: "machine/model:medium",
+    });
   });
 });

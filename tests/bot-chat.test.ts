@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -18,16 +18,14 @@ import { nodeDescriptionDtoSchema, statusDtoSchema } from "../src/views/schema.j
 import { TALLY_BASE_URL_BY_API } from "../src/model/schema-owner-models.js";
 import { createBotExtension } from "../src/bot/create-bot-tools.js";
 import { serviceRunsPageV1Schema, serviceStartResultV1Schema } from "../src/service/schema.js";
+import { createFauxModels } from "./fixtures/create-faux-models.js";
 test("configured shared bot completes a chat round trip with a fake model", async () => {
   const directory = mkdtempSync(join(tmpdir(), "workshop-bot-chat-"));
   const workshopDirectory = join(directory, ".workshop");
   mkdirSync(join(workshopDirectory, "workflows"), { recursive: true });
   writeFileSync(join(workshopDirectory, "workshop.yaml"), "bot:\n  model: fixture/fake:medium\n", "utf8");
   const installation = loadInstallation(directory);
-  const models = createModels();
-  const faux = fauxProvider({ provider: "fixture", models: [{ id: "fake" }] });
-  faux.setResponses([fauxAssistantMessage("The fake bot is ready.")]);
-  models.setProvider(faux.provider);
+  const { models } = createFauxModels([fauxAssistantMessage("The fake bot is ready.")], { modelIds: ["fake"] });
   let owner: Awaited<ReturnType<typeof startWorkshopService>> | undefined;
   try {
     owner = await startWorkshopService(installation, models);
@@ -201,9 +199,7 @@ test("bot read tools include retained captures and the completed run result", as
   ].join("\n"), "utf8");
 
   const installation = loadInstallation(directory);
-  const models = createModels();
-  const faux = fauxProvider({ provider: "fixture", models: [{ id: "fake" }] });
-  models.setProvider(faux.provider);
+  const { models, faux } = createFauxModels([], { modelIds: ["fake"] });
   const toolOutputs: string[] = [];
   let owner: Awaited<ReturnType<typeof startWorkshopService>> | undefined;
   try {
@@ -275,34 +271,12 @@ test("runs and the bot run tool read a retried agent result beside a v2 archive"
   const directory = mkdtempSync(join(tmpdir(), "workshop-bot-retried-run-read-"));
   const workshopDirectory = join(directory, ".workshop");
   mkdirSync(join(workshopDirectory, "workflows"), { recursive: true });
-  const harnessCommand = [
-    "input=$(cat)",
-    "case \"$input\" in",
-    "  *'Role: verifier'*)",
-    "    if [ \"$WORKSHOP_ATTEMPT\" = 1 ]; then",
-    "      printf 'retry\nEmit a tagged result. The worker output was malformed.'",
-    "    else",
-    "      printf 'accept\nThe candidate is valid.'",
-    "    fi",
-    "    ;;",
-    "  *)",
-    "    if [ \"$WORKSHOP_ATTEMPT\" = 1 ]; then",
-    "      printf 'invalid worker result'",
-    "    else",
-    "      printf '<status>succeeded</status>\\n<reason>Valid result.</reason>\\n<output>accepted candidate</output>'",
-    "    fi",
-    "    ;;",
-    "esac",
-    "",
-  ].join("\n");
   writeFileSync(join(workshopDirectory, "workshop.yaml"), [
     "shell: /bin/sh",
     "bot:",
     "  model: fixture/fake:medium",
     "agent:",
-    "  model: fixture/fake:medium",
-    "  harness:",
-    "    command: " + JSON.stringify(harnessCommand),
+    "  model: fixture/worker:medium",
     "",
   ].join("\n"), "utf8");
   writeFileSync(join(workshopDirectory, "workflows", "retry-read.yaml"), [
@@ -313,15 +287,24 @@ test("runs and the bot run tool read a retried agent result beside a v2 archive"
     "      result: tagged",
     "      agent: Generate a candidate.",
     "      verify:",
-    "        agent: Check the candidate.",
+    "        agent:",
+    "          model: fixture/verifier:medium",
+    "          instructions: Check the candidate.",
     "",
   ].join("\n"), "utf8");
 
   const installation = loadInstallation(directory);
   await seedHistoricalV2Run(installation, "retry-read");
-  const models = createModels();
-  const faux = fauxProvider({ provider: "fixture", models: [{ id: "fake" }] });
-  models.setProvider(faux.provider);
+  const failedWorkerText = "invalid worker result";
+  const verifierRetryText = "retry\nEmit a tagged result. The worker output was malformed.";
+  const successfulWorkerText = "<status>succeeded</status>\n<reason>Valid result.</reason>\n<output>accepted candidate</output>";
+  const verifierAcceptText = "accept\nThe candidate is valid.";
+  const { models, faux } = createFauxModels([
+    fauxAssistantMessage(failedWorkerText),
+    fauxAssistantMessage(verifierRetryText),
+    fauxAssistantMessage(successfulWorkerText),
+    fauxAssistantMessage(verifierAcceptText),
+  ], { modelIds: ["fake", "worker", "verifier"] });
   let owner: Awaited<ReturnType<typeof startWorkshopService>> | undefined;
   try {
     owner = await startWorkshopService(installation, models);
@@ -353,6 +336,27 @@ test("runs and the bot run tool read a retried agent result beside a v2 archive"
     const description = nodeDescriptionDtoSchema.parse(descriptionResponse.result);
     expect(description.node.attempts.map((attempt) => attempt.status)).toEqual(["failed", "succeeded"]);
     expect(description.node.attempts[0]?.failure?.kind).toBe("result_invalid");
+    expect(description.node.attempts.map(attempt => attempt.processes)).toEqual([[], []]);
+    const attempts = description.node.attempts;
+    const nativeExecution = (evidence: typeof attempts[number]["candidate"] | undefined) =>
+      evidence?.kind === "candidate" || evidence?.kind === "verdict" ? evidence.nativeExecution : undefined;
+    const nativeExecutions = [
+      attempts[0]?.failure?.nativeExecution,
+      nativeExecution(attempts[0]?.verdict),
+      nativeExecution(attempts[1]?.candidate),
+      nativeExecution(attempts[1]?.verdict),
+    ];
+    const expectedFinalTexts = [failedWorkerText, verifierRetryText, successfulWorkerText, verifierAcceptText];
+    expect(nativeExecutions.map((execution) => execution?.finalText)).toEqual(expectedFinalTexts);
+    for (const [index, finalText] of expectedFinalTexts.entries()) {
+      expect(nativeExecutions[index]?.finalTextSha256).toBe(
+        "sha256:" + createHash("sha256").update(finalText).digest("hex"),
+      );
+    }
+    const evidence = JSON.stringify(attempts);
+    expect(evidence).toContain("finalTextSha256");
+    expect(evidence).toContain("conversationId");
+    expect(evidence).toContain("assistantEntryId");
 
     const toolOutputs: string[] = [];
     const collectToolResult = (context: Parameters<FauxResponseFactory>[0]) => {

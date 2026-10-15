@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { defineTask, type ConversationId, type Task, type Tx } from "@earendil-works/pi-durable";
+import type { Context } from "@earendil-works/chord";
+import { withAbortSignal, withCancel } from "@earendil-works/chord/context";
+import { defineTask, type ConversationId, type DocumentWatch, type JsonObject, type Task, type TaskRuntime, type Tx } from "@earendil-works/pi-durable";
 import { z } from "zod";
 import { workflowIdSchema } from "../../definition/schema.js";
 import { installationDocumentV1Schema } from "../../installation/schema.js";
@@ -29,7 +31,7 @@ export function createCapacityGateTaskInput(input: CapacityGateTaskInput): Capac
 
 const capacityGateCheckpointSchema = z.discriminatedUnion("phase", [
   z.strictObject({ phase: z.literal("acquire") }),
-  z.strictObject({ phase: z.literal("wait"), wakeAt: utcTimestampSchema }),
+  z.strictObject({ phase: z.literal("wait") }),
 ]);
 export type CapacityGateCheckpoint = z.infer<typeof capacityGateCheckpointSchema>;
 
@@ -40,6 +42,7 @@ export const capacityGateOutcomeSchema = z.discriminatedUnion("kind", [
 export type CapacityGateOutcome = z.infer<typeof capacityGateOutcomeSchema>;
 
 export type CapacityGateTaskDefinition = Task<CapacityGateTaskInput, CapacityGateCheckpoint, CapacityGateOutcome, object>;
+type CapacityGateRuntime = TaskRuntime<CapacityGateTaskInput, CapacityGateCheckpoint, CapacityGateOutcome, object>;
 type ReadyRun = Extract<WorkflowRunDocumentV1, { state: "ready" }>;
 
 export function defineCapacityGateTask(): CapacityGateTaskDefinition {
@@ -57,7 +60,7 @@ export function defineCapacityGateTask(): CapacityGateTaskDefinition {
             return { status: "terminal", outcome: { status: "completed", result: { kind: "cancelled" } } };
           }
           if (run.desiredState === "paused" || run.status === "paused") {
-            return { status: "running", checkpoint: { phase: "wait", wakeAt: timestamp(runtime.now() + 250) } };
+            return { status: "running", checkpoint: { phase: "wait" } };
           }
           if (run.status !== "queued") throw new Error("capacity gate requires a queued run");
           const installationDraft = await tx.doc(WorkshopInstallationDoc);
@@ -71,7 +74,7 @@ export function defineCapacityGateTask(): CapacityGateTaskDefinition {
           const reserved = Object.values(installation.workflows)
             .reduce((count, index) => count + index.capacityReservations.length, 0);
           if (!workflow.capacityReservations.includes(input.runId) && reserved >= installation.maxConcurrentRuns) {
-            return { status: "running", checkpoint: { phase: "wait", wakeAt: timestamp(runtime.now() + 250) } };
+            return { status: "running", checkpoint: { phase: "wait" } };
           }
           if (!workflow.capacityReservations.includes(input.runId)) workflow.capacityReservations.push(input.runId);
           const at = timestamp(runtime.now());
@@ -98,9 +101,9 @@ export function defineCapacityGateTask(): CapacityGateTaskDefinition {
       },
       wait: async (task, runtime, context) => {
         const checkpoint = capacityGateCheckpointSchema.parse(task.state.checkpoint);
-        if (checkpoint.phase !== "wait") throw new Error("capacity gate checkpoint lacks its persisted wake deadline");
-        const wakeAt = Date.parse(checkpoint.wakeAt);
-        if (runtime.now() < wakeAt) await runtime.sleep(wakeAt, context);
+        if (checkpoint.phase !== "wait") throw new Error("capacity gate checkpoint is not waiting");
+        const input = parseCapacityGateInput(task.input);
+        await waitForCapacityChange(runtime, input, Number(runtime.taskId), context);
         await runtime.commit(() => ({ status: "running", checkpoint: { phase: "acquire" } }), context);
       },
     },
@@ -111,6 +114,93 @@ export function defineCapacityGateTask(): CapacityGateTaskDefinition {
       }), context);
     },
   });
+}
+
+async function waitForCapacityChange(
+  runtime: CapacityGateRuntime,
+  input: CapacityGateTaskInput,
+  taskId: number,
+  context: Context,
+): Promise<void> {
+  const parentContext = withAbortSignal(runtime.signal, context);
+  const { context: watchContext, cancel } = withCancel(parentContext);
+  const watches: DocumentWatch<JsonObject>[] = [];
+  try {
+    const runWatch = await runtime.watchDoc(WorkshopRunDoc, runtime.conversationId, watchContext);
+    if (runWatch === undefined) throw new Error("capacity gate run document is unavailable for watching");
+    watches.push(runWatch);
+    const installationWatch = await runtime.watchDoc(WorkshopInstallationDoc, watchContext);
+    if (installationWatch === undefined) throw new Error("capacity gate installation document is unavailable for watching");
+    watches.push(installationWatch);
+
+    let runValue: unknown = runWatch.value;
+    let installationValue: unknown = installationWatch.value;
+    const isReady = (): boolean => capacityCanProceed(input, taskId, runValue, installationValue);
+    if (isReady()) return;
+
+    let notify!: () => void;
+    const changed = new Promise<void>((resolve) => { notify = resolve; });
+    runWatch.start(async (value) => {
+      runValue = value;
+      if (isReady()) notify();
+    });
+    installationWatch.start(async (value) => {
+      installationValue = value;
+      if (isReady()) notify();
+    });
+    if (isReady()) return;
+
+    await waitForWatch(watches, changed, watchContext, runtime.signal);
+  } finally {
+    cancel();
+    await stopWatches(watches);
+  }
+}
+
+function capacityCanProceed(input: CapacityGateTaskInput, taskId: number, runValue: unknown, installationValue: unknown): boolean {
+  const run = readyRun(runValue);
+  assertCapacityGateIdentity(input, run, taskId);
+  if (run.durable.capacityGateTaskId !== taskId || run.desiredState === "stopped") return true;
+  if (run.desiredState === "paused" || run.status === "paused") return false;
+  if (run.status !== "queued") return true;
+
+  const parsedInstallation = installationDocumentV1Schema.safeParse(installationValue);
+  if (!parsedInstallation.success || parsedInstallation.data.state !== "ready") {
+    throw new Error("Durable installation document failed validation while capacity gate waits");
+  }
+  const installation = parsedInstallation.data;
+  const workflow = installation.workflows[input.workflowId];
+  const reference = workflow?.runs.find((candidate) => candidate.runId === input.runId);
+  if (workflow === undefined || reference === undefined || reference.status !== "queued") return true;
+  if (workflow.capacityReservations.includes(input.runId)) return true;
+  const reserved = Object.values(installation.workflows)
+    .reduce((count, index) => count + index.capacityReservations.length, 0);
+  return reserved < installation.maxConcurrentRuns;
+}
+
+async function waitForWatch(
+  watches: readonly DocumentWatch<JsonObject>[],
+  changed: Promise<void>,
+  context: Context,
+  runtimeSignal: AbortSignal,
+): Promise<void> {
+  const closed = Promise.race(watches.map((watch) => watch.closed.then((end) => end)));
+  const result = await Promise.race([
+    changed.then(() => ({ kind: "changed" as const })),
+    closed.then((end) => ({ kind: "closed" as const, end })),
+  ]);
+  if (result.kind === "changed") return;
+  if (runtimeSignal.aborted || context.abortSignal?.aborted) {
+    throw runtimeSignal.reason ?? context.abortSignal?.reason ?? new Error("capacity gate wait was cancelled");
+  }
+  if (result.end.reason === "listener_error") throw result.end.error;
+  throw new Error("capacity gate document watch ended: " + result.end.reason);
+}
+
+async function stopWatches(watches: readonly DocumentWatch<JsonObject>[]): Promise<void> {
+  const results = await Promise.all(watches.map((watch) => watch.stop()));
+  const failure = results.find((result) => result.reason === "listener_error");
+  if (failure?.reason === "listener_error") throw failure.error;
 }
 
 function parseCapacityGateInput(value: unknown): CapacityGateTaskInput {

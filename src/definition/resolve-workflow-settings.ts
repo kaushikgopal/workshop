@@ -28,7 +28,6 @@ export function resolveWorkflowSettings(input: {
     }
     const run = resolveExecutionSite({
       site: node.run,
-      role: "worker",
       stepId: nodeId,
       timeout,
       streamCap,
@@ -42,7 +41,6 @@ export function resolveWorkflowSettings(input: {
       ? null
       : resolveExecutionSite({
           site: node.validator,
-          role: "verifier",
           stepId: nodeId,
           timeout,
           streamCap,
@@ -83,7 +81,6 @@ export function resolveWorkflowSettings(input: {
 
 function resolveExecutionSite(input: {
   site: NodeDefinition["run"] | NonNullable<NodeDefinition["validator"]>;
-  role: "worker" | "verifier";
   stepId: string;
   timeout: string;
   streamCap: string | undefined;
@@ -108,14 +105,12 @@ function resolveExecutionSite(input: {
     site: input.site.agent,
     workflowDefault: input.workflowDefault,
     machine: input.machineDefault,
-    context: { role: input.role, stepId: input.stepId },
   });
   if (resolved.model === null) {
     throw new Error("agent model is unresolved; set agent.model on the step, workflow defaults, or machine config");
   }
   return {
     kind: "agent",
-    harnessCommand: resolved.harnessCommand,
     model: resolved.model.full,
     instructions: input.site.agent.instructions,
     ...common,

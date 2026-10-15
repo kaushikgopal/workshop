@@ -5,6 +5,7 @@ import { join, resolve as resolvePath } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { Models } from "@earendil-works/pi-ai";
 import { createRegistry, Harness, type Conversation, type ConversationId, type TaskGraph, type TaskGraphWatch, type TaskId, type Tx } from "@earendil-works/pi-durable";
+import { CodingTools } from "@earendil-works/pi-durable/tools";
 import { canonicalHash } from "../definition/hash-canonical-json.js";
 import { parseModel } from "../definition/parse-model.js";
 import { createWorkshopModels } from "../model/create-workshop-models.js";
@@ -14,7 +15,6 @@ import { buildBotChatEntries, decodeBotChatCursor, encodeBotChatCursor, pendingD
 import { botDocumentV1Schema, botChatViewV1Schema } from "../bot/schema.js";
 import { resolveRetryLimit } from "../definition/resolve-retry-limit.js";
 import { replyHumanWait } from "./reply-human-wait.js";
-import { checkInstallationHasNoOpenLegacyRuns } from "./check-legacy-runs.js";
 import { loadCheckedWorkflow, type CheckedWorkflow, type Installation } from "../installation/load-installation.js";
 import {
   activationIndexSchema,
@@ -40,10 +40,10 @@ import { parseTextResult, parseTaggedWorkerResult } from "../attempt/parse-tagge
 import { prepareRunAdmission } from "../run/prepare-admission.js";
 import { firstFixedRateDeadline } from "../run/decide-fixed-rate-schedule.js";
 import { parseDuration } from "../util/parse-units.js";
-import { createWorkflowContinuation } from "../storage/durable/create-workflow-continuation.js";
 import { admitPreparedRun } from "../storage/durable/admit-run.js";
 import { commitServiceMutation, findServiceMutationReceipt } from "../storage/durable/commit-service-mutation.js";
 import { defineWorkshopTasks, createWorkflowRunTaskInput, parseWorkflowRunTaskInput } from "../storage/durable/define-workshop-tasks.js";
+import { buildAgentExecutionEnvironment, defineAgentExecutionTask } from "../storage/durable/define-agent-execution-task.js";
 import { createCapacityGateTaskInput } from "../storage/durable/define-capacity-gate-task.js";
 import { createScheduleWakeupTaskInput, defineScheduleWakeupTask } from "../storage/durable/define-scheduler-wakeup-task.js";
 import {
@@ -65,7 +65,7 @@ import { ServiceRequestError, ServiceShutdownError, serveWorkshopService, type W
 import { serviceLogSectionPageV1Schema, serviceRunsPageV1Schema, type ServiceMetadataV1, type ServiceRequestV1 } from "./schema.js";
 import { diagramDtoSchema } from "../views/schema.js";
 
-const TASK_VERSIONS = { workflowRun: 10, nodeAttempt: 4, processExecution: 4, capacityGate: 1, scheduleWakeup: 1 } as const;
+const TASK_VERSIONS = { workflowRun: 11, nodeAttempt: 5, agentExecution: 1, processExecution: 4, capacityGate: 1, scheduleWakeup: 1 } as const;
 const STARTUP_RECONCILIATION_MS = 10_000;
 
 export function startWorkshopService(installation: Installation, models: Models = createWorkshopModels()) {
@@ -106,8 +106,10 @@ async function openServiceRuntime(
   };
 
   try {
+    const agentExecution = defineAgentExecutionTask({ getHarness: requireHarness });
     tasks = defineWorkshopTasks(metadata.bootId, {
       startupLaunchGate: "closed",
+      agentExecutionTask: agentExecution.task,
       beforeLaunch: async (conversationId, signal) => {
         if (projectionWriter === undefined) throw new Error("projection writer is not initialized");
         while (!signal.aborted) {
@@ -122,6 +124,7 @@ async function openServiceRuntime(
       installation,
       workflowRunTask: tasks.WorkflowRunTask,
       canAdmit: tasks.canLaunch,
+      waitForAdmission: tasks.waitForAdmission,
       runtimeManifest: {
         durableVersion: "1.0.2",
         integrationManifestHash: canonicalHash({ taskVersions: TASK_VERSIONS }),
@@ -131,8 +134,10 @@ async function openServiceRuntime(
     const registry = createRegistry();
     registry.install({
       name: "workshop-service-runtime",
-      tasks: [tasks.WorkflowRunTask, tasks.NodeAttemptTask, tasks.ProcessExecutionTask, tasks.CapacityGateTask, scheduleWakeupTask],
+      tasks: [tasks.WorkflowRunTask, tasks.NodeAttemptTask, tasks.ProcessExecutionTask, tasks.CapacityGateTask, agentExecution.task, scheduleWakeupTask],
     });
+    registry.install(agentExecution.guard.extension);
+    registry.install(CodingTools);
     const botExtension = createBotExtension({
       readStatus: async workflowId => await projectServiceRead(requireHarness(), installation, metadata, { version: 1, method: "status", ...(workflowId === undefined ? {} : { workflowId }) }),
       readRun: async (workflowId, runId) => await readBotRun(requireHarness(), installation, metadata, workflowId, runId),
@@ -144,13 +149,13 @@ async function openServiceRuntime(
     harness = await Harness.open(storage, {
       models,
       registry,
+      env: (target, context) => buildAgentExecutionEnvironment(target, context),
       onReport(error) {
         if (opening) openCleanupErrors.push(error);
         else console.error(`Durable harness reported an extension failure: ${errorText(error)}`);
       },
     }, BACKGROUND_CONTEXT);
     await ensureInstallationReady(harness, installation);
-    await checkInstallationHasNoOpenLegacyRuns(harness, BACKGROUND_CONTEXT);
     await reconcileStartupProcessTasks(harness, tasks, Date.now() + STARTUP_RECONCILIATION_MS);
     await assertNoUnreconciledProcessEvidence(harness, Date.now() + STARTUP_RECONCILIATION_MS, metadata.bootId);
     const runtimeHarness = harness;
@@ -361,7 +366,7 @@ async function openServiceRuntime(
             return result;
           }
           case "human.reply": {
-            const result = await replyHumanWait(activeHarness, activeTasks, request);
+            const result = await replyHumanWait(activeHarness, request);
             await refreshProjections();
             kickBot();
             return result;
@@ -736,6 +741,18 @@ async function startWorkflow(
   if (!admitted.ok) throw new Error(`${admitted.failure.kind}: ${admitted.failure.message}`);
   return admitted.value;
 }
+function hasHumanContinuation(run: ReadyRunForResolution): boolean {
+  if ((run.status !== "paused" && run.status !== "queued") || run.currentAttemptId !== null
+    || run.currentNodeId === null || (run.durable.capacityGateTaskId !== null && run.durable.capacityGateTaskId !== undefined)) return false;
+  const latestReply = [...(run.waits ?? [])].reverse().find((wait) => wait.settlement.kind === "replied");
+  if (latestReply?.settlement.kind !== "replied" || latestReply.settlement.action !== "continue") return false;
+  const waitIndex = run.chain.order.indexOf(latestReply.nodeId);
+  const successorIndex = waitIndex + 1;
+  return waitIndex >= 0 && successorIndex < run.chain.order.length
+    && run.currentNodeId === run.chain.order[successorIndex]
+    && run.nodes[successorIndex]?.status === "pending";
+}
+
 async function controlWorkflow(
   harness: Harness,
   tasks: ReturnType<typeof defineWorkshopTasks>,
@@ -805,9 +822,9 @@ async function controlWorkflow(
         }
 
         const desiredState = action === "pause" ? "paused" : action === "stop" ? "stopped" : "running";
-        const cancelTasklessWait = action === "stop" && (run.status === "waiting" || run.durable.continuationPending === true);
-        const resumeContinuation = action === "resume" && run.durable.continuationPending === true;
-        const cancelCapacityWait = cancelTasklessWait || (action === "stop" && run.status === "queued"
+        const humanContinuation = hasHumanContinuation(run);
+        const cancelAwaitHuman = action === "stop" && (run.status === "waiting" || humanContinuation);
+        const cancelCapacityWait = cancelAwaitHuman || (action === "stop" && run.status === "queued"
           && run.currentAttemptId === null && run.durable.capacityGateTaskId !== null
           && run.durable.capacityGateTaskId !== undefined);
         const status = cancelCapacityWait ? "cancelled" : restartingFailedPreflight ? "queued"
@@ -818,7 +835,8 @@ async function controlWorkflow(
         }
         const needsCapacityGate = action === "resume" && status === "queued"
           && !workflow.capacityReservations.includes(run.runId)
-          && (run.durable.capacityGateTaskId === null || run.durable.capacityGateTaskId === undefined);
+          && (run.durable.capacityGateTaskId === null || run.durable.capacityGateTaskId === undefined)
+          && !humanContinuation;
         if (status !== run.status || desiredState !== run.desiredState || restartingFailedPreflight || needsCapacityGate) {
           let workflowTaskId = run.durable.workflowTaskId;
           let capacityGateTaskId = run.durable.capacityGateTaskId ?? null;
@@ -834,7 +852,7 @@ async function controlWorkflow(
               failure: null,
               terminalOutput: null,
               currentAttemptId: null,
-              durable: { ...run.durable, capacityGateTaskId: null, continuationPending: false },
+              durable: { ...run.durable, capacityGateTaskId: null },
               waits: run.waits?.map((wait) => wait.settlement.kind === "pending"
                 ? { ...wait, settlement: { kind: "stopped" as const, resolvedAt: at } } : wait),
               nodes: run.currentNodeId === null ? run.nodes : run.nodes.map((node) =>
@@ -843,13 +861,6 @@ async function controlWorkflow(
             };
             workflow.openRunId = null;
             workflow.capacityReservations = workflow.capacityReservations.filter((runId) => runId !== run.runId);
-          }
-          if (resumeContinuation) {
-            const durable = await createWorkflowContinuation(tx, tasks, run, conversationId);
-            workflowTaskId = durable.workflowTaskId;
-            capacityGateTaskId = durable.capacityGateTaskId ?? null;
-            nextRun = { ...nextRun, durable };
-            reference.workflowTaskId = workflowTaskId;
           }
           if (restartingFailedPreflight) {
             if (run.preflight.kind !== "failed") throw new Error("failed preflight state changed before resume");

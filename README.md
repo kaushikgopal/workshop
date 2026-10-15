@@ -29,7 +29,8 @@ Set `agent.model` in `.workshop/workshop.yaml` to a model your Pi installation
 can use. The example model is a placeholder.
 
 WARNING: Workflows use your permissions. Review commands and agent instructions
-before starting a workflow. The Pi preset approves tool use without asking.
+before starting a workflow. Agent workers and verifiers run coding tools
+without asking.
 
 ### Watch it work
 
@@ -52,7 +53,7 @@ workshop status
 workshop diagram hemingway-retry
 workshop step describe hemingway-retry timestamp --json
 workshop logs hemingway-retry
-cat .workshop/state/hemingway-retry/results.md
+cat .workshop/state-v5/hemingway-retry/results.md
 workshop service stop
 ~~~
 
@@ -68,7 +69,7 @@ Try the human approval example:
 workshop start hemingway-approve --detach
 workshop status hemingway-approve
 workshop reply hemingway-approve --continue --answer 'Approved.'
-cat .workshop/state/hemingway-approve/results.md
+cat .workshop/state-v5/hemingway-approve/results.md
 ~~~
 
 Continue completes the draft run. The answer appears after its result block.
@@ -78,21 +79,29 @@ The workflow needs no publish step.
 
 One background service per installation owns the database and schedules. The
 CLI uses a private Unix socket. The service commits progress before taking the
-next action. It retires leftover process groups before recovery can repeat work.
+next action. It retires leftover command process groups before recovery can repeat work.
 
-Every process uses the same channels:
+Command workers, command verifiers, and preflight are processes. Agent
+workers and agent verifiers run as native conversations inside the service.
+Command processes share the same channels:
 
 | Channel | Contents |
 | --- | --- |
-| stdin | Input: previous output for command workers, a prompt for agents, the candidate output for command verifiers |
+| stdin | Input: previous output for command workers, the candidate output for command verifiers; preflight gets empty stdin |
 | stdout | Result, parsed after exit |
 | stderr | Progress and diagnostics, available as live previews and retained evidence |
 
-Exit zero is necessary for success. Nonzero exit fails even when stdout claims
-success. A process may ignore stdin or close it early; early closure is evidence,
-not a failure by itself.
+For a command, exit zero is necessary for success. Nonzero exit fails even when
+stdout claims success. A process may ignore stdin or close it early; early
+closure is evidence, not a failure by itself.
 
-Each attempt starts a worker, parses its stdout, and checks a configured verifier.
+Agent conversations take the prompt as text and return the final assistant
+text. Each turn and each tool result commits before the next. This gives
+recovery, not exactly-once: a replayed segment may repeat model calls. An
+interrupted tool call whose outside outcome is unknown blocks the run; a
+completed call with a committed receipt resumes.
+
+Each attempt starts a worker, parses its result stream, and checks a configured verifier.
 Accepted results advance the chain, complete it early, or create a human wait.
 Failures follow fixed retry rules. Blocks require an explicit resolution.
 When the concurrent-run limit is full, new work waits for capacity.
@@ -101,13 +110,16 @@ When the concurrent-run limit is full, new work waits for capacity.
 
 - **Admission freezes the definition and settings.** YAML edits affect new runs only.
 - **Retries and crash replay differ.** `retries: 2` permits three attempts.
-  Crash replay does not consume retries; each process execution permits at most
-  two crash relaunches.
+  Crash replay does not consume retries; each command process execution
+  permits at most two crash relaunches.
 - **Every step needs an explicit policy.** Set `retries` and `replay` on
   the step or in workflow `defaults`. Workshop supplies neither default.
 - **Repeating work needs permission.** `replay: safe` permits configured retries
   and automatic crash replay. `replay: never` requires `retries: 0`;
   an unknown external outcome blocks instead of repeating automatically.
+- **Agent interruptions recover, not repeat.** An agent commits each turn and
+  tool result. An interrupted tool call with an unknown outside outcome blocks
+  the run; a completed call with a committed receipt resumes.
 - **Verifiers must not mutate external state.** They always replay safely after
   a crash. Workshop repeats a verifier on saved evidence, not its successful worker.
 - **Retry exhaustion fails the run.** Two identical consecutive failures block
@@ -164,16 +176,18 @@ An optional `environment.preflight` object takes `command` and optional
 ### Result formats
 
 `result: text` is the default for every worker, including agents. The complete
-stdout becomes the output without trimming or tag interpretation. A zero exit
-creates a `succeeded` candidate. A configured verifier must accept it before
-the step succeeds. Set `result: tagged` explicitly when a worker needs
+result stream — stdout for a command, final assistant text for an agent —
+becomes the output without trimming or tag interpretation. A zero exit or a
+completed agent execution creates a `succeeded` candidate. A configured
+verifier must accept it before the step succeeds. Set `result: tagged`
+explicitly when a worker needs
 `needs_input` or `success_and_complete`. Text mode never infers those statuses
 from instructions or output. Agent verifiers use a strict decision-line format.
 
 Existing runs keep their frozen result modes. New admissions of YAML that relied
 on the former implicit tagged default for agents use text.
 
-A tagged worker writes these blocks to stdout in this order:
+A tagged worker writes these blocks to its result stream in this order:
 
 ```text
 <status>success_and_complete</status>
@@ -201,7 +215,7 @@ The candidate is original and distinct from earlier results.
 
 After trimming each line, exactly one line must equal accept, retry, or block.
 Analysis before the decision line is allowed but optional. Ignore that analysis
-for the decision; retain the raw stdout as evidence. The text after the decision
+for the decision; retain the raw output as evidence. The text after the decision
 line, trimmed, is the required, nonempty reason. For retry, the reason tells the worker
 what to change. Do not search inside sentences, change case, or strip Markdown.
 The reason permits at most 64 KiB in UTF-8.
@@ -215,10 +229,10 @@ between them. The last block ends at its last closing tag, so output can contain
 its own closing-tag text. Workshop removes one boundary newline, not all
 whitespace.
 
-Workshop rejects invalid UTF-8, duplicate or unknown worker blocks, and stdout
+Workshop rejects invalid UTF-8, duplicate or unknown worker blocks, and output
 over 1 MiB. Tagged worker reason and question fields permit at most 64 KiB.
 When present, these fields must contain non-whitespace text. A tagged status is
-only a proposal until verification accepts it. Agent verifier stdout also
+only a proposal until verification accepts it. Agent verifier output also
 rejects invalid UTF-8 and output over 1 MiB.
 
 ### Verification and feedback
@@ -231,9 +245,10 @@ never `accept`.
 
 A rejection retries only when retries remain and `replay: safe` permits it.
 Otherwise the run fails. A verifier always checks a valid candidate, even with
-`retries: 0`. Verifier launch errors, timeout, invalid verdicts, and exit
-126/127 block rather than repeating worker effects. A nonzero agent verifier exit
-also blocks; other nonzero command verifier exits reject the candidate.
+`retries: 0`. Verifier launch errors, timeout, invalid verdicts, and command exit
+126/127 block rather than repeating worker effects. Other nonzero command
+verifier exits reject the candidate. A native verifier that ends without a
+checked receipt blocks.
 
 Workshop saves bounded feedback before a retry. Agent workers receive it in
 the next prompt. Command workers receive the same stdin without feedback.
@@ -252,7 +267,7 @@ Submit request R-42 for 120 USD to the fake service.
 ```
 
 After verification, Workshop saves the exact proposal and question with a wait
-ID. The worker exits; the wait holds no capacity slot. Read the proposal with
+ID. The worker stops; the wait holds no capacity slot. Read the proposal with
 `workshop status <workflow>` or `workshop step describe <workflow> <step> --json`.
 Reply explicitly:
 
@@ -264,6 +279,8 @@ workshop reply submission --reject --answer 'The amount is too high.'
 
 Here `submission` is the workflow that requested the wait. Continue accepts
 the saved output and starts only the successor after capacity is available.
+The run keeps its identity: it releases its slot while waiting and reacquires
+one for the successor.
 The successor receives the proposal on stdin and `WORKSHOP_ANSWER` for a
 command, or the answer in an agent prompt. Reject cancels this occurrence without
 disabling its schedule. A conflicting or stale reply cannot advance the run.
@@ -278,11 +295,13 @@ Final-step Continue completes even while paused. Stop cancels a waiting run.
 | `WORKSHOP_RUN_ID`, `WORKSHOP_WORKFLOW_ID` | Run and workflow identity |
 | `WORKSHOP_STEP_ID`, `WORKSHOP_ATTEMPT` | Step and attempt number; preflight uses empty step and attempt 0 |
 | `WORKSHOP_EXECUTION_ID` | Process execution identity |
-| WORKSHOP_RESULTS_PATH, WORKSHOP_LOG_PATH | The workflow's single live results.md and execution.log files in .workshop/state/<workflow-id>/ |
+| WORKSHOP_RESULTS_PATH, WORKSHOP_LOG_PATH | The workflow's single live results.md and execution.log files in .workshop/state-v5/<workflow-id>/ |
 | `WORKSHOP_CANDIDATE_STATUS`, `WORKSHOP_RETRIES_LEFT` | Command verifier candidate status and retries left (`n` or `unlimited`) |
 | `WORKSHOP_ANSWER` | Committed answer for an answered wait's immediate successor and its verifier |
 | `WORKSHOP_PROVIDER`, `WORKSHOP_MODEL_ID`, `WORKSHOP_MODEL` | Agent provider, bare model ID, and provider/model |
 | `WORKSHOP_THINKING`, `WORKSHOP_MODEL_WITH_THINKING` | Agent thinking level and full model string |
+
+Command processes and agent tool shells receive these values for their execution.
 
 ## Commands
 
@@ -364,41 +383,30 @@ Durations accept `ms`, `s`, `m`, `h`, `d`, or `w`. Timeout and stream
 cap also accept `unlimited`. Byte caps use strings such as `"1024"`,
 `256kb`, or `1mb`.
 
-### Headless-agent command templates
+### Agent runtime
 
-`harness: pi` is the default. It expands to:
+`harness: pi` is the default and the only agent runtime; the selector is
+optional. Agents run as native conversations inside the service, not as
+subprocesses. Each execution gets its own conversation with a fixed
+coding-tool set. Model, thinking level, working directory, and shell resolve
+at admission and freeze for the run.
 
-```sh
-pi --print --approve --no-session --no-extensions --no-skills --no-context-files --no-mcp --model "$WORKSHOP_MODEL_WITH_THINKING"
-```
+Each turn and each tool result commits to the conversation. After an
+interruption the execution resumes from the last commit. Recovery is not
+exactly-once: a replayed segment may repeat model calls.
 
-Pi reads the prompt on stdin and writes the final assistant text to stdout.
-Worker results follow the step's result mode. Agent verifiers emit exactly one
-line containing only accept, retry, or block. Analysis may come first; a
-nonempty reason follows the decision. Pi text mode does not stream tool
-activity; an empty live preview is normal. Every verifier starts a fresh
-harness session.
+The final assistant text is the worker's or verifier's result stream, capped
+at 1 MiB. Worker results follow the step's result mode. Agent verifiers emit
+exactly one line containing only accept, retry, or block. Analysis may come
+first; a nonempty reason follows the decision.
 
-Use a custom command for another harness or a local adapter:
+Custom `harness.command` values are no longer supported; validation rejects
+them.
 
-```yaml
-agent:
-  model: example/custom-model:medium
-  harness:
-    command: './scripts/headless-agent --model "$WORKSHOP_MODEL" --thinking "$WORKSHOP_THINKING"'
-```
+### Command processes
 
-The script is supplied by you. It must read the full prompt from stdin, write
-only the declared result to stdout, and send diagnostics to stderr. Adapt
-structured harness event streams to final text before Workshop receives them.
-The same contract applies to custom worker and verifier harnesses. No per-process
-prompt or result files exist. Admission rejects custom commands that reference
-obsolete file-channel variables.
-
-### Worker processes
-
-Workers, verifiers, and preflight use `<shell> -c '<command>'` in separate
-process groups. This has "sh -c"-style semantics, not login-shell semantics. Login dotfiles are not sourced.
+Command workers, command verifiers, and preflight use
+`<shell> -c '<command>'` in separate process groups. This has "sh -c"-style semantics, not login-shell semantics. Login dotfiles are not sourced.
 Stdout retains at most 1 MiB independently of `stream_cap`. Stderr retains a
 head-and-tail window under the cap. Logs report retained and omitted bytes.
 
@@ -412,7 +420,7 @@ unchanged. Action commands must enforce limits and prevent duplicates themselves
 .workshop/
 ├─ workshop.yaml                    optional machine defaults
 ├─ workflows/<workflow>.yaml        workflow definitions
-└─ state/
+└─ state-v5/
    ├─ durable.db                    service-owned database
    ├─ service.json  service.lock    service identity and ownership
    ├─ captures/<run-id>/            temporary process captures
@@ -423,7 +431,7 @@ unchanged. Action commands must enforce limits and prevent duplicates themselves
       └─ execution-<UTC timestamp>-<admission-sequence>-<rotation-id>.log.gz  rotated execution evidence
 ~~~
 
-The private socket may live outside state/ to meet Unix socket path limits.
+The private socket may live outside state-v5/ to meet Unix socket path limits.
 Ignore .workshop/ in Git.
 
 Each workflow has one live results.md and one live execution.log. Each file
@@ -445,9 +453,12 @@ the oldest retained rotation.
 execution.log contains engine events, stderr, invalid stdout, preamble, trailer,
 feedback, and resolutions. Every section and process record has run and process
 labels. The database retains raw evidence. workshop logs exposes it through the
-service. Stdout and stderr remain separate, without reconstructed interleaving.
+service. Native agent executions surface as receipts: execution ID,
+conversation ID, assistant entry ID, and final-text hash. They carry no
+process identity.
+Stdout and stderr remain separate, without reconstructed interleaving.
 
-The captures/ directory holds temporary stdout and stderr files. The service
+The captures/ directory holds temporary command stdout and stderr files. The service
 imports retained bytes into Durable state before cleanup, and it keeps unresolved
 captures across restart.
 
@@ -500,7 +511,8 @@ On a TTY, `status` opens two screens. The overview has three columns:
 Arrow keys or `j`/`k` select a workflow; Enter opens its detail screen.
 Next-run times use the machine's local time.
 
-The detail screen shows the chain vertically. Running steps preview live stderr;
+The detail screen shows the chain vertically. Running command steps preview
+live stderr; agent steps have no process stream;
 succeeded steps show accepted output; failed or blocked steps show failure evidence.
 Skipped steps have no preview. Previews show 40 lines; `e` expands the selected
 step. Escape or Backspace returns to the overview. `q` quits.
@@ -516,16 +528,24 @@ detached startup discards service stdout and stderr.
 
 ### Upgrade
 
-Drain runs before upgrading. Finish or stop open runs with the previous build. Existing .workshop/runs/ and .workshop/archive/ folders stay in place. The new service leaves them unused.
-The new service refuses startup if an open run uses a workflow format older
-than 4. Settled history stays readable. Incompatible task definitions block as
-`runtime_incompatible` instead of continuing under different code.
+WARNING: Run one build at a time against an installation. Overlapping old and
+new runs can repeat external effects. v5 cannot enforce draining because it
+never reads the old state.
+
+Finish or stop open runs and stop the old service using the old build first.
+Then start the new build. v5 keeps all state in `.workshop/state-v5/`. It never
+opens, migrates, or deletes older state directories. Existing `.workshop/runs/`
+and `.workshop/archive/` folders stay in place, unused. Incompatible task
+definitions still block as `runtime_incompatible` instead of continuing under
+different code.
 
 Migrate workflow files to `version: 4`. Replace `max_attempts: N` with
 `retries: N-1`. Replace `check` with `verify`. Remove machine and workflow
 `orchestrator` settings and workflow `keep_files` settings. Set `bot.model` only
 when you want the shared bot. Declare `retries` and `replay` for every step
-or in `defaults`. Update harnesses to the stdin/stdout/stderr contract. Remove custom uses of WORKSHOP_ARCHIVE. WORKSHOP_RESULTS_PATH and WORKSHOP_LOG_PATH now point to workflow-owned files in state/<workflow-id>/.
+or in `defaults`. Remove custom uses of WORKSHOP_ARCHIVE. WORKSHOP_RESULTS_PATH
+and WORKSHOP_LOG_PATH point to workflow-owned files in
+state-v5/<workflow-id>/.
 
 ## Contributing
 

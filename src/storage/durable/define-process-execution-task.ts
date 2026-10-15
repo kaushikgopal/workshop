@@ -5,7 +5,6 @@ import type { Context } from "@earendil-works/chord";
 import { defineTask, type ConversationId, type Task, type TaskRuntime, type Tx } from "@earendil-works/pi-durable";
 import { z } from "zod";
 import { canonicalHash } from "../../definition/hash-canonical-json.js";
-import { parseModel } from "../../definition/parse-model.js";
 import { nodeIdSchema, workflowIdSchema } from "../../definition/schema.js";
 import {
   executionIdSchema,
@@ -23,6 +22,7 @@ import {
   blockInfoSchema,
   runIdSchema,
   type BlockInfo,
+  nodeResultStatus,
 } from "../../run/schema.js";
 import {
   persistedNodeAttemptSchema,
@@ -129,16 +129,8 @@ export function buildProcessExecutionEnvironment(
     const candidate = attempt.result.candidate;
     const retries = nodeSettings?.retries;
     if (retries === undefined) throw new Error("command validator environment lacks frozen retry settings");
-    env.WORKSHOP_CANDIDATE_STATUS = candidate.version === 2 ? candidate.stdioResult.status : "succeeded";
+    env.WORKSHOP_CANDIDATE_STATUS = nodeResultStatus(candidate);
     env.WORKSHOP_RETRIES_LEFT = retries === "unlimited" ? "unlimited" : String(Math.max(0, retries + 1 - attempt.number));
-  }
-  if (site.kind === "agent") {
-    const model = parseModel(site.model);
-    env.WORKSHOP_PROVIDER = model.provider;
-    env.WORKSHOP_MODEL_ID = model.modelId;
-    env.WORKSHOP_MODEL = model.provider + "/" + model.modelId;
-    env.WORKSHOP_THINKING = model.thinking;
-    env.WORKSHOP_MODEL_WITH_THINKING = model.full;
   }
   return env;
 }
@@ -210,26 +202,59 @@ type PersistedNodeAttempt = z.infer<typeof persistedNodeAttemptSchema>;
 type ProcessRuntime = TaskRuntime<ProcessExecutionTaskInput, ProcessCheckpoint, ProcessExecutionTaskResult, object>;
 export type ProcessExecutionTaskDefinition = Task<ProcessExecutionTaskInput, ProcessCheckpoint, ProcessExecutionTaskResult, object>;
 
-/** Owns OS-process lifecycle and capture evidence for every Durable execution role. */
-export function defineProcessExecutionTask(
-  serviceBootId: string = randomUUID(),
-  options: { readonly startupLaunchGate?: "open" | "closed"; readonly beforeLaunch?: (conversationId: ConversationId, signal: AbortSignal) => Promise<void> } = {},
-): {
+export type ProcessExecutionTaskFactory = {
   readonly serviceBootId: string;
   readonly task: ProcessExecutionTaskDefinition;
   readonly stopLaunching: () => void;
   readonly canLaunch: () => boolean;
   readonly openStartupLaunchGate: () => void;
-} {
+  readonly waitForAdmission: (signal: AbortSignal) => Promise<void>;
+};
+
+/** Owns OS-process lifecycle and capture evidence for command executions. */
+export function defineProcessExecutionTask(
+  serviceBootId: string = randomUUID(),
+  options: { readonly startupLaunchGate?: "open" | "closed"; readonly beforeLaunch?: (conversationId: ConversationId, signal: AbortSignal) => Promise<void> } = {},
+): ProcessExecutionTaskFactory {
   let acceptingLaunches = true;
-  let releaseStartupLaunchGate: (() => void) | undefined;
-  const startupLaunchGate = options.startupLaunchGate === "closed"
-    ? new Promise<void>((resolve) => { releaseStartupLaunchGate = resolve; })
-    : Promise.resolve();
+  let startupLaunchGateOpen = options.startupLaunchGate !== "closed";
+  type AdmissionWaiter = { readonly open: () => void };
+  const admissionWaiters = new Set<AdmissionWaiter>();
+  const canLaunch = () => acceptingLaunches;
+  const waitForAdmission = (signal: AbortSignal): Promise<void> => {
+    if (signal.aborted) return Promise.reject(signal.reason);
+    if (acceptingLaunches && startupLaunchGateOpen) return Promise.resolve();
+
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const cleanup = () => {
+        signal.removeEventListener("abort", onAbort);
+        admissionWaiters.delete(waiter);
+      };
+      const finish = (complete: () => void) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        complete();
+      };
+      const onAbort = () => finish(() => reject(signal.reason));
+      const waiter: AdmissionWaiter = { open: () => finish(resolve) };
+      admissionWaiters.add(waiter);
+      signal.addEventListener("abort", onAbort, { once: true });
+
+      if (signal.aborted) onAbort();
+      else if (acceptingLaunches && startupLaunchGateOpen) waiter.open();
+    });
+  };
+  const stopLaunching = () => {
+    acceptingLaunches = false;
+  };
   const openStartupLaunchGate = () => {
-    const release = releaseStartupLaunchGate;
-    releaseStartupLaunchGate = undefined;
-    release?.();
+    if (startupLaunchGateOpen) return;
+    startupLaunchGateOpen = true;
+    if (acceptingLaunches) {
+      for (const waiter of [...admissionWaiters]) waiter.open();
+    }
   };
   const launched = new Set<string>();
   const trackedProcesses = new Map<string, TrackedProcess>();
@@ -240,7 +265,7 @@ export function defineProcessExecutionTask(
     initial: () => ({ phase: "intent" }),
     phases: {
       intent: async (task, runtime, context) => {
-        await waitForStartupLaunchGate(startupLaunchGate, runtime.signal);
+        await waitForAdmission(runtime.signal);
         const input = parseProcessInput(task.input);
         const run = await snapshotRun(runtime, context);
 
@@ -641,28 +666,11 @@ export function defineProcessExecutionTask(
   return {
     serviceBootId,
     task,
-    stopLaunching: () => { acceptingLaunches = false; },
-    canLaunch: () => acceptingLaunches,
+    stopLaunching,
+    canLaunch,
     openStartupLaunchGate,
+    waitForAdmission,
   };
-}
-
-async function waitForStartupLaunchGate(
-  gate: Promise<void>,
-  signal: AbortSignal,
-): Promise<void> {
-  if (signal.aborted) throw signal.reason ?? new Error("process launch wait was aborted");
-  await new Promise<void>((resolve, reject) => {
-    const onAbort = () => {
-      signal.removeEventListener("abort", onAbort);
-      reject(signal.reason ?? new Error("process launch wait was aborted"));
-    };
-    signal.addEventListener("abort", onAbort, { once: true });
-    void gate.then(() => {
-      signal.removeEventListener("abort", onAbort);
-      resolve();
-    }, reject);
-  });
 }
 
 async function blockProcess(
@@ -827,19 +835,12 @@ function processSpawnEnvironment(input: ProcessExecutionTaskInput, run: ReadyRun
       ? settings.nodes[input.nodeId]?.run ?? null
       : settings.nodes[input.nodeId]?.validator ?? null;
   const environment: NodeJS.ProcessEnv = { ...input.env };
-  const removed = [
-    "WORKSHOP_PROMPT_FILE", "WORKSHOP_RESULT_FILE", "WORKSHOP_PREVIOUS_OUTPUT_FILE",
-    "WORKSHOP_STEP_OUTPUT_FILE", "WORKSHOP_WORKLOG_FILE", "WORKSHOP_STDOUT_FILE",
-    "WORKSHOP_STDERR_FILE", "WORKSHOP_BIN",
-  ];
+  const removed: string[] = [];
   if (input.nodeId === null || committedHumanAnswer(run, input.nodeId) === null) removed.push("WORKSHOP_ANSWER");
   if (input.role !== "validator" || site?.kind !== "command") {
     removed.push("WORKSHOP_CANDIDATE_STATUS", "WORKSHOP_RETRIES_LEFT");
   }
-  if (site?.kind !== "agent") {
-    removed.push("WORKSHOP_PROVIDER", "WORKSHOP_MODEL_ID", "WORKSHOP_MODEL", "WORKSHOP_THINKING", "WORKSHOP_MODEL_WITH_THINKING");
-  }
-  // Node drops undefined values from the child environment, which clears inherited Workshop channels.
+  // Node drops undefined values, so channels that this process cannot use do not inherit service values.
   for (const name of removed) environment[name] = undefined;
   return environment as Record<string, string>;
 }
@@ -937,7 +938,7 @@ function assertProcessIdentity(
   const attempt = requireAttempt(run, input.nodeId, input.attemptId);
   const nodeSettings = format4Settings(run).nodes[input.nodeId];
   const site = input.role === "worker" ? nodeSettings?.run : nodeSettings?.validator;
-  const command = site?.kind === "command" ? site.command : site?.kind === "agent" ? site.harnessCommand : null;
+  const command = site?.kind === "command" ? site.command : null;
   const executionId = input.role === "worker" ? attempt.workerExecutionId : attempt.validatorExecutionId;
   const authorizedAttempt = input.role === "worker"
     ? attempt.status === "executing" && attempt.result.kind === "pending"
@@ -955,7 +956,7 @@ function assertProcessIdentity(
     || input.workflowTaskId !== run.durable.workflowTaskId || input.nodeTaskId !== attempt.taskId
     || executionId !== input.executionId || input.incarnationNumber !== expectedIncarnationNumber
     || (requireExecuting && !authorizedAttempt) || (requireReference && !hasReference)
-    || site === undefined || site === null || command !== input.command
+    || site === undefined || site === null || site.kind !== "command" || command !== input.command
     || site.shell !== input.shell || site.cwd !== input.cwd || site.timeoutMs !== input.timeoutMs
     || site.streamCapBytes !== input.streamCapBytes || site.replay !== input.replay || !validDeadline
     || input.stdoutPath !== paths.stdoutPath

@@ -1,9 +1,10 @@
+import { createHash } from "node:crypto";
 import { isAbsolute } from "node:path";
 import { z } from "zod";
 import { validatorVerdictSchema } from "../attempt/parse-result.js";
-import { processExitSchema } from "../process/schema.js";
+import { executionIdSchema, processExitSchema } from "../process/schema.js";
 import { nodeIdSchema } from "../definition/schema.js";
-import { sha256Schema, utcTimestampSchema } from "../util/schema.js";
+import { byteCountSchema, sha256Schema, utcTimestampSchema } from "../util/schema.js";
 
 export const runIdSchema = z.string().min(1).brand<"RunId">();
 export const activationIdSchema = z.string().min(1).brand<"ActivationId">();
@@ -94,12 +95,39 @@ const boundedCandidateText = (maxBytes: number) => z.string()
     `text must be at most ${maxBytes} UTF-8 bytes`,
   );
 
+export const nativeExecutionReceiptSchema = z.strictObject({
+  executionId: executionIdSchema,
+  conversationId: z.number().int().positive().refine(Number.isSafeInteger),
+  requestId: z.string().min(1),
+  assistantEntryId: z.number().int().positive().refine(Number.isSafeInteger),
+  finalTextSha256: sha256Schema,
+  byteCount: byteCountSchema,
+  finalText: boundedCandidateText(1024 * 1024).optional(),
+  startedAt: z.number().int().nonnegative().refine(Number.isSafeInteger),
+  finishedAt: z.number().int().nonnegative().refine(Number.isSafeInteger),
+}).superRefine((receipt, context) => {
+  if (receipt.finishedAt < receipt.startedAt) {
+    context.addIssue({ code: "custom", path: ["finishedAt"], message: "native execution finishes after it starts" });
+  }
+  if (receipt.finalText !== undefined) {
+    if (Buffer.byteLength(receipt.finalText, "utf8") !== receipt.byteCount) {
+      context.addIssue({ code: "custom", path: ["byteCount"], message: "native execution byte count matches its recorded text" });
+    }
+    const finalTextSha256 = "sha256:" + createHash("sha256").update(receipt.finalText, "utf8").digest("hex");
+    if (finalTextSha256 !== receipt.finalTextSha256) {
+      context.addIssue({ code: "custom", path: ["finalText"], message: "native execution text matches its recorded hash" });
+    }
+  }
+});
+
+
 export const failureInfoSchema = z.strictObject({
   kind: failureKindSchema,
   message: boundedReason,
   failedAt: utcTimestampSchema,
   nodeId: nodeIdSchema.nullable(),
   attemptId: attemptIdSchema.nullable(),
+  nativeExecution: nativeExecutionReceiptSchema.optional(),
 });
 
 export const blockInfoSchema = z.strictObject({
@@ -230,13 +258,15 @@ const nonemptyWellFormedCandidateField = (maximumBytes: number, label: string) =
     label + " must be at most " + maximumBytes + " UTF-8 bytes",
   );
 
-const stdioResultSchema = z.strictObject({
+const parsedAgentResultSchema = z.strictObject({
   version: z.literal(1),
   mode: z.enum(["text", "tagged"]),
   status: z.enum(["succeeded", "success_and_complete", "needs_input"]),
   reason: nonemptyWellFormedCandidateField(64 * 1024, "reason").nullable(),
   question: nonemptyWellFormedCandidateField(64 * 1024, "question").nullable(),
 });
+
+const stdioResultSchema = parsedAgentResultSchema;
 
 const nodeResultV2Fields = {
   version: z.literal(2),
@@ -256,8 +286,19 @@ const nodeResultV2Schema = z.discriminatedUnion("source", [
   }),
 ]);
 
+const nodeResultV3Schema = z.strictObject({
+  version: z.literal(3),
+  source: z.literal("agent"),
+  output: boundedCandidateText(1024 * 1024),
+  summary: boundedCandidateText(64 * 1024),
+  artifacts: z.array(resultArtifactSchema).max(100),
+  sourceBytesHash: sha256Schema,
+  nativeExecution: nativeExecutionReceiptSchema,
+  agentResult: parsedAgentResultSchema,
+});
+
 /** Canonical checked candidate. Operator acceptance preserves its own provenance and source block. */
-export const nodeResultSchema = z.union([nodeResultV1Schema, nodeResultV2Schema]).superRefine((result, context) => {
+export const nodeResultSchema = z.union([nodeResultV1Schema, nodeResultV2Schema, nodeResultV3Schema]).superRefine((result, context) => {
   if (result.version === 1) {
     if (result.source === "agent" && result.output.length === 0) {
       context.addIssue({ code: "custom", path: ["output"], message: "agent output must be nonempty" });
@@ -276,6 +317,33 @@ export const nodeResultSchema = z.union([nodeResultV1Schema, nodeResultV2Schema]
       if (result.workerKind === "agent" && result.output.length === 0) {
         context.addIssue({ code: "custom", path: ["output"], message: "agent results must be nonempty" });
       }
+    }
+    return;
+  }
+
+  if (result.version === 3) {
+    if (result.sourceBytesHash !== result.nativeExecution.finalTextSha256) {
+      context.addIssue({ code: "custom", path: ["sourceBytesHash"], message: "native result hash matches its execution receipt" });
+    }
+    if (result.artifacts.length !== 0) {
+      context.addIssue({ code: "custom", path: ["artifacts"], message: "native agent candidates do not contain artifacts" });
+    }
+    if (result.summary !== (result.agentResult.reason ?? "")) {
+      context.addIssue({ code: "custom", path: ["summary"], message: "native candidate summary matches its reason" });
+    }
+    if (result.agentResult.mode === "text" && (result.agentResult.status !== "succeeded"
+      || result.agentResult.reason !== null || result.agentResult.question !== null)) {
+      context.addIssue({ code: "custom", path: ["agentResult"], message: "text results have succeeded status without tagged fields" });
+    }
+    if (result.agentResult.status === "needs_input") {
+      if (result.agentResult.question === null) {
+        context.addIssue({ code: "custom", path: ["agentResult", "question"], message: "needs_input requires a question" });
+      }
+      if (result.output.trim().length === 0) {
+        context.addIssue({ code: "custom", path: ["output"], message: "needs_input requires nonempty output" });
+      }
+    } else if (result.agentResult.question !== null) {
+      context.addIssue({ code: "custom", path: ["agentResult", "question"], message: "question is only valid for needs_input" });
     }
     return;
   }
@@ -335,6 +403,16 @@ export const validatorOutcomeSchema = z.discriminatedUnion("kind", [
     resultBytesHash: sha256Schema,
   }),
   z.strictObject({
+    kind: z.literal("native_agent"),
+    nativeExecution: nativeExecutionReceiptSchema,
+    verdict: agentValidatorVerdictSchema,
+    resultBytesHash: sha256Schema,
+  }).superRefine((outcome, context) => {
+    if (outcome.resultBytesHash !== outcome.nativeExecution.finalTextSha256) {
+      context.addIssue({ code: "custom", path: ["resultBytesHash"], message: "native verifier hash matches its execution receipt" });
+    }
+  }),
+  z.strictObject({
     kind: z.literal("operator"),
     verdict: validatorVerdictSchema,
     resultBytesHash: sha256Schema,
@@ -384,7 +462,8 @@ export const nodeAttemptOutcomeSchema = z.discriminatedUnion("kind", [
   }
   if (outcome.kind === "failed" || outcome.kind === "blocked") {
     if (outcome.validator !== null && outcome.candidate === null
-      && !(outcome.validator.kind === "agent" && outcome.validator.verdict.version === 2 && outcome.validator.verdict.decision !== "accept")) {
+      && !((outcome.validator.kind === "agent" || outcome.validator.kind === "native_agent")
+        && outcome.validator.verdict.version === 2 && outcome.validator.verdict.decision !== "accept")) {
       context.addIssue({ code: "custom", path: ["candidate"], message: "validator outcomes require a committed candidate" });
     }
   }
@@ -403,7 +482,7 @@ export const nodeAttemptOutcomeSchema = z.discriminatedUnion("kind", [
     if (["timeout", "process_error", "result_invalid", "result_too_large"].includes(outcome.failure.kind) && validatorPassed) {
       context.addIssue({ code: "custom", path: ["validator"], message: "execution failures cannot retain a passing validator result" });
     }
-    if ((executionFailure || resultFailure) && outcome.validator?.kind === "agent"
+    if ((executionFailure || resultFailure) && (outcome.validator?.kind === "agent" || outcome.validator?.kind === "native_agent")
       && !(outcome.candidate === null && outcome.validator.verdict.version === 2 && outcome.validator.verdict.decision === "retry")) {
       context.addIssue({ code: "custom", path: ["validator"], message: "execution failures retain process evidence, not an agent verdict" });
     }
@@ -433,3 +512,15 @@ export type NodeResult = z.infer<typeof nodeResultSchema>;
 export type ValidatorOutcome = z.infer<typeof validatorOutcomeSchema>;
 export type NodeAttemptOutcome = z.infer<typeof nodeAttemptOutcomeSchema>;
 export type RunOutcome = z.infer<typeof runOutcomeSchema>;
+
+export function nodeResultStatus(candidate: NodeResult): "succeeded" | "success_and_complete" | "needs_input" {
+  if (candidate.version === 2) return candidate.stdioResult.status;
+  if (candidate.version === 3) return candidate.agentResult.status;
+  return "succeeded";
+}
+
+export function nodeResultQuestion(candidate: NodeResult): string | null {
+  if (candidate.version === 2) return candidate.stdioResult.question;
+  if (candidate.version === 3) return candidate.agentResult.question;
+  return null;
+}

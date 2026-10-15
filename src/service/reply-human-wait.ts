@@ -5,16 +5,13 @@ import { installationDocumentV1Schema } from "../installation/schema.js";
 import { workflowRunDocumentV1Schema, workshopEventV1Schema } from "../run/records.js";
 import { humanReplyResultSchema } from "../run/schema.js";
 import { commitServiceMutation } from "../storage/durable/commit-service-mutation.js";
-import { createWorkflowContinuation } from "../storage/durable/create-workflow-continuation.js";
 import { WorkshopEventEntry, WorkshopInstallationDoc, WorkshopRunDoc } from "../storage/durable/define-workshop-records.js";
-import type { defineWorkshopTasks } from "../storage/durable/define-workshop-tasks.js";
 import type { ServiceRequestV1 } from "./schema.js";
 import { ServiceRequestError } from "./serve-workshop-service.js";
 
 /** Only the socket caller can commit human provenance. Replies never re-admit a run. */
 export async function replyHumanWait(
   harness: Harness,
-  tasks: ReturnType<typeof defineWorkshopTasks>,
   request: Extract<ServiceRequestV1, { method: "human.reply" }>,
 ): Promise<unknown> {
   const result = await commitServiceMutation({
@@ -68,13 +65,13 @@ export async function replyHumanWait(
         workflowId: run.workflowId, runId: run.runId, waitId: wait.waitId, status,
         desiredState: reject ? "stopped" : run.desiredState, resolvedAt: at,
       });
-      let next: Extract<typeof run, { state: "ready" }> = {
+      const next: Extract<typeof run, { state: "ready" }> = {
         ...run, status, desiredState: response.desiredState,
         finishedAt: reject || final ? at : null,
         terminalOutput: !reject && final ? wait.output : null,
         currentNodeId: reject ? wait.nodeId : final ? null : run.chain.order[nodeIndex + 1] ?? null,
         currentAttemptId: null,
-        durable: { ...run.durable, continuationPending: !reject && !final && status === "paused" },
+        durable: { ...run.durable, capacityGateTaskId: null },
         nodes: run.nodes.map((node) => node.nodeId === wait.nodeId
           ? { ...node, status: reject ? "cancelled" : "succeeded", successfulAttemptId: reject ? null : wait.attemptId }
           : node),
@@ -82,9 +79,6 @@ export async function replyHumanWait(
           ? { ...value, settlement: { kind: "replied", provenance: "human", action: request.action, answer: request.answer, response } }
           : value),
       };
-      if (status === "queued") {
-        next = { ...next, durable: await createWorkflowContinuation(tx, tasks, next, conversationId) };
-      }
       Object.assign(draft, workflowRunDocumentV1Schema.parse(next));
       reference.status = status;
       reference.workflowTaskId = next.durable.workflowTaskId;

@@ -1,23 +1,20 @@
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { createModels } from "@earendil-works/pi-ai/models";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
-import { createRegistry, Harness, type ConversationId } from "@earendil-works/pi-durable";
+import { fauxAssistantMessage, type FauxResponseFactory } from "@earendil-works/pi-ai/providers/faux";
 import { loadInstallation, loadCheckedWorkflow } from "../src/installation/load-installation.js";
-import { installationDocumentV1Schema } from "../src/installation/schema.js";
-import { workshopProcessV1Schema } from "../src/run/records.js";
 import { serviceLogSectionPageV1Schema, serviceRunsPageV1Schema, serviceStartResultV1Schema } from "../src/service/schema.js";
 import { probeServiceHealth } from "../src/service/probe-service-health.js";
 import { readServiceWorklog, sendServiceRequest, streamServiceLogChunks } from "../src/service/send-service-request.js";
 import { acquireServiceLock } from "../src/service/acquire-service-lock.js";
-import { WorkshopInstallationDoc, WorkshopProcessEntry } from "../src/storage/durable/define-workshop-records.js";
 import { openDurableStorage } from "../src/storage/durable/open-durable-storage.js";
 import { startWorkshopService } from "../src/service/open-service-runtime.js";
 import { checkBlockResolution } from "../src/run/check-block-resolution.js";
 import { logsDtoSchema, nodeDescriptionDtoSchema, statusDtoSchema, type LogsDto } from "../src/views/schema.js";
+import { createFauxModels } from "./fixtures/create-faux-models.js";
 
 async function waitForCompletedRun(socketPath: string, workflowId: string, runId: string): Promise<void> {
   const deadline = Date.now() + 15_000;
@@ -261,114 +258,64 @@ describe("Durable service runtime", () => {
     }
   });
 
-  test("renders committed capture text, marks unavailable content, and skips empty captures", async () => {
-    const root = mkdtempSync(join(tmpdir(), "workshop-log-text-integrity-"));
+  test("keeps native final text and receipt evidence without process captures", async () => {
+    const root = mkdtempSync(join(tmpdir(), "workshop-native-final-text-"));
     const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
     mkdirSync(workflows, { recursive: true });
-    const harnessCommand = String.raw`printf '<status>succeeded</status>\n<output>candidate</output>'
-case "$WORKSHOP_STEP_ID" in
-  bom) printf '\357\273\277raw-bom' >&2 ;;
-  invalid) printf '\377raw-invalid' >&2 ;;
-  readable) printf 'other sections remain readable' >&2 ;;
-  empty) : ;;
-esac`;
-    writeFileSync(join(config, "workshop.yaml"), `shell: /bin/sh\nkeep_files: always\nagent:\n  model: fixture/mock-model:medium\n  harness:\n    command: |\n${harnessCommand.split("\n").map((line) => `      ${line}`).join("\n")}\n`, "utf8");
-    writeFileSync(join(workflows, "capture-text.yaml"), [
+    writeFileSync(join(config, "workshop.yaml"), "shell: /bin/sh\nagent:\n  model: fixture/worker:medium\n");
+    const outputs = ["\uFEFFraw-bom", "\uFFFDvalid-unicode", "other final assistant text"];
+    writeFileSync(join(workflows, "native-text.yaml"), [
       "version: 4",
-      "defaults:",
-      "  retries: 0",
-      "  replay: never",
+      "defaults: { retries: 0, replay: never }",
       "steps:",
-      "  - bom:",
-      "      agent: Return the fixture result.",
-      "  - invalid:",
-      "      agent: Return the fixture result.",
-      "  - readable:",
-      "      agent: Return the fixture result.",
-      "  - empty:",
-      "      agent: Return the fixture result.",
+      ...outputs.flatMap((_, index) => ["  - step-" + (index + 1) + ":", "      agent: Return the fixture result."]),
       "",
-    ].join("\n"), "utf8");
+    ].join("\n"));
+    const { models } = createFauxModels(outputs.map(output => fauxAssistantMessage(output)));
     const installation = loadInstallation(root);
     let owner: Awaited<ReturnType<typeof startWorkshopService>> | undefined;
     try {
-      owner = await startWorkshopService(installation);
+      owner = await startWorkshopService(installation, models);
       const health = await probeServiceHealth(installation.stateDirectory);
       if (health.kind !== "ready") throw new Error(health.reason);
       const startedResponse = await sendServiceRequest(health.metadata.socketPath, {
-        version: 1, method: "start", requestId: "capture-text-start", workflowId: "capture-text",
+        version: 1, method: "start", requestId: "native-text-start", workflowId: "native-text",
       });
       if (!startedResponse.ok) throw new Error(startedResponse.error.message);
       const started = serviceStartResultV1Schema.parse(startedResponse.result);
-      await waitForCompletedRun(health.metadata.socketPath, "capture-text", started.runId);
-      const logSections: LogsDto["sections"] = [];
-      const logStream = await streamServiceLogChunks(health.metadata.socketPath, "capture-text", started.runId, (section, _runId, chunk) => {
-        expect(chunk.complete).toBe(true);
-        logSections.push(section);
-      });
-      const logs = logsDtoSchema.parse({ version: 2, runId: logStream.runId, sections: logSections });
-      const bom = logs.sections.find((section) => section.kind === "capture" && section.label === "bom worker stderr");
-      const unavailable = logs.sections.find((section) => section.kind === "capture" && section.label === "invalid worker stderr");
-      const readable = logs.sections.find((section) => section.kind === "capture" && section.label === "readable worker stderr");
-      expect(bom?.kind).toBe("capture");
-      if (bom?.kind !== "capture") throw new Error("BOM capture section is missing");
-      expect(bom.content).toBe("\uFEFFraw-bom");
-      expect(unavailable?.kind).toBe("capture");
-      if (unavailable?.kind !== "capture") throw new Error("unavailable capture section is missing");
-      expect(unavailable.content).toBe("[invalid UTF-8; base64 bytes]\n/3Jhdy1pbnZhbGlk");
-      expect(readable?.kind).toBe("capture");
-      if (readable?.kind !== "capture") throw new Error("readable capture section is missing");
-      expect(readable.content).toBe("other sections remain readable");
-      expect(logs.sections.some((section) => section.kind === "capture" && section.label === "empty worker stderr")).toBe(false);
-      const worklog = logs.sections.find((section) => section.kind === "worklog");
-      expect(worklog?.kind).toBe("worklog");
-      if (worklog?.kind !== "worklog") throw new Error("worklog section is missing");
-      expect(worklog.content.length).toBeGreaterThan(0);
-
-      const pages = [];
-      let cursor: string | undefined;
-      do {
-        const pageResponse = await sendServiceRequest(health.metadata.socketPath, {
-          version: 1, method: "logs.page", workflowId: "capture-text", runId: started.runId,
-          ...(cursor === undefined ? {} : { cursor }),
+      await waitForCompletedRun(health.metadata.socketPath, "native-text", started.runId);
+      for (const [index, output] of outputs.entries()) {
+        const descriptionResponse = await sendServiceRequest(health.metadata.socketPath, {
+          version: 1, method: "node.describe", workflowId: "native-text", nodeId: "step-" + (index + 1), runId: started.runId,
         });
-        if (!pageResponse.ok) throw new Error(pageResponse.error.message);
-        const page = serviceLogSectionPageV1Schema.parse(pageResponse.result);
-        pages.push(page.section);
-        cursor = page.nextCursor ?? undefined;
-      } while (cursor !== undefined);
-      expect(pages.map((section) => section.sectionId)).toEqual(logs.sections.map((section) => section.sectionId));
-      expect(pages.find((section) => section.kind === "capture" && section.label === "invalid worker stderr")?.content).toContain("base64 bytes");
+        if (!descriptionResponse.ok) throw new Error(descriptionResponse.error.message);
+        const detail = nodeDescriptionDtoSchema.parse(descriptionResponse.result);
+        expect(detail.node.successfulOutput).toBe(output);
+        expect(detail.node.attempts[0]?.processes).toEqual([]);
+        const evidence = JSON.stringify(detail);
+        expect(evidence).toContain(output);
+        expect(evidence).toContain(createHash("sha256").update(output).digest("hex"));
+        expect(evidence).toContain("finalTextSha256");
+        expect(evidence).toContain("conversationId");
+        expect(evidence).toContain("assistantEntryId");
+      }
     } finally {
       if (owner !== undefined) await owner.shutdown();
       rmSync(root, { recursive: true, force: true });
     }
   }, 30_000);
 
-  test("keeps large stderr diagnostics separate from tagged worker output", async () => {
-    const root = mkdtempSync(join(tmpdir(), "workshop-large-stderr-diagnostic-"));
+  test("keeps a large tagged final answer separate from command verification", async () => {
+    const root = mkdtempSync(join(tmpdir(), "workshop-large-agent-result-"));
     const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
+    const candidate = "x".repeat(70_000);
     const validatorLaunch = join(root, "validator-launched");
     const successorLaunch = join(root, "successor-launched");
     mkdirSync(workflows, { recursive: true });
-    const harnessCommand = [
-      "printf '<status>succeeded</status>\\n<output>candidate</output>'",
-      "head -c 70000 /dev/zero | tr '\\000' x >&2",
-    ].join("\n");
-    writeFileSync(join(config, "workshop.yaml"), [
-      "shell: /bin/sh",
-      "keep_files: always",
-      "stream_cap: 1kb",
-      "agent:",
-      "  model: fixture/mock-model:medium",
-      "  harness:",
-      "    command: |",
-      ...harnessCommand.split("\n").map((line) => "      " + line),
-      "",
-    ].join("\n"), "utf8");
-    writeFileSync(join(workflows, "large-stderr.yaml"), [
+    writeFileSync(join(config, "workshop.yaml"), "shell: /bin/sh\nkeep_files: always\nstream_cap: 1kb\nagent:\n  model: fixture/worker:medium\n");
+    writeFileSync(join(workflows, "large-result.yaml"), [
       "version: 4",
       "defaults: { retries: 0, replay: never }",
       "steps:",
@@ -376,106 +323,106 @@ esac`;
       "      result: tagged",
       "      agent: Return the fixture result.",
       "      verify:",
-      "        run: 'test \"$(cat)\" = candidate; printf launched > " + validatorLaunch + "'",
+      "        run: 'test \"$(wc -c)\" -eq 70000; printf launched > " + validatorLaunch + "'",
       "  - successor:",
-      "      run: 'test \"$(cat)\" = candidate; printf launched > " + successorLaunch + "; printf completed'",
+      "      run: 'test \"$(wc -c)\" -eq 70000; printf launched > " + successorLaunch + "; printf completed'",
       "",
-    ].join("\n"), "utf8");
+    ].join("\n"));
+    const finalText = "<status>succeeded</status>\n<output>" + candidate + "</output>";
+    const { models } = createFauxModels([fauxAssistantMessage(finalText)]);
     const installation = loadInstallation(root);
     let owner: Awaited<ReturnType<typeof startWorkshopService>> | undefined;
     try {
-      owner = await startWorkshopService(installation);
+      owner = await startWorkshopService(installation, models);
       const health = await probeServiceHealth(installation.stateDirectory);
       if (health.kind !== "ready") throw new Error(health.reason);
       const startedResponse = await sendServiceRequest(health.metadata.socketPath, {
-        version: 1, method: "start", requestId: "large-stderr-start", workflowId: "large-stderr",
+        version: 1, method: "start", requestId: "large-agent-result", workflowId: "large-result",
       });
       if (!startedResponse.ok) throw new Error(startedResponse.error.message);
       const started = serviceStartResultV1Schema.parse(startedResponse.result);
-      await waitForCompletedRun(health.metadata.socketPath, "large-stderr", started.runId);
+      await waitForCompletedRun(health.metadata.socketPath, "large-result", started.runId);
       const descriptionResponse = await sendServiceRequest(health.metadata.socketPath, {
-        version: 1, method: "node.describe", workflowId: "large-stderr", nodeId: "worker", runId: started.runId,
+        version: 1, method: "node.describe", workflowId: "large-result", nodeId: "worker", runId: started.runId,
       });
       if (!descriptionResponse.ok) throw new Error(descriptionResponse.error.message);
-      expect(nodeDescriptionDtoSchema.parse(descriptionResponse.result).node.successfulOutput).toBe("candidate");
+      const detail = nodeDescriptionDtoSchema.parse(descriptionResponse.result);
+      expect(detail.node.successfulOutput).toBe(candidate);
+      const candidateEvidence = detail.node.attempts[0]?.candidate;
+      if (candidateEvidence?.kind !== "candidate") throw new Error("native candidate evidence is missing");
+      expect(candidateEvidence.nativeExecution?.byteCount).toBe(new TextEncoder().encode(finalText).byteLength);
+      expect(detail.node.attempts[0]?.processes.map((process) => process.role)).toEqual(["validator"]);
+      expect(JSON.stringify(detail)).toContain("finalTextSha256");
+      expect(JSON.stringify(detail)).toContain(createHash("sha256").update(finalText).digest("hex"));
       expect(existsSync(validatorLaunch)).toBe(true);
       expect(existsSync(successorLaunch)).toBe(true);
-      const sections: LogsDto["sections"] = [];
-      await streamServiceLogChunks(health.metadata.socketPath, "large-stderr", started.runId, (section) => { sections.push(section); });
-      const diagnostic = sections.find((section) => section.kind === "capture" && section.label === "worker worker stderr");
-      expect(diagnostic?.kind).toBe("capture");
-      if (diagnostic?.kind !== "capture") throw new Error("worker stderr capture is missing");
-      expect(diagnostic.capture.totalBytes).toBe(70_000);
-      expect(diagnostic.capture.retainedBytes).toBe(1024);
-      expect(diagnostic.capture.complete).toBe(false);
-      const stdout = sections.find((section) => section.kind === "capture" && section.label === "worker worker stdout");
-      expect(stdout?.kind).toBe("capture");
-      if (stdout?.kind !== "capture") throw new Error("worker stdout capture is missing");
-      expect(stdout.content).toContain("<status>succeeded</status>");
     } finally {
       if (owner !== undefined) await owner.shutdown();
       rmSync(root, { recursive: true, force: true });
     }
   }, 30_000);
 
-  test("streams a valid 18 MiB capture through bounded, UTF-8-safe fragments", async () => {
-    const root = mkdtempSync(join(tmpdir(), "workshop-large-log-section-"));
+  test("rejects oversized native final text with its hash receipt", async () => {
+    const root = mkdtempSync(join(tmpdir(), "workshop-oversized-agent-result-"));
     const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
-    const outputBytes = 18 * 1024 * 1024;
-    const exactPrefix = "\uFEFFλ\r\n\u0001";
-    const beforeBoundaryCodePoint = 512 * 1024 - new TextEncoder().encode(exactPrefix).byteLength - 1;
+    const verifierLaunch = join(root, "verifier-launched");
+    const successorLaunch = join(root, "successor-launched");
+    const finalText = "x".repeat(1024 * 1024 + 1);
     mkdirSync(workflows, { recursive: true });
-    const harnessCommand = String.raw`printf '<status>succeeded</status>\n<output>candidate</output>'
-{
-  printf '\357\273\277\316\273\r\n\001'
-  head -c ${beforeBoundaryCodePoint} /dev/zero | tr '\000' x
-  printf '\342\202\254'
-  head -c 18874368 /dev/zero | tr '\000' x
-} >&2`;
-    writeFileSync(join(config, "workshop.yaml"), `shell: /bin/sh\nkeep_files: always\nstream_cap: unlimited\nagent:\n  model: fixture/mock-model:medium\n  harness:\n    command: |\n${harnessCommand.split("\n").map((line) => `      ${line}`).join("\n")}\n`, "utf8");
-    writeFileSync(join(workflows, "large-capture.yaml"), [
+    writeFileSync(join(config, "workshop.yaml"), "shell: /bin/sh\nagent:\n  model: fixture/worker:medium\n");
+    writeFileSync(join(workflows, "oversized.yaml"), [
       "version: 4",
-      "defaults:",
-      "  retries: 0",
-      "  replay: never",
+      "defaults: { retries: 0, replay: never }",
       "steps:",
-      "  - large:",
-      "      agent: Return the fixture result.",
+      "  - worker:",
+      "      agent: Return an oversized fixture result.",
+      "      verify: 'printf launched > " + verifierLaunch + "'",
+      "  - successor:",
+      "      run: 'printf launched > " + successorLaunch + "'",
       "",
-    ].join("\n"), "utf8");
+    ].join("\n"));
+    const { models } = createFauxModels([fauxAssistantMessage(finalText)]);
     const installation = loadInstallation(root);
     let owner: Awaited<ReturnType<typeof startWorkshopService>> | undefined;
     try {
-      owner = await startWorkshopService(installation);
+      owner = await startWorkshopService(installation, models);
       const health = await probeServiceHealth(installation.stateDirectory);
       if (health.kind !== "ready") throw new Error(health.reason);
       const startedResponse = await sendServiceRequest(health.metadata.socketPath, {
-        version: 1, method: "start", requestId: "large-capture-start", workflowId: "large-capture",
+        version: 1, method: "start", requestId: "oversized-agent-result", workflowId: "oversized",
       });
       if (!startedResponse.ok) throw new Error(startedResponse.error.message);
       const started = serviceStartResultV1Schema.parse(startedResponse.result);
-      await waitForCompletedRun(health.metadata.socketPath, "large-capture", started.runId);
-      const chunks: string[] = [];
-      const chunkBytes: number[] = [];
-      await streamServiceLogChunks(health.metadata.socketPath, "large-capture", started.runId, (section) => {
-        if (section.kind === "capture" && section.label === "large worker stderr" && section.content !== null) {
-          chunks.push(section.content);
-          chunkBytes.push(new TextEncoder().encode(section.content).byteLength);
-        }
-      }, 30_000);
-      const reconstructed = chunks.join("");
-      expect(chunkBytes.length).toBeGreaterThan(1);
-      expect(chunkBytes[0]).toBe(512 * 1024 - 1);
-      expect(chunks[1]?.startsWith("€")).toBe(true);
-      expect(Math.max(...chunkBytes)).toBeLessThanOrEqual(512 * 1024);
-      expect(new TextEncoder().encode(reconstructed).byteLength).toBe(outputBytes + beforeBoundaryCodePoint + 3 + new TextEncoder().encode(exactPrefix).byteLength);
-      expect(reconstructed).toBe(`${exactPrefix}${"x".repeat(beforeBoundaryCodePoint)}€${"x".repeat(outputBytes)}`);
+      const deadline = Date.now() + 15_000;
+      let run: ReturnType<typeof serviceRunsPageV1Schema.parse>["runs"][number] | undefined;
+      while (Date.now() < deadline) {
+        const response = await sendServiceRequest(health.metadata.socketPath, { version: 1, method: "runs", workflowId: "oversized", limit: 10 });
+        if (!response.ok) throw new Error(response.error.message);
+        run = serviceRunsPageV1Schema.parse(response.result).runs.find(item => item.runId === started.runId);
+        if (run?.status === "failed" || run?.status === "blocked") break;
+        await new Promise(resolveDelay => setTimeout(resolveDelay, 20));
+      }
+      expect(run?.status).toBe("failed");
+      const descriptionResponse = await sendServiceRequest(health.metadata.socketPath, {
+        version: 1, method: "node.describe", workflowId: "oversized", nodeId: "worker", runId: started.runId,
+      });
+      if (!descriptionResponse.ok) throw new Error(descriptionResponse.error.message);
+      const detail = nodeDescriptionDtoSchema.parse(descriptionResponse.result);
+      expect(detail.node.attempts[0]?.failure?.kind).toBe("result_too_large");
+      expect(detail.node.attempts[0]?.processes).toEqual([]);
+      const evidence = JSON.stringify(detail);
+      expect(evidence).toContain("finalTextSha256");
+      expect(evidence).toContain(createHash("sha256").update(finalText).digest("hex"));
+      expect(detail.node.attempts[0]?.failure?.nativeExecution?.byteCount)
+        .toBe(new TextEncoder().encode(finalText).byteLength);
+      expect(existsSync(verifierLaunch)).toBe(false);
+      expect(existsSync(successorLaunch)).toBe(false);
     } finally {
       if (owner !== undefined) await owner.shutdown();
       rmSync(root, { recursive: true, force: true });
     }
-  }, 60_000);
+  }, 30_000);
 
   test("streams compact and verbose worklogs through bounded pages", async () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-large-worklog-"));
@@ -484,19 +431,20 @@ esac`;
     const summaryBytes = 60_000;
     const nodeIds = Array.from({ length: 18 }, (_, index) => `node-${String(index).padStart(2, "0")}`);
     mkdirSync(workflows, { recursive: true });
-    const harnessCommand = String.raw`summary=$(head -c 60000 /dev/zero | tr '\000' y)
-printf '<status>succeeded</status>\n<reason>%s</reason>\n<output>candidate</output>' "$summary"`;
-    writeFileSync(join(config, "workshop.yaml"), `shell: /bin/sh\nagent:\n  model: fixture/mock-model:medium\n  harness:\n    command: |\n${harnessCommand.split("\n").map((line) => `      ${line}`).join("\n")}\n`, "utf8");
+    const summary = "y".repeat(summaryBytes);
+    const finalText = "<status>succeeded</status>\n<reason>" + summary + "</reason>\n<output>candidate</output>";
+    writeFileSync(join(config, "workshop.yaml"), "shell: /bin/sh\nagent:\n  model: fixture/worker:medium\n", "utf8");
     const stepLines = nodeIds.flatMap((nodeId) => [
       `  - ${nodeId}:`,
       "      result: tagged",
       "      agent: Return the fixture result.",
     ]);
     writeFileSync(join(workflows, "large-worklog.yaml"), ["version: 4", "defaults: { retries: 0, replay: never }", "steps:", ...stepLines, ""].join("\n"), "utf8");
+    const { models } = createFauxModels(nodeIds.map(() => fauxAssistantMessage(finalText)));
     const installation = loadInstallation(root);
     let owner: Awaited<ReturnType<typeof startWorkshopService>> | undefined;
     try {
-      owner = await startWorkshopService(installation);
+      owner = await startWorkshopService(installation, models);
       const health = await probeServiceHealth(installation.stateDirectory);
       if (health.kind !== "ready") throw new Error(health.reason);
       const startedResponse = await sendServiceRequest(health.metadata.socketPath, {
@@ -605,106 +553,61 @@ printf '<status>succeeded</status>\n<reason>%s</reason>\n<output>candidate</outp
     }
   }, 30_000);
 
-  test("uses Durable process order for late evidence and keeps each in-memory log snapshot consistent", async () => {
-    const root = mkdtempSync(join(tmpdir(), "workshop-retained-log-reopen-"));
+  test("retains native final-text receipts across a service reopen", async () => {
+    const root = mkdtempSync(join(tmpdir(), "workshop-native-evidence-reopen-"));
     const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
+    const finalText = "r".repeat(12_000);
     mkdirSync(workflows, { recursive: true });
-    const harnessCommand = String.raw`printf '<status>succeeded</status>\n<output>candidate</output>'
-head -c 12000 /dev/zero | tr '\000' r >&2`;
-    writeFileSync(join(config, "workshop.yaml"), `shell: /bin/sh\nkeep_files: always\nstream_cap: 1kb\nagent:\n  model: fixture/mock-model:medium\n  harness:\n    command: |\n${harnessCommand.split("\n").map((line) => `      ${line}`).join("\n")}\n`, "utf8");
+    writeFileSync(join(config, "workshop.yaml"), "shell: /bin/sh\nagent:\n  model: fixture/worker:medium\n");
     writeFileSync(join(workflows, "retained.yaml"), [
       "version: 4",
-      "defaults:",
-      "  retries: 0",
-      "  replay: never",
+      "defaults: { retries: 0, replay: never }",
       "steps:",
       "  - capture:",
       "      agent: Return the fixture result.",
       "",
-    ].join("\n"), "utf8");
+    ].join("\n"));
+    let requests = 0;
+    const response: FauxResponseFactory = () => {
+      requests += 1;
+      return fauxAssistantMessage(finalText);
+    };
+    const { models } = createFauxModels([response]);
     const installation = loadInstallation(root);
     let owner: Awaited<ReturnType<typeof startWorkshopService>> | undefined;
     try {
-      owner = await startWorkshopService(installation);
-      let health = await probeServiceHealth(installation.stateDirectory);
-      if (health.kind !== "ready") throw new Error(health.reason);
-      const socketPath = health.metadata.socketPath;
+      owner = await startWorkshopService(installation, models);
+      const socketPath = owner.metadata.socketPath;
+      if (socketPath === null) throw new Error("service socket path is missing");
       const startedResponse = await sendServiceRequest(socketPath, {
-        version: 1, method: "start", requestId: "retained-start", workflowId: "retained",
+        version: 1, method: "start", requestId: "native-evidence-reopen", workflowId: "retained",
       });
       if (!startedResponse.ok) throw new Error(startedResponse.error.message);
       const started = serviceStartResultV1Schema.parse(startedResponse.result);
       await waitForCompletedRun(socketPath, "retained", started.runId);
-      const firstResponse = await sendServiceRequest(socketPath, { version: 1, method: "logs.page", workflowId: "retained", runId: started.runId });
-      if (!firstResponse.ok) throw new Error(firstResponse.error.message);
-      const first = serviceLogSectionPageV1Schema.parse(firstResponse.result);
-      if (first.nextCursor === null) throw new Error("retained log snapshot has no capture continuation");
+      const beforeResponse = await sendServiceRequest(socketPath, {
+        version: 1, method: "node.describe", workflowId: "retained", nodeId: "capture", runId: started.runId,
+      });
+      if (!beforeResponse.ok) throw new Error(beforeResponse.error.message);
+      const before = nodeDescriptionDtoSchema.parse(beforeResponse.result);
+      expect(before.node.successfulOutput).toBe(finalText);
+      expect(before.node.attempts[0]?.processes).toEqual([]);
+      expect(JSON.stringify(before)).toContain(createHash("sha256").update(finalText).digest("hex"));
       await owner.shutdown();
       owner = undefined;
-      const reopenedStorage = await openDurableStorage(installation.databasePath);
-      if (!reopenedStorage.ok) throw new Error(reopenedStorage.failure.message);
-      const auditHarness = await Harness.open(reopenedStorage.storage, { models: createModels(), registry: createRegistry() }, BACKGROUND_CONTEXT);
-      try {
-        const installationDocument = installationDocumentV1Schema.safeParse(
-          await auditHarness.snapshot(WorkshopInstallationDoc, BACKGROUND_CONTEXT),
-        );
-        if (!installationDocument.success || installationDocument.data.state !== "ready") {
-          throw new Error("reopened installation document is unavailable");
-        }
-        const reference = installationDocument.data.workflows.retained?.runs.find((run) => run.runId === started.runId);
-        if (reference === undefined) throw new Error("retained run reference is missing");
-        // SAFETY: the checked installation index stores a positive Durable conversation ID.
-        const conversationId = reference.conversationId as ConversationId;
-        const conversation = await auditHarness.conversation(conversationId, BACKGROUND_CONTEXT);
-        if (conversation === undefined) throw new Error("retained run conversation is unavailable");
-        const entries = await conversation.entries({}, 256, undefined, BACKGROUND_CONTEXT);
-        const processEntry = entries.items.find((entry) => WorkshopProcessEntry.is(entry));
-        if (processEntry === undefined) throw new Error("retained process evidence is missing");
-        const processEvidence = workshopProcessV1Schema.parse(processEntry.data);
-        const lateEvidence = workshopProcessV1Schema.parse({
-          ...processEvidence,
-          recordedAt: "2000-01-01T00:00:00.000Z",
-          process: {
-            ...processEvidence.process,
-            captures: processEvidence.process.captures.map((capture) => ({
-              ...capture, totalBytes: capture.totalBytes + 1, truncatedBytes: capture.truncatedBytes + 1, complete: false,
-            })),
-          },
-        });
-        await auditHarness.commit(async (tx) => {
-          await tx.appendEntry(WorkshopProcessEntry, conversationId, { data: lateEvidence });
-        }, BACKGROUND_CONTEXT);
-      } finally {
-        await auditHarness.close(BACKGROUND_CONTEXT);
-      }
-      owner = await startWorkshopService(installation);
-      health = await probeServiceHealth(installation.stateDirectory);
-      if (health.kind !== "ready") throw new Error(health.reason);
-      const freshResponse = await sendServiceRequest(health.metadata.socketPath, {
-        version: 1, method: "logs.page", workflowId: "retained", runId: started.runId,
+      owner = await startWorkshopService(installation, models);
+      const reopenedSocket = owner.metadata.socketPath;
+      if (reopenedSocket === null) throw new Error("reopened service socket path is missing");
+      const afterResponse = await sendServiceRequest(reopenedSocket, {
+        version: 1, method: "node.describe", workflowId: "retained", nodeId: "capture", runId: started.runId,
       });
-      if (!freshResponse.ok) throw new Error(freshResponse.error.message);
-      const freshPage = serviceLogSectionPageV1Schema.parse(freshResponse.result);
-      if (freshPage.nextCursor === null) throw new Error("fresh retained log snapshot has no capture continuation");
-      const captureAfter = async (cursor: string) => {
-        let currentCursor: string | null = cursor;
-        while (currentCursor !== null) {
-          const response = await sendServiceRequest(health.metadata.socketPath, {
-            version: 1, method: "logs.page", workflowId: "retained", runId: started.runId, cursor: currentCursor,
-          });
-          if (!response.ok) throw new Error(response.error.message);
-          const page = serviceLogSectionPageV1Schema.parse(response.result);
-          if (page.section.kind === "capture" && page.section.label === "capture worker stderr") return page.section;
-          currentCursor = page.nextCursor;
-        }
-        throw new Error("worker stderr capture is missing from the log snapshot");
-      };
-      const freshCapture = await captureAfter(freshPage.nextCursor);
-      expect(freshCapture.capture.totalBytes).toBe(12_001);
-      const continuedCapture = await captureAfter(first.nextCursor);
-      expect(continuedCapture.capture.totalBytes).toBe(12_000);
-      expect(continuedCapture.capture.retainedBytes).toBe(1024);
+      if (!afterResponse.ok) throw new Error(afterResponse.error.message);
+      const after = nodeDescriptionDtoSchema.parse(afterResponse.result);
+      expect(after).toEqual(before);
+      expect(JSON.stringify(after)).toContain("conversationId");
+      expect(JSON.stringify(after)).toContain("assistantEntryId");
+      expect(requests).toBe(1);
     } finally {
       if (owner !== undefined) await owner.shutdown();
       rmSync(root, { recursive: true, force: true });

@@ -70,11 +70,11 @@ export const nodeIdSchema = z
 
 const nonemptyCommand = z.string().refine((value) => value.trim().length > 0, "command must be nonempty");
 
-/** `pi` names the built-in Pi preset; an object supplies a custom command. */
-export const harnessSchema = z.union([
-  z.literal("pi"),
-  z.strictObject({ command: nonemptyCommand }),
-]);
+/** Agent steps use Pi Durable directly; command harnesses are not supported. */
+export const harnessSchema = z.unknown().refine(
+  (value): value is "pi" => value === "pi",
+  "only harness: pi is supported; custom command harnesses are not supported",
+);
 
 export const agentDefaultsSchema = z.strictObject({
   harness: harnessSchema.optional(),

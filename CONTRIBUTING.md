@@ -118,12 +118,14 @@ flowchart TD
   SCH -->|admits| WR[WorkflowRun task]
   SVC -->|start| WR
   WR --> NA[NodeAttempt task]
-  NA --> PE[ProcessExecution task]
-  PE --> P[pi / command process]
+  NA -->|command| PE[ProcessExecution task]
+  PE --> P[command process]
+  NA -->|agent| AE[AgentExecution task]
+  AE --> C[durable conversation]
   WR -->|fixed decision table| D[retry / block / fail]
   D --> WR
-  PE --> V[state/captures: temporary bytes]
-  SVC --> RF[state/<workflow>: results.md + execution.log]
+  PE --> V[state-v5/captures: temporary bytes]
+  SVC --> RF[state-v5/<workflow>: results.md + execution.log]
 ```
 
 ### One run
@@ -136,17 +138,19 @@ WorkflowRun                                define-workshop-tasks.ts
   for each step (node) in the frozen chain:
     NodeAttempt                            define-node-attempt-task.ts
       build process stdin                  attempt/build-process-stdin.ts
-      worker    → ProcessExecution         define-process-execution-task.ts
-      parse stdout by frozen result mode
-      validator → ProcessExecution
+      command worker    → ProcessExecution   define-process-execution-task.ts
+      agent worker      → AgentExecution     define-agent-execution-task.ts
+      parse result by frozen result mode
+      command validator → ProcessExecution
+      agent validator   → AgentExecution
     if the attempt failed:
       fixed decision table                 define-workshop-tasks.ts
         retry → new NodeAttempt (needs replay: safe and retries left)
         identical consecutive failures → repeated_failure block
         exhausted retry → terminal failure
     accepted success_and_complete → finish; mark successors skipped
-    accepted needs_input → save wait; settle WorkflowRun and release capacity
-      human.reply continue → capacity gate and successor in a new WorkflowRun
+    accepted needs_input → save wait; release capacity; park the WorkflowRun
+      human.reply continue → reacquire capacity; continue the same WorkflowRun
       human.reply reject → cancel this occurrence without disabling its schedule
   retain evidence; update the newest run section in workflow results.md and execution.log
 ```
@@ -159,16 +163,17 @@ waits in a CapacityGate task until a slot frees up.
 [Pi Durable](https://www.npmjs.com/package/@earendil-works/pi-durable)
 (`@earendil-works/pi-durable`, pinned at 1.0.2) is a library that runs
 checkpointed tasks and model conversations on top of SQLite. Workshop has no
-storage or task engine of its own; it maps its concepts onto Durable's. Workers
-and validators are not Durable work: they are harness subprocesses launched by
-`src/process/launch-process.ts`.
+storage or task engine of its own; it maps its concepts onto Durable's. Command
+workers, command verifiers, and preflight are subprocesses launched by
+`src/process/launch-process.ts`. Agent workers and agent verifiers are Durable
+conversations run by the `workshop.agent-execution` task.
 
 | Durable concept | How Workshop uses it |
 | --- | --- |
-| `Harness` and `Registry` | `service/open-service-runtime.ts` opens one Harness on `state/durable.db`, registers five task definitions, reconciles leftover processes, then calls `harness.resume()`. |
-| Tasks (`defineTask`) | `WorkflowRun`, `NodeAttempt`, `ProcessExecution`, `CapacityGate`, `ScheduleWakeup` (registered as `workshop.workflow-run` and so on). Each task is a set of named phases. A phase ends by committing its next checkpoint, waiting on children, or settling as completed or failed. |
+| `Harness` and `Registry` | `service/open-service-runtime.ts` opens one Harness on `state-v5/durable.db`, registers six task definitions, reconciles leftover processes, then calls `harness.resume()`. |
+| Tasks (`defineTask`) | `WorkflowRun`, `NodeAttempt`, `ProcessExecution`, `AgentExecution`, `CapacityGate`, `ScheduleWakeup` (registered as `workshop.workflow-run` and so on). Each task is a set of named phases. A phase ends by committing its next checkpoint, waiting on children, or settling as completed or failed. |
 | Child tasks | A parent creates children with `tx.createTask` and waits for them with `allSettled`. A failed child comes back as data the parent classifies; it does not crash the parent. |
-| Conversations | Admission gives every run its own conversation. The run's tasks and records attach to it, so its history outlives the tasks. The shared bot has one ownerless conversation whose identity and committed event cursors live in a session document. |
+| Conversations | Admission gives every run its own conversation. The run's tasks and records attach to it, so its history outlives the tasks. Each agent worker and verifier execution gets its own task-owned conversation. The shared bot has one ownerless conversation whose identity and committed event cursors live in a session document. |
 | Documents (`defineDoc`) | `workshop.run` holds a run's current state, scoped to its conversation. `workshop.installation` (workflows, activations) and `workshop.service-receipts` (idempotent controls) are session-scoped. |
 | Entries (`defineEntry`) | Append-only `workshop.event`, `workshop.process`, and `workshop.judgment` evidence for each run. `logs` reads the process and event entries. |
 | `runtime.commit` | The only way state changes. Document edits, new entries, new child tasks, and the task's own checkpoint land in one SQLite transaction. |
@@ -183,8 +188,8 @@ Durable leaves some work to its caller, and Workshop fills each gap:
   the process identity and exit.
 - **Task ownership says nothing about OS processes.** Durable can resume a
   task, but it cannot tell whether that task's subprocess died. At startup the
-  service finds every recorded launch without an exit, checks the PID and
-  start time, and kills the process group. Only then may the task rerun (with
+  service finds every recorded command launch without an exit, checks the PID
+  and start time, and kills the process group. Only then may the task rerun (with
   `replay: safe`) or block.
 - **Only one process may own the storage.** Durable has no cross-process
   locking, so the service holds a kernel lock (`acquire-service-lock.ts`) and
@@ -216,7 +221,6 @@ src/
 │  ├─ serve-workshop-service.ts   socket server, ownership, request dispatch
 │  ├─ open-service-runtime.ts     Harness, recovery, bot, and service controls
 │  ├─ reply-human-wait.ts         checked replies and atomic wait settlement
-│  ├─ check-legacy-runs.ts        startup drain guard for open format 3 runs
 │  ├─ project-service-reads.ts    status, node previews, run pages, retained logs
 │  ├─ project-run-files.ts        serialized atomic readable-file projections
 │  ├─ launch-service-process.ts   reuse or spawn the service
@@ -229,13 +233,13 @@ src/
 │  └─ send-service-request.ts     socket client and paged log reads
 ├─ storage/
 │  ├─ durable/                    checkpointed tasks and records
-│  │  ├─ define-scheduler-wakeup-task.ts fixed-rate schedule admission
+│  │  ├─ define-scheduler-wakeup-task.ts fixed-rate admission on persisted deadlines
 │  │  ├─ admit-run.ts             atomic idempotent admission
-│  │  ├─ define-capacity-gate-task.ts waits for a run slot
-│  │  ├─ create-workflow-continuation.ts successor task and capacity gate
+│  │  ├─ define-capacity-gate-task.ts waits for a freed run slot on document watches
 │  │  ├─ define-workshop-tasks.ts WorkflowRun and fixed outcome decisions
 │  │  ├─ define-node-attempt-task.ts worker, result parsing, verifier
-│  │  ├─ define-process-execution-task.ts spawn, capture, crash replay
+│  │  ├─ define-process-execution-task.ts command spawn, capture, crash replay
+│  │  ├─ define-agent-execution-task.ts native agent worker and verifier conversations
 │  │  ├─ define-workshop-records.ts installation, run, bot documents and evidence
 │  │  ├─ commit-service-mutation.ts idempotent control receipts
 │  │  ├─ render-worklog.ts        compact or verbose committed worklog
@@ -248,7 +252,7 @@ src/
 │  ├─ parse-yaml.ts               reject duplicate keys and anchors
 │  ├─ check-definition.ts         format 4 authoring and migration checks
 │  ├─ check-chain.ts              linear chain invariants
-│  ├─ resolve-agent-settings.ts   model, harness, obsolete-variable guard
+│  ├─ resolve-agent-settings.ts   worker and verifier model resolution
 │  ├─ resolve-workflow-settings.ts frozen execution settings; text worker default
 │  ├─ resolve-retry-limit.ts      format 4 and historical retry counts
 │  ├─ parse-model.ts              provider/model/thinking strings
@@ -310,9 +314,10 @@ Three boundaries hold. `tests/check-parity-gaps.test.ts` and
 ### Tests and specs
 
 The tests need no model credentials. `tests/check-service-restart.test.ts`
-runs the Hemingway workflow with a mock agent through the real CLI and service,
+runs the Hemingway workflow with a faux model through the real CLI and service,
 restarts the service, and checks the same Durable run. The only real-model
 check is the README's [Watch it work](README.md#watch-it-work) walkthrough.
 
-- Spec: `.agents/dox/workshop-spec-v4-ii.md`
+- Active plan: `.agents/dox/plan-workshop-v5-2026-10-15.md`
+- Historical spec: `.agents/dox/workshop-spec-v4-ii.md`
 - Decision logs and evidence: `.agents/dox/plan-wp*.md`

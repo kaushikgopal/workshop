@@ -26,7 +26,7 @@ function snapshot(directory: string, runId = "fixture-run-one", sequence = 1, st
     runId, eventId: "event-" + runId, activationId: "activation-fixture", occurrenceId: "occurrence-" + runId,
     requestId: null, admittedAt,
     runtimeManifest: { durableVersion: "1.0.2", integrationManifestHash: "sha256:" + "a".repeat(64),
-      taskVersions: { workflowRun: 10, nodeAttempt: 4, processExecution: 4, capacityGate: 1, failureJudgment: 1 } },
+      taskVersions: { workflowRun: 11, nodeAttempt: 5, agentExecution: 1, processExecution: 4, capacityGate: 1, scheduleWakeup: 1 } },
   });
   if (!prepared.ok) throw new Error(prepared.failure.message);
   const value = prepared.value;

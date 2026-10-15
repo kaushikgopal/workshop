@@ -11,7 +11,7 @@ import {
   type RunReference,
 } from "../installation/schema.js";
 import { loadCheckedWorkflow, type Installation } from "../installation/load-installation.js";
-import { activationIdSchema, blockInfoSchema, desiredStateSchema, occurrenceIdSchema, runFailureInfoSchema, runIdSchema } from "../run/schema.js";
+import { activationIdSchema, blockInfoSchema, desiredStateSchema, nativeExecutionReceiptSchema, occurrenceIdSchema, runFailureInfoSchema, runIdSchema } from "../run/schema.js";
 import { locateProcessFiles, locateWorkflowDirectory } from "../run/locate-run-files.js";
 import { readRetainedCapture } from "../process/read-retained-capture.js";
 import type { ProcessCapture } from "../process/schema.js";
@@ -608,8 +608,9 @@ function projectAttemptDetail(
     candidate,
     candidate.sourceBytesHash,
     candidateRecordedAt,
+    { ...(candidate.version === 3 ? { nativeExecution: candidate.nativeExecution } : {}) },
   );
-  const validatorEvidence = validator?.kind !== "agent" && validator?.kind !== "operator"
+  const validatorEvidence = validator?.kind !== "agent" && validator?.kind !== "native_agent" && validator?.kind !== "operator"
     ? null
     : makeEvidenceReference(
       "verdict",
@@ -617,6 +618,7 @@ function projectAttemptDetail(
       validator,
       validator.resultBytesHash,
       validatorEvent?.type === "validator_result_committed" ? validatorEvent.occurredAt : attempt.finishedAt ?? candidateRecordedAt,
+      { ...(validator.kind === "native_agent" ? { nativeExecution: validator.nativeExecution } : {}) },
     );
   const acceptances = [
     ...(candidate?.source === "operator" ? [candidate.acceptance] : []),
@@ -630,7 +632,7 @@ function projectAttemptDetail(
         judgment.decision,
         null,
         judgment.decidedAt,
-        judgment.decision,
+        { decision: judgment.decision },
       )]);
   return {
     attemptId: attempt.attemptId,
@@ -665,7 +667,7 @@ function makeEvidenceReference(
   payload: unknown,
   sourceBytesHash: string | null,
   recordedAt: string,
-  decision?: unknown,
+  options: { readonly decision?: unknown; readonly nativeExecution?: z.infer<typeof nativeExecutionReceiptSchema> } = {},
  ) {
   const bytes = Buffer.from(JSON.stringify(payload), "utf8");
   const evidence = {
@@ -675,7 +677,8 @@ function makeEvidenceReference(
     byteCount: bytes.byteLength,
     recordedAt,
     sourceBytesHash,
-    ...(decision === undefined ? {} : { decision }),
+    ...(options.decision === undefined ? {} : { decision: options.decision }),
+    ...(options.nativeExecution === undefined ? {} : { nativeExecution: options.nativeExecution }),
   };
   return evidence;
 }

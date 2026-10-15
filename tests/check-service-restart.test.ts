@@ -27,23 +27,24 @@ import { createViewerSource } from "../src/cli/watch.js";
 import { REPO_ROOT } from "./helpers.js";
 
 const cliPath = join(REPO_ROOT, "src/cli/main.ts");
-const mockAgentPath = join(REPO_ROOT, "tests/mock/hemingway-node.ts");
+const fauxServePath = join(REPO_ROOT, "tests/fixtures/serve-faux-workshop.ts");
 const sentence = "The old man rowed until the sea forgot the shore.";
 
 describe("public service restart", () => {
-  test("runs the deterministic Hemingway mock and reconnects across a service restart without replay", async () => {
+  test("recovers native progress after a hard service crash without replaying committed tools", async () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-hemingway-cli-"));
     const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
-    const state = join(root, ".workshop", "state");
-    const launches = join(state, "mock-launches.jsonl");
+    const state = join(config, "state-v5");
+    const workflowState = join(state, "hemingway");
+    const receipt = join(workflowState, "agent-receipt.txt");
+    const afterReceipt = join(workflowState, "after-receipt.txt");
+    const activity = join(workflowState, "mock-activity.jsonl");
     mkdirSync(workflows, { recursive: true });
     writeFileSync(join(config, "workshop.yaml"), [
       "shell: /bin/sh",
       "keep_files: always",
       "agent:",
-      "  harness:",
-      `    command: 'WORKSHOP_MOCK_SLEEP_MS=800 WORKSHOP_LAUNCH_LOG=${launches} bun ${mockAgentPath}'`,
       "  model: fixture/mock-model:medium",
       "",
     ].join("\n"), "utf8");
@@ -51,25 +52,25 @@ describe("public service restart", () => {
       "version: 4",
       "defaults:",
       "  retries: 0",
-      "  replay: never",
-      "description: Run the deterministic Hemingway worker mock.",
+      "  replay: safe",
+      "description: Recover native conversation progress after a service crash.",
       "steps:",
       "  - generate:",
       "      result: tagged",
       "      agent:",
-      "        instructions: Write one original sentence in the tagged stdout format.",
+      "        instructions: Write one original sentence. Preserve RESTART_PROMPT_SENTINEL in your prompt.",
       "      verify:",
       "        run: 'printf mock-validator-passed >&2; test -n \"$(cat)\"'",
       "",
     ].join("\n"), "utf8");
 
     try {
+      const firstService = await startFauxService(root, "restart-progress");
       const validated = runCli(root, ["validate", "hemingway"]);
       expect(validated.status).toBe(0);
       const started = runCli(root, ["start", "hemingway", "--detach"]);
       expect(started.status).toBe(0);
       const runId = runIdSchema.parse(started.stdout.match(/Started run (\S+)/)?.[1]);
-      await waitForLaunch(launches);
 
       const activeResult = runCli(root, ["status", "hemingway", "--json"]);
       expect(activeResult.status).toBe(0);
@@ -78,31 +79,52 @@ describe("public service restart", () => {
       expect(active.workflows[0]?.unresolvedRun?.currentNodeId).toBe("generate");
       expect(active.workflows[0]?.unresolvedRun?.status).not.toBe("completed");
 
+      try {
+        await waitForFile(afterReceipt);
+      } catch {
+        const details = runCli(root, ["step", "describe", "hemingway", "generate", "--run", runId, "--json"]);
+        throw new Error(details.stdout || details.stderr);
+      }
+      expect(readFileSync(receipt, "utf8")).toBe("receipt\n");
+      process.kill(firstService.pid, "SIGKILL");
+      await waitForPidGone(firstService.pid);
+      const secondService = await startFauxService(root, "restart-recovered", { previousBootId: firstService.bootId });
+      expect(secondService.bootId).not.toBe(firstService.bootId);
+
       const completed = await waitForRun(root, "hemingway", runId);
       expect(completed.status).toBe("completed");
       expect(completed.terminalOutput).toBe(sentence);
-      const logsBeforeRestartResult = runCli(root, ["logs", "hemingway", "--run", runId, "--json"]);
-      expect(logsBeforeRestartResult.status).toBe(0);
-      const logsBeforeRestart = logsDtoSchema.parse(JSON.parse(logsBeforeRestartResult.stdout));
-      expect(logsBeforeRestart.runId).toBe(runId);
-      expect(logsBeforeRestart.sections.some((section) => section.kind === "worklog" && section.content.includes("One Hemingway sentence, written by the deterministic mock."))).toBe(true);
-      expect(logsBeforeRestart.sections.some((section) => section.kind === "capture" && section.content === "mock-validator-passed")).toBe(true);
-      const detailedWorklog = logsBeforeRestart.sections.find((section) => section.kind === "worklog");
+      const logsResult = runCli(root, ["logs", "hemingway", "--run", runId, "--json"]);
+      expect(logsResult.status).toBe(0);
+      const logs = logsDtoSchema.parse(JSON.parse(logsResult.stdout));
+      expect(logs.runId).toBe(runId);
+      expect(logs.sections.some((section) => section.kind === "worklog" && section.content.includes("One Hemingway sentence, written by the deterministic mock."))).toBe(true);
+      expect(logs.sections.some((section) => section.kind === "capture" && section.content === "mock-validator-passed")).toBe(true);
+      const detailedWorklog = logs.sections.find((section) => section.kind === "worklog");
       expect(detailedWorklog?.kind).toBe("worklog");
       if (detailedWorklog?.kind !== "worklog") throw new Error("detailed worklog is missing");
       expect(detailedWorklog.content).toContain("Candidate SHA-256");
+      expect(detailedWorklog.content).toContain("Native result: tagged / succeeded");
+      expect(detailedWorklog.content).toContain("fixture/mock-model:medium");
       const compactLogs = runCli(root, ["logs", "hemingway", "--run", runId]);
       expect(compactLogs.status).toBe(0);
       expect(compactLogs.stdout).toMatch(/- generate #1 succeeded · \d+ms · tagged succeeded · One Hemingway sentence/u);
       expect(compactLogs.stdout).not.toContain("Candidate SHA-256");
       expect(compactLogs.stdout).not.toContain("## Global decision log");
-      const firstLaunchCount = readLaunches(launches);
-      expect(firstLaunchCount).toBe(1);
+      expect(readFileSync(receipt, "utf8")).toBe("receipt\n");
+      expect(readFileSync(afterReceipt, "utf8")).toBe("after-receipt\n");
+      const nativeTrace = readFileSync(activity, "utf8").trim().split("\n").map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(nativeTrace).toHaveLength(1);
+      expect(nativeTrace[0]).toMatchObject({
+        event: "start", role: "worker", model: "fixture/mock-model:medium", thinking: "medium",
+        resultsPath: join(workflowState, "results.md"), logPath: join(workflowState, "execution.log"),
+        promptMarker: "RESTART_PROMPT_SENTINEL",
+      });
+      expect(nativeTrace[0]?.promptBytes).toBeGreaterThan(0);
+      expect(nativeTrace[0]?.executionId).toEqual(expect.any(String));
 
       const installationId = active.installationId;
       const firstBootId = active.service.bootId;
-      await stopService(root);
-
       const afterRestart = runCli(root, ["runs", "hemingway", "--json"]);
       expect(afterRestart.status).toBe(0);
       const history = runsDtoSchema.parse(JSON.parse(afterRestart.stdout));
@@ -116,90 +138,93 @@ describe("public service restart", () => {
       expect(logsAfterRestartResult.status).toBe(0);
       const logsAfterRestart = logsDtoSchema.parse(JSON.parse(logsAfterRestartResult.stdout));
       expect(logsAfterRestart.runId).toBe(runId);
-      expect(readLaunches(launches)).toBe(firstLaunchCount);
+      expect(logsAfterRestart.sections.some((section) => section.kind === "worklog" && section.content.includes("Native execution:"))).toBe(true);
     } finally {
       await stopService(root);
       rmSync(root, { recursive: true, force: true });
     }
   }, 30_000);
 
-  test("runs two independently mapped mock harnesses through the same process contract", async () => {
-    const root = mkdtempSync(join(tmpdir(), "workshop-harness-parity-"));
+  test("maps independent native providers and preserves model, thinking, prompt, and environment evidence", async () => {
+    const root = mkdtempSync(join(tmpdir(), "workshop-provider-parity-"));
     const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
-    const traceFile = join(root, "harness-trace.jsonl");
-    const argvHarnessPath = join(REPO_ROOT, "tests/mock/read-argv-harness.ts");
-    const envHarnessPath = join(REPO_ROOT, "tests/mock/read-env-harness.ts");
+    const traceFile = join(root, "native-provider-trace.jsonl");
     mkdirSync(workflows, { recursive: true });
     writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\nkeep_files: always\n", "utf8");
-    writeFileSync(join(workflows, "harness-parity.yaml"), [
+    writeFileSync(join(workflows, "provider-parity.yaml"), [
       "version: 4",
       "defaults:",
       "  retries: 0",
       "  replay: never",
       "steps:",
-      "  - argv-harness:",
+      "  - alpha-worker:",
       "      result: tagged",
       "      agent:",
       "        model: mock-alpha/poet:high",
-      "        harness:",
-      "          command: >-",
-      `            WORKSHOP_HARNESS_TRACE='${traceFile}' bun '${argvHarnessPath}' --model "$WORKSHOP_MODEL_WITH_THINKING"`,
       "        instructions: |",
       "          MOCK_ALPHA_PROMPT_SENTINEL",
-      "          Read the prompt from stdin and write a tagged result to stdout.",
-      "  - env-harness:",
+      "          Preserve the prompt marker in the tagged result.",
+      "  - beta-worker:",
       "      result: tagged",
       "      agent:",
       "        model: mock-beta/editor:low",
-      "        harness:",
-      "          command: >-",
-      `            WORKSHOP_HARNESS_TRACE='${traceFile}' bun '${envHarnessPath}'`,
       "        instructions: |",
       "          MOCK_BETA_PROMPT_SENTINEL",
-      "          Read the prompt from stdin and write a tagged result to stdout.",
+      "          Preserve the prompt marker and the previous result.",
       "",
     ].join("\n"), "utf8");
 
     try {
-      const validated = runCli(root, ["validate", "harness-parity"]);
+      await startFauxService(root, "native-provider-parity", { env: { WORKSHOP_TEST_TRACE_PATH: traceFile } });
+      const validated = runCli(root, ["validate", "provider-parity"]);
       expect(validated.status).toBe(0);
-      const started = runCli(root, ["start", "harness-parity"]);
-      expect(started.status).toBe(0);
+      const started = runCli(root, ["start", "provider-parity"]);
+      if (started.status !== 0) {
+        const runId = started.stdout.match(/Started run (\S+)/)?.[1];
+        const details = runId === undefined ? "" : runCli(root, ["step", "describe", "provider-parity", "alpha-worker", "--run", runId, "--json"]).stdout;
+        throw new Error((started.stderr || started.stdout) + "\n" + details);
+      }
       const runId = runIdSchema.parse(started.stdout.match(/Started run (\S+)/)?.[1]);
 
-      const historyResult = runCli(root, ["runs", "harness-parity", "--json"]);
+      const historyResult = runCli(root, ["runs", "provider-parity", "--json"]);
       expect(historyResult.status).toBe(0);
       const history = runsDtoSchema.parse(JSON.parse(historyResult.stdout));
       const completed = history.runs.find((run) => run.runId === runId);
-      if (completed === undefined) throw new Error("mock harness run is missing from public history");
+      if (completed === undefined) throw new Error("native provider run is missing from public history");
       const alphaOutput = "alpha:mock-alpha/poet:high:prompt=MOCK_ALPHA_PROMPT_SENTINEL";
-      const expectedOutput = `beta:mock-beta/editor:low:prompt=MOCK_BETA_PROMPT_SENTINEL:previous=${alphaOutput}`;
+      const expectedOutput = "beta:mock-beta/editor:low:prompt=MOCK_BETA_PROMPT_SENTINEL:previous=" + alphaOutput;
       expect(completed.status).toBe("completed");
       expect(completed.terminalOutput).toBe(expectedOutput);
 
       const traceEntrySchema = z.strictObject({
-        harness: z.enum(["argv", "environment"]),
+        role: z.enum(["alpha", "beta"]),
+        provider: z.string(),
         model: z.string(),
+        thinking: z.string(),
+        runId: z.string(),
+        executionId: z.string(),
         promptLength: z.number(),
         promptMarker: z.string(),
-        previousOutput: z.string().optional(),
+        previousOutput: z.string().nullable(),
       });
       const trace = readFileSync(traceFile, "utf8").trim().split("\n")
         .map((line) => traceEntrySchema.parse(JSON.parse(line)));
       expect(trace).toHaveLength(2);
-      const argvTrace = trace[0];
-      const envTrace = trace[1];
-      if (argvTrace === undefined || envTrace === undefined) throw new Error("both mock harnesses must write trace records");
-      expect(argvTrace).toMatchObject({
-        harness: "argv", model: "mock-alpha/poet:high", promptMarker: "MOCK_ALPHA_PROMPT_SENTINEL",
+      const alphaTrace = trace[0];
+      const betaTrace = trace[1];
+      if (alphaTrace === undefined || betaTrace === undefined) throw new Error("both native providers must write trace records");
+      expect(alphaTrace).toMatchObject({
+        role: "alpha", provider: "mock-alpha", model: "mock-alpha/poet:high", thinking: "high",
+        runId, promptMarker: "MOCK_ALPHA_PROMPT_SENTINEL", previousOutput: null,
       });
-      expect(envTrace).toMatchObject({
-        harness: "environment", model: "mock-beta/editor:low", promptMarker: "MOCK_BETA_PROMPT_SENTINEL",
-        previousOutput: alphaOutput,
+      expect(betaTrace).toMatchObject({
+        role: "beta", provider: "mock-beta", model: "mock-beta/editor:low", thinking: "low",
+        runId, promptMarker: "MOCK_BETA_PROMPT_SENTINEL", previousOutput: alphaOutput,
       });
-      expect(argvTrace.promptLength).toBeGreaterThan("MOCK_ALPHA_PROMPT_SENTINEL".length);
-      expect(envTrace.promptLength).toBeGreaterThan("MOCK_BETA_PROMPT_SENTINEL".length);
+      expect(new Set(trace.map((entry) => entry.executionId)).size).toBe(2);
+      expect(alphaTrace.promptLength).toBeGreaterThan("MOCK_ALPHA_PROMPT_SENTINEL".length);
+      expect(betaTrace.promptLength).toBeGreaterThan("MOCK_BETA_PROMPT_SENTINEL".length);
     } finally {
       await stopService(root);
       rmSync(root, { recursive: true, force: true });
@@ -424,7 +449,7 @@ describe("public service restart", () => {
       expect(pausedRun.currentNodeId).toBe("second");
       expect(existsSync(successorStarted)).toBe(false);
 
-      const metadataPath = join(root, ".workshop", "state", "service.json");
+      const metadataPath = join(root, ".workshop", "state-v5", "service.json");
       const oldService = JSON.parse(readFileSync(metadataPath, "utf8")) as { pid: number; bootId: string };
       process.kill(oldService.pid, "SIGKILL");
       await waitForPidGone(oldService.pid);
@@ -532,7 +557,7 @@ describe("public service restart", () => {
 
       const pause = runCli(root, ["pause", "safe-replay"]);
       expect(pause.status).toBe(0);
-      const oldService = JSON.parse(readFileSync(join(root, ".workshop", "state", "service.json"), "utf8")) as { pid: number; bootId: string };
+      const oldService = JSON.parse(readFileSync(join(root, ".workshop", "state-v5", "service.json"), "utf8")) as { pid: number; bootId: string };
       process.kill(oldService.pid, "SIGKILL");
       await waitForPidGone(oldService.pid);
 
@@ -613,7 +638,7 @@ describe("public service restart", () => {
       expect(missingOverrides.status).not.toBe(0);
       expect(missingOverrides.stderr).toContain("requires --allow-repeat");
       expect(missingOverrides.stdout).toContain(`Resolving run ${retry.runId}`);
-      const retryService = JSON.parse(readFileSync(join(retryRoot, ".workshop", "state", "service.json"), "utf8")) as { socketPath: string };
+      const retryService = JSON.parse(readFileSync(join(retryRoot, ".workshop", "state-v5", "service.json"), "utf8")) as { socketPath: string };
       const retryRequest = { version: 1 as const, requestId: randomUUID(), method: "resolve" as const, workflowId: "retryable", action: "retry" as const, reason: "retry after checking the external effect", allowRepeat: true };
       await dropFirstServiceReply(retryService.socketPath, retryRequest);
       await waitForFileLength(retryMarker, 2);
@@ -662,7 +687,7 @@ describe("public service restart", () => {
       expect(cliAcceptance.status).toBe(0);
       await waitForFile(acceptedValidatorStarted);
 
-      const acceptService = JSON.parse(readFileSync(join(acceptRoot, ".workshop", "state", "service.json"), "utf8")) as { socketPath: string };
+      const acceptService = JSON.parse(readFileSync(join(acceptRoot, ".workshop", "state-v5", "service.json"), "utf8")) as { socketPath: string };
       const acceptRequest = {
         version: 1 as const,
         requestId: randomUUID(),
@@ -694,7 +719,7 @@ describe("public service restart", () => {
     const failMarker = join(failRoot, "worker-launches.txt");
     try {
       const blocked = await startBlockedCommandRun(failRoot, "fail-run", `printf w >> '${failMarker}'; sleep 60`);
-      const service = JSON.parse(readFileSync(join(failRoot, ".workshop", "state", "service.json"), "utf8")) as { socketPath: string };
+      const service = JSON.parse(readFileSync(join(failRoot, ".workshop", "state-v5", "service.json"), "utf8")) as { socketPath: string };
       const request = { version: 1 as const, requestId: randomUUID(), method: "resolve" as const, workflowId: "fail-run", action: "fail" as const, reason: "the external effect cannot be safely repeated" };
       await dropFirstServiceReply(service.socketPath, request);
       const firstResolution = await sendServiceRequest(service.socketPath, request);
@@ -783,7 +808,7 @@ describe("public service restart", () => {
       expect(pausedWaiting.waitingForCapacity).toBe(true);
       expect(existsSync(successorStarted)).toBe(false);
 
-      const metadataPath = join(root, ".workshop", "state", "service.json");
+      const metadataPath = join(root, ".workshop", "state-v5", "service.json");
       const oldService = JSON.parse(readFileSync(metadataPath, "utf8")) as { pid: number; bootId: string };
       await stopService(root);
       const stoppedService = JSON.parse(readFileSync(metadataPath, "utf8")) as { status?: unknown };
@@ -1053,7 +1078,7 @@ describe("public service restart", () => {
       const workerPid = await waitForPositiveIntegerFile(pidPath);
       expect(Number.isSafeInteger(workerPid)).toBe(true);
       if (!Number.isSafeInteger(workerPid) || workerPid <= 0) throw new Error("worker pid fixture did not record a positive process id");
-      const serviceMetadataPath = join(root, ".workshop", "state", "service.json");
+      const serviceMetadataPath = join(root, ".workshop", "state-v5", "service.json");
       const oldService = JSON.parse(readFileSync(serviceMetadataPath, "utf8")) as { pid: number; bootId: string };
       process.kill(oldService.pid, "SIGKILL");
       await waitForPidGone(oldService.pid);
@@ -1083,8 +1108,7 @@ describe("public service restart", () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-retention-reopen-"));
     const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
-    const state = join(root, ".workshop", "state");
-    const workerLaunches = join(state, "worker-launches.jsonl");
+    const state = join(root, ".workshop", "state-v5");
     const validatorLaunches = join(root, "validator-launches.txt");
     const successorLaunches = join(root, "successor-launches.txt");
     const capBytes = 32 * 1024 * 1024;
@@ -1095,8 +1119,6 @@ describe("public service restart", () => {
       "shell: /bin/sh",
       "stream_cap: 32mb",
       "agent:",
-      "  harness:",
-      `    command: 'WORKSHOP_LAUNCH_LOG=${workerLaunches} bun ${mockAgentPath}'`,
       "  model: fixture/mock-model:medium",
       "",
     ].join("\n"), "utf8");
@@ -1107,8 +1129,9 @@ describe("public service restart", () => {
       "  replay: never",
       "steps:",
       "  - capture:",
+      "      result: tagged",
       "      agent:",
-      "        instructions: Write one original sentence in the tagged stdout format.",
+      "        instructions: Return one original tagged sentence.",
       "      verify:",
       "        run: |",
       `          printf validator >> '${validatorLaunches}'`,
@@ -1121,6 +1144,7 @@ describe("public service restart", () => {
     ].join("\n"), "utf8");
 
     try {
+      await startFauxService(root, "restart-recovered");
       const started = runCli(root, ["start", "capture-recovery", "--detach"]);
       expect(started.status).toBe(0);
       const runId = runIdSchema.parse(started.stdout.match(/Started run (\S+)/)?.[1]);
@@ -1137,8 +1161,9 @@ describe("public service restart", () => {
 
       process.kill(oldService.pid, "SIGKILL");
       await waitForPidGone(oldService.pid);
+      await startFauxService(root, "restart-recovered", { previousBootId: oldService.bootId });
       const restartResult = runCli(root, ["runs", "capture-recovery", "--json"], 60_000);
-      expect(restartResult.status).toBe(0);
+      if (restartResult.status !== 0) throw new Error(restartResult.stderr || restartResult.stdout);
       const recoveredService = JSON.parse(readFileSync(join(state, "service.json"), "utf8")) as { status: string; bootId: string; socketPath: string };
       expect(recoveredService.status).toBe("ready");
       expect(recoveredService.bootId).not.toBe(oldService.bootId);
@@ -1178,7 +1203,6 @@ describe("public service restart", () => {
         `${totalBytes} bytes total; ${capBytes} retained (22369622 head + 11184810 tail), ${totalBytes - capBytes} omitted; incomplete`,
       );
       expect(cliLogs.outputBytes).toBeGreaterThan(capBytes);
-      expect(readFileSync(workerLaunches, "utf8").trim().split("\n").filter(Boolean)).toHaveLength(1);
       expect(readFileSync(validatorLaunches, "utf8")).toBe("validator");
       expect(existsSync(successorLaunches)).toBe(false);
       expect(statSync(retainedPath).size).toBe(capBytes);
@@ -1193,7 +1217,7 @@ describe("public service restart", () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-startup-launch-gate-"));
     const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
-    const state = join(root, ".workshop", "state");
+    const state = join(root, ".workshop", "state-v5");
     const oldPidPath = join(root, "old-worker.pid");
     const termPath = join(root, "old-worker-term.txt");
     const queuedStartPath = join(root, "queued-worker-started.txt");
@@ -1326,7 +1350,7 @@ describe("public service restart", () => {
       expect(historicalDiagram.stdout).toContain('first["first [succeeded]"]');
       expect(historicalDiagram.stdout).toContain('second["second [succeeded]"]');
       expect(historicalDiagram.stdout).not.toContain("replacement");
-      const service = JSON.parse(readFileSync(join(root, ".workshop", "state", "service.json"), "utf8")) as { socketPath: string };
+      const service = JSON.parse(readFileSync(join(root, ".workshop", "state-v5", "service.json"), "utf8")) as { socketPath: string };
       const viewerSource = createViewerSource(service.socketPath);
       const latestView = await viewerSource.snapshot("frozen-chain");
       expect(latestView.detail?.nodes.map(node => node.nodeId)).toEqual(["replacement"]);
@@ -1803,7 +1827,7 @@ describe("public service restart", () => {
         .toMatchObject({ activationId: activation.activationId, state: "active", admittedCount: 1, nextDueAt: activation.nextDueAt });
       expect(readFileSync(holderLaunches, "utf8")).toBe("launch\n");
 
-      const serviceMetadataPath = join(root, ".workshop", "state", "service.json");
+      const serviceMetadataPath = join(root, ".workshop", "state-v5", "service.json");
       const oldService = JSON.parse(readFileSync(serviceMetadataPath, "utf8")) as { pid: number; bootId: string };
       process.kill(oldService.pid, "SIGKILL");
       await waitForPidGone(oldService.pid);
@@ -1920,7 +1944,14 @@ async function admitQueuedRunOffline(root: string, workflowId: string): Promise<
         workflows: { ...current.workflows, [workflowId]: workflowIndex },
       }));
     }, BACKGROUND_CONTEXT);
-    const taskVersions = { workflowRun: 10, nodeAttempt: 4, processExecution: 4, capacityGate: 1 } as const;
+    const taskVersions = {
+      workflowRun: 11,
+      nodeAttempt: 5,
+      agentExecution: 1,
+      processExecution: 4,
+      capacityGate: 1,
+      scheduleWakeup: 1,
+    } as const;
     const prepared = prepareRunAdmission({
       sourceText: checked.sourceText,
       sourceLabel: checked.sourcePath,
@@ -1990,7 +2021,7 @@ async function startBlockedCommandRun(
   if (started.status !== 0) throw new Error(started.stderr);
   const runId = runIdSchema.parse(started.stdout.match(/Started run (\S+)/)?.[1]);
   await waitForFile(launchMarker);
-  const service = JSON.parse(readFileSync(join(root, ".workshop", "state", "service.json"), "utf8")) as { pid: number };
+  const service = JSON.parse(readFileSync(join(root, ".workshop", "state-v5", "service.json"), "utf8")) as { pid: number };
   process.kill(service.pid, "SIGKILL");
   await waitForPidGone(service.pid);
   const reopened = runCli(root, ["status", workflowId, "--json"]);
@@ -2210,6 +2241,38 @@ async function waitForPidGone(pid: number): Promise<void> {
   throw new Error(`service process ${pid} did not exit after shutdown`);
 }
 
+async function startFauxService(
+  root: string,
+  scenario: string,
+  options: { readonly env?: NodeJS.ProcessEnv; readonly previousBootId?: string; readonly [key: string]: unknown } = {},
+): Promise<{ readonly pid: number; readonly bootId: string }> {
+  const { env: addedEnv, previousBootId, ...scenarioOptions } = options;
+  const child = spawn(process.execPath, [fauxServePath, root, scenario, JSON.stringify(scenarioOptions)], {
+    cwd: root,
+    detached: true,
+    stdio: "ignore",
+    env: { ...process.env, ...addedEnv },
+  });
+  if (child.pid === undefined) throw new Error("test-owned faux service did not start");
+  child.unref();
+  const metadataPath = join(root, ".workshop", "state-v5", "service.json");
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    if (child.exitCode !== null) throw new Error("test-owned faux service exited during startup");
+    if (existsSync(metadataPath)) {
+      const metadata = JSON.parse(readFileSync(metadataPath, "utf8")) as { status?: unknown; bootId?: unknown };
+      if (metadata.status === "ready" && typeof metadata.bootId === "string"
+        && metadata.bootId !== previousBootId) {
+        return { pid: child.pid, bootId: metadata.bootId };
+      }
+      if (metadata.status === "failed") throw new Error("test-owned faux service failed during startup");
+    }
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 20));
+  }
+  try { process.kill(child.pid, "SIGKILL"); } catch { /* service already exited */ }
+  throw new Error("test-owned faux service did not become ready");
+}
+
 function isProcessGroupAlive(pgid: number): boolean {
   try { process.kill(-pgid, 0); return true; }
   catch (error) { if ((error as NodeJS.ErrnoException).code === "ESRCH") return false; throw error; }
@@ -2234,7 +2297,7 @@ function readLaunches(path: string): number {
 }
 
 async function stopService(root: string): Promise<void> {
-  const metadataPath = join(root, ".workshop", "state", "service.json");
+  const metadataPath = join(root, ".workshop", "state-v5", "service.json");
   if (!existsSync(metadataPath)) return;
   const metadata = JSON.parse(readFileSync(metadataPath, "utf8")) as { pid?: unknown };
   if (typeof metadata.pid !== "number") return;

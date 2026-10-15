@@ -28,7 +28,7 @@ describe("fixed-rate schedule decisions", () => {
   test("sleeps against the persisted absolute deadline", () => {
     expect(schedule({ now: at("2026-01-01T00:00:00.500Z") })).toEqual({
       kind: "sleep",
-      wakeAt: "2026-01-01T00:00:00.750Z",
+      wakeAt: firstDueAt,
     });
     expect(schedule({ now: at("2026-01-01T00:00:00.999Z") })).toEqual({
       kind: "sleep",
@@ -74,12 +74,9 @@ describe("fixed-rate schedule decisions", () => {
     });
   });
 
-  test("does not schedule paused, stopped, exhausted, or unscheduled activations", () => {
-    expect(schedule({ state: "paused", now: at(firstDueAt) })).toEqual({ kind: "sleep", wakeAt: "2026-01-01T00:00:01.250Z" });
-    expect(schedule({ state: "paused", now: at("2026-01-01T00:00:03.000Z") })).toEqual({
-      kind: "sleep",
-      wakeAt: "2026-01-01T00:00:03.250Z",
-    });
+  test("waits for paused-state changes and finishes stopped, exhausted, or unscheduled activations", () => {
+    expect(schedule({ state: "paused", now: at(firstDueAt) })).toEqual({ kind: "wait" });
+    expect(schedule({ state: "paused", now: at("2026-01-01T00:00:03.000Z") })).toEqual({ kind: "wait" });
     expect(schedule({ state: "stopped" })).toEqual({ kind: "finished" });
     expect(schedule({ state: "exhausted" })).toEqual({ kind: "finished" });
     expect(schedule({ everyMs: null, nextDueAt: null })).toEqual({ kind: "finished" });

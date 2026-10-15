@@ -269,7 +269,7 @@ async function waitForRunStatus(root: string, workflowId: string, runId: string,
 }
 
 async function stopService(root: string): Promise<void> {
-  const metadataPath = join(root, ".workshop", "state", "service.json");
+  const metadataPath = join(root, ".workshop", "state-v5", "service.json");
   if (!existsSync(metadataPath)) return;
   const metadata = JSON.parse(readFileSync(metadataPath, "utf8")) as { pid?: unknown };
   if (typeof metadata.pid !== "number") return;

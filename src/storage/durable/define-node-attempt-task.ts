@@ -1,18 +1,20 @@
 import { createHash, randomUUID } from "node:crypto";
 import { Buffer } from "node:buffer";
 import { statSync } from "node:fs";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
+import { withAbortSignal, withCancel } from "@earendil-works/chord/context";
 import type { Context } from "@earendil-works/chord";
-import { defineTask, type ConversationId, type Cursor, type Task, type TaskId, type TaskRuntime, type Tx } from "@earendil-works/pi-durable";
+import { defineTask, type ConversationId, type Cursor, type DocumentWatch, type JsonObject, type Task, type TaskId, type TaskRuntime, type Tx } from "@earendil-works/pi-durable";
 import { z } from "zod";
 import { buildFailureFeedback, hashFailureEvidence } from "../../attempt/build-failure-feedback.js";
 import { resolveRetryLimit } from "../../definition/resolve-retry-limit.js";
 import { canonicalHash } from "../../definition/hash-canonical-json.js";
+import { parseModel } from "../../definition/parse-model.js";
 import type { ResolvedExecutionSite } from "../../definition/schema-resolved.js";
 import { nodeIdSchema, workflowIdSchema } from "../../definition/schema.js";
 import { parseTextResult, parseTaggedWorkerResult } from "../../attempt/parse-tagged-result.js";
 import { parseVerifierResult } from "../../attempt/parse-verifier-result.js";
-import { reconstructProcessStdin } from "../../attempt/build-process-stdin.js";
+import { committedHumanAnswer, reconstructProcessStdin } from "../../attempt/build-process-stdin.js";
 import { readCaptureBytes } from "../../process/read-retained-capture.js";
 import { locateWorkflowDirectory } from "../../run/locate-run-files.js";
 import { installationDocumentV1Schema } from "../../installation/schema.js";
@@ -23,9 +25,11 @@ import {
   failureInfoSchema,
   nodeAttemptOutcomeSchema,
   nodeResultSchema,
+  nativeExecutionReceiptSchema,
   runIdSchema,
   validatorOutcomePasses,
   validatorOutcomeSchema,
+  nodeResultStatus,
   type BlockInfo,
   type FailureInfo,
   type NodeAttemptOutcome,
@@ -51,12 +55,20 @@ import {
   type ProcessExecutionTaskDefinition,
 } from "./define-process-execution-task.js";
 import { utcTimestampSchema } from "../../util/schema.js";
+import {
+  agentExecutionTaskInputSchema,
+  agentExecutionTaskResultSchema,
+  type AgentExecutionTaskDefinition,
+  type AgentExecutionTaskInput,
+  type AgentExecutionTaskResult,
+} from "./define-agent-execution-task.js";
 
 const positive = z.number().int().positive().refine(Number.isSafeInteger);
 type ReadyRun = Extract<WorkflowRunDocumentV1, { state: "ready" }>;
 type PersistedNodeAttempt = z.infer<typeof persistedNodeAttemptSchema>;
 type NodeRuntime = TaskRuntime<NodeAttemptTaskInput, NodeCheckpoint, NodeAttemptOutcome, object>;
-type AwaitProcessCheckpoint = Extract<NodeCheckpoint, { phase: "awaitWorker" | "awaitValidator" }>;
+type AwaitProcessCheckpoint = Extract<NodeCheckpoint, { transport: "process" }>;
+type AwaitAgentCheckpoint = Extract<NodeCheckpoint, { transport: "agent" }>;
 type ReplayableProcessResult = Extract<ProcessExecutionTaskResult, { kind: "replayable" }>;
 export type NodeAttemptTaskDefinition = Task<NodeAttemptTaskInput, NodeCheckpoint, NodeAttemptOutcome, object>;
 
@@ -72,11 +84,13 @@ export const nodeAttemptTaskInputSchema = z.strictObject({
 });
 export type NodeAttemptTaskInput = z.infer<typeof nodeAttemptTaskInputSchema>;
 
-const nodeCheckpointSchema = z.discriminatedUnion("phase", [
+const nodeCheckpointSchema = z.union([
   z.strictObject({ phase: z.literal("prepare") }),
-  z.strictObject({ phase: z.literal("awaitWorker"), processTaskId: positive, executionId: executionIdSchema, incarnationId: incarnationIdSchema, incarnationNumber: positive }),
+  z.strictObject({ phase: z.literal("awaitWorker"), transport: z.literal("process"), processTaskId: positive, executionId: executionIdSchema, incarnationId: incarnationIdSchema, incarnationNumber: positive }),
+  z.strictObject({ phase: z.literal("awaitWorker"), transport: z.literal("agent"), agentTaskId: positive, executionId: executionIdSchema }),
   z.strictObject({ phase: z.literal("launchValidator") }),
-  z.strictObject({ phase: z.literal("awaitValidator"), processTaskId: positive, executionId: executionIdSchema, incarnationId: incarnationIdSchema, incarnationNumber: positive }),
+  z.strictObject({ phase: z.literal("awaitValidator"), transport: z.literal("process"), processTaskId: positive, executionId: executionIdSchema, incarnationId: incarnationIdSchema, incarnationNumber: positive }),
+  z.strictObject({ phase: z.literal("awaitValidator"), transport: z.literal("agent"), agentTaskId: positive, executionId: executionIdSchema }),
   z.strictObject({ phase: z.literal("finish") }),
 ]);
 type NodeCheckpoint = z.infer<typeof nodeCheckpointSchema>;
@@ -85,14 +99,24 @@ export function defineNodeAttemptTask(
   ProcessExecutionTask: ProcessExecutionTaskDefinition,
   activeBootId: string,
   canLaunch: () => boolean = () => true,
+  AgentExecutionTask?: AgentExecutionTaskDefinition,
+  waitForAdmission?: (signal: AbortSignal) => Promise<void>,
 ): NodeAttemptTaskDefinition {
+  if (AgentExecutionTask !== undefined && waitForAdmission === undefined) {
+    throw new Error("native agent attempts require an admission wait callback");
+  }
+  const awaitAdmission = waitForAdmission ?? ((signal: AbortSignal) => {
+    if (signal.aborted) return Promise.reject(signal.reason);
+    if (!canLaunch()) return Promise.reject(new Error("gated command attempts require an admission wait callback"));
+    return Promise.resolve();
+  });
   return defineTask<NodeAttemptTaskInput, NodeCheckpoint, NodeAttemptOutcome>({
     name: "workshop.node-attempt",
-    version: 4,
+    version: 5,
     initial: () => ({ phase: "prepare" }),
     phases: {
       prepare: async (task, runtime, context) => {
-        await waitForLaunchPermission(runtime, canLaunch, context);
+        await waitForLaunchPermission(runtime, canLaunch, awaitAdmission);
         const input = parseNodeInput(task.input);
         const run = await snapshotRun(runtime, context);
         assertNodeIdentity(input, run, runtime.taskId);
@@ -120,6 +144,25 @@ export function defineNodeAttemptTask(
         }
         const predecessor = run.chain.predecessors[input.nodeId];
         if (predecessor === undefined) throw new Error("frozen node has no predecessor snapshot");
+        if (settings.run.kind === "agent") {
+          if (AgentExecutionTask === undefined) {
+            const block = blockInfo("runtime_incompatible", "native agent execution task is unavailable", input.runId, input.nodeId, input.attemptId, timestamp(runtime.now()));
+            await settleAttempt(task, runtime, input, { kind: "blocked", block, candidate: null, validator: null }, "interrupted", context);
+            return;
+          }
+          const executionId = executionIdSchema.parse(randomUUID());
+          const startedAt = runtime.now();
+          let deadlineAt: number | null;
+          try { deadlineAt = absoluteAgentDeadline(startedAt, settings.run.timeoutMs); }
+          catch {
+            const failure = failureInfo("runtime_fault", "configured agent timeout exceeds the supported timestamp range", input, runtime.now());
+            await settleAttempt(task, runtime, input, { kind: "failed", failure, candidate: null, validator: null }, "failed", context);
+            return;
+          }
+          await launchNativeAgentExecution({ runtime, input, taskId: Number(runtime.taskId), role: "worker",
+            site: settings.run, executionId, startedAt, deadlineAt, AgentExecutionTask, context });
+          return;
+        }
         const launchIntentAt = timestamp(runtime.now());
         let deadlineAt: string | null;
         try {
@@ -165,18 +208,17 @@ export function defineNodeAttemptTask(
           assign(draft, next);
           return {
             status: "waiting",
-            checkpoint: { phase: "awaitWorker", processTaskId: Number(processTaskId), executionId, incarnationId, incarnationNumber: 1 },
+            checkpoint: { phase: "awaitWorker", transport: "process", processTaskId: Number(processTaskId), executionId, incarnationId, incarnationNumber: 1 },
             on: [processTaskId],
             policy: "allSettled",
           };
         }, context);
       },
       awaitWorker: async (task, runtime, context) => {
-        await waitForLaunchPermission(runtime, canLaunch, context);
+        await waitForLaunchPermission(runtime, canLaunch, awaitAdmission);
         const input = parseNodeInput(task.input);
         const checkpoint = nodeCheckpointSchema.parse(task.state.checkpoint);
         if (checkpoint.phase !== "awaitWorker") throw new Error("NodeAttempt checkpoint lacks its worker task identity");
-        const taskOutcome = (await runtime.outcomes([durableTaskId<ProcessExecutionTaskResult>(checkpoint.processTaskId)], context))[0];
         const run = await snapshotRun(runtime, context);
         assertNodeIdentity(input, run, runtime.taskId);
         const attempt = requireAttempt(run, input.nodeId, input.attemptId);
@@ -185,6 +227,16 @@ export function defineNodeAttemptTask(
           await settleAttempt(task, runtime, input, { kind: "blocked", block, candidate: null, validator: null }, "interrupted", context);
           return;
         }
+        if (checkpoint.transport === "agent") {
+          await completeNativeWorker({ task, runtime, input, run, attempt, checkpoint, context });
+          return;
+        }
+        if (run.resolvedSettings.nodes[input.nodeId]?.run.kind !== "command") {
+          const block = blockInfo("integrity_failed", "worker process checkpoint does not match frozen command settings", input.runId, input.nodeId, input.attemptId, timestamp(runtime.now()));
+          await settleAttempt(task, runtime, input, { kind: "blocked", block, candidate: null, validator: null }, "interrupted", context);
+          return;
+        }
+        const taskOutcome = (await runtime.outcomes([durableTaskId<ProcessExecutionTaskResult>(checkpoint.processTaskId)], context))[0];
         if (taskOutcome === undefined || taskOutcome.status !== "completed") {
           const block = blockInfo("external_outcome_unknown", "worker process task ended without a checked receipt", input.runId, input.nodeId, input.attemptId, timestamp(runtime.now()));
           await settleAttempt(task, runtime, input, { kind: "blocked", block, candidate: null, validator: null }, "interrupted", context);
@@ -262,7 +314,7 @@ export function defineNodeAttemptTask(
         await commitWorkerCandidate(runtime, input, candidate, settings.validator !== null, context);
       },
       launchValidator: async (task, runtime, context) => {
-        await waitForLaunchPermission(runtime, canLaunch, context);
+        await waitForLaunchPermission(runtime, canLaunch, awaitAdmission);
         const input = parseNodeInput(task.input);
         const run = await snapshotRun(runtime, context);
         assertNodeIdentity(input, run, runtime.taskId);
@@ -280,6 +332,24 @@ export function defineNodeAttemptTask(
         }
         const predecessor = run.chain.predecessors[input.nodeId];
         if (predecessor === undefined) throw new Error("frozen node has no predecessor snapshot");
+        if (settings.validator.kind === "agent") {
+          if (AgentExecutionTask === undefined) {
+            const block = blockInfo("runtime_incompatible", "native agent execution task is unavailable", input.runId, input.nodeId, input.attemptId, timestamp(runtime.now()));
+            await settleAttempt(task, runtime, input, { kind: "blocked", block, candidate, validator: null }, "interrupted", context);
+            return;
+          }
+          const executionId = executionIdSchema.parse(randomUUID());
+          const startedAt = runtime.now();
+          let agentDeadlineAt: number | null;
+          try { agentDeadlineAt = absoluteAgentDeadline(startedAt, settings.validator.timeoutMs); }
+          catch {
+            await blockVerifier(runtime, input, candidate, "configured verifier timeout exceeds the supported timestamp range", context);
+            return;
+          }
+          await launchNativeAgentExecution({ runtime, input, taskId: Number(runtime.taskId), role: "validator",
+            site: settings.validator, executionId, startedAt, deadlineAt: agentDeadlineAt, AgentExecutionTask, context });
+          return;
+        }
         const launchIntentAt = timestamp(runtime.now());
         let deadlineAt: string | null;
         try {
@@ -326,18 +396,17 @@ export function defineNodeAttemptTask(
           assign(draft, next);
           return {
             status: "waiting",
-            checkpoint: { phase: "awaitValidator", processTaskId: Number(processTaskId), executionId, incarnationId, incarnationNumber: 1 },
+            checkpoint: { phase: "awaitValidator", transport: "process", processTaskId: Number(processTaskId), executionId, incarnationId, incarnationNumber: 1 },
             on: [processTaskId],
             policy: "allSettled",
           };
         }, context);
       },
       awaitValidator: async (task, runtime, context) => {
-        await waitForLaunchPermission(runtime, canLaunch, context);
+        await waitForLaunchPermission(runtime, canLaunch, awaitAdmission);
         const input = parseNodeInput(task.input);
         const checkpoint = nodeCheckpointSchema.parse(task.state.checkpoint);
         if (checkpoint.phase !== "awaitValidator") throw new Error("NodeAttempt checkpoint lacks its validator task identity");
-        const taskOutcome = (await runtime.outcomes([durableTaskId<ProcessExecutionTaskResult>(checkpoint.processTaskId)], context))[0];
         const run = await snapshotRun(runtime, context);
         assertNodeIdentity(input, run, runtime.taskId);
         const attempt = requireAttempt(run, input.nodeId, input.attemptId);
@@ -348,6 +417,17 @@ export function defineNodeAttemptTask(
           return;
         }
         const candidate = attempt.result.kind === "candidate_committed" ? attempt.result.candidate : null;
+        if (checkpoint.transport === "agent") {
+          await completeNativeValidator({ task, runtime, input, attempt, checkpoint, candidate, context });
+          return;
+        }
+        const validatorSite = run.resolvedSettings.nodes[input.nodeId]?.validator;
+        if (validatorSite?.kind !== "command") {
+          const block = blockInfo("integrity_failed", "validator process checkpoint does not match frozen command settings", input.runId, input.nodeId, input.attemptId, timestamp(runtime.now()));
+          await settleAttempt(task, runtime, input, { kind: "blocked", block, candidate, validator: null }, "interrupted", context);
+          return;
+        }
+        const taskOutcome = (await runtime.outcomes([durableTaskId<ProcessExecutionTaskResult>(checkpoint.processTaskId)], context))[0];
         if (taskOutcome === undefined || taskOutcome.status !== "completed") {
           const block = blockInfo("process_death_unconfirmed", "verifier process task ended without a checked retirement receipt", input.runId, input.nodeId, input.attemptId, timestamp(runtime.now()));
           await settleAttempt(task, runtime, input, { kind: "blocked", block, candidate, validator: null }, "interrupted", context);
@@ -378,43 +458,16 @@ export function defineNodeAttemptTask(
           return;
         }
         const process = checked.data;
-        const validatorSite = run.resolvedSettings.nodes[input.nodeId]?.validator;
-        if (validatorSite === undefined || validatorSite === null) throw new Error("frozen verifier settings disappeared");
-        if (process.timedOut || process.exit.kind !== "code" || process.exit.code === 126 || process.exit.code === 127
-          || (validatorSite.kind === "agent" && process.exit.code !== 0)) {
+        if (process.timedOut || process.exit.kind !== "code" || process.exit.code === 126 || process.exit.code === 127) {
           await blockVerifier(runtime, input, candidate, "verifier process failed (launch, timeout, signal, or invalid exit)", context);
           return;
         }
-        let validator: ValidatorOutcome;
-        if (validatorSite.kind === "command") {
-          validator = validatorOutcomeSchema.parse({
-            kind: "command",
-            exit: process.exit,
-            stdoutHash: process.stdoutCaptureHash,
-            stderrHash: process.stderrCaptureHash,
-          });
-        } else {
-          const stdout = process.semanticStdout;
-          if (stdout.kind !== "captured") {
-            await blockVerifier(runtime, input, candidate, "agent verifier stdout is unavailable, oversized, or invalid UTF-8", context);
-            return;
-          }
-          const parsed = parseVerifierResult(Buffer.from(stdout.text, "utf8"));
-          if (!parsed.ok) {
-            await blockVerifier(runtime, input, candidate, parsed.failure.message, context);
-            return;
-          }
-          if (candidate === null && parsed.value.decision === "accept") {
-            await blockVerifier(runtime, input, candidate, "only retry or block is valid after worker failure", context);
-            return;
-          }
-          validator = validatorOutcomeSchema.parse({
-            kind: "agent",
-            exit: process.exit,
-            verdict: { version: 2, decision: parsed.value.decision, reason: parsed.value.reason },
-            resultBytesHash: parsed.sourceBytesHash,
-          });
-        }
+        const validator = validatorOutcomeSchema.parse({
+          kind: "command",
+          exit: process.exit,
+          stdoutHash: process.stdoutCaptureHash,
+          stderrHash: process.stderrCaptureHash,
+        });
         await commitValidatorOutcome(runtime, input, candidate, validator, context);
       },
       finish: async (task, runtime, context) => {
@@ -451,8 +504,15 @@ export function defineNodeAttemptTask(
   });
 }
 
-async function waitForLaunchPermission(runtime: NodeRuntime, canLaunch: () => boolean, context: Context): Promise<void> {
-  while (!canLaunch()) await runtime.sleep(runtime.now() + 250, context);
+async function waitForLaunchPermission(
+  runtime: NodeRuntime,
+  canLaunch: () => boolean,
+  waitForAdmission: (signal: AbortSignal) => Promise<void>,
+): Promise<void> {
+  while (true) {
+    await waitForAdmission(runtime.signal);
+    if (canLaunch()) return;
+  }
 }
 
 async function commitWorkerCandidate(
@@ -541,6 +601,311 @@ async function commitValidatorOutcome(
   }, context);
 }
 
+type NativeAgentSite = Extract<ResolvedExecutionSite, { kind: "agent" }>;
+type AgentTextResult = Extract<AgentExecutionTaskResult, { kind: "completed" | "too_large" }>;
+
+async function launchNativeAgentExecution(args: {
+  runtime: NodeRuntime;
+  input: NodeAttemptTaskInput;
+  taskId: number;
+  role: "worker" | "validator";
+  site: NativeAgentSite;
+  executionId: ProcessExecutionTaskEnvironmentInput["executionId"];
+  startedAt: number;
+  deadlineAt: number | null;
+  AgentExecutionTask: AgentExecutionTaskDefinition;
+  context: Context;
+}): Promise<void> {
+  await args.runtime.commit(async (tx) => {
+    const { draft, run: current } = await runDraft(tx, args.runtime.conversationId);
+    assertNodeIdentity(args.input, current, args.runtime.taskId);
+    const attempt = requireAttempt(current, args.input.nodeId, args.input.attemptId);
+    if (args.role === "worker") {
+      if (attempt.status !== "prepared" || attempt.workerExecutionId !== null || attempt.result.kind !== "pending") {
+        throw new Error("node attempt is not ready to admit its native worker");
+      }
+    } else if ((attempt.result.kind !== "candidate_committed" && attempt.result.kind !== "worker_failure_committed")
+      || attempt.validatorExecutionId !== null) {
+      throw new Error("node attempt is not ready to admit its native verifier");
+    }
+    if (!("formatVersion" in current.resolvedSettings) || current.resolvedSettings.formatVersion !== 4) {
+      throw new Error("native execution requires frozen format 4 settings");
+    }
+    const settings = current.resolvedSettings.nodes[args.input.nodeId];
+    const site = args.role === "worker" ? settings?.run : settings?.validator;
+    if (settings === undefined || site?.kind !== "agent" || canonicalHash(site) !== canonicalHash(args.site)) {
+      throw new Error("native execution differs from frozen agent settings");
+    }
+    const prompt = reconstructProcessStdin({
+      role: args.role,
+      nodeId: args.input.nodeId,
+      attemptId: args.input.attemptId,
+      executionId: args.executionId,
+    }, current);
+    const nativeInput = agentExecutionTaskInputSchema.parse({
+      executionId: args.executionId,
+      role: args.role === "worker" ? "worker" : "verifier",
+      model: (() => {
+        const model = parseModel(site.model);
+        return { provider: model.provider, modelId: model.modelId, thinkingLevel: model.thinking };
+      })(),
+      cwd: site.cwd,
+      shellPath: site.shell,
+      promptText: Buffer.from(prompt.bytes).toString("utf8"),
+      env: buildNativeWorkshopEnvironment(current, args.input, args.role, args.executionId, site),
+      startedAt: args.startedAt,
+      deadlineAt: args.deadlineAt,
+    });
+    const childId = await tx.createTask(args.AgentExecutionTask, nativeInput, {
+      ownership: { kind: "task", taskId: args.runtime.taskId },
+      conversationId: args.runtime.conversationId,
+    });
+    const phase = args.role === "worker" ? "awaitWorker" : "awaitValidator";
+    const next = replaceRunAttempt(current, args.input.nodeId, args.input.attemptId, (value) => ({
+      ...value,
+      status: args.role === "worker" ? "executing" : "validating",
+      phase,
+      ...(args.role === "worker" ? { workerExecutionId: args.executionId } : { validatorExecutionId: args.executionId }),
+    }));
+    assign(draft, next);
+    return {
+      status: "waiting",
+      checkpoint: args.role === "worker"
+        ? { phase: "awaitWorker" as const, transport: "agent" as const, agentTaskId: Number(childId), executionId: args.executionId }
+        : { phase: "awaitValidator" as const, transport: "agent" as const, agentTaskId: Number(childId), executionId: args.executionId },
+      on: [childId],
+      policy: "allSettled",
+    };
+  }, args.context);
+}
+
+function buildNativeWorkshopEnvironment(
+  run: ReadyRun,
+  input: NodeAttemptTaskInput,
+  role: "worker" | "validator",
+  executionId: string,
+  site: NativeAgentSite,
+): Record<string, string> {
+  const model = parseModel(site.model);
+  const directory = locateWorkflowDirectory(run);
+  const env: Record<string, string> = {
+    WORKSHOP_RUN_ID: run.runId,
+    WORKSHOP_WORKFLOW_ID: run.workflowId,
+    WORKSHOP_STEP_ID: input.nodeId,
+    WORKSHOP_ATTEMPT: String(input.attemptNumber),
+    WORKSHOP_EXECUTION_ID: executionId,
+    WORKSHOP_RESULTS_PATH: join(directory, "results.md"),
+    WORKSHOP_LOG_PATH: join(directory, "execution.log"),
+    WORKSHOP_PROVIDER: model.provider,
+    WORKSHOP_MODEL_ID: model.modelId,
+    WORKSHOP_MODEL: model.provider + "/" + model.modelId,
+    WORKSHOP_THINKING: model.thinking,
+    WORKSHOP_MODEL_WITH_THINKING: model.full,
+  };
+  const answer = committedHumanAnswer(run, input.nodeId);
+  if (answer !== null) env.WORKSHOP_ANSWER = answer;
+  return env;
+}
+
+function absoluteAgentDeadline(startedAt: number, timeoutMs: number | null): number | null {
+  if (timeoutMs === null) return null;
+  const deadlineAt = startedAt + timeoutMs;
+  if (!Number.isSafeInteger(deadlineAt) || !Number.isFinite(new Date(deadlineAt).getTime())) {
+    throw new Error("agent deadline exceeds the supported timestamp range");
+  }
+  return deadlineAt;
+}
+
+async function readNativeAgentResult(
+  runtime: NodeRuntime,
+  checkpoint: AwaitAgentCheckpoint,
+  expectedRole: "worker" | "verifier",
+  context: Context,
+): Promise<AgentExecutionTaskResult | undefined> {
+  const taskId = durableTaskId<AgentExecutionTaskResult>(checkpoint.agentTaskId);
+  const task = await runtime.getTask(taskId, context);
+  if (task === undefined || task.kind !== "workshop.agent-execution" || task.owner !== runtime.taskId
+    || task.conversationId !== runtime.conversationId) return undefined;
+  const taskInput = agentExecutionTaskInputSchema.safeParse(task.input);
+  if (!taskInput.success || taskInput.data.executionId !== checkpoint.executionId || taskInput.data.role !== expectedRole) return undefined;
+  const outcome = (await runtime.outcomes([taskId], context))[0];
+  if (outcome === undefined || outcome.status !== "completed") return undefined;
+  const result = agentExecutionTaskResultSchema.safeParse(outcome.result);
+  if (!result.success || result.data.executionId !== checkpoint.executionId
+    || result.data.requestId !== "workshop.agent-execution:" + checkpoint.executionId
+    || result.data.startedAt !== taskInput.data.startedAt || result.data.finishedAt < taskInput.data.startedAt) return undefined;
+  return result.data;
+}
+
+async function completeNativeWorker(args: {
+  task: unknown;
+  runtime: NodeRuntime;
+  input: NodeAttemptTaskInput;
+  run: ReadyRun;
+  attempt: PersistedNodeAttempt;
+  checkpoint: AwaitAgentCheckpoint;
+  context: Context;
+}): Promise<void> {
+  const result = await readNativeAgentResult(args.runtime, args.checkpoint, "worker", args.context);
+  if (result === undefined) {
+    const block = blockInfo("external_outcome_unknown", "native worker ended without a checked execution receipt", args.input.runId, args.input.nodeId, args.input.attemptId, timestamp(args.runtime.now()));
+    await settleAttempt(args.task, args.runtime, args.input, { kind: "blocked", block, candidate: null, validator: null }, "interrupted", args.context);
+    return;
+  }
+  if (result.kind === "blocked") {
+    const block = blockInfo("external_outcome_unknown", "native worker has an interrupted unsafe tool call", args.input.runId, args.input.nodeId, args.input.attemptId, timestamp(args.runtime.now()));
+    await settleAttempt(args.task, args.runtime, args.input, { kind: "blocked", block, candidate: null, validator: null }, "interrupted", args.context);
+    return;
+  }
+  if (result.kind === "timed_out") {
+    const block = blockInfo("external_outcome_unknown", "native worker timed out before a checked final answer", args.input.runId, args.input.nodeId, args.input.attemptId, timestamp(args.runtime.now()));
+    await settleAttempt(args.task, args.runtime, args.input, { kind: "blocked", block, candidate: null, validator: null }, "interrupted", args.context);
+    return;
+  }
+  if (result.kind === "guard_failed") {
+    const block = blockInfo("integrity_failed", result.reason, args.input.runId, args.input.nodeId, args.input.attemptId, timestamp(args.runtime.now()));
+    await settleAttempt(args.task, args.runtime, args.input, { kind: "blocked", block, candidate: null, validator: null }, "interrupted", args.context);
+    return;
+  }
+  if (result.kind === "cancelled") {
+    const block = blockInfo("external_outcome_unknown", "native worker was cancelled without an operator stop receipt", args.input.runId, args.input.nodeId, args.input.attemptId, timestamp(args.runtime.now()));
+    await settleAttempt(args.task, args.runtime, args.input, { kind: "blocked", block, candidate: null, validator: null }, "interrupted", args.context);
+    return;
+  }
+  if (result.kind === "failed") {
+    await handleWorkerFailure(args.runtime, args.input,
+      failureInfo("process_error", result.reason, args.input, args.runtime.now()), args.context);
+    return;
+  }
+  if (result.kind === "too_large") {
+    const failure = failureInfo("result_too_large", "worker final text exceeded the 1 MiB result limit", args.input,
+      args.runtime.now(), nativeFailureReceipt(result));
+    await persistNativeWorkerFailure(args.runtime, args.input, failure, args.checkpoint, args.context);
+    await handleWorkerFailure(args.runtime, args.input, failure, args.context);
+    return;
+  }
+  const bytes = Buffer.from(result.finalText, "utf8");
+  if (sha256(bytes) !== result.finalTextSha256) {
+    const block = blockInfo("integrity_failed", "native worker final-text hash does not match its receipt", args.input.runId, args.input.nodeId, args.input.attemptId, timestamp(args.runtime.now()));
+    await settleAttempt(args.task, args.runtime, args.input, { kind: "blocked", block, candidate: null, validator: null }, "interrupted", args.context);
+    return;
+  }
+  if (!("formatVersion" in args.run.resolvedSettings) || args.run.resolvedSettings.formatVersion !== 4) {
+    throw new Error("native worker requires frozen format 4 settings");
+  }
+  const settings = args.run.resolvedSettings.nodes[args.input.nodeId];
+  if (settings === undefined) throw new Error("frozen node settings disappeared");
+  const parsed = settings.result === "text" ? parseTextResult(bytes) : parseTaggedWorkerResult(bytes);
+  if (!parsed.ok) {
+    const failure = failureInfo(parsed.failure.kind, parsed.failure.message, args.input,
+      args.runtime.now(), nativeFailureReceipt(result));
+    await persistNativeWorkerFailure(args.runtime, args.input, failure, args.checkpoint, args.context);
+    await handleWorkerFailure(args.runtime, args.input, failure, args.context);
+    return;
+  }
+  const candidate = nodeResultSchema.parse({
+    version: 3,
+    source: "agent",
+    output: parsed.value.output,
+    summary: "reason" in parsed.value ? parsed.value.reason ?? "" : "",
+    artifacts: [],
+    sourceBytesHash: result.finalTextSha256,
+    nativeExecution: nativeReceipt(result),
+    agentResult: {
+      version: 1,
+      mode: settings.result,
+      status: parsed.value.status,
+      reason: "reason" in parsed.value ? parsed.value.reason : null,
+      question: "question" in parsed.value ? parsed.value.question : null,
+    },
+  });
+  await commitWorkerCandidate(args.runtime, args.input, candidate, settings.validator !== null, args.context);
+}
+
+async function completeNativeValidator(args: {
+  task: unknown;
+  runtime: NodeRuntime;
+  input: NodeAttemptTaskInput;
+  attempt: PersistedNodeAttempt;
+  checkpoint: AwaitAgentCheckpoint;
+  candidate: NodeResult | null;
+  context: Context;
+}): Promise<void> {
+  const result = await readNativeAgentResult(args.runtime, args.checkpoint, "verifier", args.context);
+  if (result === undefined) {
+    const block = blockInfo("process_death_unconfirmed", "native verifier ended without a checked execution receipt", args.input.runId, args.input.nodeId, args.input.attemptId, timestamp(args.runtime.now()));
+    await settleAttempt(args.task, args.runtime, args.input, { kind: "blocked", block, candidate: args.candidate, validator: null }, "interrupted", args.context);
+    return;
+  }
+  if (result.kind === "blocked" || result.kind === "timed_out") {
+    const block = blockInfo("external_outcome_unknown", "native verifier ended with an unknown tool outcome", args.input.runId, args.input.nodeId, args.input.attemptId, timestamp(args.runtime.now()));
+    await settleAttempt(args.task, args.runtime, args.input, { kind: "blocked", block, candidate: args.candidate, validator: null }, "interrupted", args.context);
+    return;
+  }
+  if (result.kind !== "completed") {
+    const reason = result.kind === "guard_failed" ? result.reason
+      : result.kind === "failed" ? result.reason
+        : result.kind === "too_large" ? "agent verifier final text exceeded the 1 MiB result limit"
+          : "native verifier was cancelled without a checked operator stop";
+    await blockVerifier(args.runtime, args.input, args.candidate, reason, args.context);
+    return;
+  }
+  const bytes = Buffer.from(result.finalText, "utf8");
+  if (sha256(bytes) !== result.finalTextSha256) {
+    const block = blockInfo("integrity_failed", "native verifier final-text hash does not match its receipt", args.input.runId, args.input.nodeId, args.input.attemptId, timestamp(args.runtime.now()));
+    await settleAttempt(args.task, args.runtime, args.input, { kind: "blocked", block, candidate: args.candidate, validator: null }, "interrupted", args.context);
+    return;
+  }
+  const parsed = parseVerifierResult(bytes);
+  if (!parsed.ok) {
+    await blockVerifier(args.runtime, args.input, args.candidate, parsed.failure.message, args.context);
+    return;
+  }
+  if (args.candidate === null && parsed.value.decision === "accept") {
+    await blockVerifier(args.runtime, args.input, args.candidate, "only retry or block is valid after worker failure", args.context);
+    return;
+  }
+  const validator = validatorOutcomeSchema.parse({
+    kind: "native_agent",
+    nativeExecution: nativeReceipt(result),
+    verdict: { version: 2, decision: parsed.value.decision, reason: parsed.value.reason },
+    resultBytesHash: result.finalTextSha256,
+  });
+  await commitValidatorOutcome(args.runtime, args.input, args.candidate, validator, args.context);
+}
+
+function nativeReceipt(result: Extract<AgentExecutionTaskResult, { kind: "completed" }>) {
+  return {
+    executionId: result.executionId,
+    conversationId: result.conversationId,
+    requestId: result.requestId,
+    assistantEntryId: result.assistantEntryId,
+    finalTextSha256: result.finalTextSha256,
+    byteCount: Buffer.byteLength(result.finalText, "utf8"),
+    finalText: result.finalText,
+    startedAt: result.startedAt,
+    finishedAt: result.finishedAt,
+  };
+}
+
+function nativeFailureReceipt(result: Extract<AgentExecutionTaskResult, { kind: "completed" | "too_large" }>) {
+  return nativeExecutionReceiptSchema.parse({
+    executionId: result.executionId,
+    conversationId: result.conversationId,
+    requestId: result.requestId,
+    assistantEntryId: result.assistantEntryId,
+    finalTextSha256: result.finalTextSha256,
+    byteCount: result.kind === "completed" ? Buffer.byteLength(result.finalText, "utf8") : result.byteCount,
+    ...(result.kind === "completed" ? { finalText: result.finalText } : {}),
+    startedAt: result.startedAt,
+    finishedAt: result.finishedAt,
+  });
+}
+
+function sha256(bytes: Uint8Array): string {
+  return "sha256:" + createHash("sha256").update(bytes).digest("hex");
+}
+
 function createProcessInput(args: {
   run: ReadyRun;
   taskId: number;
@@ -554,6 +919,7 @@ function createProcessInput(args: {
   launchIntentAt: string;
   deadlineAt: string | null;
 }): ProcessExecutionTaskInput {
+  if (args.site.kind !== "command") throw new Error("native agent execution cannot use ProcessExecution");
   const files = processExecutionFiles(
     { role: args.role, nodeId: args.input.nodeId, incarnationNumber: args.incarnationNumber ?? 1, executionId: args.executionId },
     locateWorkflowDirectory(args.run),
@@ -581,7 +947,7 @@ function createProcessInput(args: {
     launchIntentAt: args.launchIntentAt,
     deadlineAt: args.deadlineAt,
     shell: args.site.shell,
-    command: args.site.kind === "command" ? args.site.command : args.site.harnessCommand,
+    command: args.site.command,
     cwd: args.site.cwd,
     timeoutMs: args.site.timeoutMs,
     streamCapBytes: args.site.streamCapBytes,
@@ -681,8 +1047,8 @@ async function scheduleSafeProcessReplay(args: {
       conversationId: runtime.conversationId,
     });
     const nextCheckpoint = role === "worker"
-      ? { phase: "awaitWorker" as const, processTaskId: Number(processTaskId), executionId: replay.executionId, incarnationId: replay.incarnationId, incarnationNumber: replay.incarnationNumber }
-      : { phase: "awaitValidator" as const, processTaskId: Number(processTaskId), executionId: replay.executionId, incarnationId: replay.incarnationId, incarnationNumber: replay.incarnationNumber };
+      ? { phase: "awaitWorker" as const, transport: "process" as const, processTaskId: Number(processTaskId), executionId: replay.executionId, incarnationId: replay.incarnationId, incarnationNumber: replay.incarnationNumber }
+      : { phase: "awaitValidator" as const, transport: "process" as const, processTaskId: Number(processTaskId), executionId: replay.executionId, incarnationId: replay.incarnationId, incarnationNumber: replay.incarnationNumber };
     return { status: "waiting", checkpoint: nextCheckpoint, on: [processTaskId], policy: "allSettled" };
   }, context);
 }
@@ -805,7 +1171,48 @@ async function waitForNodeReplayResume(runtime: NodeRuntime, input: NodeAttemptT
       return run;
     }
     // A queued run remains here until its persisted CapacityGate acquires a slot.
-    await runtime.sleep(runtime.now() + 250, context);
+    await waitForRunChange(runtime, input, context);
+  }
+}
+
+async function waitForRunChange(runtime: NodeRuntime, input: NodeAttemptTaskInput, context: Context): Promise<void> {
+  const parentContext = withAbortSignal(runtime.signal, context);
+  const { context: watchContext, cancel } = withCancel(parentContext);
+  let watch: DocumentWatch<JsonObject> | undefined;
+  try {
+    watch = await runtime.watchDoc(WorkshopRunDoc, runtime.conversationId, watchContext);
+    if (watch === undefined) throw new Error("NodeAttempt run document is unavailable for watching");
+    const initial = readyRun(watch.value);
+    assertNodeIdentity(input, initial, runtime.taskId);
+    let notify!: () => void;
+    const changed = new Promise<void>((resolve) => { notify = resolve; });
+    watch.start(async (value) => {
+      const observed = readyRun(value);
+      assertNodeIdentity(input, observed, runtime.taskId);
+      notify();
+    });
+    const current = await snapshotRun(runtime, watchContext);
+    assertNodeIdentity(input, current, runtime.taskId);
+    if (canonicalHash(current) !== canonicalHash(initial)) return;
+
+    const result = await Promise.race([
+      changed.then(() => ({ kind: "changed" as const })),
+      watch.closed.then((end) => ({ kind: "closed" as const, end })),
+    ]);
+    if (result.kind === "changed") return;
+    if (runtime.signal.aborted || watchContext.abortSignal?.aborted) {
+      throw runtime.signal.reason ?? watchContext.abortSignal?.reason ?? new Error("run-state wait was cancelled");
+    }
+    if (result.end.reason === "listener_error") throw result.end.error;
+    throw new Error("NodeAttempt run document watch ended: " + result.end.reason);
+  } finally {
+    cancel();
+    if (watch !== undefined) {
+      const end = await watch.stop();
+      if (end.reason === "listener_error" && !runtime.signal.aborted && !watchContext.abortSignal?.aborted) {
+        throw end.error;
+      }
+    }
   }
 }
 
@@ -888,6 +1295,7 @@ async function checkedOperatorStopRetirement(
       && attempt.validatorExecutionId === null;
   }
   if (checkpoint.phase === "finish") return false;
+  if (checkpoint.transport !== "process") return false;
   const expectedRole = checkpoint.phase === "awaitWorker" ? "worker" : "validator";
   if ((expectedRole === "worker" && attempt.result.kind !== "pending")
     || (expectedRole === "validator" && ((attempt.result.kind !== "candidate_committed" && attempt.result.kind !== "worker_failure_committed") || !hasWorkerReceipt))) return false;
@@ -930,7 +1338,7 @@ async function finishNodeAttempt(
   const attempt = requireAttempt(run, input.nodeId, input.attemptId);
   if (attempt.result.kind === "worker_failure_committed") {
     const { failure, validator } = attempt.result;
-    if (validator?.kind === "agent" && validator.verdict.version === 2 && validator.verdict.decision === "block") {
+    if ((validator?.kind === "agent" || validator?.kind === "native_agent") && validator.verdict.version === 2 && validator.verdict.decision === "block") {
       const block = blockInfo("verifier_block", validator.verdict.reason, input.runId, input.nodeId, input.attemptId, timestamp(runtime.now()));
       await settleAttempt(null, runtime, input, { kind: "blocked", block, candidate: null, validator }, "interrupted", context);
     } else {
@@ -943,7 +1351,7 @@ async function finishNodeAttempt(
     : null;
   if (candidate === null) throw new Error("attempt has no committed candidate to settle");
   const validator = attempt.result.kind === "validation_committed" ? attempt.result.validator : null;
-  if (validator?.kind === "agent" && validator.verdict.version === 2 && validator.verdict.decision === "block") {
+  if ((validator?.kind === "agent" || validator?.kind === "native_agent") && validator.verdict.version === 2 && validator.verdict.decision === "block") {
     const reason = validator.verdict.reason;
     const block = blockInfo("verifier_block", reason, input.runId, input.nodeId, input.attemptId, timestamp(runtime.now()));
     await settleAttempt(null, runtime, input, { kind: "blocked", block, candidate, validator }, "interrupted", context);
@@ -1166,8 +1574,12 @@ function utf8Suffix(value: string, maxBytes: number): string {
   return value.slice(start);
 }
 
-function failureInfo(kind: FailureInfo["kind"], message: string, input: NodeAttemptTaskInput, at: number): FailureInfo {
-  return failureInfoSchema.parse({ kind, message, failedAt: timestamp(at), nodeId: input.nodeId, attemptId: input.attemptId });
+function failureInfo(
+  kind: FailureInfo["kind"], message: string, input: NodeAttemptTaskInput, at: number,
+  nativeExecution?: z.infer<typeof nativeExecutionReceiptSchema>,
+): FailureInfo {
+  return failureInfoSchema.parse({ kind, message, failedAt: timestamp(at), nodeId: input.nodeId, attemptId: input.attemptId,
+    ...(nativeExecution === undefined ? {} : { nativeExecution }) });
 }
 
 function timestamp(ms: number): string {
@@ -1190,6 +1602,24 @@ function replayDeadlineMatches(launchIntentAt: string, deadlineAt: string | null
   return Number.isSafeInteger(launchTime) && Number.isSafeInteger(deadlineTime)
     && Number.isFinite(new Date(deadlineTime).getTime())
     && remaining >= 0 && remaining <= timeoutMs;
+}
+
+async function persistNativeWorkerFailure(
+  runtime: NodeRuntime, input: NodeAttemptTaskInput, failure: FailureInfo,
+  checkpoint: AwaitAgentCheckpoint, context: Context,
+): Promise<void> {
+  await runtime.commit(async (tx) => {
+    const { draft, run } = await runDraft(tx, runtime.conversationId);
+    assertNodeIdentity(input, run, runtime.taskId);
+    const attempt = requireAttempt(run, input.nodeId, input.attemptId);
+    if (attempt.workerExecutionId !== failure.nativeExecution?.executionId) {
+      throw new Error("native worker failure receipt does not match the active worker execution");
+    }
+    assign(draft, replaceRunAttempt(run, input.nodeId, input.attemptId, (value) => ({
+      ...value, workerFailure: failure,
+    })));
+    return { status: "running", checkpoint };
+  }, context);
 }
 
 async function handleWorkerFailure(runtime: NodeRuntime, input: NodeAttemptTaskInput, failure: FailureInfo, context: Context): Promise<void> {
@@ -1247,8 +1677,8 @@ async function buildAttemptFailureMetadata(
   const stdout = process?.captures.find((capture) => capture.stream === "stdout");
   const stderrBytes = Buffer.from(stderr?.retained?.bytes ?? "", "base64");
   const verifier = outcome.validator;
-  const verifierReason = verifier?.kind === "agent" && verifier.verdict.version === 2 ? verifier.verdict.reason : null;
-  const feedbackText = verifierReason !== null && verifier?.kind === "agent"
+  const verifierReason = (verifier?.kind === "agent" || verifier?.kind === "native_agent") && verifier.verdict.version === 2 ? verifier.verdict.reason : null;
+  const feedbackText = verifier !== null && verifierReason !== null
     ? validatorFailureReason(verifier)
     : outcome.failure.message + "\n\nstdout:\n" + (stdout?.retained === undefined ? "unavailable" : readCaptureBytes(Buffer.from(stdout.retained.bytes, "base64")))
       + "\n\nstderr:\n" + (stderr?.retained === undefined ? "unavailable" : readCaptureBytes(stderrBytes))

@@ -22,6 +22,8 @@ import {
   desiredStateSchema,
   activationIdSchema,
   nodeResultSchema,
+  nodeResultQuestion,
+  nodeResultStatus,
   humanWaitSchema,
   waitIdSchema,
   validatorOutcomeSchema,
@@ -77,6 +79,7 @@ export const runtimeManifestSchema = z.strictObject({
     capacityGate: positiveSafeInteger.optional(),
     failureJudgment: positiveSafeInteger.optional(),
     scheduleWakeup: positiveSafeInteger.optional(),
+    agentExecution: positiveSafeInteger.optional(),
   }),
 });
 
@@ -204,6 +207,28 @@ export const persistedNodeAttemptSchema = z.strictObject({
     if (blockIds.has(blockId)) context.addIssue({ code: "custom", path: ["blockIds", index], message: "attempt block references are unique" });
     blockIds.add(blockId);
   }
+  const candidate = attempt.result.kind === "candidate_committed" || attempt.result.kind === "validation_committed"
+    ? attempt.result.candidate
+    : attempt.result.kind === "settled" ? attempt.result.outcome.candidate : null;
+  const validator = attempt.result.kind === "validation_committed" || attempt.result.kind === "worker_failure_committed"
+    ? attempt.result.validator
+    : attempt.result.kind === "settled" ? attempt.result.outcome.validator : null;
+  if (candidate?.version === 3) {
+    if (attempt.workerExecutionId !== candidate.nativeExecution.executionId) {
+      context.addIssue({ code: "custom", path: ["workerExecutionId"], message: "native candidate receipt matches its logical worker execution" });
+    }
+    if (attempt.processIncarnations.some((reference) => reference.executionId === candidate.nativeExecution.executionId)) {
+      context.addIssue({ code: "custom", path: ["processIncarnations"], message: "native worker evidence has no process incarnation" });
+    }
+  }
+  if (validator?.kind === "native_agent") {
+    if (attempt.validatorExecutionId !== validator.nativeExecution.executionId) {
+      context.addIssue({ code: "custom", path: ["validatorExecutionId"], message: "native verifier receipt matches its logical verifier execution" });
+    }
+    if (attempt.processIncarnations.some((reference) => reference.executionId === validator.nativeExecution.executionId)) {
+      context.addIssue({ code: "custom", path: ["processIncarnations"], message: "native verifier evidence has no process incarnation" });
+    }
+  }
   const judgmentIds = new Set<string>();
   for (const [index, judgment] of attempt.judgments.entries()) {
     if (judgmentIds.has(judgment.judgmentId)) {
@@ -277,7 +302,6 @@ const admittedRunDocumentV1Schema = z.strictObject({
     conversationId: positiveSafeInteger,
     workflowTaskId: positiveSafeInteger,
     capacityGateTaskId: positiveSafeInteger.nullable().optional(),
-    continuationPending: z.boolean().optional(),
   }),
   status: runStatusSchema,
   desiredState: desiredStateSchema,
@@ -340,9 +364,10 @@ const admittedRunDocumentV1Schema = z.strictObject({
     const attempt = node?.attempts.find((value) => value.attemptId === wait.attemptId);
     const candidate = attempt?.result.kind === "settled" && attempt.result.outcome.kind === "succeeded"
       ? attempt.result.outcome.candidate : null;
-    if (waitIds.has(wait.waitId) || wait.runId !== run.runId || candidate?.version !== 2
-      || candidate.stdioResult.status !== "needs_input" || candidate.output !== wait.output
-      || candidate.stdioResult.question !== wait.question || Date.parse(wait.createdAt) < Date.parse(attempt?.finishedAt ?? wait.createdAt)) {
+    if (waitIds.has(wait.waitId) || wait.runId !== run.runId || candidate === null
+      || (candidate.version !== 2 && candidate.version !== 3) || nodeResultStatus(candidate) !== "needs_input"
+      || candidate.output !== wait.output || nodeResultQuestion(candidate) !== wait.question
+      || Date.parse(wait.createdAt) < Date.parse(attempt?.finishedAt ?? wait.createdAt)) {
       context.addIssue({ code: "custom", path: ["waits", index], message: "wait identity and immutable proposal match its accepted attempt" });
     }
     waitIds.add(wait.waitId);
@@ -361,11 +386,6 @@ const admittedRunDocumentV1Schema = z.strictObject({
   }
   if (run.nodes.some((node) => node.status === "waiting" && !pendingWaits.some((wait) => wait.nodeId === node.nodeId))) {
     context.addIssue({ code: "custom", path: ["nodes"], message: "waiting nodes require an unresolved wait" });
-  }
-  if (run.durable.continuationPending && (run.status !== "paused" || run.desiredState !== "paused" || run.currentAttemptId !== null
-    || run.nodes.find((node) => node.nodeId === run.currentNodeId)?.status !== "pending"
-    || run.durable.capacityGateTaskId != null)) {
-    context.addIssue({ code: "custom", path: ["durable"], message: "taskless continuation is paused at a pending successor without capacity" });
   }
   if (run.workflowId !== run.canonicalDefinition.id) {
     context.addIssue({ code: "custom", path: ["workflowId"], message: "run identity matches its frozen definition" });
@@ -411,7 +431,14 @@ const admittedRunDocumentV1Schema = z.strictObject({
     context.addIssue({ code: "custom", path: ["finishedAt"], message: "terminal run state matches its finish timestamp" });
   }
   const waitingForCapacity = run.durable.capacityGateTaskId !== null && run.durable.capacityGateTaskId !== undefined;
-  if ((run.status === "queued" && run.startedAt !== null && !waitingForCapacity)
+  const latestReply = [...waits].reverse().find((wait) => wait.settlement.kind === "replied");
+  const repliedNodeIndex = latestReply === undefined ? -1 : run.chain.order.indexOf(latestReply.nodeId);
+  const unadmittedHumanContinuation = run.currentNodeId !== null && run.currentAttemptId === null
+    && run.status === "queued" && latestReply?.settlement.kind === "replied"
+    && latestReply.settlement.action === "continue" && repliedNodeIndex >= 0
+    && run.chain.order[repliedNodeIndex + 1] === run.currentNodeId
+    && run.nodes[repliedNodeIndex + 1]?.status === "pending";
+  if ((run.status === "queued" && run.startedAt !== null && !waitingForCapacity && !unadmittedHumanContinuation)
     || (waitingForCapacity && run.status !== "queued")
     || (["running", "waiting", "completed", "failed"].includes(run.status) && run.startedAt === null)) {
     context.addIssue({ code: "custom", path: ["startedAt"], message: "run start time matches its lifecycle state" });
@@ -431,9 +458,11 @@ const admittedRunDocumentV1Schema = z.strictObject({
   const firstSkipped = run.nodes.findIndex((node) => node.status === "skipped");
   const completingNode = firstSkipped < 0 ? undefined : run.nodes[firstSkipped - 1];
   const completingAttempt = completingNode?.attempts.at(-1);
-  const earlyCompletion = completingAttempt?.result.kind === "settled" && completingAttempt.result.outcome.kind === "succeeded"
-    && completingAttempt.result.outcome.candidate.version === 2
-    && completingAttempt.result.outcome.candidate.stdioResult.status === "success_and_complete";
+  const earlyCompletionCandidate = completingAttempt?.result.kind === "settled" && completingAttempt.result.outcome.kind === "succeeded"
+    ? completingAttempt.result.outcome.candidate : null;
+  const earlyCompletion = earlyCompletionCandidate !== null
+    && (earlyCompletionCandidate.version === 2 || earlyCompletionCandidate.version === 3)
+    && nodeResultStatus(earlyCompletionCandidate) === "success_and_complete";
   if (firstSkipped >= 0 && (run.status !== "completed" || !earlyCompletion
     || run.nodes.slice(firstSkipped).some((node) => node.status !== "skipped"))) {
     context.addIssue({ code: "custom", path: ["nodes"], message: "skipped nodes form the suffix of accepted early completion" });

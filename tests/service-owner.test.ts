@@ -139,7 +139,7 @@ describe("Durable service ownership", () => {
     const configDirectory = join(root, ".workshop");
     mkdirSync(configDirectory, { recursive: true });
     writeFileSync(join(configDirectory, "workshop.yaml"), "\n", "utf8");
-    const stateDirectory = join(root, ".workshop", "state");
+    const stateDirectory = join(root, ".workshop", "state-v5");
     const markerPath = join(directory, "partial-open-failed.txt");
     let stderr = "";
     const failed = spawn(process.execPath, [FAILED_OPEN_FIXTURE, root, markerPath], {

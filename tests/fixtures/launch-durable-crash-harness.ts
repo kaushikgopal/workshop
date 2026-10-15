@@ -91,7 +91,7 @@ const preparedResult = prepareRunAdmission({
   runtimeManifest: {
     durableVersion: "1.0.2",
     integrationManifestHash: `sha256:${createHash("sha256").update("durable crash recovery test").digest("hex")}`,
-    taskVersions: { workflowRun: 10, nodeAttempt: 4, processExecution: 4, capacityGate: 1 },
+    taskVersions: { workflowRun: 11, nodeAttempt: 5, agentExecution: 1, processExecution: 4, capacityGate: 1, scheduleWakeup: 1 },
   },
   runId: `command-chain-crash-recovery-${mode}`,
   eventId: `crash-recovery-${mode}-admission`,

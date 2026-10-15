@@ -3,7 +3,8 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { createModels } from "@earendil-works/pi-ai/models";
+import { createModels, type Models } from "@earendil-works/pi-ai/models";
+import { fauxAssistantMessage, type FauxResponseFactory } from "@earendil-works/pi-ai/providers/faux";
 import { createRegistry, Harness, type ConversationId, type TaskId } from "@earendil-works/pi-durable";
 import { describe, expect, test } from "bun:test";
 import { buildFailureFeedback, hashFailureEvidence } from "../src/attempt/build-failure-feedback.js";
@@ -21,25 +22,84 @@ import { admitPreparedRun } from "../src/storage/durable/admit-run.js";
 import { WorkshopInstallationDoc, WorkshopRunDoc } from "../src/storage/durable/define-workshop-records.js";
 import { createWorkflowRunTaskInput, defineWorkshopTasks, parseWorkflowRunTaskInput } from "../src/storage/durable/define-workshop-tasks.js";
 import { openDurableStorage } from "../src/storage/durable/open-durable-storage.js";
+import { defineAgentExecutionTask } from "../src/storage/durable/define-agent-execution-task.js";
+import { sendServiceRequest } from "../src/service/send-service-request.js";
+import { serviceRunsPageV1Schema, serviceStartResultV1Schema } from "../src/service/schema.js";
+import { startWorkshopService } from "../src/service/open-service-runtime.js";
+import { createFauxModels, type FauxResponses } from "./fixtures/create-faux-models.js";
 
 const shellQuote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
 const emit = (value: string) => "printf '%s' " + shellQuote(value);
 const success = emit("<status>succeeded</status>\n<output>candidate</output>");
 const verdict = (decision: string, reason = "check reason") => emit(decision + "\n" + reason);
-const agent = (command: string) => ({ agent: { instructions: "Use the evidence.", model: "fixture/model:low", harness: { command } } });
+const agent = (role: "worker" | "verifier" = "verifier") => ({ agent: { instructions: "Use the evidence.", model: "fixture/" + role + ":low" } });
+const fauxTexts = (...texts: string[]): FauxResponses => texts.map(text => fauxAssistantMessage(text));
+const captureFinalText = (prompts: string[], text: string): FauxResponseFactory => context => { for (const message of context.messages) if (message.role === "user") { const content = message.content; prompts.push(typeof content === "string" ? content : content.flatMap(block => block.type === "text" ? [block.text] : []).join("\n")); } return fauxAssistantMessage(text); };
 const yaml = (nodes: unknown[], retries: number | "unlimited" = 0, replay = "safe") => JSON.stringify({ version: 4, defaults: { retries, replay }, steps: nodes });
 
-async function openFixture(directory: string, shell = "/bin/sh", beforeLaunch?: (conversationId: ConversationId, signal: AbortSignal) => Promise<void>) {
-  const opened = await openDurableStorage(join(directory, "durable.db"));
+async function openFixture(directory: string, shell = "/bin/sh", beforeLaunch?: (conversationId: ConversationId, signal: AbortSignal) => Promise<void>, databasePath?: string) {
+  const resolvedDatabasePath = databasePath ?? (existsSync(join(directory, ".workshop", "workshop.yaml")) ? loadInstallation(directory).databasePath : join(directory, "durable.db"));
+  const opened = await openDurableStorage(resolvedDatabasePath);
   if (!opened.ok) throw new Error(opened.failure.message);
-  const tasks = defineWorkshopTasks(undefined, beforeLaunch === undefined ? {} : { beforeLaunch });
+  let harness: Harness | undefined;
+  const agentExecution = defineAgentExecutionTask({ getHarness: () => {
+    if (harness === undefined) throw new Error("fixture Harness is unavailable");
+    return harness;
+  } });
+  const tasks = defineWorkshopTasks(undefined, { ...(beforeLaunch === undefined ? {} : { beforeLaunch }), agentExecutionTask: agentExecution.task });
   const registry = createRegistry();
-  registry.install({ name: "decisions", tasks: [tasks.WorkflowRunTask, tasks.NodeAttemptTask, tasks.ProcessExecutionTask, tasks.CapacityGateTask] });
-  const harness = await Harness.open(opened.storage, { models: createModels(), registry }, BACKGROUND_CONTEXT);
+  registry.install({ name: "decisions", tasks: [tasks.WorkflowRunTask, tasks.NodeAttemptTask, tasks.ProcessExecutionTask, tasks.CapacityGateTask, agentExecution.task] });
+  harness = await Harness.open(opened.storage, { models: createModels(), registry }, BACKGROUND_CONTEXT);
   return { harness, tasks, shell };
 }
 
 type Fixture = Awaited<ReturnType<typeof openFixture>>;
+
+async function executeNativeFixture(directory: string, source: string, responses: FauxResponses,
+  check: (run: Extract<ReturnType<typeof workflowRunDocumentV1Schema.parse>, { state: "ready" }>, fixture: Fixture, conversationId: ConversationId) => Promise<void> | void,
+  shell = "/bin/sh", modelOverride?: Models) {
+  const config = join(directory, ".workshop");
+  const workflows = join(config, "workflows");
+  mkdirSync(workflows, { recursive: true });
+  writeFileSync(join(config, "workshop.yaml"), "shell: " + shell + "\nagent:\n  model: fixture/worker:medium\n");
+  writeFileSync(join(workflows, "decisions.yaml"), source);
+  const installation = loadInstallation(directory);
+  const models = modelOverride ?? createFauxModels(responses).models;
+  let owner: Awaited<ReturnType<typeof startWorkshopService>> | undefined;
+  let fixture: Fixture | undefined;
+  try {
+    owner = await startWorkshopService(installation, models);
+    const socket = owner.metadata.socketPath;
+    if (socket === null) throw new Error("service socket path is missing");
+    const startedResponse = await sendServiceRequest(socket, { version: 1, method: "start", workflowId: "decisions", requestId: randomUUID() });
+    if (!startedResponse.ok) throw new Error(startedResponse.error.code + ": " + startedResponse.error.message);
+    const started = serviceStartResultV1Schema.parse(startedResponse.result);
+    const deadline = Date.now() + 10_000;
+    let settled = false;
+    while (Date.now() < deadline) {
+      const response = await sendServiceRequest(socket, { version: 1, method: "runs", workflowId: "decisions", limit: 10 });
+      if (!response.ok) throw new Error(response.error.code + ": " + response.error.message);
+      const current = serviceRunsPageV1Schema.parse(response.result).runs.find(candidate => candidate.runId === started.runId);
+      if (current !== undefined && ["completed", "failed", "blocked", "waiting", "paused", "cancelled"].includes(current.status)) { settled = true; break; }
+      await Bun.sleep(10);
+    }
+    if (!settled) throw new Error("native fixture run did not settle before its deadline");
+    await owner.shutdown();
+    owner = undefined;
+    fixture = await openFixture(directory, shell, undefined, installation.databasePath);
+    const index = installationDocumentV1Schema.parse(await fixture.harness.snapshot(WorkshopInstallationDoc, BACKGROUND_CONTEXT));
+    if (index.state !== "ready") throw new Error("service installation index is unavailable");
+    const reference = index.workflows.decisions?.runs.find(candidate => candidate.runId === started.runId);
+    if (reference === undefined) throw new Error("service run reference is missing");
+    const conversationId = reference.conversationId as ConversationId;
+    const run = workflowRunDocumentV1Schema.parse(await fixture.harness.snapshot(WorkshopRunDoc, conversationId, BACKGROUND_CONTEXT));
+    if (run.state !== "ready") throw new Error("run disappeared");
+    await check(run, fixture, conversationId);
+  } finally {
+    if (owner !== undefined) await owner.shutdown();
+    if (fixture !== undefined) await fixture.harness.close(BACKGROUND_CONTEXT);
+  }
+}
 async function executeFixture(directory: string, source: string, check: (run: Extract<ReturnType<typeof workflowRunDocumentV1Schema.parse>, { state: "ready" }>, fixture: Fixture, conversationId: ConversationId) => Promise<void> | void, shell = "/bin/sh", beforeIdle?: (fixture: Fixture, conversationId: ConversationId) => Promise<Fixture | void>, beforeLaunch?: (conversationId: ConversationId, signal: AbortSignal) => Promise<void>) {
   let fixture: Fixture | undefined;
   try {
@@ -52,7 +112,7 @@ async function executeFixture(directory: string, source: string, check: (run: Ex
       sourceText: source, sourceLabel: "decisions.yaml", workflowId: "decisions", machineConfig: machine, resolvedSettings,
       projectCwd: directory, stateDirectory: join(directory, "state"),
       runtimeManifest: { durableVersion: "1.0.2", integrationManifestHash: "sha256:" + createHash("sha256").update("decisions").digest("hex"),
-        taskVersions: { workflowRun: 10, nodeAttempt: 4, processExecution: 4, capacityGate: 1 } },
+        taskVersions: { workflowRun: 11, nodeAttempt: 5, agentExecution: 1, processExecution: 4, capacityGate: 1, scheduleWakeup: 1 } },
       runId: "decisions-" + randomUUID(), eventId: randomUUID(), activationId: "activation", occurrenceId: "occurrence", requestId: randomUUID(), admittedAt: at,
     });
     if (!prepared.ok) throw new Error(prepared.failure.message);
@@ -95,16 +155,17 @@ async function withDirectory(action: (directory: string) => Promise<void>) {
 
 describe("format 4 decision table", () => {
   for (const row of [
-    { name: "valid worker without verifier", node: { run: "printf candidate" }, status: "completed" },
-    { name: "command verifier accepts", node: { run: "printf candidate", verify: "test $(cat) = candidate" }, status: "completed" },
-    { name: "agent verifier accepts even with no retries", node: { run: "printf candidate", verify: agent(verdict("accept")) }, status: "completed" },
-    { name: "command rejection without permitted retry", node: { run: "printf candidate", verify: "exit 7" }, status: "failed" },
-    { name: "agent rejection without permitted retry", node: { run: "printf candidate", verify: agent(verdict("retry")) }, status: "failed" },
-    { name: "unsafe replay never permits retry", node: { run: "exit 9" }, status: "failed", replay: "never" },
-    { name: "agent verifier blocks", node: { run: "printf candidate", verify: agent(verdict("block")) }, status: "blocked", block: "verifier_block" },
+    { name: "valid worker without verifier", node: { run: "printf candidate" }, status: "completed", response: null },
+    { name: "command verifier accepts", node: { run: "printf candidate", verify: "test $(cat) = candidate" }, status: "completed", response: null },
+    { name: "agent verifier accepts even with no retries", node: { run: "printf candidate", verify: agent() }, status: "completed", response: "accept\ncheck reason" },
+    { name: "command rejection without permitted retry", node: { run: "printf candidate", verify: "exit 7" }, status: "failed", response: null },
+    { name: "agent rejection without permitted retry", node: { run: "printf candidate", verify: agent() }, status: "failed", response: "retry\ncheck reason" },
+    { name: "unsafe replay never permits retry", node: { run: "exit 9" }, status: "failed", replay: "never", response: null },
+    { name: "agent verifier blocks", node: { run: "printf candidate", verify: agent() }, status: "blocked", block: "verifier_block", response: "block\ncheck reason" },
   ] as const) {
     test(row.name, async () => withDirectory(async (directory) => {
-      await executeFixture(directory, yaml([{ first: row.node }, { later: "printf successor" }], 0, row.replay), (run) => {
+      await executeNativeFixture(directory, yaml([{ first: row.node }, { later: "printf successor" }], 0, row.replay),
+        row.response === null ? [] : fauxTexts(row.response), (run) => {
         expect(run.status).toBe(row.status);
         expect(run.block?.kind).toBe(row.block);
         expect(run.nodes[1]?.attempts.length).toBe(row.status === "completed" ? 1 : 0);
@@ -115,10 +176,9 @@ describe("format 4 decision table", () => {
   for (const verifierKind of ["none", "command", "agent"] as const) {
     test("worker failure retries with " + verifierKind + " verifier", async () => withDirectory(async (directory) => {
       const verifierMarker = join(directory, "verifier");
-      const verifier = verifierKind === "none" ? {} : { verify: verifierKind === "command"
-        ? "printf v >> " + shellQuote(verifierMarker)
-        : agent("cat > " + shellQuote(verifierMarker) + "; if [ $WORKSHOP_ATTEMPT = 1 ]; then " + verdict("retry") + "; else " + verdict("accept") + "; fi") };
-      await executeFixture(directory, yaml([{ first: { run: "if [ $WORKSHOP_ATTEMPT = 1 ]; then printf failure-out; printf failure-err >&2; exit 9; fi; printf fixed", ...verifier } }], 1), (run) => {
+      const verifier = verifierKind === "none" ? {} : { verify: verifierKind === "command" ? "printf v >> " + shellQuote(verifierMarker) : agent() };
+      await executeNativeFixture(directory, yaml([{ first: { run: "if [ $WORKSHOP_ATTEMPT = 1 ]; then printf failure-out; printf failure-err >&2; exit 9; fi; printf fixed", ...verifier } }], 1),
+        verifierKind === "agent" ? fauxTexts("retry\ncheck reason", "accept\ncheck reason") : [], (run) => {
         expect(run.status).toBe("completed");
         expect(run.nodes[0]?.attempts.map((attempt) => attempt.status)).toEqual(["failed", "succeeded"]);
         const feedback = run.nodes[0]?.attempts[0]?.feedback;
@@ -131,20 +191,20 @@ describe("format 4 decision table", () => {
 
   for (const failureCommand of ["exit 7", "printf malformed"] as const) {
     test("worker failure never asks verifier after exhaustion: " + failureCommand, async () => withDirectory(async (directory) => {
-      const marker = join(directory, "verifier");
-      await executeFixture(directory, yaml([{ first: { run: failureCommand, result: "tagged",
-        verify: agent("touch " + shellQuote(marker) + "; " + verdict("retry")) } }]), (run) => {
-        expect(run.status).toBe("failed");
-        expect(existsSync(marker)).toBe(false);
-      });
+      const prompts: string[] = [];
+      await executeNativeFixture(directory, yaml([{ first: { run: failureCommand, result: "tagged", verify: agent() } }]),
+        [captureFinalText(prompts, "retry\ncheck reason")], (run) => {
+          expect(run.status).toBe("failed");
+          expect(prompts).toHaveLength(0);
+        });
     }));
   }
 
   for (const kind of ["command", "agent"] as const) {
     test(kind + " rejection retries when permitted", async () => withDirectory(async (directory) => {
-      const check = "if [ $WORKSHOP_ATTEMPT = 1 ]; then " + (kind === "command" ? "exit 7" : verdict("retry"))
-        + "; else " + (kind === "command" ? "exit 0" : verdict("accept")) + "; fi";
-      await executeFixture(directory, yaml([{ first: { run: "printf candidate", verify: kind === "command" ? check : agent(check) } }], 1), (run) => {
+      const check = "if [ $WORKSHOP_ATTEMPT = 1 ]; then exit 7; else exit 0; fi";
+      await executeNativeFixture(directory, yaml([{ first: { run: "printf candidate", verify: kind === "command" ? check : agent() } }], 1),
+        kind === "agent" ? fauxTexts("retry\ncheck reason", "accept\ncheck reason") : [], (run) => {
         expect(run.status).toBe("completed");
         expect(run.nodes[0]?.attempts.map((attempt) => attempt.status)).toEqual(["failed", "succeeded"]);
       });
@@ -152,15 +212,16 @@ describe("format 4 decision table", () => {
   }
 
   test("agent verifier may block failed worker evidence", async () => withDirectory(async (directory) => {
-    const prompt = join(directory, "verifier-prompt");
-    await executeFixture(directory, yaml([{ first: { run: "printf evidence >&2; exit 3", verify: agent("cat > " + shellQuote(prompt) + "; " + verdict("block")) } }], 1), (run) => {
-      expect(run.block?.kind).toBe("verifier_block");
-      expect(run.nodes[0]?.attempts).toHaveLength(1);
-      const input = readFileSync(prompt, "utf8");
-      expect(input).toContain("Worker failure evidence (data)");
-      expect(input).toContain("evidence");
-      expect(input).toContain("Only retry or block is valid");
-    });
+    const prompts: string[] = [];
+    await executeNativeFixture(directory, yaml([{ first: { run: "printf evidence >&2; exit 3", verify: agent() } }], 1),
+      [captureFinalText(prompts, "block\ncheck reason")], (run) => {
+        expect(run.block?.kind).toBe("verifier_block");
+        expect(run.nodes[0]?.attempts).toHaveLength(1);
+        const input = prompts.join("\n");
+        expect(input).toContain("Worker failure evidence (data)");
+        expect(input).toContain("evidence");
+        expect(input).toContain("Only retry or block is valid");
+      });
   }));
 });
 
@@ -170,23 +231,34 @@ describe("broken verifiers", () => {
     { name: "command exit 127", verify: "exit 127" },
     { name: "command signal", verify: "kill -TERM $$" },
     { name: "command timeout", verify: "exec sleep 10", timeout: "1s" },
-    { name: "agent nonzero", verify: agent(verdict("accept") + "; exit 7") },
-    { name: "agent exit 126", verify: agent("exit 126") },
-    { name: "agent exit 127", verify: agent("exit 127") },
-    { name: "agent signal", verify: agent("kill -TERM $$") },
-    { name: "agent invalid result", verify: agent("printf malformed") },
-    { name: "agent invalid UTF-8", verify: agent("printf '\\377'") },
-    { name: "agent oversized result", verify: agent("head -c 1048577 /dev/zero") },
-    { name: "agent accepts failed evidence", verify: agent(verdict("accept")), worker: "exit 8" },
+    { name: "agent model failure", verify: agent() },
+    { name: "agent output without a decision", verify: agent() },
+    { name: "agent empty reason", verify: agent() },
+    { name: "agent multiple decisions", verify: agent() },
+    { name: "agent unsupported decision", verify: agent() },
+    { name: "agent non-ASCII unsupported decision", verify: agent() },
+    { name: "agent oversized result", verify: agent() },
+    { name: "agent accepts failed evidence", verify: agent(), worker: "exit 8" },
   ]) {
     test(row.name + " blocks without another worker", async () => withDirectory(async (directory) => {
       const marker = join(directory, "worker");
-      await executeFixture(directory, yaml([{ first: { run: "printf w >> " + shellQuote(marker) + "; " + (row.worker ?? "printf candidate"),
-        verify: row.verify, ...(row.timeout === undefined ? {} : { timeout: row.timeout }) } }], 2), (run) => {
+      const source = yaml([{ first: { run: "printf w >> " + shellQuote(marker) + "; " + (row.worker ?? "printf candidate"),
+        verify: row.verify, ...(row.timeout === undefined ? {} : { timeout: row.timeout }) } }], 2);
+      const check = (run: Extract<ReturnType<typeof workflowRunDocumentV1Schema.parse>, { state: "ready" }>) => {
         expect(run.block?.kind).toBe("verifier_failed");
         expect(run.nodes[0]?.attempts).toHaveLength(1);
         expect(readFileSync(marker, "utf8")).toBe("w");
-      });
+      };
+      if (row.name.startsWith("agent")) {
+        const response = row.name === "agent accepts failed evidence" ? fauxAssistantMessage("accept\nnot allowed")
+          : row.name === "agent oversized result" ? fauxAssistantMessage("x".repeat(1_048_577))
+            : row.name === "agent model failure" ? fauxAssistantMessage("", { stopReason: "error", errorMessage: "fixture model failure" })
+              : fauxAssistantMessage(row.name === "agent output without a decision" ? "not a verdict"
+                : row.name === "agent empty reason" ? "block"
+                  : row.name === "agent multiple decisions" ? "accept\nvalid\nretry\nno"
+                    : row.name === "agent unsupported decision" ? "ACCEPT\nnot accepted" : "méthode");
+        await executeNativeFixture(directory, source, [response], check);
+      } else await executeFixture(directory, source, check);
     }));
   }
 
@@ -213,15 +285,16 @@ describe("retry evidence", () => {
   }
 
   test("identical verifier rejection blocks unlimited retries", async () => withDirectory(async (directory) => {
-    await executeFixture(directory, yaml([{ first: { run: "printf candidate", verify: agent(verdict("retry", "same rejection")) } }], "unlimited"), (run) => {
+    await executeNativeFixture(directory, yaml([{ first: { run: "printf candidate", verify: agent() } }], "unlimited"),
+      fauxTexts("retry\nsame rejection", "retry\nsame rejection"), (run) => {
       expect(run.block?.kind).toBe("repeated_failure");
       expect(run.nodes[0]?.attempts).toHaveLength(2);
     });
   }));
 
   test("verifier reason changes prevent a repeated-failure block", async () => withDirectory(async (directory) => {
-    await executeFixture(directory, yaml([{ first: { run: "printf candidate", verify: agent("if [ $WORKSHOP_ATTEMPT = 1 ]; then "
-      + verdict("retry", "first reason") + "; else " + verdict("retry", "second reason") + "; fi") } }], 1), (run) => {
+    await executeNativeFixture(directory, yaml([{ first: { run: "printf candidate", verify: agent() } }], 1),
+      fauxTexts("retry\nfirst reason", "retry\nsecond reason"), (run) => {
       expect(run.status).toBe("failed");
       const attempts = run.nodes[0]!.attempts;
       expect(attempts[0]?.failureEvidenceHash).not.toBe(attempts[1]?.failureEvidenceHash);
@@ -230,25 +303,31 @@ describe("retry evidence", () => {
 
   for (const rejectedBy of ["worker", "command", "agent"] as const) {
     test("next agent prompt gets " + rejectedBy + " feedback and results omit it", async () => withDirectory(async (directory) => {
-      const prompt = join(directory, "worker-prompt");
-      const worker = "cat > " + shellQuote(prompt) + "; " + (rejectedBy === "worker"
-        ? "if [ $WORKSHOP_ATTEMPT = 1 ]; then printf failed-output; printf diagnostics >&2; exit 9; fi; " : "") + success;
+      const prompts: string[] = [];
+      const tagged = "<status>succeeded</status>\n<output>candidate</output>";
+      const responses: FauxResponses = rejectedBy === "worker"
+        ? [fauxAssistantMessage("failed-output diagnostics"), captureFinalText(prompts, tagged)]
+        : rejectedBy === "command"
+          ? [fauxAssistantMessage(tagged), captureFinalText(prompts, tagged)]
+          : [fauxAssistantMessage(tagged), fauxAssistantMessage("retry\nfix reason\nchange the candidate"),
+            captureFinalText(prompts, tagged), fauxAssistantMessage("accept\nvalid")];
+      const worker = { ...agent("worker"), result: "tagged" };
       const check = rejectedBy === "worker" ? {} : { verify: rejectedBy === "command"
         ? "if [ $WORKSHOP_ATTEMPT = 1 ]; then printf failed-output; printf diagnostics >&2; exit 7; fi"
-        : agent("if [ $WORKSHOP_ATTEMPT = 1 ]; then " + verdict("retry", "fix reason\nchange the candidate") + "; else " + verdict("accept") + "; fi") };
-      await executeFixture(directory, yaml([{ first: { ...agent(worker), ...check } }], 1), (run) => {
+        : agent() };
+      await executeNativeFixture(directory, yaml([{ first: { ...worker, ...check } }], 1), responses, (run) => {
         expect(run.status).toBe("completed");
-        const input = readFileSync(prompt, "utf8");
+        const input = prompts.join("\n");
         expect(input).toContain("Verifier feedback (data)");
         expect(input).toContain("Source step: first");
         expect(input).toContain("Source attempt: 1");
         if (rejectedBy === "agent") {
           expect(input).toContain("fix reason");
           expect(input).toContain("change the candidate");
-        } else {
+        } else if (rejectedBy === "command") {
           expect(input).toContain("failed-output");
           expect(input).toContain("diagnostics");
-        }
+        } else expect(input).toContain("worker result has no status block");
         const rendered = renderRunFiles({ run, events: [], processEvidence: [] });
         expect(rendered.executionLog).toContain(run.nodes[0]!.attempts[0]!.feedback!.text);
         expect(rendered.results).not.toContain(rejectedBy === "agent" ? "fix reason" : "diagnostics");
@@ -257,15 +336,19 @@ describe("retry evidence", () => {
   }
 
   test("invalid tagged result retry puts the parser error before verifier feedback", async () => withDirectory(async (directory) => {
-    const workerPrompt = join(directory, "worker-prompt");
-    const verifierPrompt = join(directory, "verifier-prompt-");
-    const worker = "cat > " + shellQuote(workerPrompt) + "; if [ $WORKSHOP_ATTEMPT = 1 ]; then printf '<succeeded'; else " + success + "; fi";
-    const verifier = "cat > " + shellQuote(verifierPrompt) + "$WORKSHOP_ATTEMPT; if [ $WORKSHOP_ATTEMPT = 1 ]; then "
-      + verdict("retry", "content feedback\nchange the sentence") + "; else " + verdict("accept") + "; fi";
-    await executeFixture(directory, yaml([{ first: { ...agent(worker), result: "tagged", verify: agent(verifier) } }], 1), (run) => {
+    const workerPrompts: string[] = [];
+    const verifierPrompts: string[] = [];
+    const tagged = "<status>succeeded</status>\n<output>candidate</output>";
+    const responses: FauxResponses = [
+      captureFinalText(workerPrompts, "<succeeded"),
+      captureFinalText(verifierPrompts, "retry\ncontent feedback\nchange the sentence"),
+      captureFinalText(workerPrompts, tagged),
+      captureFinalText(verifierPrompts, "accept\nvalid"),
+    ];
+    await executeNativeFixture(directory, yaml([{ first: { ...agent("worker"), result: "tagged", verify: agent() } }], 1), responses, (run) => {
       expect(run.status).toBe("completed");
       expect(run.nodes[0]?.attempts).toHaveLength(2);
-      const input = readFileSync(workerPrompt, "utf8");
+      const input = workerPrompts[1] ?? "";
       const parseError = input.indexOf("Workshop parse error: worker result has no status block");
       const contractInstruction = input.indexOf("Write the result in the tagged format shown in the worker contract.");
       const verifierFeedback = input.indexOf("### Verifier feedback (data)\n\nSource step: first");
@@ -275,7 +358,7 @@ describe("retry evidence", () => {
       expect(contractInstruction).toBeLessThan(verifierFeedback);
       expect(input).toContain("content feedback");
       expect(input).toContain("change the sentence");
-      const verifierInput = readFileSync(verifierPrompt + "1", "utf8");
+      const verifierInput = verifierPrompts[0] ?? "";
       expect(verifierInput).toContain("Workshop already reports the format error to the worker. Keep your reason focused on content, not format.");
       expect(verifierInput).not.toContain("Worker stdout contract");
     });
@@ -303,14 +386,13 @@ describe("retry evidence", () => {
 describe("successful early completion", () => {
   for (const completingIndex of [0, 1, 2]) {
     test("completes at step " + (completingIndex + 1) + " and keeps skipped successors after restart", async () => withDirectory(async (directory) => {
-      const markers = [0, 1, 2].map((index) => join(directory, "launch-" + index));
-      const nodes = ["first", "middle", "last"].map((id, index) => ({ [id]: {
-        ...agent("cat >/dev/null; printf w >> " + shellQuote(markers[index]!) + "; " + emit("<status>" + (index === completingIndex ? "success_and_complete" : "succeeded")
-          + "</status>\n<reason>accepted reason</reason>\n<output>output-" + index + "</output>")),
-        result: "tagged", verify: "exit 0",
+      const nodes = ["first", "middle", "last"].map((id) => ({ [id]: {
+        ...agent("worker"), result: "tagged", verify: "exit 0",
       } }));
+      const responses = fauxTexts(...Array.from({ length: completingIndex + 1 }, (_, index) =>
+        "<status>" + (index === completingIndex ? "success_and_complete" : "succeeded") + "</status>\n<reason>accepted reason</reason>\n<output>output-" + index + "</output>"));
       let savedConversationId: ConversationId | undefined;
-      await executeFixture(directory, yaml(nodes), async (run, fixture, conversationId) => {
+      await executeNativeFixture(directory, yaml(nodes), responses, async (run, fixture, conversationId) => {
         savedConversationId = conversationId;
         const index = installationDocumentV1Schema.parse(await fixture.harness.snapshot(WorkshopInstallationDoc, BACKGROUND_CONTEXT));
         if (index.state !== "ready") throw new Error("early completion index disappeared");
@@ -334,7 +416,7 @@ describe("successful early completion", () => {
         const run = workflowRunDocumentV1Schema.parse(await reopened.harness.snapshot(WorkshopRunDoc, savedConversationId, BACKGROUND_CONTEXT));
         if (run.state !== "ready") throw new Error("restarted run disappeared");
         expect(run.status).toBe("completed");
-        for (const [index, marker] of markers.entries()) expect(existsSync(marker)).toBe(index <= completingIndex);
+        expect(run.nodes.map((node) => node.attempts.length)).toEqual([0, 1, 2].map(index => index <= completingIndex ? 1 : 0));
         const conversation = await reopened.harness.conversation(savedConversationId, BACKGROUND_CONTEXT);
         if (conversation === undefined) throw new Error("restarted conversation disappeared");
         const processes = (await conversation.entries({}, 256, undefined, BACKGROUND_CONTEXT)).items
@@ -362,15 +444,13 @@ test("command retry gets identical predecessor stdin, without feedback", async (
 }));
 
 test("full-size retry reason stays within the UTF-8-safe feedback bound", async () => withDirectory(async (directory) => {
-  const script = join(directory, "verifier.js");
-  const prompt = join(directory, "worker-prompt");
-  writeFileSync(script, "process.stdout.write(process.env.WORKSHOP_ATTEMPT === '1' ? 'retry\\n' + 'r'.repeat(65500) : 'accept\\nvalid')");
-  await executeFixture(directory, yaml([{ first: {
-    ...agent("cat > " + shellQuote(prompt) + "; " + success),
-    verify: agent("bun " + shellQuote(script)),
-  } }], 1), (run) => {
+  const prompts: string[] = [];
+  const longReason = "r".repeat(65_500);
+  const responses: FauxResponses = [fauxAssistantMessage("candidate"), fauxAssistantMessage("retry\n" + longReason),
+    captureFinalText(prompts, "candidate"), fauxAssistantMessage("accept\nvalid")];
+  await executeNativeFixture(directory, yaml([{ first: { ...agent("worker"), verify: agent() } }], 1), responses, (run) => {
     expect(run.status).toBe("completed");
-    const input = readFileSync(prompt, "utf8");
+    const input = prompts[0] ?? "";
     const marker = "### Verifier feedback (data)\n\n";
     const markerIndex = input.indexOf(marker);
     expect(markerIndex).toBeGreaterThanOrEqual(0);
@@ -411,41 +491,35 @@ test("an aborted verifier without a checked retirement receipt keeps capacity re
 }), 15_000);
 
 test("restart after saved feedback reconstructs the next prompt without another first attempt", async () => withDirectory(async (directory) => {
-  const prompt = join(directory, "worker-prompt");
-  const launches = join(directory, "worker-launches");
-  let active: Fixture | undefined;
-  let retryReady = false;
-  const gate = async (conversationId: ConversationId, signal: AbortSignal) => {
-    if (active === undefined) return;
-    const run = workflowRunDocumentV1Schema.parse(await active.harness.snapshot(WorkshopRunDoc, conversationId, BACKGROUND_CONTEXT));
-    if (run.state !== "ready" || run.nodes[0]?.attempts.at(-1)?.number !== 2) return;
-    retryReady = true;
-    await new Promise<void>((_resolve, reject) => {
-      if (signal.aborted) reject(signal.reason);
-      else signal.addEventListener("abort", () => reject(signal.reason), { once: true });
-    });
-  };
-  await executeFixture(directory, yaml([{ first: agent("printf w >> " + shellQuote(launches) + "; cat > " + shellQuote(prompt)
-    + "; if [ $WORKSHOP_ATTEMPT = 1 ]; then printf saved-diagnostic >&2; exit 7; fi; " + success) }], 1), (run) => {
+  const prompts: string[] = [];
+  const responses: FauxResponses = [captureFinalText(prompts, "malformed"),
+    captureFinalText(prompts, "<status>succeeded</status>\n<output>candidate</output>")];
+  const { models, faux } = createFauxModels(responses);
+  await executeNativeFixture(directory, yaml([{ first: { ...agent("worker"), result: "tagged" } }], 1), [], (run) => {
     expect(run.status).toBe("completed");
-    expect(run.nodes[0]?.attempts).toHaveLength(2);
-    expect(readFileSync(launches, "utf8")).toBe("ww");
-    const input = readFileSync(prompt, "utf8");
-    expect(input).toContain("Source step: first");
-    expect(input).toContain("Source attempt: 1");
-    expect(input).toContain("saved-diagnostic");
-  }, "/bin/sh", async (fixture, conversationId) => {
-    active = fixture;
-    const deadline = Date.now() + 5_000;
-    while (!retryReady && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
-    expect(retryReady).toBe(true);
-    const saved = workflowRunDocumentV1Schema.parse(await fixture.harness.snapshot(WorkshopRunDoc, conversationId, BACKGROUND_CONTEXT));
-    if (saved.state !== "ready") throw new Error("saved feedback run disappeared");
-    expect(saved.nodes[0]?.attempts[0]?.feedback?.text).toContain("saved-diagnostic");
-    expect(readFileSync(launches, "utf8")).toBe("w");
-    await fixture.harness.close(BACKGROUND_CONTEXT);
-    const reopened = await openFixture(directory);
-    await reopened.harness.resume();
-    return reopened;
-  }, gate);
-}), 15_000);
+    expect(run.nodes[0]?.attempts.map(attempt => attempt.status)).toEqual(["failed", "succeeded"]);
+    expect(prompts).toHaveLength(2);
+    expect(prompts[1]).toContain("Source step: first");
+    expect(prompts[1]).toContain("Source attempt: 1");
+    expect(prompts[1]).toContain("worker result has no status block");
+  }, "/bin/sh", models);
+
+  const owner = await startWorkshopService(loadInstallation(directory), models);
+  try {
+    const socket = owner.metadata.socketPath;
+    if (socket === null) throw new Error("service socket path is missing");
+    const deadline = Date.now() + 5000;
+    let completed = false;
+    while (Date.now() < deadline) {
+      const response = await sendServiceRequest(socket, { version: 1, method: "runs", workflowId: "decisions", limit: 10 });
+      if (!response.ok) throw new Error(response.error.message);
+      completed = serviceRunsPageV1Schema.parse(response.result).runs[0]?.status === "completed";
+      if (completed) break;
+      await Bun.sleep(10);
+    }
+    expect(completed).toBe(true);
+    expect(faux.state.callCount).toBe(2);
+  } finally {
+    await owner.shutdown();
+  }
+}));

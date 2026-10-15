@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
+import { fauxAssistantMessage } from "@earendil-works/pi-ai/providers/faux";
 import { loadInstallation } from "../src/installation/load-installation.js";
 import { startWorkshopService } from "../src/service/open-service-runtime.js";
 import { probeServiceHealth } from "../src/service/probe-service-health.js";
@@ -11,6 +12,7 @@ import { sendServiceRequest } from "../src/service/send-service-request.js";
 import { runIdSchema } from "../src/run/schema.js";
 import { serviceLogSectionPageV1Schema, serviceStartResultV1Schema } from "../src/service/schema.js";
 import { nodeDescriptionDtoSchema, statusDtoSchema } from "../src/views/schema.js";
+import { createFauxModels } from "./fixtures/create-faux-models.js";
 
 async function until<T>(read: () => Promise<T | undefined>): Promise<T> {
   const deadline = Date.now() + 10_000;
@@ -163,28 +165,180 @@ describe("service run projections", () => {
     }
   }, 30_000);
 
-  test("logs worker envelopes and verifier feedback with process labels", async () => {
-    const root = mkdtempSync(join(tmpdir(), "workshop-projection-envelopes-"));
+  test("records worker and verifier final text as native execution evidence", async () => {
+    const root = mkdtempSync(join(tmpdir(), "workshop-projection-agent-evidence-"));
     let owner: Awaited<ReturnType<typeof startWorkshopService>> | undefined;
+    const workerText = "worker preamble\n<status>succeeded</status>\n<output>proposal</output>\nworker trailer";
+    const verifierText = "accept\nchecked";
+    const { models } = createFauxModels([
+      fauxAssistantMessage(workerText),
+      fauxAssistantMessage(verifierText),
+    ]);
     try {
-      const configured = installation(root);
-      const harness = "input=$(cat); printf 'role diagnostic' >&2; case \"$input\" in *'Role: verifier'*) printf 'accept\nchecked' ;; *) printf 'worker preamble\\n<status>succeeded</status>\\n<output>proposal</output>\\nworker trailer' ;; esac";
-      writeFileSync(join(root, ".workshop", "workshop.yaml"), "shell: /bin/sh\nagent:\n  model: mock/model:low\n  harness:\n    command: " + JSON.stringify(harness) + "\n");
-      writeFileSync(join(root, ".workshop", "workflows", "projection.yaml"), "version: 4\ndefaults: { retries: 0, replay: never }\nsteps:\n  - first:\n      result: tagged\n      agent: Write proposal.\n      verify:\n        agent: Check proposal.\n");
-      owner = await startWorkshopService(loadInstallation(root));
+      mkdirSync(join(root, ".workshop", "workflows"), { recursive: true });
+      writeFileSync(join(root, ".workshop", "workshop.yaml"), "shell: /bin/sh\nagent:\n  model: fixture/worker:low\n");
+      writeFileSync(join(root, ".workshop", "workflows", "projection.yaml"), [
+        "version: 4",
+        "defaults: { retries: 0, replay: never }",
+        "steps:",
+        "  - first:",
+        "      result: tagged",
+        "      agent: Write proposal.",
+        "      verify:",
+        "        agent:",
+        "          model: fixture/verifier:low",
+        "          instructions: Check proposal.",
+      ].join("\n"));
+      owner = await startWorkshopService(loadInstallation(root), models);
       const socket = await socketFor(root);
-      const response = await sendServiceRequest(socket, { version: 1, method: "start", requestId: "envelope-projection", workflowId: "projection" });
+      const response = await sendServiceRequest(socket, { version: 1, method: "start", requestId: "agent-evidence", workflowId: "projection" });
       if (!response.ok) throw new Error(response.error.message);
       const { runId } = serviceStartResultV1Schema.parse(response.result);
       await until(async () => { const value = await node(socket, runId, "first"); return value.runStatus === "completed" ? value : undefined; });
-      const log = readFileSync(join(configured.stateDirectory, "projection", "execution.log"), "utf8");
-      for (const role of ["worker", "validator"]) {
-        expect(log).toContain("[step=first attempt=1 role=" + role + "] incarnation 1 stderr\nrole diagnostic");
-      }
-      expect(log).toContain("[step=first attempt=1 role=worker] incarnation 1 preamble\n");
-      expect(log).toContain("[step=first attempt=1 role=worker] incarnation 1 trailer\n");
-      expect(log).toContain("verifier feedback\nchecked");
-      expect(log).toContain("attempt_settled");
+      const detail = await node(socket, runId, "first");
+      expect(detail.node.status).toBe("succeeded");
+      expect(detail.node.successfulOutput).toBe("proposal");
+      expect(detail.node.attempts[0]?.processes).toEqual([]);
+      expect(detail.node.attempts[0]?.candidate).toMatchObject({
+        nativeExecution: { finalText: workerText, byteCount: new TextEncoder().encode(workerText).byteLength },
+      });
+      expect(detail.node.attempts[0]?.verdict).toMatchObject({
+        nativeExecution: { finalText: verifierText, byteCount: new TextEncoder().encode(verifierText).byteLength },
+      });
+      const evidence = JSON.stringify(detail);
+      expect(evidence).toContain(createHash("sha256").update(workerText).digest("hex"));
+      expect(evidence).toContain(createHash("sha256").update(verifierText).digest("hex"));
+      expect(evidence).toContain("finalTextSha256");
+      expect(evidence).toContain("conversationId");
+      expect(evidence).toContain("assistantEntryId");
+      expect(detail.node.attempts[0]?.status).toBe("succeeded");
+    } finally {
+      if (owner !== undefined) await owner.shutdown();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("reopens a tagged needs_input result with the same native worker receipt", async () => {
+    const root = mkdtempSync(join(tmpdir(), "workshop-projection-agent-wait-"));
+    let owner: Awaited<ReturnType<typeof startWorkshopService>> | undefined;
+    const finalText = "<status>needs_input</status>\n<question>Approve this proposal?</question>\n<output>draft</output>";
+    const { models, faux } = createFauxModels([fauxAssistantMessage(finalText)]);
+    try {
+      installation(root);
+      writeFileSync(join(root, ".workshop", "workshop.yaml"), "shell: /bin/sh\nagent:\n  model: fixture/worker:low\n");
+      writeFileSync(join(root, ".workshop", "workflows", "projection.yaml"), [
+        "version: 4",
+        "defaults: { retries: 0, replay: never }",
+        "steps:",
+        "  - first:",
+        "      result: tagged",
+        "      agent: Draft a proposal and ask for review.",
+      ].join("\n"));
+      const configured = loadInstallation(root);
+      owner = await startWorkshopService(configured, models);
+      let socket = await socketFor(root);
+      const response = await sendServiceRequest(socket, { version: 1, method: "start", requestId: "agent-wait", workflowId: "projection" });
+      if (!response.ok) throw new Error(response.error.message);
+      const { runId } = serviceStartResultV1Schema.parse(response.result);
+      const waiting = await until(async () => {
+        const value = await node(socket, runId, "first");
+        return value.runStatus === "waiting" ? value : undefined;
+      });
+      const firstAttempt = waiting.node.attempts[0]!;
+      expect(waiting.node.wait).toMatchObject({ question: "Approve this proposal?", output: "draft" });
+      expect(firstAttempt.candidate).toMatchObject({ nativeExecution: { finalText, executionId: firstAttempt.workerExecutionId } });
+      expect(faux.state.callCount).toBe(1);
+
+      await owner.shutdown();
+      owner = undefined;
+      owner = await startWorkshopService(configured, models);
+      socket = await socketFor(root);
+      const reopened = await node(socket, runId, "first");
+      expect(reopened.runStatus).toBe("waiting");
+      expect(reopened.node.attempts[0]?.workerExecutionId).toBe(firstAttempt.workerExecutionId);
+      expect(reopened.node.attempts[0]?.candidate).toMatchObject({ nativeExecution: { finalText, executionId: firstAttempt.workerExecutionId } });
+      expect(faux.state.callCount).toBe(1);
+    } finally {
+      if (owner !== undefined) await owner.shutdown();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("keeps the native receipt when tagged worker text is malformed", async () => {
+    const root = mkdtempSync(join(tmpdir(), "workshop-projection-agent-failure-"));
+    let owner: Awaited<ReturnType<typeof startWorkshopService>> | undefined;
+    const finalText = "worker text without a tagged result";
+    const { models } = createFauxModels([fauxAssistantMessage(finalText)]);
+    try {
+      installation(root);
+      writeFileSync(join(root, ".workshop", "workshop.yaml"), "shell: /bin/sh\nagent:\n  model: fixture/worker:low\n");
+      writeFileSync(join(root, ".workshop", "workflows", "projection.yaml"), [
+        "version: 4",
+        "defaults: { retries: 0, replay: never }",
+        "steps:",
+        "  - first:",
+        "      result: tagged",
+        "      agent: Produce a tagged result.",
+      ].join("\n"));
+      owner = await startWorkshopService(loadInstallation(root), models);
+      const socket = await socketFor(root);
+      const response = await sendServiceRequest(socket, { version: 1, method: "start", requestId: "agent-malformed", workflowId: "projection" });
+      if (!response.ok) throw new Error(response.error.message);
+      const { runId } = serviceStartResultV1Schema.parse(response.result);
+      const failed = await until(async () => {
+        const value = await node(socket, runId, "first");
+        return value.runStatus === "failed" ? value : undefined;
+      });
+      const attempt = failed.node.attempts[0]!;
+      expect(attempt.failure).toMatchObject({
+        kind: "result_invalid",
+        nativeExecution: {
+          executionId: attempt.workerExecutionId,
+          finalText,
+          finalTextSha256: "sha256:" + createHash("sha256").update(finalText).digest("hex"),
+        },
+      });
+      expect(attempt.processes).toEqual([]);
+    } finally {
+      if (owner !== undefined) await owner.shutdown();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("keeps the native hash for oversized worker text", async () => {
+    const root = mkdtempSync(join(tmpdir(), "workshop-projection-agent-large-"));
+    let owner: Awaited<ReturnType<typeof startWorkshopService>> | undefined;
+    const finalText = "x".repeat(1024 * 1024 + 1);
+    const { models } = createFauxModels([fauxAssistantMessage(finalText)]);
+    try {
+      installation(root);
+      writeFileSync(join(root, ".workshop", "workshop.yaml"), "shell: /bin/sh\nagent:\n  model: fixture/worker:low\n");
+      writeFileSync(join(root, ".workshop", "workflows", "projection.yaml"), [
+        "version: 4",
+        "defaults: { retries: 0, replay: never }",
+        "steps:",
+        "  - first:",
+        "      result: tagged",
+        "      agent: Produce a tagged result.",
+      ].join("\n"));
+      owner = await startWorkshopService(loadInstallation(root), models);
+      const socket = await socketFor(root);
+      const response = await sendServiceRequest(socket, { version: 1, method: "start", requestId: "agent-oversized", workflowId: "projection" });
+      if (!response.ok) throw new Error(response.error.message);
+      const { runId } = serviceStartResultV1Schema.parse(response.result);
+      const failed = await until(async () => {
+        const value = await node(socket, runId, "first");
+        return value.runStatus === "failed" ? value : undefined;
+      });
+      const attempt = failed.node.attempts[0]!;
+      expect(attempt.failure?.kind).toBe("result_too_large");
+      expect(attempt.failure?.nativeExecution).toMatchObject({
+        executionId: attempt.workerExecutionId,
+        finalTextSha256: "sha256:" + createHash("sha256").update(finalText).digest("hex"),
+        byteCount: new TextEncoder().encode(finalText).byteLength,
+      });
+      expect(attempt.failure?.nativeExecution?.finalText).toBeUndefined();
+      expect(attempt.processes).toEqual([]);
     } finally {
       if (owner !== undefined) await owner.shutdown();
       rmSync(root, { recursive: true, force: true });

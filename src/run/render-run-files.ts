@@ -3,6 +3,7 @@ import { parseTaggedWorkerResult, parseTextResult } from "../attempt/parse-tagge
 import { parseVerifierResult } from "../attempt/parse-verifier-result.js";
 import { readCaptureBytes, readRetainedCapture } from "../process/read-retained-capture.js";
 import type { WorkflowRunDocumentV1, WorkshopEventV1, WorkshopProcessV1 } from "./records.js";
+import { nodeResultStatus } from "./schema.js";
 
 export interface RunFileSnapshot {
   readonly run: Extract<WorkflowRunDocumentV1, { state: "ready" }>;
@@ -60,7 +61,7 @@ export function renderRunFiles(snapshot: RunFileSnapshot) {
     const candidate = attempt?.result.kind === "settled" && attempt.result.outcome.kind === "succeeded"
       ? attempt.result.outcome.candidate : null;
     const reply = wait?.settlement.kind === "replied" ? wait.settlement : null;
-    return { stepId: node.nodeId, status: candidate?.version === 2 ? candidate.stdioResult.status : "succeeded",
+    return { stepId: node.nodeId, status: candidate === null ? "succeeded" : nodeResultStatus(candidate),
       output: candidate?.output ?? null, answer: reply === null ? null : { action: reply.action, text: reply.answer },
       skipped: node.status === "skipped" };
   });

@@ -12,6 +12,7 @@ import {
   evidenceIdSchema,
   failureInfoSchema,
   judgmentDecisionSchema,
+  nativeExecutionReceiptSchema,
   occurrenceIdSchema,
   operatorAcceptanceSchema,
   runIdSchema,
@@ -289,11 +290,21 @@ const evidenceReferenceDtoSchema = z.discriminatedUnion("kind", [
     ...evidenceReferenceFields,
     kind: z.literal("candidate"),
     sourceBytesHash: sha256Schema,
+    nativeExecution: nativeExecutionReceiptSchema.optional(),
+  }).superRefine((evidence, context) => {
+    if (evidence.nativeExecution && evidence.sourceBytesHash !== evidence.nativeExecution.finalTextSha256) {
+      context.addIssue({ code: "custom", path: ["sourceBytesHash"], message: "native candidate evidence matches its execution receipt" });
+    }
   }),
   z.strictObject({
     ...evidenceReferenceFields,
     kind: z.literal("verdict"),
     sourceBytesHash: sha256Schema,
+    nativeExecution: nativeExecutionReceiptSchema.optional(),
+  }).superRefine((evidence, context) => {
+    if (evidence.nativeExecution && evidence.sourceBytesHash !== evidence.nativeExecution.finalTextSha256) {
+      context.addIssue({ code: "custom", path: ["sourceBytesHash"], message: "native verdict evidence matches its execution receipt" });
+    }
   }),
   z.strictObject({
     ...evidenceReferenceFields,
@@ -494,19 +505,32 @@ export const attemptDetailDtoSchema = z.strictObject({
     || superseded.some((id) => id === attempt.workerExecutionId || id === attempt.validatorExecutionId)) {
     report(["supersededValidatorExecutionIds"], "superseded verifier IDs are unique and distinct from active executions");
   }
-  for (const id of superseded) {
-    if (!attempt.processes.some((process) => process.executionId === id && process.role === "validator")) {
-      report(["supersededValidatorExecutionIds"], "superseded verifiers retain their process evidence");
-    }
-  }
   checkProcessIncarnations(attempt.processes, report, ["processes"]);
+  const workerNativeReceipt = (attempt.candidate?.kind === "candidate" ? attempt.candidate.nativeExecution : undefined)
+    ?? attempt.workerFailure?.nativeExecution ?? attempt.failure?.nativeExecution;
+  const validatorNativeReceipt = attempt.verdict?.kind === "verdict" ? attempt.verdict.nativeExecution : undefined;
   if (attempt.workerExecutionId !== null && !attempt.processes.some((process) => process.role === "worker")
+    && workerNativeReceipt?.executionId !== attempt.workerExecutionId
     && !(attempt.status === "executing" && attempt.phase === "awaitWorker" && attempt.candidate === null)) {
     report(["processes"], "worker execution IDs require process-incarnation evidence");
   }
   if (attempt.validatorExecutionId !== null && !attempt.processes.some((process) => process.role === "validator")
+    && validatorNativeReceipt?.executionId !== attempt.validatorExecutionId
     && !(attempt.status === "validating" && attempt.phase === "awaitValidator" && attempt.verdict === null)) {
     report(["processes"], "validator execution IDs require process-incarnation evidence");
+  }
+  if (workerNativeReceipt !== undefined
+    && workerNativeReceipt.executionId !== attempt.workerExecutionId) {
+    report(["candidate", "nativeExecution", "executionId"], "native candidate receipt matches its worker execution ID");
+  }
+  if (validatorNativeReceipt !== undefined
+    && validatorNativeReceipt.executionId !== attempt.validatorExecutionId) {
+    report(["verdict", "nativeExecution", "executionId"], "native verdict receipt matches its validator execution ID");
+  }
+  const nativeExecutionIds = [workerNativeReceipt?.executionId, validatorNativeReceipt?.executionId]
+    .filter((id) => id !== undefined);
+  if (nativeExecutionIds.some((id) => attempt.processes.some((process) => process.executionId === id))) {
+    report(["processes"], "native execution receipts have no process-incarnation evidence");
   }
   const workerProcesses = attempt.processes.filter((process) => process.role === "worker");
   const validatorProcesses = attempt.processes.filter((process) => process.role === "validator");
@@ -528,16 +552,20 @@ export const attemptDetailDtoSchema = z.strictObject({
   if (validatorProcesses.some((process) => process.launchIntentAt !== null)) {
     const lastWorker = workerProcesses[workerProcesses.length - 1];
     const workerAcceptance = attempt.operatorAcceptances.find((acceptance) => acceptance.target === "worker");
+    const hasNativeWorkerReceipt = workerNativeReceipt?.executionId === attempt.workerExecutionId;
     const workerReadyAt = [
-      attempt.candidate?.recordedAt,
-      workerAcceptance?.resolvedAt,
-      lastWorker?.finishedAt,
-    ].filter((value): value is string => value !== undefined && value !== null)
-      .map(timestampMilliseconds)
-      .reduce((latest, value) => Math.max(latest, value), Number.NEGATIVE_INFINITY);
-    if ((attempt.candidate === null && attempt.workerFailure === undefined) || lastWorker === undefined
-      || workerProcesses.some((process) => process.cleanupState !== "confirmed_dead")) {
-      report(["processes"], "verifier launch requires committed worker evidence and confirmed worker-group death");
+      ...(attempt.candidate === null ? [] : [timestampMilliseconds(attempt.candidate.recordedAt)]),
+      ...(workerAcceptance === undefined ? [] : [timestampMilliseconds(workerAcceptance.resolvedAt)]),
+      ...(lastWorker?.finishedAt == null ? [] : [timestampMilliseconds(lastWorker.finishedAt)]),
+      ...(hasNativeWorkerReceipt ? [workerNativeReceipt.finishedAt] : []),
+    ].reduce((latest, value) => Math.max(latest, value), Number.NEGATIVE_INFINITY);
+    const hasWorkerExecutionEvidence = hasNativeWorkerReceipt || lastWorker !== undefined;
+    const workerGroupConfirmed = hasNativeWorkerReceipt
+      ? workerProcesses.length === 0
+      : lastWorker !== undefined && workerProcesses.every((process) => process.cleanupState === "confirmed_dead");
+    if ((attempt.candidate === null && attempt.workerFailure === undefined)
+      || !hasWorkerExecutionEvidence || !workerGroupConfirmed) {
+      report(["processes"], "verifier launch requires committed worker evidence and confirmed native completion or process cleanup");
     }
     if (!Number.isFinite(workerReadyAt)) report(["processes"], "validator launch requires worker completion or acceptance time");
     for (const [index, process] of validatorProcesses.entries()) {
@@ -647,6 +675,13 @@ export const nodeDetailDtoSchema = z.strictObject({
     }
     const validatorProcesses = attempt.processes.filter((process) => process.role === "validator");
     const validatorAcceptance = attempt.operatorAcceptances.find((acceptance) => acceptance.target === "validator");
+    // Format 4 agent validators use Durable conversations, so retired executions have no process record.
+    const isNativeValidator = "result" in node.resolvedSettings && node.resolvedSettings.validator?.kind === "agent";
+    for (const id of attempt.supersededValidatorExecutionIds ?? []) {
+      if (!attempt.processes.some((process) => process.executionId === id && process.role === "validator") && !isNativeValidator) {
+        report(["attempts", index, "supersededValidatorExecutionIds"], "superseded command verifiers retain their process evidence");
+      }
+    }
     if (node.resolvedSettings.validator === null && validatorProcesses.length > 0) {
       report(["attempts", index, "processes"], "unconfigured validators cannot have process evidence");
     }
@@ -723,7 +758,8 @@ export const nodeDetailDtoSchema = z.strictObject({
         const lastValidator = attempt.processes.filter((process) => process.role === "validator").at(-1);
         const exitedSuccessfully = lastValidator?.status === "exited"
           && lastValidator.exit?.kind === "code" && lastValidator.exit.code === 0;
-        if (!exitedSuccessfully) {
+        const hasNativeReceipt = attempt.verdict?.kind === "verdict" && attempt.verdict.nativeExecution !== undefined;
+        if (!exitedSuccessfully && !hasNativeReceipt) {
           report(["attempts", index, "verdict"], "agent verdict evidence requires a successful validator process exit or operator acceptance");
         }
       }

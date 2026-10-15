@@ -167,32 +167,25 @@ describe("prepareRunAdmission", () => {
     expect(result.failure.kind).toBe("resolved_settings_mismatch");
   });
 
-  test("rejects removed harness variables before admission with migration guidance", () => {
-    const legacyHarnessSource = [
-      "version: 4",
-      "defaults: { retries: 0, replay: never }",
-      "steps:",
-      "  - legacy-worker:",
-      "      agent:",
-      "        instructions: Write the result.",
-      "        model: provider/model:low",
-      "        harness:",
-      "          command: 'custom-agent $WORKSHOP_RESULT_FILE'",
-      "",
-    ].join("\n");
+  test("rejects alternate machine agent settings before admission", () => {
+    const invalidMachine = {
+      ...machineConfig,
+      agent: { harness: { command: "custom-agent" }, model: "provider/model:low" },
+    };
     const result = prepareRunAdmission({
       ...preparedRequest(),
-      sourceText: legacyHarnessSource,
+      machineConfig: invalidMachine,
     });
 
     expect(result.ok).toBe(false);
-    if (result.ok) throw new Error("legacy harness command passed admission");
+    if (result.ok) throw new Error("alternate agent command passed machine validation");
     expect(result.failure.kind).toBe("machine_settings_invalid");
-    expect(result.failure.message).toContain("step \"legacy-worker\" worker harness");
-    expect(result.failure.message).toContain("WORKSHOP_RESULT_FILE");
-    expect(result.failure.message).toContain("read input from stdin");
-    expect(result.failure.message).toContain("write the declared result to stdout");
-    expect(result.failure.message).toContain("send diagnostics to stderr");
+    expect(result.failure.message).toContain("machine settings are invalid");
+    expect(result.failure.cause).toMatchObject({
+      issues: [expect.objectContaining({
+        message: "only harness: pi is supported; custom command harnesses are not supported",
+      })],
+    });
   });
 
   test("rejects malformed definitions and unsafe run paths before storage access", () => {

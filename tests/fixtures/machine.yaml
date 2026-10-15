@@ -5,6 +5,5 @@ max_concurrent_runs: 1
 default_timeout: 10m
 stream_cap: 256kb
 agent:
-  harness:
-    command: 'bun tests/mock/hemingway-node.ts'
+  harness: pi
   model: "fixture/mock-model:medium"

@@ -50,7 +50,7 @@ export function loadInstallation(root: string): Installation {
   }
 
   const workflowsDirectory = join(workshopDirectory, "workflows");
-  const stateDirectory = join(workshopDirectory, "state");
+  const stateDirectory = join(workshopDirectory, "state-v5");
   const configPath = join(workshopDirectory, "workshop.yaml");
   const machine = loadMachineConfig(configPath);
   const projectCwd = machine.project_dir === undefined ? absoluteRoot : resolve(workshopDirectory, machine.project_dir);

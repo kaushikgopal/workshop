@@ -58,14 +58,19 @@ export function renderWorklog(value: WorkflowRunDocumentV1, options: { readonly 
         lines.push(`- Candidate SHA-256: ${candidate.sourceBytesHash}`);
         if (candidate.version === 2) {
           lines.push("- Stdout result: " + candidate.stdioResult.mode + " / " + candidate.stdioResult.status);
-          if (candidate.stdioResult.question !== null) {
-            lines.push("- Question:", ...quote(candidate.stdioResult.question));
-          }
+          if (candidate.stdioResult.question !== null) lines.push("- Question:", ...quote(candidate.stdioResult.question));
+        } else if (candidate.version === 3) {
+          lines.push("- Native result: " + candidate.agentResult.mode + " / " + candidate.agentResult.status);
+          lines.push("- Native execution: " + inlineCode(candidate.nativeExecution.executionId)
+            + "; conversation " + candidate.nativeExecution.conversationId
+            + "; assistant entry " + candidate.nativeExecution.assistantEntryId
+            + "; final-text SHA-256 " + candidate.nativeExecution.finalTextSha256);
+          if (candidate.agentResult.question !== null) lines.push("- Question:", ...quote(candidate.agentResult.question));
         }
         if (candidate.source === "operator") {
           lines.push(`- Acceptance provenance: ${candidate.acceptance.provenance}; resolution: ${inlineCode(candidate.acceptance.resolutionId)}`);
           lines.push(...quote(candidate.acceptance.reason));
-        } else {
+        } else if (candidate.version !== 3) {
           lines.push(`- Worker exit: ${describeExit(candidate.exit)}`);
         }
         lines.push("- Summary:", ...quote(candidate.summary));
@@ -74,6 +79,15 @@ export function renderWorklog(value: WorkflowRunDocumentV1, options: { readonly 
         }
       }
 
+      const nativeWorkerFailure = attempt.workerFailure?.nativeExecution
+        ?? (attempt.result.kind === "settled" && attempt.result.outcome.kind === "failed"
+          ? attempt.result.outcome.failure.nativeExecution : undefined);
+      if (nativeWorkerFailure !== undefined) {
+        lines.push("- Native worker failure execution: " + inlineCode(nativeWorkerFailure.executionId)
+          + "; conversation " + nativeWorkerFailure.conversationId
+          + "; assistant entry " + nativeWorkerFailure.assistantEntryId
+          + "; final-text SHA-256 " + nativeWorkerFailure.finalTextSha256);
+      }
       const validator = validatorOf(attempt);
       if (validator !== null) lines.push(...describeValidator(validator));
       if (attempt.result.kind === "settled") {
@@ -148,12 +162,18 @@ function describeValidator(validator: ValidatorOutcome): string[] {
     lines.push(`  - Stdout SHA-256: ${validator.stdoutHash ?? "not captured"}`);
     lines.push(`  - Stderr SHA-256: ${validator.stderrHash ?? "not captured"}`);
   } else {
+    if (validator.kind === "native_agent") {
+      lines.push("  - Native verifier execution: " + inlineCode(validator.nativeExecution.executionId)
+        + "; conversation " + validator.nativeExecution.conversationId
+        + "; assistant entry " + validator.nativeExecution.assistantEntryId
+        + "; final-text SHA-256 " + validator.nativeExecution.finalTextSha256);
+    }
     lines.push(...describeVerdict(validator.verdict));
   }
   return lines;
 }
 
-type AgentOrOperatorVerdict = Extract<ValidatorOutcome, { kind: "agent" | "operator" }>["verdict"];
+type AgentOrOperatorVerdict = Extract<ValidatorOutcome, { kind: "agent" | "native_agent" | "operator" }>["verdict"];
 
 function describeVerdict(verdict: AgentOrOperatorVerdict): string[] {
   if (verdict.version === 1) {
@@ -216,14 +236,14 @@ function renderCompactWorklog(run: Extract<WorkflowRunDocumentV1, { state: "read
         : "";
       const candidateSummary = candidate === null ? "" : candidate.version === 1
         ? candidate.summary
-        : [
-            candidate.stdioResult.mode + " " + candidate.stdioResult.status,
-            candidate.summary,
-            candidate.stdioResult.question === null ? "" : "Question: " + candidate.stdioResult.question,
-          ].filter(Boolean).join(" · ");
+        : candidate.version === 2
+          ? [candidate.stdioResult.mode + " " + candidate.stdioResult.status, candidate.summary,
+            candidate.stdioResult.question === null ? "" : "Question: " + candidate.stdioResult.question].filter(Boolean).join(" · ")
+          : [candidate.agentResult.mode + " " + candidate.agentResult.status, candidate.summary,
+            candidate.agentResult.question === null ? "" : "Question: " + candidate.agentResult.question].filter(Boolean).join(" · ");
       const summary = compactText(candidateSummary || outcomeDetail || "no summary");
       const validator = validatorOf(attempt);
-      const verdictReason = validator?.kind === "agent" || validator?.kind === "operator"
+      const verdictReason = validator?.kind === "agent" || validator?.kind === "native_agent" || validator?.kind === "operator"
         ? compactText(renderedVerdictReason(validator.verdict))
         : null;
       lines.push(`- ${node.nodeId} #${attempt.number} ${outcome} · ${duration} · ${summary}${verdictReason === null ? "" : ` · decision: ${verdictReason}`}`);

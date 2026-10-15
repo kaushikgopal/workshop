@@ -23,7 +23,6 @@ export const resolvedExecutionSiteSchema = z.discriminatedUnion("kind", [
   }),
   z.strictObject({
     kind: z.literal("agent"),
-    harnessCommand: z.string().min(1),
     model: z.string().min(1),
     instructions: z.string(),
     shell: absolutePath,

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
+import { withAbortSignal, withCancel } from "@earendil-works/chord/context";
 import type { Context } from "@earendil-works/chord";
-import { defineTask, type ConversationId, type Cursor, type Task, type TaskId, type TaskRuntime, type Tx } from "@earendil-works/pi-durable";
+import { defineTask, type ConversationId, type Cursor, type DocumentWatch, type JsonObject, type Task, type TaskId, type TaskRuntime, type Tx } from "@earendil-works/pi-durable";
 import { z } from "zod";
 import { reconstructProcessStdin } from "../../attempt/build-process-stdin.js";
 import { locateWorkflowDirectory } from "../../run/locate-run-files.js";
@@ -16,6 +17,8 @@ import {
   failureInfoSchema,
   nodeAttemptOutcomeSchema,
   nodeResultSchema,
+  nodeResultStatus,
+  nodeResultQuestion,
   runIdSchema,
   type BlockInfo,
   type FailureInfo,
@@ -33,6 +36,7 @@ import {
 import { WorkshopEventEntry, WorkshopInstallationDoc, WorkshopProcessEntry, WorkshopRunDoc } from "./define-workshop-records.js";
 import {
   capacityGateOutcomeSchema,
+  createCapacityGateTaskInput,
   defineCapacityGateTask,
   type CapacityGateOutcome,
   type CapacityGateTaskDefinition,
@@ -51,6 +55,7 @@ import {
 import { defineNodeAttemptTask, nodeAttemptTaskInputSchema, type NodeAttemptTaskDefinition } from "./define-node-attempt-task.js";
 import { utcTimestampSchema } from "../../util/schema.js";
 import { DEFAULT_STREAM_CAP_BYTES } from "../../util/parse-units.js";
+import type { AgentExecutionTaskDefinition } from "./define-agent-execution-task.js";
 
 const positive = z.number().int().positive().refine(Number.isSafeInteger);
 const nonnegative = z.number().int().nonnegative().refine(Number.isSafeInteger);
@@ -69,7 +74,6 @@ export const workflowRunTaskInputSchema = z.strictObject({
   activationId: z.string().min(1),
   occurrenceId: z.string().min(1),
   resumeCheckpoint: workflowResumeCheckpointSchema.optional(),
-  successorNodeIndex: positive.optional(),
 });
 export type WorkflowRunTaskInput = z.infer<typeof workflowRunTaskInputSchema>;
 export interface WorkflowRunIdentity {
@@ -99,7 +103,8 @@ export function parseWorkflowRunTaskInput(value: unknown, identity: WorkflowRunI
 
 const workflowCheckpointSchema = z.discriminatedUnion("phase", [
   z.strictObject({ phase: z.literal("start") }),
-  z.strictObject({ phase: z.literal("awaitCapacity"), taskId: positive }),
+  z.strictObject({ phase: z.literal("awaitCapacity"), taskId: positive, nodeIndex: nonnegative.optional() }),
+  z.strictObject({ phase: z.literal("awaitHuman"), nodeIndex: nonnegative, nodeId: nodeIdSchema, attemptId: attemptIdSchema, waitId: z.string().uuid() }),
   z.strictObject({ phase: z.literal("preflight") }),
   z.strictObject({ phase: z.literal("awaitPreflight"), taskId: positive, executionId: executionIdSchema, incarnationId: incarnationIdSchema, incarnationNumber: positive }),
   z.strictObject({ phase: z.literal("admitAttempt"), nodeIndex: nonnegative }),
@@ -111,14 +116,6 @@ const workflowCheckpointSchema = z.discriminatedUnion("phase", [
     taskId: positive,
   }),
   z.strictObject({ phase: z.literal("decide"), nodeIndex: nonnegative, nodeId: nodeIdSchema, attemptId: attemptIdSchema }),
-]);
-const workflowCheckpointV8Schema = z.discriminatedUnion("phase", [
-  z.strictObject({ phase: z.literal("start") }),
-  z.strictObject({ phase: z.literal("awaitCapacity"), taskId: positive }),
-  z.strictObject({ phase: z.literal("preflight") }),
-  z.strictObject({ phase: z.literal("awaitPreflight"), taskId: positive, executionId: executionIdSchema, incarnationId: incarnationIdSchema, incarnationNumber: positive }),
-  z.strictObject({ phase: z.literal("admitAttempt"), nodeIndex: nonnegative }),
-  z.strictObject({ phase: z.literal("awaitAttempt"), nodeIndex: nonnegative, nodeId: nodeIdSchema, attemptId: attemptIdSchema, taskId: positive }),
 ]);
 type WorkflowCheckpoint = z.infer<typeof workflowCheckpointSchema>;
 
@@ -135,6 +132,7 @@ export function defineWorkshopTasks(
   options: {
     readonly startupLaunchGate?: "open" | "closed";
     readonly beforeLaunch?: (conversationId: ConversationId, signal: AbortSignal) => Promise<void>;
+    readonly agentExecutionTask?: AgentExecutionTaskDefinition;
   } = {},
 ): {
   readonly serviceBootId: string;
@@ -145,6 +143,7 @@ export function defineWorkshopTasks(
   readonly stopLaunching: () => void;
   readonly canLaunch: () => boolean;
   readonly openStartupLaunchGate: () => void;
+  readonly waitForAdmission: (signal: AbortSignal) => Promise<void>;
 } {
   const {
     serviceBootId: activeBootId,
@@ -152,9 +151,10 @@ export function defineWorkshopTasks(
     stopLaunching,
     canLaunch,
     openStartupLaunchGate,
+    waitForAdmission,
   } = defineProcessExecutionTask(serviceBootId, options);
 
-  const NodeAttemptTask = defineNodeAttemptTask(ProcessExecutionTask, activeBootId, canLaunch);
+  const NodeAttemptTask = defineNodeAttemptTask(ProcessExecutionTask, activeBootId, canLaunch, options.agentExecutionTask, waitForAdmission);
 
   const CapacityGateTask = defineCapacityGateTask();
 
@@ -162,16 +162,11 @@ export function defineWorkshopTasks(
 
   const WorkflowRunTask = defineTask<WorkflowRunTaskInput, WorkflowCheckpoint, RunOutcome>({
     name: "workshop.workflow-run",
-    version: 10,
-    migrate: (input, checkpoint, fromVersion) => {
-      if (fromVersion === 8) return { input: workflowRunTaskInputSchema.parse(input), checkpoint: workflowCheckpointV8Schema.parse(checkpoint) };
-      if (fromVersion === 9) return { input: workflowRunTaskInputSchema.parse(input), checkpoint: workflowCheckpointSchema.parse(checkpoint) };
-      throw new Error(`unsupported WorkflowRun task version ${fromVersion}`);
-    },
+    version: 11,
     initial: () => ({ phase: "start" }),
     phases: {
       start: async (task, runtime, context) => {
-        await waitForLaunchPermission(runtime, canLaunch, context);
+        await waitForAdmission(runtime.signal);
         const input = parseWorkflowInput(task.input);
         const run = await snapshotRun(runtime, context);
         assertWorkflowIdentity(input, run, runtime.taskId);
@@ -181,8 +176,9 @@ export function defineWorkshopTasks(
         }
         const taskVersions = run.runtimeManifest.taskVersions;
         const schedulerCompatible = taskVersions.scheduleWakeup === undefined || taskVersions.scheduleWakeup === 1;
-        const compatible = schedulerCompatible && taskVersions.workflowRun === 10
-          && taskVersions.nodeAttempt === 4 && taskVersions.processExecution === 4 && taskVersions.capacityGate === 1;
+        const compatible = schedulerCompatible && taskVersions.workflowRun === 11
+          && taskVersions.nodeAttempt === 5 && taskVersions.agentExecution === 1
+          && taskVersions.processExecution === 4 && taskVersions.capacityGate === 1;
         if (!compatible) {
           const block = blockInfo("runtime_incompatible", "runtime manifest does not match the registered task versions", input.runId, null, null, timestamp(runtime.now()));
           await blockRun(task, runtime, input, block, context, { markNode: false });
@@ -193,9 +189,7 @@ export function defineWorkshopTasks(
           assertWorkflowIdentity(input, current, runtime.taskId);
           if (current.desiredState === "stopped") return { status: "running", checkpoint: { phase: "start" } };
           if (current.status === "running" && (current.durable.capacityGateTaskId === null || current.durable.capacityGateTaskId === undefined)) {
-            const next = input.resumeCheckpoint ?? (input.successorNodeIndex !== undefined
-              ? { phase: "admitAttempt" as const, nodeIndex: input.successorNodeIndex }
-              : current.resolvedSettings.preflight === null
+            const next = input.resumeCheckpoint ?? (current.resolvedSettings.preflight === null
               ? { phase: "admitAttempt" as const, nodeIndex: 0 }
               : { phase: "preflight" as const });
             return { status: "running", checkpoint: next };
@@ -234,7 +228,7 @@ export function defineWorkshopTasks(
         }, context);
       },
       awaitCapacity: async (task, runtime, context) => {
-        await waitForLaunchPermission(runtime, canLaunch, context);
+        await waitForAdmission(runtime.signal);
         const input = parseWorkflowInput(task.input);
         const checkpoint = workflowCheckpointSchema.parse(task.state.checkpoint);
         if (checkpoint.phase !== "awaitCapacity") throw new Error("WorkflowRun checkpoint lacks its CapacityGate identity");
@@ -311,17 +305,68 @@ export function defineWorkshopTasks(
               policy: "allSettled",
             };
           }
-          const nodeIndex = current.chain.order.findIndex((nodeId) => nodeId === current.currentNodeId);
-          if (nodeIndex < 0) throw new Error("resumed run lost its current node cursor");
+          const nodeIndex = checkpoint.nodeIndex ?? current.chain.order.findIndex((nodeId) => nodeId === current.currentNodeId);
+          if (nodeIndex < 0 || current.chain.order[nodeIndex] !== current.currentNodeId) {
+            throw new Error("resumed run lost its exact current node cursor");
+          }
           return current.resolvedSettings.preflight !== null && current.preflight.kind === "pending"
             ? { status: "running", checkpoint: { phase: "preflight" } }
             : { status: "running", checkpoint: { phase: "admitAttempt", nodeIndex } };
         }, context);
       },
 
+      awaitHuman: async (task, runtime, context) => {
+        const input = parseWorkflowInput(task.input);
+        const checkpoint = workflowCheckpointSchema.parse(task.state.checkpoint);
+        if (checkpoint.phase !== "awaitHuman") throw new Error("WorkflowRun checkpoint lacks its human wait identity");
+        const observed = await waitForHumanChange(runtime, input, checkpoint, context);
+        assertWorkflowIdentity(input, observed, runtime.taskId);
+        assertHumanWaitCheckpoint(observed, checkpoint);
+        if (observed.desiredState === "stopped" && !isSettledRun(observed)) {
+          await cancelRun(task, runtime, input, context);
+          return;
+        }
+        await runtime.commit(async (tx) => {
+          const { draft, run: current } = await runDraft(tx, runtime.conversationId);
+          assertWorkflowIdentity(input, current, runtime.taskId);
+          assertHumanWaitCheckpoint(current, checkpoint);
+          const settled = settledRunOutcome(current);
+          if (settled !== undefined) {
+            return { status: "terminal", outcome: { status: "completed", result: settled } };
+          }
+          if (current.desiredState === "stopped" || current.status === "paused" || current.desiredState === "paused") {
+            return { status: "running", checkpoint };
+          }
+          if (current.status !== "queued") throw new Error("human continuation requires a queued successor");
+          const nodeIndex = humanSuccessorIndex(current, checkpoint);
+          let gateId = current.durable.capacityGateTaskId;
+          if (gateId === null || gateId === undefined) {
+            const created = await tx.createTask(CapacityGateTask, createCapacityGateTaskInput({
+              runId: current.runId,
+              workflowId: current.workflowId,
+              activationId: current.activationId,
+              occurrenceId: current.occurrenceId,
+              workflowTaskId: Number(runtime.taskId),
+            }), { ownership: { kind: "task", taskId: runtime.taskId }, conversationId: runtime.conversationId });
+            gateId = Number(created);
+            assign(draft, workflowRunDocumentV1Schema.parse({
+              ...current,
+              durable: { ...current.durable, capacityGateTaskId: gateId },
+            }));
+          }
+          const capacityTaskId = durableTaskId<CapacityGateOutcome>(gateId);
+          return {
+            status: "waiting",
+            checkpoint: { phase: "awaitCapacity", taskId: Number(capacityTaskId), nodeIndex },
+            on: [capacityTaskId],
+            policy: "allSettled",
+          };
+        }, context);
+      },
+
 
       preflight: async (task, runtime, context) => {
-        await waitForLaunchPermission(runtime, canLaunch, context);
+        await waitForAdmission(runtime.signal);
         const input = parseWorkflowInput(task.input);
         const checkpoint = workflowCheckpointSchema.parse(task.state.checkpoint);
         if (checkpoint.phase !== "preflight") throw new Error("WorkflowRun checkpoint lacks its preflight phase");
@@ -420,7 +465,7 @@ export function defineWorkshopTasks(
         }, context);
       },
       awaitPreflight: async (task, runtime, context) => {
-        await waitForLaunchPermission(runtime, canLaunch, context);
+        await waitForAdmission(runtime.signal);
         const input = parseWorkflowInput(task.input);
         const checkpoint = workflowCheckpointSchema.parse(task.state.checkpoint);
         if (checkpoint.phase !== "awaitPreflight") throw new Error("WorkflowRun checkpoint lacks its preflight task identity");
@@ -544,7 +589,7 @@ export function defineWorkshopTasks(
         }, context);
       },
       admitAttempt: async (task, runtime, context) => {
-        await waitForLaunchPermission(runtime, canLaunch, context);
+        await waitForAdmission(runtime.signal);
         const input = parseWorkflowInput(task.input);
         const checkpoint = workflowCheckpointSchema.parse(task.state.checkpoint);
         if (checkpoint.phase !== "admitAttempt") throw new Error("WorkflowRun checkpoint lacks a node cursor");
@@ -678,12 +723,12 @@ export function defineWorkshopTasks(
           return;
         }
         const candidate = nodeResultSchema.parse(result.candidate);
-        if (candidate.version === 2 && candidate.stdioResult.status === "needs_input") {
+        if (nodeResultStatus(candidate) === "needs_input") {
           await commitHumanWait(runtime, input, checkpoint, candidate, context);
           return;
         }
         const nextIndex = checkpoint.nodeIndex + 1;
-        if (nextIndex < run.chain.order.length && !(candidate.version === 2 && candidate.stdioResult.status === "success_and_complete")) {
+        if (nextIndex < run.chain.order.length && nodeResultStatus(candidate) !== "success_and_complete") {
           await runtime.commit(async (tx) => {
             const { draft, run: current } = await runDraft(tx, runtime.conversationId);
             assertWorkflowIdentity(input, current, runtime.taskId);
@@ -766,6 +811,14 @@ export function defineWorkshopTasks(
         await runtime.commit(() => ({ status: "terminal", outcome: { status: "completed", result: { kind: "blocked", block: existingBlock } } }), context);
         return;
       }
+      if (run.desiredState === "stopped" && checkpoint.success && checkpoint.data.phase === "awaitHuman") {
+        if (run.status === "cancelled") {
+          await runtime.commit(() => ({ status: "terminal", outcome: { status: "completed", result: { kind: "cancelled" } } }), context);
+        } else {
+          await cancelRun(task, runtime, input, context);
+        }
+        return;
+      }
       if (run.desiredState === "stopped" && checkpoint.success) {
         const stopRetirement = await checkedWorkflowStopRetirement(runtime, input, run, checkpoint.data, context);
         if (typeof stopRetirement === "object") {
@@ -778,7 +831,7 @@ export function defineWorkshopTasks(
             const attempt = requireAttempt(run, checkpoint.data.nodeId, checkpoint.data.attemptId);
             if (attempt.result.kind === "settled" && attempt.result.outcome.kind === "succeeded"
               && (checkpoint.data.nodeIndex === run.chain.order.length - 1
-                || (attempt.result.outcome.candidate.version === 2 && attempt.result.outcome.candidate.stdioResult.status === "success_and_complete"))) {
+                || nodeResultStatus(attempt.result.outcome.candidate) === "success_and_complete")) {
               await completeRun(task, runtime, input, checkpoint.data, attempt.result.outcome.candidate, context);
               return;
             }
@@ -797,7 +850,7 @@ export function defineWorkshopTasks(
     },
   });
 
-  return { serviceBootId: activeBootId, WorkflowRunTask, NodeAttemptTask, ProcessExecutionTask, CapacityGateTask, stopLaunching, canLaunch, openStartupLaunchGate };
+  return { serviceBootId: activeBootId, WorkflowRunTask, NodeAttemptTask, ProcessExecutionTask, CapacityGateTask, stopLaunching, canLaunch, openStartupLaunchGate, waitForAdmission };
 }
 
 
@@ -1196,7 +1249,7 @@ async function cancelRun(
     const activeOutcome = activeAttempt?.result.kind === "settled" ? activeAttempt.result.outcome : null;
     const nextNodes = run.currentNodeId === null ? run.nodes : run.nodes.map((node) => {
       if (node.nodeId !== run.currentNodeId) return node;
-      if (node.status !== "running" && node.status !== "pending") return node;
+      if (node.status !== "running" && node.status !== "pending" && node.status !== "waiting") return node;
       if (activeOutcome?.kind === "succeeded" && activeAttempt !== undefined) {
         return { ...node, status: "succeeded" as const, successfulAttemptId: activeAttempt.attemptId };
       }
@@ -1216,6 +1269,8 @@ async function cancelRun(
       terminalOutput: null,
       currentAttemptId: null,
       durable: { ...run.durable, capacityGateTaskId: null },
+      waits: run.waits?.map((wait) => wait.settlement.kind === "pending"
+        ? { ...wait, settlement: { kind: "stopped" as const, resolvedAt: at } } : wait),
       nodes: nextNodes,
     });
     assign(draft, next);
@@ -1297,9 +1352,10 @@ async function commitHumanWait(
     assertWorkflowIdentity(input, run, runtime.taskId);
     const node = run.nodes[checkpoint.nodeIndex];
     const attempt = node?.attempts.at(-1);
-    if (candidate.version !== 2 || candidate.stdioResult.status !== "needs_input" || candidate.stdioResult.question === null
+    if (nodeResultStatus(candidate) !== "needs_input" || nodeResultQuestion(candidate) === null
       || node?.nodeId !== checkpoint.nodeId || attempt?.attemptId !== checkpoint.attemptId
       || attempt.result.kind !== "settled" || attempt.result.outcome.kind !== "succeeded"
+      || run.currentNodeId !== checkpoint.nodeId || run.currentAttemptId !== checkpoint.attemptId
       || canonicalHash(attempt.result.outcome.candidate) !== canonicalHash(candidate)) {
       throw new Error("human wait requires the canonical accepted needs_input result");
     }
@@ -1313,7 +1369,7 @@ async function commitHumanWait(
       durable: { ...run.durable, capacityGateTaskId: null },
       waits: [...(run.waits ?? []), {
         waitId, runId: run.runId, nodeId: checkpoint.nodeId, attemptId: checkpoint.attemptId,
-        question: candidate.stdioResult.question, output: candidate.output, createdAt: at,
+        question: nodeResultQuestion(candidate)!, output: candidate.output, createdAt: at,
         settlement: stopped ? { kind: "stopped", resolvedAt: at } : { kind: "pending" },
       }],
       nodes: run.nodes.map((value, index) => index === checkpoint.nodeIndex
@@ -1329,7 +1385,9 @@ async function commitHumanWait(
     await appendEvent(tx, runtime.conversationId, {
       version: 1, eventId: randomUUID(), type: "run_settled", runId: input.runId, outcome, occurredAt: at,
     });
-    return { status: "terminal", outcome: { status: "completed", result: outcome } };
+    return stopped
+      ? { status: "terminal", outcome: { status: "completed", result: { kind: "cancelled" as const } } }
+      : { status: "running", checkpoint: { phase: "awaitHuman", nodeIndex: checkpoint.nodeIndex, nodeId: checkpoint.nodeId, attemptId: checkpoint.attemptId, waitId } };
   }, context);
 }
 
@@ -1445,13 +1503,142 @@ function readyRun(value: unknown): ReadyRun {
   return parsed.data;
 }
 
-async function waitForLaunchPermission(runtime: WorkflowRuntime, canLaunch: () => boolean, context: Context): Promise<void> {
-  while (!canLaunch()) await runtime.sleep(runtime.now() + 250, context);
-}
-
 async function snapshotRun<I, S extends { phase: string }, R, H extends object>(runtime: TaskRuntime<I, S, R, H>, context: Context): Promise<ReadyRun> {
   return readyRun(await runtime.snapshot(WorkshopRunDoc, runtime.conversationId, context));
 }
+async function waitForHumanChange(
+  runtime: WorkflowRuntime,
+  input: WorkflowRunTaskInput,
+  checkpoint: Extract<WorkflowCheckpoint, { phase: "awaitHuman" }>,
+  context: Context,
+): Promise<ReadyRun> {
+  const parentContext = withAbortSignal(runtime.signal, context);
+  const { context: waitContext, cancel } = withCancel(parentContext);
+  let watch: DocumentWatch<JsonObject> | undefined;
+  try {
+    watch = await runtime.watchDoc(WorkshopRunDoc, runtime.conversationId, waitContext);
+    if (watch === undefined) throw new Error("WorkflowRun document is unavailable for human-wait watching");
+    let observed = readyRun(watch.value);
+    const shouldContinue = (run: ReadyRun): boolean => {
+      assertWorkflowIdentity(input, run, runtime.taskId);
+      assertHumanWaitCheckpoint(run, checkpoint);
+      const wait = run.waits?.find((value) => value.waitId === checkpoint.waitId);
+      return run.desiredState === "stopped" || isSettledRun(run)
+        || (run.desiredState === "running" && run.status === "queued"
+          && wait?.settlement.kind === "replied" && wait.settlement.action === "continue");
+    };
+    let notify!: () => void;
+    const changed = new Promise<void>((resolve) => { notify = resolve; });
+    watch.start(async (value) => {
+      observed = readyRun(value);
+      if (shouldContinue(observed)) notify();
+    });
+    if (shouldContinue(observed)) return observed;
+
+    observed = readyRun(await runtime.snapshot(WorkshopRunDoc, runtime.conversationId, waitContext));
+    if (shouldContinue(observed)) return observed;
+    const closed = watch.closed.then((end) => ({ kind: "closed" as const, end }));
+    const result = await Promise.race([
+      changed.then(() => ({ kind: "changed" as const })),
+      closed,
+    ]);
+    if (result.kind === "changed") return observed;
+    if (runtime.signal.aborted || waitContext.abortSignal?.aborted) {
+      throw runtime.signal.reason ?? waitContext.abortSignal?.reason ?? new Error("human wait was cancelled");
+    }
+    if (result.end.reason === "listener_error") throw result.end.error;
+    throw new Error("WorkflowRun document watch ended: " + result.end.reason);
+  } finally {
+    cancel();
+    if (watch !== undefined) {
+      const end = await watch.stop();
+      if (end.reason === "listener_error") throw end.error;
+    }
+  }
+}
+
+function assertHumanWaitCheckpoint(
+  run: ReadyRun,
+  checkpoint: Extract<WorkflowCheckpoint, { phase: "awaitHuman" }>,
+): void {
+  const wait = run.waits?.find((value) => value.waitId === checkpoint.waitId);
+  const node = run.nodes[checkpoint.nodeIndex];
+  if (wait === undefined || wait.runId !== run.runId || wait.nodeId !== checkpoint.nodeId
+    || wait.attemptId !== checkpoint.attemptId || node?.nodeId !== checkpoint.nodeId) {
+    throw new Error("WorkflowRun human-wait checkpoint differs from the canonical wait");
+  }
+  if (wait.settlement.kind === "pending") {
+    if (run.status !== "waiting" || run.currentNodeId !== checkpoint.nodeId
+      || run.currentAttemptId !== checkpoint.attemptId || node.status !== "waiting") {
+      throw new Error("pending human wait differs from its canonical node state");
+    }
+    return;
+  }
+  if (wait.settlement.kind === "stopped") {
+    if (run.status !== "cancelled" || node.status !== "cancelled") {
+      throw new Error("stopped human wait differs from its canonical cancellation");
+    }
+    return;
+  }
+  if (wait.settlement.action === "reject") {
+    if (run.status !== "cancelled" || node.status !== "cancelled") {
+      throw new Error("rejected human wait differs from its canonical cancellation");
+    }
+    return;
+  }
+  if (node.status !== "succeeded" || node.successfulAttemptId !== checkpoint.attemptId
+    || run.currentAttemptId !== null) {
+    throw new Error("continued human wait differs from its accepted node state");
+  }
+  const successor = checkpoint.nodeIndex + 1;
+  if (successor < run.chain.order.length) {
+    if (run.desiredState === "stopped" && run.status === "cancelled"
+      && run.currentNodeId === run.chain.order[successor] && run.nodes[successor]?.status === "cancelled") return;
+    if (run.currentNodeId !== run.chain.order[successor] || run.nodes[successor]?.status !== "pending") {
+      throw new Error("continued human wait lost its exact pending successor");
+    }
+  } else if (run.currentNodeId !== null) {
+    throw new Error("final human wait retained a successor cursor");
+  }
+}
+
+function humanSuccessorIndex(
+  run: ReadyRun,
+  checkpoint: Extract<WorkflowCheckpoint, { phase: "awaitHuman" }>,
+): number {
+  const wait = run.waits?.find((value) => value.waitId === checkpoint.waitId);
+  if (wait?.settlement.kind !== "replied" || wait.settlement.action !== "continue") {
+    throw new Error("capacity reacquisition requires a committed Continue reply");
+  }
+  const index = checkpoint.nodeIndex + 1;
+  if (index >= run.chain.order.length || run.currentNodeId !== run.chain.order[index]
+    || run.nodes[index]?.status !== "pending" || run.currentAttemptId !== null) {
+    throw new Error("human continuation does not identify its exact pending successor");
+  }
+  return index;
+}
+
+function isSettledRun(run: ReadyRun): boolean {
+  return run.status === "completed" || run.status === "failed" || run.status === "cancelled" || run.status === "blocked";
+}
+
+function settledRunOutcome(run: ReadyRun): RunOutcome | undefined {
+  if (run.status === "completed") {
+    if (run.terminalOutput === null) throw new Error("completed human wait lacks terminal output");
+    return { kind: "completed", terminalOutput: run.terminalOutput };
+  }
+  if (run.status === "failed") {
+    if (run.failure === null) throw new Error("failed human wait lacks failure evidence");
+    return { kind: "failed", failure: run.failure };
+  }
+  if (run.status === "cancelled") return { kind: "cancelled" };
+  if (run.status === "blocked") {
+    if (run.block === null) throw new Error("blocked human wait lacks block evidence");
+    return { kind: "blocked", block: run.block };
+  }
+  return undefined;
+}
+
 async function waitForWorkflowResume(
   runtime: WorkflowRuntime,
   input: WorkflowRunTaskInput,
@@ -1486,11 +1673,50 @@ async function waitForWorkflowResume(
       && (run.durable.capacityGateTaskId === null || run.durable.capacityGateTaskId === undefined))) {
       return run;
     }
-    await runtime.sleep(runtime.now() + 250, context);
+    await waitForRunChange(runtime, input, context);
   }
 }
 
+async function waitForRunChange(runtime: WorkflowRuntime, input: WorkflowRunTaskInput, context: Context): Promise<void> {
+  const parentContext = withAbortSignal(runtime.signal, context);
+  const { context: watchContext, cancel } = withCancel(parentContext);
+  let watch: DocumentWatch<JsonObject> | undefined;
+  try {
+    watch = await runtime.watchDoc(WorkshopRunDoc, runtime.conversationId, watchContext);
+    if (watch === undefined) throw new Error("WorkflowRun document is unavailable for watching");
+    const initial = readyRun(watch.value);
+    assertWorkflowIdentity(input, initial, runtime.taskId);
+    let notify!: () => void;
+    const changed = new Promise<void>((resolve) => { notify = resolve; });
+    watch.start(async (value) => {
+      const observed = readyRun(value);
+      assertWorkflowIdentity(input, observed, runtime.taskId);
+      notify();
+    });
+    const current = await snapshotRun(runtime, watchContext);
+    assertWorkflowIdentity(input, current, runtime.taskId);
+    if (canonicalHash(current) !== canonicalHash(initial)) return;
 
+    const result = await Promise.race([
+      changed.then(() => ({ kind: "changed" as const })),
+      watch.closed.then((end) => ({ kind: "closed" as const, end })),
+    ]);
+    if (result.kind === "changed") return;
+    if (runtime.signal.aborted || watchContext.abortSignal?.aborted) {
+      throw runtime.signal.reason ?? watchContext.abortSignal?.reason ?? new Error("run-state wait was cancelled");
+    }
+    if (result.end.reason === "listener_error") throw result.end.error;
+    throw new Error("WorkflowRun document watch ended: " + result.end.reason);
+  } finally {
+    cancel();
+    if (watch !== undefined) {
+      const end = await watch.stop();
+      if (end.reason === "listener_error" && !runtime.signal.aborted && !watchContext.abortSignal?.aborted) {
+        throw end.error;
+      }
+    }
+  }
+}
 
 async function runDraft(tx: Tx, conversationId: ConversationId) {
   const draft = await tx.doc(WorkshopRunDoc, conversationId);

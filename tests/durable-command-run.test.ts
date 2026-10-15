@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
+import { getEventListeners } from "node:events";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -22,6 +23,7 @@ import { WorkshopInstallationDoc, WorkshopRunDoc, WorkshopProcessEntry } from ".
 import {
   buildProcessExecutionEnvironment,
   decideProcessReplay,
+  defineProcessExecutionTask,
   processExecutionFiles,
   processExecutionTaskInputSchema,
   processExecutionTaskResultSchema,
@@ -131,7 +133,7 @@ function prepare(
     runtimeManifest: {
       durableVersion: "1.0.2",
       integrationManifestHash: hash("command-only integration test"),
-      taskVersions: { workflowRun: 10, nodeAttempt: 4, processExecution: 4, capacityGate: 1 },
+      taskVersions: { workflowRun: 11, nodeAttempt: 5, agentExecution: 1, processExecution: 4, capacityGate: 1 },
     },
     runId,
     eventId: `admission-${runId}`,
@@ -449,64 +451,47 @@ describe("Durable workflow lifecycle", () => {
 });
 
 describe("Durable workflow compatibility", () => {
-  test("blocks a migrated WorkflowRun v8 checkpoint under the stdin runtime", async () => {
-    const directory = mkdtempSync(join(tmpdir(), "workshop-workflow-migration-v8-"));
+  test("blocks a run with an incompatible runtime task manifest", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "workshop-workflow-compatibility-"));
     const databasePath = join(directory, "durable.db");
-    let v8Harness: Awaited<ReturnType<typeof Harness.open>> | undefined;
     let opened: CommandHarness | undefined;
-    const v8WorkflowTask = defineTask<ReturnType<typeof createWorkflowRunTaskInput>, { phase: "start" }, ReturnType<typeof runOutcomeSchema.parse>>({
-      name: "workshop.workflow-run",
-      version: 8,
-      initial: () => ({ phase: "start" }),
-      phases: { start: async () => { throw new Error("v8 task must remain unstarted before migration"); } },
-      abort: async () => {},
-    });
     try {
-      const prepared = prepare(directory, "workflow-v8-request-001", "command-chain-workflow-v8-run-001");
-      const v8Prepared = {
+      const prepared = prepare(directory, "workflow-incompatible-request-001", "command-chain-incompatible-run-001");
+      const incompatiblePrepared = {
         ...prepared,
         runtimeManifest: {
           ...prepared.runtimeManifest,
-          taskVersions: { workflowRun: 8, nodeAttempt: 4, processExecution: 4, capacityGate: 1 },
+          taskVersions: { workflowRun: 11, nodeAttempt: 3, processExecution: 4, capacityGate: 1 },
         },
       };
-      const storage = await openDurableStorage(databasePath);
-      if (!storage.ok) throw new Error(`${storage.failure.message}: ${String(storage.failure.cause)}`);
-      const registry = createRegistry();
-      registry.install({ name: "workshop-v8-migration-fixture", tasks: [v8WorkflowTask] });
-      v8Harness = await Harness.open(storage.storage, { models: createModels(), registry }, BACKGROUND_CONTEXT);
-      await initializeInstallation(v8Harness, prepared.canonicalHash);
+      opened = await openCommandHarness(databasePath);
+      await initializeInstallation(opened.harness, prepared.canonicalHash);
       const admission = await admitPreparedRun({
-        harness: v8Harness,
-        prepared: v8Prepared,
-        workflowRunTask: v8WorkflowTask as never,
+        harness: opened.harness,
+        prepared: incompatiblePrepared,
+        workflowRunTask: opened.tasks.WorkflowRunTask,
         createTaskInput: createWorkflowRunTaskInput,
         parseTaskInput: parseWorkflowRunTaskInput,
         context: BACKGROUND_CONTEXT,
       });
-      if (!admission.ok) throw new Error(`${admission.failure.kind}: ${admission.failure.message}`);
-      await v8Harness.close(BACKGROUND_CONTEXT);
-      v8Harness = undefined;
-
-      opened = await openCommandHarness(databasePath);
+      if (!admission.ok) throw new Error(admission.failure.kind + ": " + admission.failure.message);
       await opened.harness.waitForIdle(BACKGROUND_CONTEXT);
       const task = await opened.harness.waitForTask(admission.value.workflowTaskId as TaskId<ReturnType<typeof runOutcomeSchema.parse>>, BACKGROUND_CONTEXT);
-      if (task.state.status !== "terminal" || task.state.outcome.status !== "completed") throw new Error("migrated WorkflowRun did not settle");
+      if (task.state.status !== "terminal" || task.state.outcome.status !== "completed") throw new Error("incompatible WorkflowRun did not settle");
       const outcome = runOutcomeSchema.parse(task.state.outcome.result);
       expect(outcome.kind).toBe("blocked");
-      if (outcome.kind !== "blocked") throw new Error("legacy process contract bypassed the runtime gate");
+      if (outcome.kind !== "blocked") throw new Error("incompatible runtime bypassed the compatibility gate");
       expect(outcome.block.kind).toBe("runtime_incompatible");
       const run = workflowRunDocumentV1Schema.parse(await opened.harness.snapshot(WorkshopRunDoc, admission.value.conversationId as ConversationId, BACKGROUND_CONTEXT));
       expect(run.state).toBe("ready");
-      if (run.state !== "ready") throw new Error("migrated run is missing its canonical document");
+      if (run.state !== "ready") throw new Error("incompatible run is missing its canonical document");
       expect(run.status).toBe("blocked");
       expect(run.block?.kind).toBe("runtime_incompatible");
-      expect(run.runtimeManifest.taskVersions).toEqual({ workflowRun: 8, nodeAttempt: 4, processExecution: 4, capacityGate: 1 });
+      expect(run.runtimeManifest.taskVersions).toEqual({ workflowRun: 11, nodeAttempt: 3, processExecution: 4, capacityGate: 1 });
       const conversation = await opened.harness.conversation(admission.value.conversationId as ConversationId, BACKGROUND_CONTEXT);
-      if (conversation === undefined) throw new Error("legacy WorkflowRun conversation is missing");
+      if (conversation === undefined) throw new Error("incompatible WorkflowRun conversation is missing");
       expect((await conversation.entries({}, 100, undefined, BACKGROUND_CONTEXT)).items.filter((entry) => entry.kind === "workshop.process")).toHaveLength(0);
     } finally {
-      if (v8Harness !== undefined) await v8Harness.close(BACKGROUND_CONTEXT);
       if (opened !== undefined) await opened.harness.close(BACKGROUND_CONTEXT);
       rmSync(directory, { recursive: true, force: true });
     }
@@ -672,31 +657,17 @@ describe("canonical worker output views", () => {
 });
 
 describe("format 4 stdout outcomes", () => {
-  test("completes early results, waits for human input, and retains verifier blocks", async () => {
+  test("completes early command results and waits for human input", async () => {
     const cases = [
       {
         status: "success_and_complete" as const,
         output: ["<status>success_and_complete</status>", "<reason>workflow is complete</reason>", "<output>final proposal</output>"].join("\n"),
-        verifierOutput: acceptedVerifierOutput,
-        outputRole: "worker" as const,
         runStatus: "completed" as const,
-        blockKind: null,
       },
       {
         status: "needs_input" as const,
         output: ["<status>needs_input</status>", "<reason>required detail is missing</reason>", "<question>Which location should I use?</question>", "<output>pending proposal</output>"].join("\n"),
-        verifierOutput: acceptedVerifierOutput,
-        outputRole: "worker" as const,
         runStatus: "waiting" as const,
-        blockKind: null,
-      },
-      {
-        status: "verifier_block" as const,
-        output: taggedWorkerOutput,
-        verifierOutput: "block\ncandidate needs an unsupported action",
-        outputRole: "validator" as const,
-        runStatus: "blocked" as const,
-        blockKind: "verifier_block",
       },
     ] as const;
 
@@ -716,20 +687,37 @@ describe("format 4 stdout outcomes", () => {
       process.env.WORKSHOP_TEST_VALIDATOR_INPUT = markers.validatorInput;
       let opened: CommandHarness | undefined;
       try {
-        const workerCommand = fixture.outputRole === "worker" ? "printf '%s' '" + fixture.output + "'" : undefined;
-        const machine = headlessChainMachineConfig(fixture.verifierOutput, workerCommand);
-        const prepared = prepare(directory, "stdio-gate-request-" + index, "command-chain-stdio-gate-run-" + index, headlessChainSourceText, machine);
+        const source = headlessChainCommandSourceText(printfShellText(fixture.output));
+        const prepared = prepare(directory, "stdio-gate-request-" + index, "command-chain-stdio-gate-run-" + index, source, { shell: "/bin/bash" });
         opened = await openCommandHarness(join(directory, "durable.db"));
         await initializeInstallation(opened.harness, prepared.canonicalHash);
         const admission = await admit(opened.harness, opened.tasks, prepared);
         if (!admission.ok) throw new Error(admission.failure.kind + ": " + admission.failure.message);
-        await opened.harness.waitForIdle(BACKGROUND_CONTEXT);
-        const task = await opened.harness.waitForTask(
-          admission.value.workflowTaskId as TaskId<ReturnType<typeof runOutcomeSchema.parse>>,
-          BACKGROUND_CONTEXT,
-        );
-        if (task.state.status !== "terminal" || task.state.outcome.status !== "completed") throw new Error("stdio outcome run did not settle");
-        const outcome = runOutcomeSchema.parse(task.state.outcome.result);
+        let outcome: ReturnType<typeof runOutcomeSchema.parse> | undefined;
+        if (fixture.status === "needs_input") {
+          opened.harness.resume();
+          const deadline = Date.now() + 3_000;
+          let snapshot: ReturnType<typeof workflowRunDocumentV1Schema.parse> | undefined;
+          while (Date.now() < deadline) {
+            snapshot = workflowRunDocumentV1Schema.parse(
+              await opened.harness.snapshot(WorkshopRunDoc, admission.value.conversationId as ConversationId, BACKGROUND_CONTEXT),
+            );
+            if (snapshot.state === "ready" && snapshot.status === "waiting") break;
+            await Bun.sleep(10);
+          }
+          if (snapshot?.state !== "ready" || snapshot.status !== "waiting") throw new Error("run did not reach human wait: " + JSON.stringify(snapshot));
+          const inspection = await opened.harness.inspect(BACKGROUND_CONTEXT);
+          const workflowTask = inspection.tasks.find((entry) => Number(entry.record.id) === Number(admission.value.workflowTaskId));
+          expect(workflowTask?.record.state).toMatchObject({ status: "running", checkpoint: { phase: "awaitHuman" } });
+        } else {
+          await opened.harness.waitForIdle(BACKGROUND_CONTEXT);
+          const task = await opened.harness.waitForTask(
+            admission.value.workflowTaskId as TaskId<ReturnType<typeof runOutcomeSchema.parse>>,
+            BACKGROUND_CONTEXT,
+          );
+          if (task.state.status !== "terminal" || task.state.outcome.status !== "completed") throw new Error("stdio outcome run did not settle");
+          outcome = runOutcomeSchema.parse(task.state.outcome.result);
+        }
         const stored = workflowRunDocumentV1Schema.parse(
           await opened.harness.snapshot(WorkshopRunDoc, admission.value.conversationId as ConversationId, BACKGROUND_CONTEXT),
         );
@@ -751,37 +739,20 @@ describe("format 4 stdout outcomes", () => {
           if (result.outcome.kind !== "succeeded") throw new Error("success_and_complete did not succeed");
           expect(candidate.stdioResult.status).toBe("success_and_complete");
           expect(stored.terminalOutput).toBe("final proposal");
-        } else if (fixture.status === "needs_input") {
-          expect(outcome.kind).toBe("waiting");
+        } else {
+          expect(outcome).toBeUndefined();
           expect(result.outcome.kind).toBe("succeeded");
           expect(stored.waits?.[0]).toMatchObject({ output: "pending proposal", question: "Which location should I use?" });
-        } else {
-          expect(outcome.kind).toBe("blocked");
-          if (outcome.kind !== "blocked") throw new Error("verifier block did not settle as blocked");
-          expect(String(outcome.block.kind)).toBe(fixture.blockKind);
-          expect(result.outcome.kind).toBe("blocked");
-          if (result.outcome.kind !== "blocked") throw new Error("tagged status lacks a checked block");
-          expect(String(result.outcome.block.kind)).toBe(fixture.blockKind);
         }
-        if (fixture.status !== "verifier_block") {
-          expect(candidate.stdioResult.status).toBe(fixture.status);
-          expect(existsSync(markers.validators)).toBe(true);
-        } else {
-          expect(readFileSync(markers.validators, "utf8")).toBe("v");
-          expect(result.outcome.kind).toBe("blocked");
-          if (result.outcome.kind !== "blocked") throw new Error("verifier block did not retain a blocked outcome");
-          expect(result.outcome.validator).toMatchObject({
-            kind: "agent",
-            verdict: { version: 2, decision: "block", reason: "candidate needs an unsupported action" },
-          });
-        }
+        expect(candidate.stdioResult.status).toBe(fixture.status);
+        expect(existsSync(markers.validators)).toBe(true);
       } finally {
         if (opened !== undefined) await opened.harness.close(BACKGROUND_CONTEXT);
         restoreEnvironment();
         rmSync(directory, { recursive: true, force: true });
       }
     }
-  });
+  }, 15_000);
 });
 
 async function verifyDurableRestartAfterProcessLaunch(
@@ -1015,7 +986,43 @@ function isProcessGroupAlive(pgid: number): boolean {
 }
 
 describe("Durable process launch startup gate", () => {
-  test("keeps a clean initial intent checkpoint launchable after service boot changes", async () => {
+  test("notifies every admission waiter when the startup gate opens", async () => {
+    const tasks = defineProcessExecutionTask(randomUUID(), { startupLaunchGate: "closed" });
+    const first = new AbortController();
+    const second = new AbortController();
+    const waiters = [tasks.waitForAdmission(first.signal), tasks.waitForAdmission(second.signal)];
+
+    tasks.openStartupLaunchGate();
+    await Promise.all(waiters);
+
+    await tasks.waitForAdmission(new AbortController().signal);
+  });
+
+  test("waits for abort after launching stops and removes the abort listener", async () => {
+    const tasks = defineProcessExecutionTask(randomUUID(), { startupLaunchGate: "closed" });
+    const controller = new AbortController();
+    const reason = new Error("test cancellation");
+    const pending = tasks.waitForAdmission(controller.signal);
+    let settled = false;
+    const observed = pending.then(
+      () => { settled = true; },
+      (error: unknown) => { settled = true; throw error; },
+    );
+
+    expect(getEventListeners(controller.signal, "abort")).toHaveLength(1);
+    tasks.stopLaunching();
+    expect(tasks.canLaunch()).toBe(false);
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(getEventListeners(controller.signal, "abort")).toHaveLength(1);
+
+    controller.abort(reason);
+    await expect(observed).rejects.toBe(reason);
+    expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+    await expect(tasks.waitForAdmission(controller.signal)).rejects.toBe(reason);
+  });
+
+  test("keeps external launches closed until admission opens after service boot changes", async () => {
     const directory = mkdtempSync(join(tmpdir(), "workshop-process-startup-gate-"));
     const databasePath = join(directory, "durable.db");
     const markerPath = join(directory, "process-launched.txt");
@@ -1026,7 +1033,7 @@ describe("Durable process launch startup gate", () => {
       "  replay: never",
       "steps:",
       "  - first:",
-      `      run: 'echo $$ > ${markerPath}; sleep 0.05; printf gate-opened'`,
+      "      run: 'echo $$ > " + markerPath + "; sleep 0.05; printf gate-opened'",
       "",
     ].join("\n");
     const oldBootId = randomUUID();
@@ -1038,10 +1045,10 @@ describe("Durable process launch startup gate", () => {
       await initializeInstallation(opened.harness, prepared.canonicalHash);
       const admission = await admit(opened.harness, opened.tasks, prepared);
       expect(admission.ok).toBe(true);
-      if (!admission.ok) throw new Error(`${admission.failure.kind}: ${admission.failure.message}`);
+      if (!admission.ok) throw new Error(admission.failure.kind + ": " + admission.failure.message);
       opened.harness.resume();
-      const initialIntent = await waitForProcessIntent(opened);
-      expect(initialIntent.input.serviceBootId).toBe(oldBootId);
+      const initial = await waitForWorkflowStart(opened, admission.value.workflowTaskId);
+      expect(initial.record.state.checkpoint).toMatchObject({ phase: "start" });
       expect(existsSync(markerPath)).toBe(false);
       // SAFETY: admission returns the numeric ID created for this run's ownerless conversation.
       const conversationId = admission.value.conversationId as ConversationId;
@@ -1053,8 +1060,8 @@ describe("Durable process launch startup gate", () => {
       opened = undefined;
       opened = await openCommandHarness(databasePath, newBootId, { startupLaunchGate: "closed" });
       opened.harness.resume();
-      const reopenedIntent = await waitForProcessIntent(opened);
-      expect(reopenedIntent.input.serviceBootId).toBe(oldBootId);
+      const reopened = await waitForWorkflowStart(opened, admission.value.workflowTaskId);
+      expect(reopened.record.state.checkpoint).toMatchObject({ phase: "start" });
       expect(existsSync(markerPath)).toBe(false);
       const reopenedConversation = await opened.harness.conversation(conversationId, BACKGROUND_CONTEXT);
       if (reopenedConversation === undefined) throw new Error("reopened run conversation is missing");
@@ -1069,25 +1076,24 @@ describe("Durable process launch startup gate", () => {
       const started = processes.find((process) => process.status === "running");
       expect(started?.launchServiceBootId).toBe(newBootId);
       expect(started?.identity?.serviceBootId).toBe(newBootId);
-      expect(readFileSync(markerPath, "utf8")).toBe(`${started?.identity?.pid ?? ""}\n`);
+      expect(readFileSync(markerPath, "utf8")).toBe((started?.identity?.pid ?? "") + "\n");
     } finally {
       if (opened !== undefined) await opened.harness.close(BACKGROUND_CONTEXT);
       rmSync(directory, { recursive: true, force: true });
     }
   }, 15_000);
 
-  async function waitForProcessIntent(opened: CommandHarness) {
+  async function waitForWorkflowStart(opened: CommandHarness, taskId: number) {
     const deadline = Date.now() + 5_000;
     while (Date.now() < deadline) {
       const inspection = await opened.harness.inspect(BACKGROUND_CONTEXT);
-      const task = inspection.tasks.find((entry) => entry.record.kind === opened.tasks.ProcessExecutionTask.definition.name);
-      if (task?.record.state.status === "running") {
-        const input = processExecutionTaskInputSchema.parse(task.record.input);
-        return { task, input };
-      }
+      const task = inspection.tasks.find((entry) => Number(entry.record.id) === Number(taskId));
+      const checkpoint = task?.record.state.checkpoint;
+      if (task?.record.state.status === "running" && typeof checkpoint === "object" && checkpoint !== null
+        && "phase" in checkpoint && checkpoint.phase === "start") return task;
       await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
     }
-    throw new Error("process task did not reach its initial intent checkpoint");
+    throw new Error("WorkflowRun did not reach its initial admission wait");
   }
 });
 
@@ -1132,58 +1138,39 @@ describe("Durable launch intent without process identity", () => {
 });
 
 
-const headlessChainSourceText = [
-  "version: 4",
-  "defaults:",
-  "  retries: 0",
-  "  replay: never",
-  "steps:",
-  "  - first:",
-  "      result: tagged",
-  "      agent:",
-  "        instructions: produce a checked candidate",
-  "      verify:",
-  "        agent:",
-  "          instructions: check the candidate",
-  "  - second:",
-  "      run: >-",
-  "        printf 's' >> \"$WORKSHOP_TEST_SUCCESSORS\"; printf '%s-next' \"$(cat)\"",
-  "",
-].join("\n");
-
 const taggedWorkerOutput = [
   "<status>succeeded</status>",
   "<reason>worker summary</reason>",
   "<output>validated candidate</output>",
 ].join("\n") + "\n";
-const acceptedVerifierOutput = "accept\ncandidate checks out\n";
 
-function headlessChainMachineConfig(verifierOutput: string, workerCommand = "printf '%s' '" + taggedWorkerOutput + "'") {
-  const workerCommandWithMarker = [
-    "printf 'w' >> \"$WORKSHOP_TEST_WORKERS\"",
-    workerCommand,
-  ].join("; ");
-  const verifierCommand = verifierOutput === "__sleep__"
-    ? [
-      "printf 'v' >> \"$WORKSHOP_TEST_VALIDATORS\"",
-      "printf '%s' \"$input\" > \"$WORKSHOP_TEST_VALIDATOR_INPUT\"",
-      "sleep 3",
-    ].join("; ")
-    : [
-      "printf 'v' >> \"$WORKSHOP_TEST_VALIDATORS\"",
-      "printf '%s' \"$input\" > \"$WORKSHOP_TEST_VALIDATOR_INPUT\"",
-      "printf '%s' '" + verifierOutput + "'",
-    ].join("; ");
-  return {
-    shell: "/bin/bash",
-    agent: {
-      model: "provider/model:low",
-      harness: {
-        command: "input=$(cat); if printf '%s' \"$input\" | grep -q 'Role: verifier'; then " + verifierCommand
-          + "; else " + workerCommandWithMarker + "; fi",
-      },
-    },
-  } as const;
+function printfShellText(value: string): string {
+  const escaped = value.replaceAll("\\", "\\\\").replaceAll("'", "\\'").replaceAll("\n", "\\n");
+  return "printf '%s' $'" + escaped + "'";
+}
+
+function headlessChainCommandSourceText(
+  workerCommand = printfShellText(taggedWorkerOutput),
+  validatorCommand = "test \"$input\" = 'validated candidate'; printf '%s' 'accepted'",
+): string {
+  return [
+    "version: 4",
+    "defaults:",
+    "  retries: 0",
+    "  replay: never",
+    "steps:",
+    "  - first:",
+    "      result: tagged",
+    "      run: >-",
+    "        input=$(cat); printf 'w' >> \"$WORKSHOP_TEST_WORKERS\"; " + workerCommand,
+    "      verify:",
+    "        run: >-",
+    "          input=$(cat); printf 'v' >> \"$WORKSHOP_TEST_VALIDATORS\"; printf '%s' \"$input\" > \"$WORKSHOP_TEST_VALIDATOR_INPUT\"; " + validatorCommand,
+    "  - second:",
+    "      run: >-",
+    "        printf 's' >> \"$WORKSHOP_TEST_SUCCESSORS\"; printf '%s-next' \"$(cat)\"",
+    "",
+  ].join("\n");
 }
 
 function preserveEnvironment(names: readonly string[]): () => void {
@@ -1197,7 +1184,7 @@ function preserveEnvironment(names: readonly string[]): () => void {
 }
 
 describe("Durable headless validation chain", () => {
-  test("parses tagged worker and decision-line verifier stdout before publishing the candidate", async () => {
+  test("runs a tagged command worker and command verifier before publishing the candidate", async () => {
     const directory = mkdtempSync(join(tmpdir(), "workshop-headless-chain-"));
     const envNames = [
       "WORKSHOP_TEST_WORKERS",
@@ -1222,8 +1209,8 @@ describe("Durable headless validation chain", () => {
         directory,
         "headless-chain-request-001",
         "command-chain-headless-run-001",
-        headlessChainSourceText,
-        headlessChainMachineConfig(acceptedVerifierOutput),
+        headlessChainCommandSourceText(),
+        { shell: "/bin/bash" },
       );
       opened = await openCommandHarness(join(directory, "durable.db"));
       await initializeInstallation(opened.harness, prepared.canonicalHash);
@@ -1254,7 +1241,7 @@ describe("Durable headless validation chain", () => {
       }
       expect(firstResult.outcome.candidate).toMatchObject({
         version: 2,
-        source: "agent",
+        source: "command",
         output: "validated candidate",
         summary: "worker summary",
         artifacts: [],
@@ -1262,17 +1249,14 @@ describe("Durable headless validation chain", () => {
         sourceBytesHash: hash(taggedWorkerOutput),
       });
       expect(firstResult.outcome.validator).toMatchObject({
-        kind: "agent",
-        verdict: { version: 2, decision: "accept", reason: "candidate checks out" },
-        resultBytesHash: hash(acceptedVerifierOutput),
+        kind: "command",
+        exit: { kind: "code", code: 0 },
       });
       expect(readFileSync(markers.workers, "utf8")).toBe("w");
       expect(readFileSync(markers.validators, "utf8")).toBe("v");
       expect(readFileSync(markers.successors, "utf8")).toBe("s");
       const verifierInput = readFileSync(markers.validatorInput, "utf8");
-      expect(verifierInput).toContain("Role: verifier");
-      expect(verifierInput).toContain("### Candidate output (data)");
-      expect(verifierInput).toContain("validated candidate");
+      expect(verifierInput).toBe("validated candidate");
 
       const firstAttempt = stored.nodes[0]!.attempts[0]!;
       expect(firstAttempt.workerExecutionId).not.toBeNull();
@@ -1293,136 +1277,68 @@ describe("Durable headless validation chain", () => {
     }
   });
 
-  test("includes a tagged truncation excerpt instead of blocking large prior output", async () => {
-    const directory = mkdtempSync(join(tmpdir(), "workshop-agent-previous-output-excerpt-"));
-    const promptPath = join(directory, "agent-prompt.txt");
-    const previousPrompt = process.env.WORKSHOP_TEST_AGENT_PROMPT;
-    process.env.WORKSHOP_TEST_AGENT_PROMPT = promptPath;
+  test("keeps the committed candidate and never starts a successor after command validator failure", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "workshop-command-validator-rejected-"));
+    const envNames = ["WORKSHOP_TEST_WORKERS", "WORKSHOP_TEST_VALIDATORS", "WORKSHOP_TEST_SUCCESSORS", "WORKSHOP_TEST_VALIDATOR_INPUT"];
+    const restoreEnvironment = preserveEnvironment(envNames);
+    const markers = {
+      workers: join(directory, "workers.txt"),
+      validators: join(directory, "validators.txt"),
+      successors: join(directory, "successors.txt"),
+      validatorInput: join(directory, "validator-input.txt"),
+    };
+    process.env.WORKSHOP_TEST_WORKERS = markers.workers;
+    process.env.WORKSHOP_TEST_VALIDATORS = markers.validators;
+    process.env.WORKSHOP_TEST_SUCCESSORS = markers.successors;
+    process.env.WORKSHOP_TEST_VALIDATOR_INPUT = markers.validatorInput;
     let opened: CommandHarness | undefined;
     try {
-      const source = [
-        "version: 4",
-        "defaults:",
-        "  retries: 0",
-        "  replay: never",
-        "steps:",
-        "  - first:",
-        "      run: >-",
-        "        yes x | head -c 70000",
-        "  - second:",
-        "      result: tagged",
-        "      agent:",
-        "        instructions: summarize the earlier output",
-        "",
-      ].join("\n");
-      const machine = {
-        shell: "/bin/bash",
-        agent: {
-          model: "provider/model:low",
-          harness: {
-            command: "input=$(cat); printf '%s' \"$input\" > \"$WORKSHOP_TEST_AGENT_PROMPT\"; printf '%s' '<status>succeeded</status><output>done</output>'",
-          },
-        },
-      } as const;
-      const prepared = prepare(directory, "agent-previous-excerpt-request", "command-chain-agent-previous-excerpt-run", source, machine);
+      const prepared = prepare(
+        directory,
+        "command-validator-rejected-request",
+        "command-chain-validator-rejected-run",
+        headlessChainCommandSourceText(
+          printfShellText(taggedWorkerOutput),
+          printfShellText("candidate violates the constraint") + " >&2; exit 7",
+        ),
+        { shell: "/bin/bash" },
+      );
       opened = await openCommandHarness(join(directory, "durable.db"));
       await initializeInstallation(opened.harness, prepared.canonicalHash);
       const admission = await admit(opened.harness, opened.tasks, prepared);
       if (!admission.ok) throw new Error(admission.failure.kind + ": " + admission.failure.message);
       await opened.harness.waitForIdle(BACKGROUND_CONTEXT);
-      const task = await opened.harness.waitForTask(admission.value.workflowTaskId as TaskId<ReturnType<typeof runOutcomeSchema.parse>>, BACKGROUND_CONTEXT);
-      if (task.state.status !== "terminal" || task.state.outcome.status !== "completed") throw new Error("large prior output blocked its agent successor");
-      expect(runOutcomeSchema.parse(task.state.outcome.result)).toEqual({ kind: "completed", terminalOutput: "done" });
-      const prompt = readFileSync(promptPath, "utf8");
-      const runTag = hash(prepared.runId).slice(7, 15);
-      expect(prompt).toContain("x\nx\n");
-      expect(prompt).toContain("[Truncated after the first 64 KiB. Find the complete earlier result in WORKSHOP_RESULTS_PATH (results.md) by its tag: result-first-" + runTag + ".]");
+      const task = await opened.harness.waitForTask(
+        admission.value.workflowTaskId as TaskId<ReturnType<typeof runOutcomeSchema.parse>>,
+        BACKGROUND_CONTEXT,
+      );
+      if (task.state.status !== "terminal" || task.state.outcome.status !== "completed") {
+        throw new Error("command validator failure did not settle as a domain result");
+      }
+      const outcome = runOutcomeSchema.parse(task.state.outcome.result);
+      expect(outcome.kind).toBe("failed");
+      if (outcome.kind !== "failed") throw new Error("failing command validator did not reject the candidate");
+
+      const stored = workflowRunDocumentV1Schema.parse(
+        await opened.harness.snapshot(WorkshopRunDoc, admission.value.conversationId as ConversationId, BACKGROUND_CONTEXT),
+      );
+      if (stored.state !== "ready") throw new Error("failed headless run disappeared");
+      const firstResult = stored.nodes[0]?.attempts[0]?.result;
+      if (firstResult?.kind !== "settled" || firstResult.outcome.kind !== "failed") {
+        throw new Error("failed command validator did not retain checked evidence");
+      }
+      expect(firstResult.outcome.candidate?.output).toBe("validated candidate");
+      expect(firstResult.outcome.failure.kind).toBe("validator_rejection");
+      expect(firstResult.outcome.failure.message).toBe("command validator exited with code 7");
+      expect(firstResult.outcome.validator).toMatchObject({ kind: "command", exit: { kind: "code", code: 7 } });
+      expect(stored.nodes[1]?.status).toBe("pending");
+      expect(readFileSync(markers.workers, "utf8")).toBe("w");
+      expect(readFileSync(markers.validators, "utf8")).toBe("v");
+      expect(existsSync(markers.successors)).toBe(false);
     } finally {
       if (opened !== undefined) await opened.harness.close(BACKGROUND_CONTEXT);
-      if (previousPrompt === undefined) delete process.env.WORKSHOP_TEST_AGENT_PROMPT;
-      else process.env.WORKSHOP_TEST_AGENT_PROMPT = previousPrompt;
+      restoreEnvironment();
       rmSync(directory, { recursive: true, force: true });
-    }
-  });
-
-  test("keeps the committed candidate and never starts a successor after validator failure", async () => {
-    for (const mode of ["rejected", "malformed"] as const) {
-      const directory = mkdtempSync(join(tmpdir(), `workshop-validator-${mode}-`));
-      const envNames = [
-        "WORKSHOP_TEST_WORKERS",
-        "WORKSHOP_TEST_VALIDATORS",
-        "WORKSHOP_TEST_SUCCESSORS",
-        "WORKSHOP_TEST_VALIDATOR_INPUT",
-      ];
-      const restoreEnvironment = preserveEnvironment(envNames);
-      const markers = {
-        workers: join(directory, "workers.txt"),
-        validators: join(directory, "validators.txt"),
-        successors: join(directory, "successors.txt"),
-        validatorInput: join(directory, "validator-input.txt"),
-      };
-      process.env.WORKSHOP_TEST_WORKERS = markers.workers;
-      process.env.WORKSHOP_TEST_VALIDATORS = markers.validators;
-      process.env.WORKSHOP_TEST_SUCCESSORS = markers.successors;
-      process.env.WORKSHOP_TEST_VALIDATOR_INPUT = markers.validatorInput;
-      let opened: CommandHarness | undefined;
-      try {
-        const verdict = mode === "rejected"
-          ? "retry\ncandidate violates the constraint; remove the conflicting value.\n"
-          : "not-json";
-        const prepared = prepare(
-          directory,
-          `headless-validator-${mode}-request`,
-          `command-chain-validator-${mode}-run`,
-          headlessChainSourceText,
-          headlessChainMachineConfig(verdict),
-        );
-        opened = await openCommandHarness(join(directory, "durable.db"));
-        await initializeInstallation(opened.harness, prepared.canonicalHash);
-        const admission = await admit(opened.harness, opened.tasks, prepared);
-        expect(admission.ok).toBe(true);
-        if (!admission.ok) throw new Error(`${admission.failure.kind}: ${admission.failure.message}`);
-        await opened.harness.waitForIdle(BACKGROUND_CONTEXT);
-        const task = await opened.harness.waitForTask(
-          admission.value.workflowTaskId as TaskId<ReturnType<typeof runOutcomeSchema.parse>>,
-          BACKGROUND_CONTEXT,
-        );
-        expect(task.state.status).toBe("terminal");
-        if (task.state.outcome.status !== "completed") throw new Error("validator failure did not settle as a domain result");
-        const outcome = runOutcomeSchema.parse(task.state.outcome.result);
-        expect(outcome.kind).toBe(mode === "rejected" ? "failed" : "blocked");
-        if (outcome.kind === "blocked") expect(outcome.block.kind).toBe("verifier_failed");
-
-        const stored = workflowRunDocumentV1Schema.parse(
-          await opened.harness.snapshot(WorkshopRunDoc, admission.value.conversationId as ConversationId, BACKGROUND_CONTEXT),
-        );
-        if (stored.state !== "ready") throw new Error("failed headless run disappeared");
-        const firstResult = stored.nodes[0]?.attempts[0]?.result;
-        if (firstResult?.kind !== "settled" || (firstResult.outcome.kind !== "failed" && firstResult.outcome.kind !== "blocked")) {
-          throw new Error("failed validator attempt did not settle with checked evidence");
-        }
-        expect(firstResult.outcome.candidate?.output).toBe("validated candidate");
-        if (mode === "rejected" && firstResult.outcome.kind === "failed") {
-          expect(firstResult.outcome.failure.kind).toBe("validator_rejection");
-          expect(firstResult.outcome.failure.message).toContain("candidate violates the constraint");
-          expect(firstResult.outcome.failure.message).toContain("remove the conflicting value");
-          expect(firstResult.outcome.validator).toMatchObject({
-            kind: "agent",
-            verdict: { version: 2, decision: "retry", reason: "candidate violates the constraint; remove the conflicting value." },
-          });
-        } else {
-          expect(firstResult.outcome.kind).toBe("blocked");
-          expect(firstResult.outcome.validator).toBeNull();
-        }
-        expect(stored.nodes[1]?.status).toBe("pending");
-        expect(readFileSync(markers.workers, "utf8")).toBe("w");
-        expect(readFileSync(markers.validators, "utf8")).toBe("v");
-        expect(existsSync(markers.successors)).toBe(false);
-      } finally {
-        if (opened !== undefined) await opened.harness.close(BACKGROUND_CONTEXT);
-        restoreEnvironment();
-        rmSync(directory, { recursive: true, force: true });
-      }
     }
   });
   test("rejects malformed tagged worker stdout before verifier or successor launch", async () => {
@@ -1441,8 +1357,8 @@ describe("Durable headless validation chain", () => {
     process.env.WORKSHOP_TEST_VALIDATOR_INPUT = markers.validatorInput;
     let opened: CommandHarness | undefined;
     try {
-      const machine = headlessChainMachineConfig(acceptedVerifierOutput, "printf '%s' 'malformed worker output'");
-      const prepared = prepare(directory, "unpaired-worker-request-001", "command-chain-unpaired-worker-run-001", headlessChainSourceText, machine);
+      const source = headlessChainCommandSourceText("printf '%s' 'malformed worker output'");
+      const prepared = prepare(directory, "unpaired-worker-request-001", "command-chain-unpaired-worker-run-001", source, { shell: "/bin/bash" });
       opened = await openCommandHarness(join(directory, "durable.db"));
       await initializeInstallation(opened.harness, prepared.canonicalHash);
       const admission = await admit(opened.harness, opened.tasks, prepared);
@@ -1499,14 +1415,14 @@ describe("Durable headless validation chain", () => {
     let opened: CommandHarness | undefined;
     try {
       // A verifier shares its step's timeout; the fixture worker finishes well inside it.
-      const timeoutSource = headlessChainSourceText.replace("  - first:", "  - first:\n      timeout: 1s");
-      if (timeoutSource === headlessChainSourceText) throw new Error("validator-timeout fixture did not apply");
+      const timeoutSource = headlessChainCommandSourceText(printfShellText(taggedWorkerOutput), "sleep 3")
+        .replace("  - first:", "  - first:\n      timeout: 1s");
       const prepared = prepare(
         directory,
         "headless-validator-timeout-request",
         "command-chain-validator-timeout-run",
         timeoutSource,
-        headlessChainMachineConfig("__sleep__"),
+        { shell: "/bin/bash" },
       );
       opened = await openCommandHarness(join(directory, "durable.db"));
       await initializeInstallation(opened.harness, prepared.canonicalHash);
@@ -1751,7 +1667,7 @@ describe("Durable command validator chain", () => {
   });
 });
 
-const agentProcessSourceText = [
+const commandProcessSourceText = [
   "version: 4",
   "defaults:",
   "  retries: 0",
@@ -1759,24 +1675,16 @@ const agentProcessSourceText = [
   "steps:",
   "  - first:",
   "      timeout: 5s",
-  "      agent:",
-  "        instructions: worker instructions",
+  "      run: >-",
+  "        (sleep 30) & printf '%s\\n' '<status>succeeded</status>' '<reason>checked</reason>' '<output>command-result</output>'",
   "      verify:",
-  "        agent:",
-  "          instructions: validator instructions",
+  "        run: >-",
+  "          input=$(cat); (sleep 30) & test \"$input\" = 'command-result'; printf '%s' 'accepted'",
   "",
 ].join("\n");
-const workerAgentStdout = "<status>succeeded</status>\n<reason>checked</reason>\n<output>agent-result</output>\n";
-const validatorAgentStdout = "accept\ncandidate is valid\n";
-const agentProcessMachineConfig = {
-  shell: "/bin/bash",
-  agent: {
-    harness: {
-      command: "input=$(cat); (sleep 30) & if printf '%s' \"$input\" | grep -q 'Role: verifier'; then printf '%s' '" + validatorAgentStdout + "'; else printf '%s' '" + workerAgentStdout + "'; fi",
-    },
-    model: "provider/model:low",
-  },
-} as const;
+const commandWorkerStdout = "<status>succeeded</status>\n<reason>checked</reason>\n<output>command-result</output>\n";
+const commandValidatorStdout = "accepted";
+const commandProcessMachineConfig = { shell: "/bin/bash" } as const;
 
   test("allows an active validator to launch and finish while the run is paused", async () => {
     const directory = mkdtempSync(join(tmpdir(), "workshop-paused-validator-"));
@@ -1785,13 +1693,13 @@ const agentProcessMachineConfig = {
       const prepared = prepare(
         directory,
         "paused-validator-request-001",
-        "agent-process-adapter-paused-run-001",
-        agentProcessSourceText,
-        agentProcessMachineConfig,
-        "agent-process-adapter",
+        "command-process-adapter-paused-run-001",
+        commandProcessSourceText,
+        commandProcessMachineConfig,
+        "command-process-adapter",
       );
       opened = await openCommandHarness(join(directory, "durable.db"));
-      const seeded = await seedAgentProcessTasks(opened.harness, opened.tasks, prepared, { pauseBeforeValidator: true });
+      const seeded = await seedCommandProcessTasks(opened.harness, opened.tasks, prepared, { pauseBeforeValidator: true });
       const validatorTaskId = seeded.taskIds[1];
       if (validatorTaskId === undefined) throw new Error("paused validator task was not created");
       const validatorTask = await opened.harness.waitForTask(validatorTaskId, BACKGROUND_CONTEXT);
@@ -1853,38 +1761,33 @@ describe("safe process replay policy", () => {
 });
 
 
-describe("Durable process execution adapter", () => {
-  test("requires versioned stdin identities and captures tagged agent stdout", async () => {
-    const directory = mkdtempSync(join(tmpdir(), "workshop-process-adapter-"));
+describe("Durable command process execution", () => {
+  test("requires versioned stdin identities and captures tagged command stdout", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "workshop-command-process-"));
     let opened: CommandHarness | undefined;
     try {
       const prepared = prepare(
         directory,
         "process-adapter-request-001",
-        "agent-process-adapter-run-001",
-        agentProcessSourceText,
-        agentProcessMachineConfig,
-        "agent-process-adapter",
+        "command-process-adapter-run-001",
+        commandProcessSourceText,
+        commandProcessMachineConfig,
+        "command-process-adapter",
       );
       opened = await openCommandHarness(join(directory, "durable.db"));
-      const seeded = await seedAgentProcessTasks(opened.harness, opened.tasks, prepared);
+      const seeded = await seedCommandProcessTasks(opened.harness, opened.tasks, prepared);
       expect(seeded.inputs.map((input) => input.role)).toEqual(["worker", "validator"]);
       expect(seeded.inputs.every((input) => input.ioVersion === 1)).toBe(true);
       expect(seeded.inputs.every((input) => /^sha256:[0-9a-f]{64}$/.test(input.stdinSha256))).toBe(true);
-      expect(seeded.inputs.every((input) => input.stdinByteCount > 0)).toBe(true);
+      expect(seeded.inputs.find((input) => input.role === "worker")?.stdinByteCount).toBe(0);
+      expect(seeded.inputs.find((input) => input.role === "validator")?.stdinByteCount).toBeGreaterThan(0);
       expect(seeded.inputs.every((input) => input.env.WORKSHOP_RESULTS_PATH !== undefined)).toBe(true);
       expect(seeded.inputs.every((input) => input.env.WORKSHOP_LOG_PATH !== undefined)).toBe(true);
-      const removedVariables = [
-        "WORKSHOP_PROMPT_FILE", "WORKSHOP_RESULT_FILE", "WORKSHOP_PREVIOUS_OUTPUT_FILE",
-        "WORKSHOP_STEP_OUTPUT_FILE", "WORKSHOP_WORKLOG_FILE", "WORKSHOP_STDOUT_FILE", "WORKSHOP_STDERR_FILE",
-      ];
-      expect(seeded.inputs.every((input) => removedVariables.every((name) => input.env[name] === undefined))).toBe(true);
-
       await opened.harness.waitForIdle(BACKGROUND_CONTEXT);
       const storedRun = workflowRunDocumentV1Schema.parse(
         await opened.harness.snapshot(WorkshopRunDoc, seeded.conversationId, BACKGROUND_CONTEXT),
       );
-      if (storedRun.state !== "ready") throw new Error("process adapter run disappeared");
+      if (storedRun.state !== "ready") throw new Error("command process run disappeared");
       for (const input of seeded.inputs) {
         const reconstructed = reconstructProcessStdin({
           role: input.role,
@@ -1911,16 +1814,16 @@ describe("Durable process execution adapter", () => {
         if (stdout === undefined) throw new Error("exited process evidence lacks stdout capture");
         return [entry.process.role, stdout] as const;
       }));
-      expect(stdoutByRole.get("worker")?.sha256).toBe(hash(workerAgentStdout));
-      expect(stdoutByRole.get("worker")?.totalBytes).toBe(Buffer.byteLength(workerAgentStdout));
-      expect(stdoutByRole.get("validator")?.sha256).toBe(hash(validatorAgentStdout));
-      expect(stdoutByRole.get("validator")?.totalBytes).toBe(Buffer.byteLength(validatorAgentStdout));
+      expect(stdoutByRole.get("worker")?.sha256).toBe(hash(commandWorkerStdout));
+      expect(stdoutByRole.get("worker")?.totalBytes).toBe(Buffer.byteLength(commandWorkerStdout));
+      expect(stdoutByRole.get("validator")?.sha256).toBe(hash(commandValidatorStdout));
+      expect(stdoutByRole.get("validator")?.totalBytes).toBe(Buffer.byteLength(commandValidatorStdout));
 
       const taskResults = await Promise.all(seeded.taskIds.map((taskId) => opened!.harness.waitForTask(taskId, BACKGROUND_CONTEXT)));
       const results = taskResults.map((task) => {
         expect(task.state.status).toBe("terminal");
         expect(task.state.outcome.status).toBe("completed");
-        if (task.state.outcome.status !== "completed") throw new Error("agent process lacked a checked outcome");
+        if (task.state.outcome.status !== "completed") throw new Error("command process lacked a checked outcome");
         return processExecutionTaskResultSchema.parse(task.state.outcome.result);
       });
       expect(results.every((result) => result.kind === "exited" && !result.timedOut
@@ -1939,12 +1842,12 @@ describe("Durable process execution adapter", () => {
         directory,
         "process-stdin-tamper-request-001",
         "process-stdin-tamper-run-001",
-        agentProcessSourceText,
-        agentProcessMachineConfig,
+        commandProcessSourceText,
+        commandProcessMachineConfig,
         "process-stdin-tamper",
       );
       opened = await openCommandHarness(join(directory, "durable.db"));
-      const seeded = await seedAgentProcessTasks(opened.harness, opened.tasks, prepared, { corruptWorkerStdin: true });
+      const seeded = await seedCommandProcessTasks(opened.harness, opened.tasks, prepared, { corruptWorkerStdin: true });
       const workerTaskId = seeded.taskIds[0];
       if (workerTaskId === undefined) throw new Error("tampered worker process task is missing");
       const workerTask = await opened.harness.waitForTask(workerTaskId, BACKGROUND_CONTEXT);
@@ -2017,7 +1920,7 @@ describe("Durable process execution adapter", () => {
   });
 });
 
-async function seedAgentProcessTasks(
+async function seedCommandProcessTasks(
   harness: CommandHarness["harness"],
   tasks: CommandHarness["tasks"],
   prepared: ReturnType<typeof prepare>,
@@ -2031,8 +1934,8 @@ async function seedAgentProcessTasks(
   if (nodeId === undefined) throw new Error("prepared chain has no node");
   const settings = prepared.resolvedSettings.nodes[nodeId];
   const validatorSite = settings?.validator;
-  if (settings === undefined || settings.run.kind !== "agent" || validatorSite?.kind !== "agent") {
-    throw new Error("test fixture must resolve an agent worker and agent validator");
+  if (settings === undefined || settings.run.kind !== "command" || validatorSite?.kind !== "command") {
+    throw new Error("test fixture must resolve a command worker and command validator");
   }
   const attemptId = attemptIdSchema.parse("process-adapter-attempt-001");
   const workerExecutionId = executionIdSchema.parse("process-adapter-worker-001");
@@ -2102,7 +2005,7 @@ async function seedAgentProcessTasks(
       terminalOutput: null,
     });
     Object.assign(await tx.doc(WorkshopRunDoc, conversation.id), run);
-    const validInput = createAdapterAgentProcessInput({
+    const validInput = createCommandProcessInput({
       run: readyRun(run),
       nodeId,
       attemptId,
@@ -2131,7 +2034,7 @@ async function seedAgentProcessTasks(
   const candidateStdout = "<status>succeeded</status>\n<reason>candidate committed before validator</reason>\n<output>seeded candidate</output>\n";
   const candidate = nodeResultSchema.parse({
     version: 2,
-    source: "agent",
+    source: "command",
     output: "seeded candidate",
     summary: "candidate committed before validator",
     artifacts: [],
@@ -2158,7 +2061,7 @@ async function seedAgentProcessTasks(
       }),
     });
     Object.assign(draft, updated);
-    const input = createAdapterAgentProcessInput({
+    const input = createCommandProcessInput({
       run: readyRun(updated),
       nodeId,
       attemptId,
@@ -2188,7 +2091,7 @@ function readyRun(value: ReturnType<typeof workflowRunDocumentV1Schema.parse>): 
   return value;
 }
 
-function createAdapterAgentProcessInput(args: {
+function createCommandProcessInput(args: {
   run: ReadyWorkflowRun;
   nodeId: ReadyWorkflowRun["nodes"][number]["nodeId"];
   attemptId: ReturnType<typeof attemptIdSchema.parse>;
@@ -2200,7 +2103,7 @@ function createAdapterAgentProcessInput(args: {
   launchIntentAt: string;
   site: ResolvedExecutionSite;
 }): ReturnType<typeof processExecutionTaskInputSchema.parse> {
-  if (args.site.kind !== "agent") throw new Error("adapter test expects an agent execution site");
+  if (args.site.kind !== "command") throw new Error("adapter test expects a command execution site");
   const deadlineAt = args.site.timeoutMs === null
     ? null
     : iso(Date.parse(args.launchIntentAt) + args.site.timeoutMs);
@@ -2231,7 +2134,7 @@ function createAdapterAgentProcessInput(args: {
     launchIntentAt: args.launchIntentAt,
     deadlineAt,
     shell: args.site.shell,
-    command: args.site.harnessCommand,
+    command: args.site.command,
     cwd: args.site.cwd,
     timeoutMs: args.site.timeoutMs,
     streamCapBytes: args.site.streamCapBytes,

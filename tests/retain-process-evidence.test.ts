@@ -7,7 +7,7 @@ import { processCaptureSchema, processIncarnationSchema } from "../src/process/s
 import { readRetainedCapture } from "../src/process/read-retained-capture.js";
 import { captureProcessRecords } from "../src/storage/durable/define-process-execution-task.js";
 import { removeProcessCaptures } from "../src/storage/disk/remove-process-captures.js";
-import { locateProcessFiles } from "../src/run/locate-run-files.js";
+import { locateProcessFiles, locateWorkflowDirectory } from "../src/run/locate-run-files.js";
 
 const hash = (bytes: Uint8Array) => "sha256:" + createHash("sha256").update(bytes).digest("hex");
 const stats = (totalBytes: number) => ({ totalBytes, retainedBytes: totalBytes, truncatedBytes: 0, limitExceeded: false, error: null });
@@ -94,11 +94,15 @@ describe("retained process evidence", () => {
 
   test("keeps temporary captures outside the readable folder and separates preflight executions", () => {
     const identity = { role: "preflight" as const, nodeId: null, attemptNumber: null, incarnationNumber: 1, executionId: "one" };
-    const one = locateProcessFiles("/project/.workshop/state/workflow", "run-id", identity);
-    const two = locateProcessFiles("/project/.workshop/state/workflow", "run-id", { ...identity, executionId: "two" });
-    expect(one.stdoutPath).toBe("/project/.workshop/state/captures/run-id/preflight/one/preflight.stdout");
+    const one = locateProcessFiles("/project/.workshop/state-v5/workflow", "run-id", identity);
+    const two = locateProcessFiles("/project/.workshop/state-v5/workflow", "run-id", { ...identity, executionId: "two" });
+    expect(one.stdoutPath).toBe("/project/.workshop/state-v5/captures/run-id/preflight/one/preflight.stdout");
     expect(one.stdoutPath).not.toBe(two.stdoutPath);
-    expect(one.resultsPath).toBe("/project/.workshop/state/workflow/results.md");
+    expect(one.resultsPath).toBe("/project/.workshop/state-v5/workflow/results.md");
+    expect(locateWorkflowDirectory({
+      workflowId: "workflow",
+      paths: { runDirectory: "/project/.workshop/runs/run-id" },
+    })).toBe("/project/.workshop/state-v5/workflow");
   });
 });
 

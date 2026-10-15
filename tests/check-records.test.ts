@@ -513,7 +513,7 @@ describe("domain outcomes and process evidence", () => {
     const agentSettings = {
       ...commandSettings(),
       validator: {
-        kind: "agent", harnessCommand: "pi --print", model: "provider/model", instructions: "check candidate",
+        kind: "agent", model: "provider/model", instructions: "check candidate",
         shell: "/bin/bash", cwd: "/tmp/project", timeoutMs: null, streamCapBytes: "unlimited", replay: "never",
       },
     };

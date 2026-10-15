@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { locateWorkflowDirectory } from "../run/locate-run-files.js";
 import { buildFailureFeedback } from "./build-failure-feedback.js";
 import { workflowRunDocumentV1Schema, type WorkflowRunDocumentV1 } from "../run/records.js";
+import { nodeResultStatus } from "../run/schema.js";
 import type { persistedNodeAttemptSchema } from "../run/records.js";
 import {
   renderVerifierPromptV4,
@@ -93,7 +94,7 @@ export function reconstructProcessStdin(input: ProcessStdinIdentity, runDocument
     throw new Error("verifier stdin requires committed worker evidence");
   }
   const candidate = attempt.result.kind === "worker_failure_committed" ? null : attempt.result.candidate;
-  const candidateStatus = candidate === null ? "failed" : candidate.version === 2 ? candidate.stdioResult.status : "succeeded";
+  const candidateStatus = candidate === null ? "failed" : nodeResultStatus(candidate);
   const retriesRemaining = nodeSettings.retries === "unlimited"
     ? "unlimited"
     : Math.max(0, nodeSettings.retries + 1 - attempt.number);

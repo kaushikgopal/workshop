@@ -1,5 +1,4 @@
 const MAX_DATE_MS = 8_640_000_000_000_000;
-const SCHEDULE_CONTROL_POLL_MS = 250;
 
 type ActivationState = "active" | "paused" | "stopped" | "exhausted";
 type RunLimit = number | "unlimited";
@@ -17,6 +16,7 @@ export type FixedRateScheduleInput = {
 
 export type FixedRateScheduleDecision =
   | { readonly kind: "finished" }
+  | { readonly kind: "wait" }
   | { readonly kind: "sleep"; readonly wakeAt: string }
   | {
       readonly kind: "skip";
@@ -45,7 +45,7 @@ export function decideFixedRateSchedule(input: FixedRateScheduleInput): FixedRat
     return { kind: "invalid", reason: "scheduler clock is outside the supported UTC timestamp range" };
   }
   if (input.state === "stopped" || input.state === "exhausted") return { kind: "finished" };
-  if (input.state === "paused") return controlPollDecision(input.now);
+  if (input.state === "paused") return { kind: "wait" };
   if (input.everyMs === null || input.nextDueAt === null) return { kind: "finished" };
   if (!Number.isSafeInteger(input.everyMs) || input.everyMs <= 0) {
     return { kind: "invalid", reason: "persisted schedule interval is not a positive safe integer" };
@@ -62,7 +62,7 @@ export function decideFixedRateSchedule(input: FixedRateScheduleInput): FixedRat
 
   const dueAt = parseUtcMillis(input.nextDueAt);
   if (dueAt === undefined) return { kind: "invalid", reason: "persisted schedule deadline is not a supported UTC timestamp" };
-  if (input.now < dueAt) return sleepDecision(input.nextDueAt, input.now);
+  if (input.now < dueAt) return { kind: "sleep", wakeAt: input.nextDueAt };
 
   const elapsedMs = input.now - dueAt;
   if (!Number.isSafeInteger(elapsedMs) || elapsedMs < 0) {
@@ -126,24 +126,6 @@ export function firstFixedRateDeadline(activatedAt: string, everyMs: number): st
   const nextDueAt = formatUtcMillis(activatedAtMs + everyMs);
   if (nextDueAt === undefined) throw new Error("first schedule deadline exceeds the supported UTC timestamp range");
   return nextDueAt;
-}
-
-function sleepDecision(nextDueAt: string | null, now: number): FixedRateScheduleDecision {
-  if (nextDueAt === null) return { kind: "finished" };
-  const dueAt = parseUtcMillis(nextDueAt);
-  if (dueAt === undefined) return { kind: "invalid", reason: "persisted schedule deadline is not a supported UTC timestamp" };
-  return sleepUntil(Math.min(dueAt, now + SCHEDULE_CONTROL_POLL_MS));
-}
-
-function controlPollDecision(now: number): FixedRateScheduleDecision {
-  return sleepUntil(now + SCHEDULE_CONTROL_POLL_MS);
-}
-
-function sleepUntil(pollAt: number): FixedRateScheduleDecision {
-  const wakeAt = formatUtcMillis(pollAt);
-  return wakeAt === undefined
-    ? { kind: "invalid", reason: "scheduler wake deadline exceeds the supported UTC timestamp range" }
-    : { kind: "sleep", wakeAt };
 }
 
 function parseUtcMillis(value: string): number | undefined {

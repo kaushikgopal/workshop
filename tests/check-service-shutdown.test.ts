@@ -20,7 +20,7 @@ import { statusDtoSchema } from "../src/views/schema.js";
 import { canonicalHash } from "../src/definition/hash-canonical-json.js";
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-const taskVersions = { workflowRun: 10, nodeAttempt: 4, processExecution: 4, capacityGate: 1, scheduleWakeup: 1 } as const;
+const taskVersions = { workflowRun: 11, nodeAttempt: 5, agentExecution: 1, processExecution: 4, capacityGate: 1, scheduleWakeup: 1 } as const;
 
 describe("Durable service shutdown", () => {
   test("does not admit scheduled work while shutdown reconciles a TERM-trapping process", async () => {
@@ -173,11 +173,7 @@ describe("Durable service shutdown", () => {
       const schedulerTask = inspection.tasks.find((task) => Number(task.record.id) === activationAfterShutdown.schedulerTaskId);
       expect(schedulerTask?.record.state.checkpoint).toMatchObject({ phase: "wait" });
       const schedulerCheckpoint = schedulerTask?.record.state.checkpoint;
-      if (typeof schedulerCheckpoint !== "object" || schedulerCheckpoint === null
-        || !("wakeAt" in schedulerCheckpoint) || typeof schedulerCheckpoint.wakeAt !== "string") {
-        throw new Error("scheduled occurrence lost its persisted wait deadline during shutdown");
-      }
-      expect(Date.parse(schedulerCheckpoint.wakeAt)).toBeGreaterThan(Date.parse(nextDueAt));
+      expect(schedulerCheckpoint).toMatchObject({ phase: "wait", waitFor: "admission" });
       expect(inspection.tasks.filter((task) => ["workshop.node-attempt", "workshop.process-execution"].includes(task.record.kind)
         && Number(task.record.conversationId) === Number(firstRun.conversationId))).toHaveLength(0);
     } finally {
