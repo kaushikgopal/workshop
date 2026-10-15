@@ -31,7 +31,7 @@ export function renderWorkerPromptV4(input: WorkerPromptV4Input): string {
   return renderPrompt(input, "worker", renderWorkerContract(input.resultMode), "");
 }
 
-/** Render the format 4 verifier prompt. Verifiers always return tagged decisions. */
+/** Render the format 4 verifier prompt. */
 export function renderVerifierPromptV4(input: VerifierPromptV4Input): string {
   return renderPrompt(input, "verifier", renderVerifierContract(input.workerFailureKind), renderVerifierData(input));
 }
@@ -104,14 +104,14 @@ function renderWorkerContract(resultMode: "text" | "tagged"): string {
 }
 
 function renderVerifierContract(workerFailureKind: VerifierPromptV4Input["workerFailureKind"]): string {
-  return "### Verifier stdout contract (tagged mode)\n\n"
-    + "Write these lines to stdout. Start each tag at the first column:\n\n"
-    + "<decision>accept|retry|block</decision>\n"
-    + "<reason>nonempty explanation</reason>\n"
-    + "[<corrections>nonempty changes, only with retry</corrections>]\n\n"
-    + "Use one supported decision. Include one nonempty reason. Add corrections only with retry."
+  return "### Verifier stdout contract\n\n"
+    + "The first line is the decision: accept, retry, or block. The rest is the required reason. "
+    + "For retry, the reason tells the worker what to change.\n\n"
+    + "Example:\n"
+    + "accept\n"
+    + "The candidate is original and distinct from earlier results."
     + (workerFailureKind === "result_invalid"
-      ? "\n\nWorkshop already reports the format error to the worker. Keep corrections focused on content, not format."
+      ? "\n\nWorkshop already reports the format error to the worker. Keep your reason focused on content, not format."
       : "");
 }
 

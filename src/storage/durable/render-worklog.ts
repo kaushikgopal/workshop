@@ -162,14 +162,13 @@ function describeVerdict(verdict: AgentOrOperatorVerdict): string[] {
   return [
     "  - Decision: " + verdict.decision,
     ...quote(verdict.reason),
-    ...(verdict.corrections === null ? [] : ["  - Corrections:", ...quote(verdict.corrections)]),
   ];
 }
 
 function renderedVerdictReason(verdict: AgentOrOperatorVerdict): string {
   return verdict.version === 1
     ? verdict.reason
-    : verdict.decision + ": " + (verdict.corrections === null ? verdict.reason : verdict.reason + "\nCorrections: " + verdict.corrections);
+    : verdict.decision + ": " + verdict.reason;
 }
 
 function describeSite(site: ResolvedExecutionSite): string {
@@ -227,7 +226,7 @@ function renderCompactWorklog(run: Extract<WorkflowRunDocumentV1, { state: "read
       const verdictReason = validator?.kind === "agent" || validator?.kind === "operator"
         ? compactText(renderedVerdictReason(validator.verdict))
         : null;
-      lines.push(`- ${node.nodeId} #${attempt.number} ${outcome} · ${duration} · ${summary}${verdictReason === null ? "" : ` · verdict: ${verdictReason}`}`);
+      lines.push(`- ${node.nodeId} #${attempt.number} ${outcome} · ${duration} · ${summary}${verdictReason === null ? "" : ` · decision: ${verdictReason}`}`);
     }
   }
   if (run.resolutions.length > 0) {

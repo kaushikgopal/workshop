@@ -140,7 +140,9 @@ function committedPreviousOutput(run: ReadyRun, nodeId: string): { stepId: strin
 
 function earlierFeedback(attempts: readonly PersistedNodeAttempt[], number: number): string | null {
   const source = attempts.filter((attempt) => attempt.number < number && attempt.feedback !== undefined).at(-1)?.feedback;
-  return source === undefined ? null : "Source step: " + source.nodeId + "\nSource attempt: " + source.attemptNumber + "\n\n" + source.text;
+  return source === undefined ? null : buildFailureFeedback(
+    "Source step: " + source.nodeId + "\nSource attempt: " + source.attemptNumber + "\n\n" + source.text,
+  );
 }
 
 function workerFeedback(run: ReadyRun, nodeId: string, attempt: PersistedNodeAttempt): string | null {

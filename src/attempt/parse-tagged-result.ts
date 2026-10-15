@@ -18,14 +18,6 @@ export type TaggedWorkerResult = {
   trailer: string;
 };
 
-export type TaggedVerifierDecision = {
-  decision: "accept" | "retry" | "block";
-  reason: string;
-  corrections: string | null;
-  preamble: string;
-  trailer: string;
-};
-
 type DecodedResult = { text: string; sourceBytesHash: string };
 type ParseFailure = { ok: false; failure: { kind: "result_invalid" | "result_too_large"; message: string } };
 
@@ -169,56 +161,6 @@ export function parseTaggedWorkerResult(bytes: Uint8Array): ResultParse<TaggedWo
       preamble: text.slice(0, statusStart),
       trailer: text.slice(outputBlock.end),
     },
-    sourceBytesHash,
-  };
-}
-
-export function parseTaggedVerifierDecision(bytes: Uint8Array): ResultParse<TaggedVerifierDecision> {
-  const decoded = decodeResult(bytes);
-  if ("ok" in decoded) return decoded;
-  const { text, sourceBytesHash } = decoded;
-  const decisionStart = findOpeningLine(text, "<decision>");
-  if (decisionStart === -1) return invalidResult("verifier result has no decision block");
-
-  const decisionBlock = firstBlock(text, decisionStart, "decision");
-  if (!decisionBlock) return invalidResult("verifier decision block is incomplete");
-  const decision = decisionBlock.value.trim();
-  if (decision !== "accept" && decision !== "retry" && decision !== "block") {
-    return invalidResult("verifier decision is unknown");
-  }
-
-  const reasonStart = skipWhitespace(text, decisionBlock.end);
-  if (!text.startsWith("<reason>", reasonStart)) return invalidResult("verifier reason block is missing or misplaced");
-  const firstReason = firstBlock(text, reasonStart, "reason");
-  if (!firstReason) return invalidResult("verifier reason block is incomplete");
-
-  const nextBlock = skipWhitespace(text, firstReason.end);
-  let reason: string;
-  let corrections: string | null = null;
-  let end: number;
-  if (text.startsWith("<corrections>", nextBlock)) {
-    if (decision !== "retry") return invalidResult("corrections are only valid for retry");
-    reason = firstReason.value;
-    const correctionsBlock = lastBlock(text, nextBlock, "corrections");
-    if (!correctionsBlock) return invalidResult("verifier corrections block is incomplete");
-    corrections = correctionsBlock.value;
-    end = correctionsBlock.end;
-  } else {
-    // Without corrections, reason is the last block and uses its final closing tag.
-    const lastReason = lastBlock(text, reasonStart, "reason");
-    if (!lastReason) return invalidResult("verifier reason block is incomplete");
-    reason = lastReason.value;
-    end = lastReason.end;
-  }
-
-  if (!hasNonWhitespaceText(reason) || !withinFieldLimit(reason)) return invalidResult("verifier reason is invalid");
-  if (corrections !== null && (!hasNonWhitespaceText(corrections) || !withinFieldLimit(corrections))) {
-    return invalidResult("verifier corrections are invalid");
-  }
-
-  return {
-    ok: true,
-    value: { decision, reason, corrections, preamble: text.slice(0, decisionStart), trailer: text.slice(end) },
     sourceBytesHash,
   };
 }

@@ -25,8 +25,7 @@ import { openDurableStorage } from "../src/storage/durable/open-durable-storage.
 const shellQuote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
 const emit = (value: string) => "printf '%s' " + shellQuote(value);
 const success = emit("<status>succeeded</status>\n<output>candidate</output>");
-const verdict = (decision: string, reason = "check reason", corrections?: string) => emit("<decision>" + decision + "</decision>\n<reason>" + reason + "</reason>"
-  + (corrections === undefined ? "" : "\n<corrections>" + corrections + "</corrections>"));
+const verdict = (decision: string, reason = "check reason") => emit(decision + "\n" + reason);
 const agent = (command: string) => ({ agent: { instructions: "Use the evidence.", model: "fixture/model:low", harness: { command } } });
 const yaml = (nodes: unknown[], retries: number | "unlimited" = 0, replay = "safe") => JSON.stringify({ version: 4, defaults: { retries, replay }, steps: nodes });
 
@@ -236,7 +235,7 @@ describe("retry evidence", () => {
         ? "if [ $WORKSHOP_ATTEMPT = 1 ]; then printf failed-output; printf diagnostics >&2; exit 9; fi; " : "") + success;
       const check = rejectedBy === "worker" ? {} : { verify: rejectedBy === "command"
         ? "if [ $WORKSHOP_ATTEMPT = 1 ]; then printf failed-output; printf diagnostics >&2; exit 7; fi"
-        : agent("if [ $WORKSHOP_ATTEMPT = 1 ]; then " + verdict("retry", "fix reason", "fix corrections") + "; else " + verdict("accept") + "; fi") };
+        : agent("if [ $WORKSHOP_ATTEMPT = 1 ]; then " + verdict("retry", "fix reason\nchange the candidate") + "; else " + verdict("accept") + "; fi") };
       await executeFixture(directory, yaml([{ first: { ...agent(worker), ...check } }], 1), (run) => {
         expect(run.status).toBe("completed");
         const input = readFileSync(prompt, "utf8");
@@ -245,7 +244,7 @@ describe("retry evidence", () => {
         expect(input).toContain("Source attempt: 1");
         if (rejectedBy === "agent") {
           expect(input).toContain("fix reason");
-          expect(input).toContain("fix corrections");
+          expect(input).toContain("change the candidate");
         } else {
           expect(input).toContain("failed-output");
           expect(input).toContain("diagnostics");
@@ -262,7 +261,7 @@ describe("retry evidence", () => {
     const verifierPrompt = join(directory, "verifier-prompt-");
     const worker = "cat > " + shellQuote(workerPrompt) + "; if [ $WORKSHOP_ATTEMPT = 1 ]; then printf '<succeeded'; else " + success + "; fi";
     const verifier = "cat > " + shellQuote(verifierPrompt) + "$WORKSHOP_ATTEMPT; if [ $WORKSHOP_ATTEMPT = 1 ]; then "
-      + verdict("retry", "content feedback", "change the sentence") + "; else " + verdict("accept") + "; fi";
+      + verdict("retry", "content feedback\nchange the sentence") + "; else " + verdict("accept") + "; fi";
     await executeFixture(directory, yaml([{ first: { ...agent(worker), result: "tagged", verify: agent(verifier) } }], 1), (run) => {
       expect(run.status).toBe("completed");
       expect(run.nodes[0]?.attempts).toHaveLength(2);
@@ -277,7 +276,7 @@ describe("retry evidence", () => {
       expect(input).toContain("content feedback");
       expect(input).toContain("change the sentence");
       const verifierInput = readFileSync(verifierPrompt + "1", "utf8");
-      expect(verifierInput).toContain("Workshop already reports the format error to the worker.");
+      expect(verifierInput).toContain("Workshop already reports the format error to the worker. Keep your reason focused on content, not format.");
       expect(verifierInput).not.toContain("Worker stdout contract");
     });
   }));
@@ -362,14 +361,22 @@ test("command retry gets identical predecessor stdin, without feedback", async (
   });
 }));
 
-test("full-size agent reason and corrections produce bounded retry feedback", async () => withDirectory(async (directory) => {
+test("full-size retry reason stays within the UTF-8-safe feedback bound", async () => withDirectory(async (directory) => {
   const script = join(directory, "verifier.js");
-  writeFileSync(script, "process.stdout.write('<decision>retry</decision>\\n<reason>' + 'r'.repeat(65536) + '</reason>\\n<corrections>' + 'c'.repeat(65536) + '</corrections>')");
-  await executeFixture(directory, yaml([{ first: { run: "printf candidate", verify: agent("bun " + shellQuote(script)) } }]), (run) => {
-    expect(run.status).toBe("failed");
-    const feedback = run.nodes[0]?.attempts[0]?.feedback?.text;
-    expect(feedback).toBeDefined();
-    expect(Buffer.byteLength(feedback ?? "", "utf8")).toBeLessThanOrEqual(64 * 1024);
+  const prompt = join(directory, "worker-prompt");
+  writeFileSync(script, "process.stdout.write(process.env.WORKSHOP_ATTEMPT === '1' ? 'retry\\n' + 'r'.repeat(65500) : 'accept\\nvalid')");
+  await executeFixture(directory, yaml([{ first: {
+    ...agent("cat > " + shellQuote(prompt) + "; " + success),
+    verify: agent("bun " + shellQuote(script)),
+  } }], 1), (run) => {
+    expect(run.status).toBe("completed");
+    const input = readFileSync(prompt, "utf8");
+    const marker = "### Verifier feedback (data)\n\n";
+    const markerIndex = input.indexOf(marker);
+    expect(markerIndex).toBeGreaterThanOrEqual(0);
+    const feedback = input.slice(markerIndex + marker.length);
+    expect(Buffer.byteLength(feedback, "utf8")).toBeLessThanOrEqual(64 * 1024);
+    expect(feedback.isWellFormed()).toBe(true);
     expect(feedback).toEndWith("[Feedback truncated to 64 KiB.]");
   });
 }));

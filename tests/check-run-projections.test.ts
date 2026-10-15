@@ -163,12 +163,12 @@ describe("service run projections", () => {
     }
   }, 30_000);
 
-  test("logs worker and verifier envelopes, diagnostics, and feedback with process labels", async () => {
+  test("logs worker envelopes and verifier feedback with process labels", async () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-projection-envelopes-"));
     let owner: Awaited<ReturnType<typeof startWorkshopService>> | undefined;
     try {
       const configured = installation(root);
-      const harness = "input=$(cat); printf 'role diagnostic' >&2; case \"$input\" in *'Role: verifier'*) printf 'verifier preamble\\n<decision>accept</decision>\\n<reason>checked</reason>\\nverifier trailer' ;; *) printf 'worker preamble\\n<status>succeeded</status>\\n<output>proposal</output>\\nworker trailer' ;; esac";
+      const harness = "input=$(cat); printf 'role diagnostic' >&2; case \"$input\" in *'Role: verifier'*) printf 'accept\nchecked' ;; *) printf 'worker preamble\\n<status>succeeded</status>\\n<output>proposal</output>\\nworker trailer' ;; esac";
       writeFileSync(join(root, ".workshop", "workshop.yaml"), "shell: /bin/sh\nagent:\n  model: mock/model:low\n  harness:\n    command: " + JSON.stringify(harness) + "\n");
       writeFileSync(join(root, ".workshop", "workflows", "projection.yaml"), "version: 4\ndefaults: { retries: 0, replay: never }\nsteps:\n  - first:\n      result: tagged\n      agent: Write proposal.\n      verify:\n        agent: Check proposal.\n");
       owner = await startWorkshopService(loadInstallation(root));
@@ -180,9 +180,9 @@ describe("service run projections", () => {
       const log = readFileSync(join(configured.stateDirectory, "projection", "execution.log"), "utf8");
       for (const role of ["worker", "validator"]) {
         expect(log).toContain("[step=first attempt=1 role=" + role + "] incarnation 1 stderr\nrole diagnostic");
-        expect(log).toContain("[step=first attempt=1 role=" + role + "] incarnation 1 preamble\n");
-        expect(log).toContain("[step=first attempt=1 role=" + role + "] incarnation 1 trailer\n");
       }
+      expect(log).toContain("[step=first attempt=1 role=worker] incarnation 1 preamble\n");
+      expect(log).toContain("[step=first attempt=1 role=worker] incarnation 1 trailer\n");
       expect(log).toContain("verifier feedback\nchecked");
       expect(log).toContain("attempt_settled");
     } finally {

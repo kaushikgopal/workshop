@@ -68,8 +68,9 @@ describe("format 4 agent prompts", () => {
     expect(prompt.indexOf("## 2. Workflow Instructions")).toBeLessThan(prompt.indexOf("## 3. Verifier Instructions"));
     expect(prompt.indexOf("## 3. Verifier Instructions")).toBeLessThan(prompt.indexOf("## 4. Labeled Data"));
     expect(prompt).toContain("Role: verifier");
-    expect(prompt).toContain("\n<decision>accept|retry|block</decision>");
-    expect(prompt).not.toContain("\n    <decision>");
+    expect(prompt).toContain("The first line is the decision: accept, retry, or block. The rest is the required reason. For retry, the reason tells the worker what to change.");
+    expect(prompt).toContain("Example:\naccept\nThe candidate is original and distinct from earlier results.");
+    expect(prompt).not.toContain("<decision>");
     expect(prompt).toContain("Candidate output (data)\n\n" + candidate);
     expect(prompt).toContain("Candidate status: success_and_complete");
     expect(prompt).toContain("Retries remaining: 3");
@@ -100,7 +101,8 @@ describe("format 4 agent prompts", () => {
       failureEvidence: "worker result has no status block",
       retriesRemaining: 1,
     });
-    expect(prompt).toContain("Workshop already reports the format error to the worker. Keep corrections focused on content, not format.");
+    expect(prompt).toContain("Only retry or block is valid. Accept cannot repair a failed worker.");
+    expect(prompt).toContain("Workshop already reports the format error to the worker. Keep your reason focused on content, not format.");
     expect(prompt).not.toContain("Worker stdout contract");
   });
 

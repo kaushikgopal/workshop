@@ -1,16 +1,11 @@
 import { createHash } from "node:crypto";
 import { describe, expect, test } from "bun:test";
-import {
-  parseTaggedVerifierDecision,
-  parseTaggedWorkerResult,
-  parseTextResult,
-} from "../src/attempt/parse-tagged-result.js";
+import { parseTaggedWorkerResult, parseTextResult } from "../src/attempt/parse-tagged-result.js";
 
 const bytes = (text: string): Uint8Array => new TextEncoder().encode(text);
 const invalidUtf8 = Uint8Array.of(0xc3, 0x28);
 const fence = String.fromCharCode(96).repeat(3);
 const worker = (status: string, content = "<output>work</output>") => "<status>" + status + "</status>\n" + content;
-const verifier = (decision: string, reason = "why") => "<decision>" + decision + "</decision>\n<reason>" + reason + "</reason>";
 
 function expectInvalid(result: { ok: boolean; failure?: { kind: string } }, kind = "result_invalid") {
   expect(result.ok).toBe(false);
@@ -137,68 +132,6 @@ describe("tagged worker result parsing", () => {
     )));
     expectInvalid(parseTaggedWorkerResult(bytes(
       "<status>needs_input</status><question>" + "x".repeat(64 * 1024 + 1) + "</question><output>work</output>",
-    )));
-  });
-});
-
-describe("tagged verifier decision parsing", () => {
-  test("accepts all decisions with a required reason", () => {
-    for (const decision of ["accept", "retry", "block"]) {
-      expect(parseTaggedVerifierDecision(bytes(verifier(decision)))).toMatchObject({
-        ok: true,
-        value: { decision, reason: "why", corrections: null },
-      });
-    }
-  });
-
-  test("rejects missing or whitespace-only reasons", () => {
-    expectInvalid(parseTaggedVerifierDecision(bytes("<decision>accept</decision>")));
-    expectInvalid(parseTaggedVerifierDecision(bytes(verifier("accept", " \t\n "))));
-  });
-
-  test("allows corrections only for retry and requires nonempty corrections", () => {
-    expectInvalid(parseTaggedVerifierDecision(bytes(
-      "<decision>accept</decision><reason>why</reason><corrections>fix</corrections>",
-    )));
-    expectInvalid(parseTaggedVerifierDecision(bytes(
-      "<decision>retry</decision><reason>why</reason><corrections> \n </corrections>",
-    )));
-    expect(parseTaggedVerifierDecision(bytes(
-      "<decision>retry</decision><reason>why</reason><corrections>fix it</corrections>",
-    ))).toMatchObject({ ok: true, value: { corrections: "fix it" } });
-  });
-
-  test("uses the last reason closing tag when reason is the final block", () => {
-    const result = parseTaggedVerifierDecision(bytes(
-      "<decision>accept</decision>\n<reason>first\n</reason>\ncontinued</reason>\ntrailer",
-    ));
-    expect(result).toMatchObject({
-      ok: true,
-      value: { reason: "first\n</reason>\ncontinued", trailer: "\ntrailer" },
-    });
-  });
-
-  test("uses corrections as the final block", () => {
-    const result = parseTaggedVerifierDecision(bytes(
-      "<decision>retry</decision>\n<reason>try again</reason>\n<corrections>change it</corrections>\n" + fence,
-    ));
-    expect(result).toMatchObject({
-      ok: true,
-      value: { reason: "try again", corrections: "change it", trailer: "\n" + fence },
-    });
-  });
-
-  test("trims decision values and rejects invalid order and oversized fields", () => {
-    expect(parseTaggedVerifierDecision(bytes(
-      "<decision> retry </decision><reason>why</reason>",
-    ))).toMatchObject({ ok: true, value: { decision: "retry" } });
-    expectInvalid(parseTaggedVerifierDecision(bytes("<decision>accept</decision><corrections>fix</corrections>")));
-    expectInvalid(parseTaggedVerifierDecision(bytes(verifier("unknown"))));
-    expectInvalid(parseTaggedVerifierDecision(bytes(
-      "<decision>accept</decision><reason>" + "x".repeat(64 * 1024 + 1) + "</reason>",
-    )));
-    expectInvalid(parseTaggedVerifierDecision(bytes(
-      "<decision>retry</decision><reason>why</reason><corrections>" + "x".repeat(64 * 1024 + 1) + "</corrections>",
     )));
   });
 });

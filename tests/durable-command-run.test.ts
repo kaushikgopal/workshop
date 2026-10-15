@@ -671,7 +671,7 @@ describe("canonical worker output views", () => {
   });
 });
 
-describe("format 4 tagged stdout outcomes", () => {
+describe("format 4 stdout outcomes", () => {
   test("completes early results, waits for human input, and retains verifier blocks", async () => {
     const cases = [
       {
@@ -693,7 +693,7 @@ describe("format 4 tagged stdout outcomes", () => {
       {
         status: "verifier_block" as const,
         output: taggedWorkerOutput,
-        verifierOutput: ["<decision>block</decision>", "<reason>candidate needs an unsupported action</reason>"].join("\n"),
+        verifierOutput: "block\ncandidate needs an unsupported action",
         outputRole: "validator" as const,
         runStatus: "blocked" as const,
         blockKind: "verifier_block",
@@ -772,7 +772,7 @@ describe("format 4 tagged stdout outcomes", () => {
           if (result.outcome.kind !== "blocked") throw new Error("verifier block did not retain a blocked outcome");
           expect(result.outcome.validator).toMatchObject({
             kind: "agent",
-            verdict: { version: 2, decision: "block", reason: "candidate needs an unsupported action", corrections: null },
+            verdict: { version: 2, decision: "block", reason: "candidate needs an unsupported action" },
           });
         }
       } finally {
@@ -1156,10 +1156,7 @@ const taggedWorkerOutput = [
   "<reason>worker summary</reason>",
   "<output>validated candidate</output>",
 ].join("\n") + "\n";
-const acceptedVerifierOutput = [
-  "<decision>accept</decision>",
-  "<reason>candidate checks out</reason>",
-].join("\n") + "\n";
+const acceptedVerifierOutput = "accept\ncandidate checks out\n";
 
 function headlessChainMachineConfig(verifierOutput: string, workerCommand = "printf '%s' '" + taggedWorkerOutput + "'") {
   const workerCommandWithMarker = [
@@ -1200,7 +1197,7 @@ function preserveEnvironment(names: readonly string[]): () => void {
 }
 
 describe("Durable headless validation chain", () => {
-  test("parses tagged worker and verifier stdout before publishing the candidate", async () => {
+  test("parses tagged worker and first-line verifier stdout before publishing the candidate", async () => {
     const directory = mkdtempSync(join(tmpdir(), "workshop-headless-chain-"));
     const envNames = [
       "WORKSHOP_TEST_WORKERS",
@@ -1266,7 +1263,7 @@ describe("Durable headless validation chain", () => {
       });
       expect(firstResult.outcome.validator).toMatchObject({
         kind: "agent",
-        verdict: { version: 2, decision: "accept", reason: "candidate checks out", corrections: null },
+        verdict: { version: 2, decision: "accept", reason: "candidate checks out" },
         resultBytesHash: hash(acceptedVerifierOutput),
       });
       expect(readFileSync(markers.workers, "utf8")).toBe("w");
@@ -1371,7 +1368,7 @@ describe("Durable headless validation chain", () => {
       let opened: CommandHarness | undefined;
       try {
         const verdict = mode === "rejected"
-          ? ["<decision>retry</decision>", "<reason>candidate violates the constraint</reason>", "<corrections>remove the conflicting value</corrections>"].join("\n") + "\n"
+          ? "retry\ncandidate violates the constraint; remove the conflicting value.\n"
           : "not-json";
         const prepared = prepare(
           directory,
@@ -1411,7 +1408,7 @@ describe("Durable headless validation chain", () => {
           expect(firstResult.outcome.failure.message).toContain("remove the conflicting value");
           expect(firstResult.outcome.validator).toMatchObject({
             kind: "agent",
-            verdict: { version: 2, decision: "retry", reason: "candidate violates the constraint", corrections: "remove the conflicting value" },
+            verdict: { version: 2, decision: "retry", reason: "candidate violates the constraint; remove the conflicting value." },
           });
         } else {
           expect(firstResult.outcome.kind).toBe("blocked");
@@ -1770,7 +1767,7 @@ const agentProcessSourceText = [
   "",
 ].join("\n");
 const workerAgentStdout = "<status>succeeded</status>\n<reason>checked</reason>\n<output>agent-result</output>\n";
-const validatorAgentStdout = "<decision>accept</decision>\n<reason>candidate is valid</reason>\n";
+const validatorAgentStdout = "accept\ncandidate is valid\n";
 const agentProcessMachineConfig = {
   shell: "/bin/bash",
   agent: {

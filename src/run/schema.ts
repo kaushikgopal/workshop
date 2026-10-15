@@ -315,15 +315,10 @@ const successfulValidatorExitSchema = z.strictObject({
   code: z.literal(0),
 });
 
-export const taggedValidatorVerdictSchema = z.strictObject({
+export const agentValidatorVerdictSchema = z.strictObject({
   version: z.literal(2),
   decision: z.enum(["accept", "retry", "block"]),
   reason: nonemptyWellFormedCandidateField(64 * 1024, "reason"),
-  corrections: nonemptyWellFormedCandidateField(64 * 1024, "corrections").nullable(),
-}).superRefine((verdict, context) => {
-  if (verdict.decision !== "retry" && verdict.corrections !== null) {
-    context.addIssue({ code: "custom", path: ["corrections"], message: "corrections are only valid for retry" });
-  }
 });
 
 export const validatorOutcomeSchema = z.discriminatedUnion("kind", [
@@ -336,7 +331,7 @@ export const validatorOutcomeSchema = z.discriminatedUnion("kind", [
   z.strictObject({
     kind: z.literal("agent"),
     exit: successfulValidatorExitSchema,
-    verdict: z.union([validatorVerdictSchema, taggedValidatorVerdictSchema]),
+    verdict: z.union([validatorVerdictSchema, agentValidatorVerdictSchema]),
     resultBytesHash: sha256Schema,
   }),
   z.strictObject({

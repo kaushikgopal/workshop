@@ -10,7 +10,8 @@ import { resolveRetryLimit } from "../../definition/resolve-retry-limit.js";
 import { canonicalHash } from "../../definition/hash-canonical-json.js";
 import type { ResolvedExecutionSite } from "../../definition/schema-resolved.js";
 import { nodeIdSchema, workflowIdSchema } from "../../definition/schema.js";
-import { parseTextResult, parseTaggedWorkerResult, parseTaggedVerifierDecision } from "../../attempt/parse-tagged-result.js";
+import { parseTextResult, parseTaggedWorkerResult } from "../../attempt/parse-tagged-result.js";
+import { parseVerifierResult } from "../../attempt/parse-verifier-result.js";
 import { reconstructProcessStdin } from "../../attempt/build-process-stdin.js";
 import { readCaptureBytes } from "../../process/read-retained-capture.js";
 import { locateWorkflowDirectory } from "../../run/locate-run-files.js";
@@ -398,7 +399,7 @@ export function defineNodeAttemptTask(
             await blockVerifier(runtime, input, candidate, "agent verifier stdout is unavailable, oversized, or invalid UTF-8", context);
             return;
           }
-          const parsed = parseTaggedVerifierDecision(Buffer.from(stdout.text, "utf8"));
+          const parsed = parseVerifierResult(Buffer.from(stdout.text, "utf8"));
           if (!parsed.ok) {
             await blockVerifier(runtime, input, candidate, parsed.failure.message, context);
             return;
@@ -410,7 +411,7 @@ export function defineNodeAttemptTask(
           validator = validatorOutcomeSchema.parse({
             kind: "agent",
             exit: process.exit,
-            verdict: { version: 2, decision: parsed.value.decision, reason: parsed.value.reason, corrections: parsed.value.corrections },
+            verdict: { version: 2, decision: parsed.value.decision, reason: parsed.value.reason },
             resultBytesHash: parsed.sourceBytesHash,
           });
         }
@@ -836,12 +837,10 @@ export function resolveWorkerArtifacts(
 function validatorFailureReason(validator: ValidatorOutcome): string {
   if (validator.kind === "command") {
     return validator.exit.kind === "code"
-      ? `command validator exited with code ${validator.exit.code}`
-      : `command validator exited by ${validator.exit.kind}`;
+      ? "command validator exited with code " + validator.exit.code
+      : "command validator exited by " + validator.exit.kind;
   }
-  return validator.verdict.version === 2 && validator.verdict.corrections !== null
-    ? validator.verdict.reason + "\n\nCorrections:\n" + validator.verdict.corrections
-    : validator.verdict.reason;
+  return validator.verdict.reason;
 }
 
 function cancelledAttemptOutcome(attempt: PersistedNodeAttempt): NodeAttemptOutcome {

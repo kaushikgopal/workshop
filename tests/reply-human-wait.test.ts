@@ -256,7 +256,7 @@ for (const kind of ["command", "agent"] as const) test(kind + " successor receiv
   });
 });
 
-for (const verify of ["exit 0", "exit 9", agent(emit("<decision>block</decision>\n<reason>Do not ask yet.</reason>"))]) test("needs_input reaches its verifier before any wait: " + JSON.stringify(verify), async () => {
+for (const verify of ["exit 0", "exit 9", agent(emit("block\nDo not ask yet."))]) test("needs_input reaches its verifier before any wait: " + JSON.stringify(verify), async () => {
   const accepted = verify === "exit 0";
   const blocked = typeof verify !== "string";
   await fixture({ approval: source([{ prepare: { ...worker(), verify } }, { act: "touch unexpected" }]) }, async (f) => {

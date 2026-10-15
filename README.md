@@ -168,7 +168,7 @@ stdout becomes the output without trimming or tag interpretation. A zero exit
 creates a `succeeded` candidate. A configured verifier must accept it before
 the step succeeds. Set `result: tagged` explicitly when a worker needs
 `needs_input` or `success_and_complete`. Text mode never infers those statuses
-from instructions or output. Agent verifiers keep their strict `<decision>` format.
+from instructions or output. Agent verifiers use a strict first-line decision format.
 
 Existing runs keep their frozen result modes. New admissions of YAML that relied
 on the former implicit tagged default for agents use text.
@@ -192,30 +192,33 @@ Nothing requires action.
 Accepted `success_and_complete` completes the run immediately and marks
 unexecuted successors `skipped`. It never bypasses a configured verifier.
 
-An agent verifier writes:
+An agent verifier writes a decision line and a reason:
 
 ```text
-<decision>retry</decision>
-<reason>The parser accepts malformed input.</reason>
-<corrections>
-Reject malformed input and add a regression test.
-</corrections>
+accept
+The candidate is original and distinct from earlier results.
 ```
 
-`decision` is `accept`, `retry`, or `block`. A nonempty `reason` is
-required. Optional `corrections` is allowed only with `retry`. Command
-verifiers accept by exiting zero; their stdout is evidence, not a verdict.
+The first nonblank line, after trimming whitespace, must be exactly accept,
+retry, or block. Leading blank lines are allowed. No other text may come
+before the decision. Do not search elsewhere, change case, or strip Markdown.
+The remaining text, trimmed, is the required reason. For retry, the reason
+tells the worker what to change. The reason permits at most 64 KiB in UTF-8.
+No compatibility mode exists; all other formats are invalid. Command verifiers
+accept by exiting zero; their stdout is evidence, not a verdict.
 
-Blocks are flat, without attributes or escaping. Workshop ignores preamble and
-trailer text but retains both as evidence. Opening `status` or `decision`
-must start a line. Blocks follow the declared order with only whitespace between
-them. The last block ends at its last closing tag, so output can contain its own
-closing-tag text. Workshop removes one boundary newline, not all whitespace.
+Tagged worker blocks are flat, without attributes or escaping. Workshop ignores
+preamble and trailer text but retains both as evidence. The opening status
+block must start a line. Blocks follow the declared order with only whitespace
+between them. The last block ends at its last closing tag, so output can contain
+its own closing-tag text. Workshop removes one boundary newline, not all
+whitespace.
 
-Workshop rejects invalid UTF-8, duplicate or unknown blocks, and stdout over
-1 MiB. Each `reason`, `question`, and `corrections` permits at most 64 KiB.
-When present, these fields must contain non-whitespace text.
-A tagged status is only a proposal until verification accepts it.
+Workshop rejects invalid UTF-8, duplicate or unknown worker blocks, and stdout
+over 1 MiB. Tagged worker reason and question fields permit at most 64 KiB.
+When present, these fields must contain non-whitespace text. A tagged status is
+only a proposal until verification accepts it. Agent verifier stdout also
+rejects invalid UTF-8 and output over 1 MiB.
 
 ### Verification and feedback
 
@@ -369,8 +372,8 @@ pi --print --approve --no-session --no-extensions --no-skills --no-context-files
 ```
 
 Pi reads the prompt on stdin and writes the final assistant text to stdout.
-Worker results follow the step's result mode. Agent verifiers always emit tagged
-decisions. Pi text mode does not stream tool activity; an empty live preview is
+Worker results follow the step's result mode. Agent verifiers emit a decision
+on the first nonblank line, followed by the reason. Pi text mode does not stream tool activity; an empty live preview is
 normal. Every verifier starts a fresh harness session.
 
 Use a custom command for another harness or a local adapter:

@@ -40,7 +40,7 @@ const rows = [
 const quote = (text: string) => "'" + text.replaceAll("'", "'\\''") + "'";
 const emit = (text: string) => "printf '%s' " + quote(text);
 const agent = (command: string) => ({ agent: { instructions: "Use evidence.", model: "fixture/model:low", harness: { command } } });
-const blockVerifier = emit("<decision>block</decision>\n<reason>check effects</reason>");
+const blockVerifier = emit("block\ncheck effects");
 const source = (node: unknown = { run: "printf candidate", verify: agent(blockVerifier) }, retries: number | "unlimited" = 0, environment?: unknown) =>
   JSON.stringify({ version: 4, defaults: { retries, replay: "safe" }, ...(environment === undefined ? {} : { environment }), steps: [{ work: node }, { later: "printf successor" }] });
 
@@ -197,7 +197,7 @@ for (const kind of ["verifier_block", "verifier_failed", "repeated_failure", "pr
 for (const workerFailed of [false, true]) {
   test("broken verifier retries only saved " + (workerFailed ? "worker failure" : "candidate"), async () => {
     const verifier = "printf v >> verifier-launches; if [ ! -f repaired ]; then exit 7; fi; "
-      + emit(workerFailed ? "<decision>retry</decision>\n<reason>worker must retry</reason>" : "<decision>accept</decision>\n<reason>checked</reason>");
+      + emit(workerFailed ? "retry\nworker must retry" : "accept\nchecked");
     const node = { run: "printf w >> worker-launches; " + (workerFailed ? "printf failed >&2; exit 9" : "printf candidate"), verify: agent(verifier) };
     await withFixture(source(node, workerFailed ? 1 : 0), async (fixture) => {
       const before = await fixture.read();
@@ -316,7 +316,7 @@ test("bot reason reaches the next agent attempt without changing retries", async
 
 for (const status of ["success_and_complete", "needs_input"] as const) {
   test("human tagged acceptance preserves " + status + " semantics", async () => {
-    const verifier = "if [ ! -f repaired ]; then exit 7; fi; " + emit("<decision>accept</decision>\n<reason>checked</reason>");
+    const verifier = "if [ ! -f repaired ]; then exit 7; fi; " + emit("accept\nchecked");
     await withFixture(source({ run: emit("<status>succeeded</status>\n<output>candidate</output>"), result: "tagged", verify: agent(verifier) }), async (fixture) => {
       await changeBlock(fixture, "external_outcome_unknown", true);
       const resultFile = join(fixture.directory, "human-result");
@@ -378,7 +378,7 @@ test("concurrent human and bot resolutions commit one decision", async () => {
 });
 
 test("bot resolution limit belongs to each node, not the whole run", async () => {
-  const firstVerifier = "if [ -f first-repaired ]; then " + emit("<decision>accept</decision>\n<reason>checked</reason>") + "; else " + blockVerifier + "; fi";
+  const firstVerifier = "if [ -f first-repaired ]; then " + emit("accept\nchecked") + "; else " + blockVerifier + "; fi";
   const text = JSON.stringify({ version: 4, defaults: { retries: 0, replay: "safe" }, steps: [
     { work: { run: "printf first", verify: agent(firstVerifier) } },
     { later: { run: "printf later", verify: agent(blockVerifier) } },

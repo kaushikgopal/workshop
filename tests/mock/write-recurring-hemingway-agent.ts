@@ -108,8 +108,8 @@ try {
       ? "The sentence is original and distinct from " + earlier.length + " earlier accepted sentence(s)."
       : distinct ? "The candidate failed the deterministic sentence policy." : "The candidate repeats an earlier accepted sentence.";
     const result = passed
-      ? "<decision>accept</decision>\n<reason>" + reason + "</reason>"
-      : "<decision>retry</decision>\n<reason>" + reason + "</reason>\n<corrections>Write a distinct one-sentence result.</corrections>";
+      ? "accept\n" + reason
+      : "retry\n" + reason + "\nWrite a distinct one-sentence result.";
     process.stdout.write(result);
     record("verdict", { executionId, candidate, priorCount: earlier.length, passed, reason });
   }

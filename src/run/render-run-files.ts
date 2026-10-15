@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import { parseTaggedVerifierDecision, parseTaggedWorkerResult, parseTextResult } from "../attempt/parse-tagged-result.js";
+import { parseTaggedWorkerResult, parseTextResult } from "../attempt/parse-tagged-result.js";
+import { parseVerifierResult } from "../attempt/parse-verifier-result.js";
 import { readCaptureBytes, readRetainedCapture } from "../process/read-retained-capture.js";
 import type { WorkflowRunDocumentV1, WorkshopEventV1, WorkshopProcessV1 } from "./records.js";
 
@@ -106,16 +107,16 @@ export function renderRunFiles(snapshot: RunFileSnapshot) {
       const bytes = Buffer.from(capture.retained.bytes, "base64");
       const settings = record.nodeId === null ? null : run.resolvedSettings.nodes[record.nodeId];
       const parsed = process.role === "validator" && settings?.validator?.kind === "agent"
-        ? parseTaggedVerifierDecision(bytes)
+        ? parseVerifierResult(bytes)
         : process.role === "worker" && settings !== null && settings !== undefined && "result" in settings && settings.result === "tagged"
           ? parseTaggedWorkerResult(bytes) : parseTextResult(bytes);
       if (!parsed.ok || process.exit?.kind !== "code" || process.exit.code !== 0) {
         sections.push(prefix + " invalid stdout\n" + (text ?? "unavailable"));
+      } else if ("decision" in parsed.value) {
+        sections.push(prefix + " verifier feedback\n" + parsed.value.reason);
       } else if ("preamble" in parsed.value) {
         if (parsed.value.preamble !== "") sections.push(prefix + " preamble\n" + parsed.value.preamble);
         if (parsed.value.trailer !== "") sections.push(prefix + " trailer\n" + parsed.value.trailer);
-        if ("decision" in parsed.value) sections.push(prefix + " verifier feedback\n" + parsed.value.reason
-          + (parsed.value.corrections === null ? "" : "\n" + parsed.value.corrections));
       } else if (process.role !== "worker") sections.push(prefix + " stdout\n" + (text ?? "unavailable"));
     }
   }

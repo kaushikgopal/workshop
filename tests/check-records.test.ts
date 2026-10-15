@@ -307,7 +307,7 @@ describe("versioned persisted contracts", () => {
     expect(roundTrip(nodeResultSchema, earlyCompletion)).toEqual(earlyCompletion);
   });
 
-  test("round-trips historical and tagged agent verdicts with explicit pass decisions", () => {
+  test("round-trips historical and decision-based agent verdicts", () => {
     const historical = {
       kind: "agent", exit: { kind: "code", code: 0 },
       verdict: { version: 1, passed: false, reason: "Historical rejection." }, resultBytesHash: HASH_A,
@@ -317,7 +317,7 @@ describe("versioned persisted contracts", () => {
 
     const retry = {
       kind: "agent", exit: { kind: "code", code: 0 },
-      verdict: { version: 2, decision: "retry", reason: "The parser rejects malformed input.", corrections: "Add a regression test." },
+      verdict: { version: 2, decision: "retry", reason: "The parser rejects malformed input. Add a regression test." },
       resultBytesHash: HASH_B,
     };
     expect(roundTrip(validatorOutcomeSchema, retry)).toEqual(retry);
@@ -332,10 +332,10 @@ describe("versioned persisted contracts", () => {
       validator: validatorOutcomeSchema.parse(retry),
     }).kind).toBe("failed");
     expect(validatorOutcomePasses(validatorOutcomeSchema.parse({
-      ...retry, verdict: { version: 2, decision: "accept", reason: "The candidate passes.", corrections: null },
+      ...retry, verdict: { version: 2, decision: "accept", reason: "The candidate passes." },
     }))).toBe(true);
     expect(validatorOutcomePasses(validatorOutcomeSchema.parse({
-      ...retry, verdict: { version: 2, decision: "block", reason: "The evidence is incomplete.", corrections: null },
+      ...retry, verdict: { version: 2, decision: "block", reason: "The evidence is incomplete." },
     }))).toBe(false);
   });
 
@@ -373,11 +373,11 @@ describe("versioned persisted contracts", () => {
     })).toThrow();
     expect(() => validatorOutcomeSchema.parse({
       kind: "agent", exit: { kind: "code", code: 0 }, resultBytesHash: HASH_A,
-      verdict: { version: 2, decision: "accept", reason: "Accepted.", corrections: "Not allowed." },
+      verdict: { version: 2, decision: "accept", reason: "Accepted.", removedField: "Not allowed." },
     })).toThrow();
     expect(() => validatorOutcomeSchema.parse({
       kind: "operator", resultBytesHash: HASH_A,
-      verdict: { version: 2, decision: "accept", reason: "Accepted.", corrections: null },
+      verdict: { version: 2, decision: "accept", reason: "Accepted." },
       acceptance: { target: "validator" },
     })).toThrow();
     expect(() => processIncarnationSchema.parse({
