@@ -229,6 +229,7 @@ function createFixture(options: {
       "  replay: safe",
       "steps:",
       "  - generate:",
+      ...(options.malformedGenerator === true ? ["      result: tagged"] : []),
       "      agent:",
       "        instructions: Read earlier accepted sentences from WORKSHOP_RESULTS_PATH and write one distinct original sentence.",
       "      verify:",

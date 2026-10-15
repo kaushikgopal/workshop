@@ -306,8 +306,9 @@ describe("successful early completion", () => {
     test("completes at step " + (completingIndex + 1) + " and keeps skipped successors after restart", async () => withDirectory(async (directory) => {
       const markers = [0, 1, 2].map((index) => join(directory, "launch-" + index));
       const nodes = ["first", "middle", "last"].map((id, index) => ({ [id]: {
-        run: "printf w >> " + shellQuote(markers[index]!) + "; " + emit("<status>" + (index === completingIndex ? "success_and_complete" : "succeeded")
-          + "</status>\n<reason>accepted reason</reason>\n<output>output-" + index + "</output>"), result: "tagged", verify: "exit 0",
+        ...agent("cat >/dev/null; printf w >> " + shellQuote(markers[index]!) + "; " + emit("<status>" + (index === completingIndex ? "success_and_complete" : "succeeded")
+          + "</status>\n<reason>accepted reason</reason>\n<output>output-" + index + "</output>")),
+        result: "tagged", verify: "exit 0",
       } }));
       let savedConversationId: ConversationId | undefined;
       await executeFixture(directory, yaml(nodes), async (run, fixture, conversationId) => {

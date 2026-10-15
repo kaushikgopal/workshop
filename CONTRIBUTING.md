@@ -249,7 +249,7 @@ src/
 │  ├─ check-definition.ts         format 4 authoring and migration checks
 │  ├─ check-chain.ts              linear chain invariants
 │  ├─ resolve-agent-settings.ts   model, harness, obsolete-variable guard
-│  ├─ resolve-workflow-settings.ts frozen execution settings
+│  ├─ resolve-workflow-settings.ts frozen execution settings; text worker default
 │  ├─ resolve-retry-limit.ts      format 4 and historical retry counts
 │  ├─ parse-model.ts              provider/model/thinking strings
 │  ├─ hash-canonical-json.ts      stable definition hashes
@@ -277,7 +277,7 @@ src/
 │  ├─ parse-tagged-result.ts      text and tagged stdout results
 │  ├─ build-process-stdin.ts      committed role input bytes and hashes
 │  ├─ build-failure-feedback.ts   bounded feedback and raw evidence hashes
-│  └─ render-agent-prompt.ts      format 4 worker and verifier prompts
+│  └─ render-agent-prompt.ts      text and tagged worker contracts; tagged verifier prompts
 ├─ process/
 │  ├─ launch-process.ts           supervised process group and stdin writer
 │  ├─ identify-process.ts         PID, group, and start identity checks

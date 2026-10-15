@@ -373,6 +373,7 @@ esac`;
       "defaults: { retries: 0, replay: never }",
       "steps:",
       "  - worker:",
+      "      result: tagged",
       "      agent: Return the fixture result.",
       "      verify:",
       "        run: 'test \"$(cat)\" = candidate; printf launched > " + validatorLaunch + "'",
@@ -488,6 +489,7 @@ printf '<status>succeeded</status>\n<reason>%s</reason>\n<output>candidate</outp
     writeFileSync(join(config, "workshop.yaml"), `shell: /bin/sh\nagent:\n  model: fixture/mock-model:medium\n  harness:\n    command: |\n${harnessCommand.split("\n").map((line) => `      ${line}`).join("\n")}\n`, "utf8");
     const stepLines = nodeIds.flatMap((nodeId) => [
       `  - ${nodeId}:`,
+      "      result: tagged",
       "      agent: Return the fixture result.",
     ]);
     writeFileSync(join(workflows, "large-worklog.yaml"), ["version: 4", "defaults: { retries: 0, replay: never }", "steps:", ...stepLines, ""].join("\n"), "utf8");

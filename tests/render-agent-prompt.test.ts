@@ -48,7 +48,8 @@ describe("format 4 agent prompts", () => {
   test("renders text worker output without a tagged envelope", () => {
     const prompt = renderWorkerPromptV4({ ...identity, resultMode: "text" });
     expect(prompt).toContain("Worker stdout contract (text mode)");
-    expect(prompt).toContain("complete proposed output as UTF-8 text to stdout");
+    expect(prompt).toContain("Your entire final reply is the result.");
+    expect(prompt).toContain("Write only the requested output text to stdout, with no preamble or commentary.");
     expect(prompt).not.toContain("<status>succeeded");
   });
 

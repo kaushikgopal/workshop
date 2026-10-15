@@ -57,7 +57,7 @@ export function resolveWorkflowSettings(input: {
       run,
       validator,
       retries,
-      result: node.result ?? ("agent" in node.run ? "tagged" : "text"),
+      result: node.result ?? "text",
     };
   }
 

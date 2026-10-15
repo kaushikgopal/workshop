@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
@@ -115,6 +115,25 @@ describe("workflow and machine schemas", () => {
     }
     expect(readme).toContain(PI_HARNESS_COMMAND);
     expect(readme).not.toMatch(/WORKSHOP_\w*_FILE|failure judge|result helper/u);
+  });
+
+  test("validates every workflow example and resolves its worker result mode", () => {
+    const directory = join(import.meta.dir, "..", "examples", "workflows");
+    const modes = new Map<string, Record<string, { result: string }>>();
+    for (const file of readdirSync(directory).filter((name) => name.endsWith(".yaml"))) {
+      const workflowId = file.slice(0, -".yaml".length);
+      const path = join(directory, file);
+      const checked = checkDefinitionText(readFileSync(path, "utf8"), path, workflowId);
+      const settings = resolveWorkflowSettings({
+        definition: checked.def,
+        machine: { agent: { model: "fixture/mock-model:medium" } },
+        projectCwd: "/tmp",
+      });
+      modes.set(workflowId, settings.nodes);
+    }
+    expect(modes.get("hemingway-clock")?.["generate-line"]?.result).toBe("text");
+    expect(modes.get("hemingway-retry")?.["generate-line"]?.result).toBe("text");
+    expect(modes.get("hemingway-approve")?.draft?.result).toBe("tagged");
   });
 
   test("rejects unknown keys at every internal schema depth and prohibits instructions in defaults", () => {
@@ -443,7 +462,7 @@ describe("format 4 resolved settings", () => {
       run: { replay: "safe", timeoutMs: 30_000 },
       validator: { kind: "command", replay: "safe", timeoutMs: 30_000 },
     });
-    expect(settings.nodes.write).toMatchObject({ retries: "unlimited", result: "tagged", validator: null });
+    expect(settings.nodes.write).toMatchObject({ retries: "unlimited", result: "text", validator: null });
     expect(settings.nodes.publish).toMatchObject({ retries: 0, result: "tagged", run: { replay: "never" } });
   });
 

@@ -139,7 +139,10 @@ environment:
 steps:
   - timestamp: date -u +%FT%TZ
   - generate-line:
-      agent: Read earlier accepted sentences from $WORKSHOP_RESULTS_PATH. Draft one original sentence.
+      agent: |
+        Read earlier accepted sentences from $WORKSHOP_RESULTS_PATH.
+        Draft one original sentence.
+        Write only the sentence to stdout. Do not add an explanation or commentary.
       verify:
         agent: Compare the candidate with earlier accepted sentences in $WORKSHOP_RESULTS_PATH.
 ~~~
@@ -160,9 +163,15 @@ An optional `environment.preflight` object takes `command` and optional
 
 ### Result formats
 
-`result: text` is the default for commands. The complete stdout becomes the
-output without trimming. `result: tagged` is the default for agents and is
-also available to commands. Either mode can be set on any worker.
+`result: text` is the default for every worker, including agents. The complete
+stdout becomes the output without trimming or tag interpretation. A zero exit
+creates a `succeeded` candidate. A configured verifier must accept it before
+the step succeeds. Set `result: tagged` explicitly when a worker needs
+`needs_input` or `success_and_complete`. Text mode never infers those statuses
+from instructions or output. Agent verifiers keep their strict `<decision>` format.
+
+Existing runs keep their frozen result modes. New admissions of YAML that relied
+on the former implicit tagged default for agents use text.
 
 A tagged worker writes these blocks to stdout in this order:
 

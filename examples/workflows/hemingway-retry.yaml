@@ -26,7 +26,7 @@ steps:
         sentence in a result-<step-id>-<run-tag> block. Older runs may be in
         timestamped .gz files beside results.md. Avoid repeating their scenes,
         images, or wording.
-        Put only the sentence in output. Put any explanation in reason.
+        Write only the sentence to stdout. Do not add an explanation or commentary.
         Do not edit Workshop files.
       verify:
         agent: |

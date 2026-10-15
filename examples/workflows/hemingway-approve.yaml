@@ -9,6 +9,7 @@ environment:
     command: 'command -v pi >/dev/null'
 steps:
   - draft:
+      result: tagged
       agent: |
         Draft one original Hemingway-inspired sentence, not a quotation.
         Request human approval (needs_input) with the question: Approve this sentence?

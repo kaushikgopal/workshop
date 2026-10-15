@@ -170,7 +170,7 @@ describe("service run projections", () => {
       const configured = installation(root);
       const harness = "input=$(cat); printf 'role diagnostic' >&2; case \"$input\" in *'Role: verifier'*) printf 'verifier preamble\\n<decision>accept</decision>\\n<reason>checked</reason>\\nverifier trailer' ;; *) printf 'worker preamble\\n<status>succeeded</status>\\n<output>proposal</output>\\nworker trailer' ;; esac";
       writeFileSync(join(root, ".workshop", "workshop.yaml"), "shell: /bin/sh\nagent:\n  model: mock/model:low\n  harness:\n    command: " + JSON.stringify(harness) + "\n");
-      writeFileSync(join(root, ".workshop", "workflows", "projection.yaml"), "version: 4\ndefaults: { retries: 0, replay: never }\nsteps:\n  - first:\n      agent: Write proposal.\n      verify:\n        agent: Check proposal.\n");
+      writeFileSync(join(root, ".workshop", "workflows", "projection.yaml"), "version: 4\ndefaults: { retries: 0, replay: never }\nsteps:\n  - first:\n      result: tagged\n      agent: Write proposal.\n      verify:\n        agent: Check proposal.\n");
       owner = await startWorkshopService(loadInstallation(root));
       const socket = await socketFor(root);
       const response = await sendServiceRequest(socket, { version: 1, method: "start", requestId: "envelope-projection", workflowId: "projection" });

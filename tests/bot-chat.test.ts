@@ -310,6 +310,7 @@ test("runs and the bot run tool read a retried agent result beside a v2 archive"
     "defaults: { retries: 1, replay: safe }",
     "steps:",
     "  - generate:",
+    "      result: tagged",
     "      agent: Generate a candidate.",
     "      verify:",
     "        agent: Check the candidate.",

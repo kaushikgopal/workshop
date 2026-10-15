@@ -95,7 +95,7 @@ try {
       ? "<status>succeeded</status>\n<output>unfinished"
       : env.WORKSHOP_MOCK_NEEDS_INPUT === "1"
         ? "<status>needs_input</status>\n<question>Approve this sentence?</question>\n<output>" + output + "</output>"
-        : "<status>succeeded</status>\n<output>" + output + "</output>";
+        : output;
     process.stdout.write(result);
     record("result", { executionId, malformed: mode === "malformed", output });
   } else {

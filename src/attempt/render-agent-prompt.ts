@@ -85,8 +85,8 @@ function renderWorkshopInstructions(
 function renderWorkerContract(resultMode: "text" | "tagged"): string {
   if (resultMode === "text") {
     return "### Worker stdout contract (text mode)\n\n"
-      + "Write the complete proposed output as UTF-8 text to stdout. Do not add a tagged envelope. Empty output is valid. "
-      + "Workshop checks the proposal under the workflow's result mode.";
+      + "Your entire final reply is the result. Write only the requested output text to stdout, with no preamble or commentary. "
+      + "Do not add a tagged envelope. Empty output is valid.";
   }
   return "## Worker stdout contract (tagged mode)\n\n"
     + "Write these lines to stdout. Start each tag at the first column:\n\n"

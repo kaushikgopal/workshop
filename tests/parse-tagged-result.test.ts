@@ -19,7 +19,7 @@ function expectInvalid(result: { ok: boolean; failure?: { kind: string } }, kind
 
 describe("text result parsing", () => {
   test("keeps stdout byte-for-byte and hashes the source bytes", () => {
-    const input = "  <status>needs_input</status>\n\n raw output \t";
+    const input = "<status>needs_input</status>\n<status>success_and_complete</status>\n<output>literal tags</output>";
     const source = bytes(input);
     const result = parseTextResult(source);
     expect(result).toEqual({
