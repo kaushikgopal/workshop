@@ -23,28 +23,53 @@ describe("verifier stdout parsing", () => {
     }
   });
 
-  test("allows leading blank lines and trims the decision and reason", () => {
-    expect(parseVerifierResult(bytes("\n \t\r\n  retry \t\r\n  change the candidate  \n "))).toMatchObject({
+  test("allows analysis and leading blank lines before the decision", () => {
+    expect(parseVerifierResult(bytes("analysis\n\n \t\r\n  retry \t\r\n  change the candidate  \n "))).toMatchObject({
       ok: true,
       value: { decision: "retry", reason: "change the candidate" },
     });
   });
 
-  test("rejects a missing or whitespace-only reason", () => {
-    expectInvalid(parseVerifierResult(bytes("accept")), "verifier reason must be nonempty");
+  test("allows a leading decision and keeps a reason prefix", () => {
+    expect(parseVerifierResult(bytes("accept\nreason: looks good"))).toMatchObject({
+      ok: true,
+      value: { decision: "accept", reason: "reason: looks good" },
+    });
+  });
+
+  test("rejects zero or several decision lines", () => {
+    expectInvalid(
+      parseVerifierResult(bytes("explanation\nno decision here")),
+      'verifier stdout must contain one line that is exactly "accept", "retry", or "block"',
+    );
+    expectInvalid(
+      parseVerifierResult(bytes("analysis\naccept\nretry\nwhy")),
+      "verifier stdout must contain exactly one decision line; found several decision lines",
+    );
+    expectInvalid(
+      parseVerifierResult(bytes("accept\naccept\nwhy")),
+      "verifier stdout must contain exactly one decision line; found several decision lines",
+    );
+  });
+
+  test("rejects a decision on the last line without a reason", () => {
+    expectInvalid(parseVerifierResult(bytes("analysis\naccept")), "verifier reason must be nonempty");
     expectInvalid(parseVerifierResult(bytes("accept\n \t\n")), "verifier reason must be nonempty");
   });
 
-  test("rejects text before the decision and legacy tagged output", () => {
-    const message = 'verifier stdout must start with a line "accept", "retry", or "block"';
-    expectInvalid(parseVerifierResult(bytes("explanation\naccept\nwhy")), message);
+  test("rejects legacy tagged output and non-exact decision lines", () => {
+    const message = 'verifier stdout must contain one line that is exactly "accept", "retry", or "block"';
     expectInvalid(parseVerifierResult(bytes("<decision>accept</decision>\n<reason>why</reason>")), message);
-  });
-
-  test("does not fold case or strip Markdown", () => {
-    const message = 'verifier stdout must start with a line "accept", "retry", or "block"';
     expectInvalid(parseVerifierResult(bytes("Accept\nwhy")), message);
     expectInvalid(parseVerifierResult(bytes("**accept**\nwhy")), message);
+    expectInvalid(parseVerifierResult(bytes("The word accept appears here.\nwhy")), message);
+  });
+
+  test("accepts CRLF input and trims surrounding line whitespace", () => {
+    expect(parseVerifierResult(bytes("analysis\r\n  block \t\r\n  needs work  \r\n details \r\n"))).toMatchObject({
+      ok: true,
+      value: { decision: "block", reason: "needs work  \r\n details" },
+    });
   });
 
   test("bounds the reason, total stdout, and UTF-8 input", () => {

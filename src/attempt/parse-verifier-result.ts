@@ -13,7 +13,7 @@ function invalidResult(message: string): VerifierResultParse {
   return { ok: false, failure: { kind: "result_invalid", message } };
 }
 
-/** Parse the strict first-line verifier decision and its bounded reason. */
+/** Parse the strict verifier decision line and its bounded reason. */
 export function parseVerifierResult(bytes: Uint8Array): VerifierResultParse {
   if (bytes.byteLength > MAX_RESULT_BYTES) {
     return { ok: false, failure: { kind: "result_too_large", message: "result exceeds 1 MiB" } };
@@ -27,13 +27,20 @@ export function parseVerifierResult(bytes: Uint8Array): VerifierResultParse {
   }
 
   const lines = text.split("\n");
-  let decisionLine = 0;
-  while (decisionLine < lines.length && lines[decisionLine]!.trim() === "") decisionLine += 1;
-  const decision = lines[decisionLine]?.trim();
-  if (decision !== "accept" && decision !== "retry" && decision !== "block") {
-    return invalidResult('verifier stdout must start with a line "accept", "retry", or "block"');
+  let decisionLine = -1;
+  let decision: VerifierDecision | undefined;
+  for (let index = 0; index < lines.length; index += 1) {
+    const value = lines[index]!.trim();
+    if (value !== "accept" && value !== "retry" && value !== "block") continue;
+    if (decision !== undefined) {
+      return invalidResult("verifier stdout must contain exactly one decision line; found several decision lines");
+    }
+    decisionLine = index;
+    decision = value;
   }
-
+  if (decision === undefined) {
+    return invalidResult('verifier stdout must contain one line that is exactly "accept", "retry", or "block"');
+  }
   const reason = lines.slice(decisionLine + 1).join("\n").trim();
   if (reason.length === 0) return invalidResult("verifier reason must be nonempty");
   if (new TextEncoder().encode(reason).byteLength > MAX_REASON_BYTES) {

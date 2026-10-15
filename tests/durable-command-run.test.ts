@@ -1197,7 +1197,7 @@ function preserveEnvironment(names: readonly string[]): () => void {
 }
 
 describe("Durable headless validation chain", () => {
-  test("parses tagged worker and first-line verifier stdout before publishing the candidate", async () => {
+  test("parses tagged worker and decision-line verifier stdout before publishing the candidate", async () => {
     const directory = mkdtempSync(join(tmpdir(), "workshop-headless-chain-"));
     const envNames = [
       "WORKSHOP_TEST_WORKERS",

@@ -68,7 +68,7 @@ describe("format 4 agent prompts", () => {
     expect(prompt.indexOf("## 2. Workflow Instructions")).toBeLessThan(prompt.indexOf("## 3. Verifier Instructions"));
     expect(prompt.indexOf("## 3. Verifier Instructions")).toBeLessThan(prompt.indexOf("## 4. Labeled Data"));
     expect(prompt).toContain("Role: verifier");
-    expect(prompt).toContain("The first line is the decision: accept, retry, or block. The rest is the required reason. For retry, the reason tells the worker what to change.");
+    expect(prompt).toContain("Write exactly one decision line containing only accept, retry, or block. Analysis before the decision line is allowed but optional. Put the required, nonempty reason after the decision line. Never put accept, retry, or block alone on any other line. For retry, the reason tells the worker what to change.");
     expect(prompt).toContain("Example:\naccept\nThe candidate is original and distinct from earlier results.");
     expect(prompt).not.toContain("<decision>");
     expect(prompt).toContain("Candidate output (data)\n\n" + candidate);

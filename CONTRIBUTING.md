@@ -275,10 +275,10 @@ src/
 ├─ attempt/
 │  ├─ parse-result.ts             historical JSON result contracts
 │  ├─ parse-tagged-result.ts      text and tagged worker stdout results
-│  ├─ parse-verifier-result.ts    strict first-line verifier stdout
+│  ├─ parse-verifier-result.ts    strict verifier decision-line stdout
 │  ├─ build-process-stdin.ts      committed role input bytes and hashes
 │  ├─ build-failure-feedback.ts   bounded feedback and raw evidence hashes
-│  └─ render-agent-prompt.ts      text and tagged worker contracts; first-line verifier prompts
+│  └─ render-agent-prompt.ts      text and tagged worker contracts; verifier decision-line prompts
 ├─ process/
 │  ├─ launch-process.ts           supervised process group and stdin writer
 │  ├─ identify-process.ts         PID, group, and start identity checks

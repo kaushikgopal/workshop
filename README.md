@@ -168,7 +168,7 @@ stdout becomes the output without trimming or tag interpretation. A zero exit
 creates a `succeeded` candidate. A configured verifier must accept it before
 the step succeeds. Set `result: tagged` explicitly when a worker needs
 `needs_input` or `success_and_complete`. Text mode never infers those statuses
-from instructions or output. Agent verifiers use a strict first-line decision format.
+from instructions or output. Agent verifiers use a strict decision-line format.
 
 Existing runs keep their frozen result modes. New admissions of YAML that relied
 on the former implicit tagged default for agents use text.
@@ -199,11 +199,12 @@ accept
 The candidate is original and distinct from earlier results.
 ```
 
-The first nonblank line, after trimming whitespace, must be exactly accept,
-retry, or block. Leading blank lines are allowed. No other text may come
-before the decision. Do not search elsewhere, change case, or strip Markdown.
-The remaining text, trimmed, is the required reason. For retry, the reason
-tells the worker what to change. The reason permits at most 64 KiB in UTF-8.
+After trimming each line, exactly one line must equal accept, retry, or block.
+Analysis before the decision line is allowed but optional. Ignore that analysis
+for the decision; retain the raw stdout as evidence. The text after the decision
+line, trimmed, is the required, nonempty reason. For retry, the reason tells the worker
+what to change. Do not search inside sentences, change case, or strip Markdown.
+The reason permits at most 64 KiB in UTF-8.
 No compatibility mode exists; all other formats are invalid. Command verifiers
 accept by exiting zero; their stdout is evidence, not a verdict.
 
@@ -372,9 +373,11 @@ pi --print --approve --no-session --no-extensions --no-skills --no-context-files
 ```
 
 Pi reads the prompt on stdin and writes the final assistant text to stdout.
-Worker results follow the step's result mode. Agent verifiers emit a decision
-on the first nonblank line, followed by the reason. Pi text mode does not stream tool activity; an empty live preview is
-normal. Every verifier starts a fresh harness session.
+Worker results follow the step's result mode. Agent verifiers emit exactly one
+line containing only accept, retry, or block. Analysis may come first; a
+nonempty reason follows the decision. Pi text mode does not stream tool
+activity; an empty live preview is normal. Every verifier starts a fresh
+harness session.
 
 Use a custom command for another harness or a local adapter:
 

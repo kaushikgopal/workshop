@@ -105,7 +105,8 @@ function renderWorkerContract(resultMode: "text" | "tagged"): string {
 
 function renderVerifierContract(workerFailureKind: VerifierPromptV4Input["workerFailureKind"]): string {
   return "### Verifier stdout contract\n\n"
-    + "The first line is the decision: accept, retry, or block. The rest is the required reason. "
+    + "Write exactly one decision line containing only accept, retry, or block. Analysis before the decision line is allowed but optional. "
+    + "Put the required, nonempty reason after the decision line. Never put accept, retry, or block alone on any other line. "
     + "For retry, the reason tells the worker what to change.\n\n"
     + "Example:\n"
     + "accept\n"
