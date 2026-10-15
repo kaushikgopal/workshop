@@ -1,11 +1,27 @@
 import { expect, test } from "bun:test";
-import { InputRenderable, RGBA } from "@opentui/core";
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { InputRenderable, RGBA, TextAttributes } from "@opentui/core";
 import { createTestRenderer } from "@opentui/core/testing";
 import { createViewerRefresh, makeShutdown, mountViewer, reduceKey, type ViewerState } from "../src/tui/mount-viewer.js";
 import type { ViewerSource, ViewerSnapshot } from "../src/tui/data-source.js";
 import { buildNode, buildRun, buildSnapshot, WAIT } from "./build-viewer-fixture.js";
 
 const state = (): ViewerState => ({ workflowId: null, selectedId: "alpha", selectedStepId: null, expanded: [] });
+
+function sourceFiles(directory: string): string[] {
+  return readdirSync(directory, { withFileTypes: true }).flatMap(entry => {
+    const path = join(directory, entry.name);
+    return entry.isDirectory() ? sourceFiles(path) : entry.isFile() && entry.name.endsWith(".ts") ? [path] : [];
+  });
+}
+
+test("viewer sources use terminal defaults and ANSI palette colors, not truecolor literals", () => {
+  const colorLiteral = /#[\da-f]{3,8}\b|\brgba?\s*\(|\bRGBA\.from(?:Hex|Ints|Values)\s*\(/i;
+  for (const file of ["src/tui", "src/views"].flatMap(sourceFiles)) {
+    expect(readFileSync(file, "utf8"), file).not.toMatch(colorLiteral);
+  }
+});
 
 function deferred<T>() {
   let resolve = (_value: T): void => { throw new Error("Deferred promise not initialized"); };
@@ -65,9 +81,35 @@ test("rendered detail places previews beneath boxes and dims skipped steps", asy
     expect(frame).not.toMatch(/activation|attempt|duration|hash|pid|history/i);
     const spans = setup.captureSpans().lines.flatMap(line => line.spans);
     const skipped = spans.find(span => span.text.includes("third"));
-    expect(skipped?.fg.equals(RGBA.fromHex("#6e7681"))).toBe(true);
+    expect(skipped?.fg.equals(RGBA.fromIndex(8))).toBe(true);
+    expect((skipped?.attributes ?? 0) & TextAttributes.DIM).toBe(TextAttributes.DIM);
     const arrows = spans.filter(span => span.text.includes("↓"));
-    expect(arrows.some(span => span.fg.equals(RGBA.fromHex("#6e7681")))).toBe(true);
+    expect(arrows.some(span => span.fg.equals(RGBA.fromIndex(8)))).toBe(true);
+  } finally { setup.renderer.destroy(); }
+});
+
+test("step states use ANSI palette colors and selected steps use inverse video", async () => {
+  const setup = await createTestRenderer({ width: 100, height: 30 });
+  try {
+    const mount = mountViewer(setup.renderer);
+    const states = [
+      ["failed", "failed", "Failed", 1],
+      ["blocked", "blocked", "Blocked", 3],
+      ["waiting", "waiting", "Needs input", 3],
+      ["running", "running", "Running", 6],
+      ["succeeded", "succeeded", "Completed", 2],
+    ] as const;
+    const snapshot = buildSnapshot(states.map(([id, status]) => ({ ...buildNode(id), status })));
+    const selection = { ...state(), workflowId: "alpha" };
+    await createViewerRefresh({ source: { snapshot: async () => snapshot }, state: selection, paint: model => mount.paint(model) }).refresh();
+    await setup.renderOnce();
+    const spans = setup.captureSpans().lines.flatMap(line => line.spans);
+    for (const [id, , label, colorIndex] of states) {
+      const span = spans.find(candidate => candidate.text.includes("[ " + id + " · " + label + " ]"));
+      expect(span?.fg.equals(RGBA.fromIndex(colorIndex))).toBe(true);
+    }
+    const marker = spans.find(span => span.text === "▶ ");
+    expect((marker?.attributes ?? 0) & TextAttributes.INVERSE).toBe(TextAttributes.INVERSE);
   } finally { setup.renderer.destroy(); }
 });
 

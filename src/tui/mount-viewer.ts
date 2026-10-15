@@ -1,13 +1,54 @@
-import { BoxRenderable, ScrollBoxRenderable, TextRenderable, createCliRenderer, fg, t, type CliRenderer } from "@opentui/core";
+import { BoxRenderable, RGBA, ScrollBoxRenderable, StyledText, TextAttributes, TextRenderable, createCliRenderer, type CliRenderer, type TextChunk } from "@opentui/core";
 import { renderStatusTable, statusLabel } from "../views/render-status.js";
 import { buildViewerModel, type ViewerModel } from "./build-panes.js";
 import type { ViewerSnapshot, ViewerSource } from "./data-source.js";
 
-const DIM = "#6e7681";
-const TEXT = "#c9d1d9";
-const ACCENT = "#79c0ff";
-const COLORS: Record<string, string> = { skipped: DIM, pending: DIM, succeeded: "#7ee787", completed: "#7ee787",
-  running: ACCENT, waiting: "#ffa657", blocked: "#ffa657", failed: "#ff7b72" };
+const ANSI = { red: 1, green: 2, yellow: 3, cyan: 6, brightBlack: 8 } as const;
+const STATUS_COLORS: Record<string, number> = {
+  skipped: ANSI.brightBlack, pending: ANSI.brightBlack, succeeded: ANSI.green, completed: ANSI.green,
+  running: ANSI.cyan, waiting: ANSI.yellow, blocked: ANSI.yellow, failed: ANSI.red,
+};
+
+function chunk(text: string, color = RGBA.defaultForeground(), attributes = 0): TextChunk {
+  return { __isChunk: true, text, fg: color, attributes };
+}
+
+function statusColor(status: string): RGBA | null {
+  const normalized = status.toLowerCase();
+  if (normalized.startsWith("configuration error")) return RGBA.fromIndex(ANSI.red);
+  const key = normalized === "needs input" ? "waiting" : normalized;
+  const index = STATUS_COLORS[key];
+  return index === undefined ? null : RGBA.fromIndex(index);
+}
+
+function statusAttributes(status: string): number {
+  const normalized = status.toLowerCase();
+  return normalized === "skipped" || normalized === "pending" ? TextAttributes.DIM : 0;
+}
+
+function renderOverviewTable(rows: readonly (readonly [string, string, string])[], lines: readonly string[], width: number, selectedId: string | null): StyledText {
+  const narrow = width < 60;
+  const chunks: TextChunk[] = [];
+  for (const [index, line] of lines.entries()) {
+    const rowIndex = narrow ? Math.floor(index / 4) : index - 1;
+    const row = rows[rowIndex];
+    if (row) {
+      const color = statusColor(row[1]) ?? RGBA.defaultForeground();
+      const attributes = statusAttributes(row[1]);
+      const isSelected = row[0] === selectedId && (narrow ? index % 4 === 0 : true);
+      if (isSelected) {
+        chunks.push(chunk(line.slice(0, 2), RGBA.defaultForeground(), TextAttributes.INVERSE));
+        chunks.push(chunk(line.slice(2), color, attributes));
+      } else {
+        chunks.push(chunk(line, color, attributes));
+      }
+    } else {
+      chunks.push(chunk(line, RGBA.defaultForeground(), index === 0 ? TextAttributes.BOLD : 0));
+    }
+    if (index < lines.length - 1) chunks.push(chunk("\n"));
+  }
+  return new StyledText(chunks);
+}
 
 export interface ViewerState {
   workflowId: string | null;
@@ -51,14 +92,15 @@ export interface ViewerMount {
 
 /** Persistent containers preserve scroll and focus across projection updates. */
 export function mountViewer(renderer: CliRenderer): ViewerMount {
-  const root = new BoxRenderable(renderer, { width: "100%", height: "100%", flexDirection: "column" });
+  const root = new BoxRenderable(renderer, { width: "100%", height: "100%", flexDirection: "column", shouldFill: false });
   const header = new TextRenderable(renderer, { height: 1, content: "WORKSHOP" });
   const content = new ScrollBoxRenderable(renderer, { flexGrow: 1, width: "100%", scrollX: false });
   const notice = new TextRenderable(renderer, { content: "" });
   const table = new TextRenderable(renderer, { content: "", wrapMode: "none" });
   const chain = new BoxRenderable(renderer, { flexDirection: "column", width: "100%" });
   const bot = new ScrollBoxRenderable(renderer, { height: Math.max(2, Math.min(8, Math.floor(renderer.terminalHeight / 4))),
-    width: "100%", stickyScroll: true, stickyStart: "bottom", border: true, title: "Shared bot feed" });
+    width: "100%", stickyScroll: true, stickyStart: "bottom", border: true, borderColor: RGBA.defaultForeground(),
+    titleColor: RGBA.defaultForeground(), focusedBorderColor: RGBA.defaultForeground(), title: "Shared bot feed" });
   const botText = new TextRenderable(renderer, { content: "" });
   bot.add(botText);
   const footer = new TextRenderable(renderer, { height: 1, content: "" });
@@ -100,7 +142,7 @@ export function mountViewer(renderer: CliRenderer): ViewerMount {
       notice.visible = model.notice.length > 0;
       table.visible = model.screen === "overview";
       chain.visible = model.screen === "detail";
-      table.content = renderStatusTable(model.rows, available, model.selectedId).join("\n");
+      table.content = renderOverviewTable(model.rows, renderStatusTable(model.rows, available, model.selectedId), available, model.selectedId);
       for (const [index, step] of model.steps.entries()) {
         let mounted = steps.get(step.id);
         if (!mounted) {
@@ -117,10 +159,15 @@ export function mountViewer(renderer: CliRenderer): ViewerMount {
         }
         const selected = step.id === model.selectedStepId;
         const label = (selected ? "▶ " : "  ") + "[ " + step.id + " · " + statusLabel(step.status) + " ]";
-        mounted.title.content = t`${fg(COLORS[step.status] ?? TEXT)(label)}`;
+        const color = statusColor(step.status) ?? RGBA.defaultForeground();
+        const titleChunks = selected
+          ? [chunk(label.slice(0, 2), RGBA.defaultForeground(), TextAttributes.INVERSE), chunk(label.slice(2), color, TextAttributes.BOLD | statusAttributes(step.status))]
+          : [chunk(label, color, TextAttributes.BOLD | statusAttributes(step.status))];
+        mounted.title.content = new StyledText(titleChunks);
         mounted.preview.content = step.lines.join("\n") + (step.expandable ? "\n" + (step.expanded ? "[e collapse]" : "[e expand retained evidence]") : "");
         mounted.preview.visible = step.lines.length > 0 || step.expandable;
-        mounted.arrow.content = index === model.steps.length - 1 ? "" : t`${fg((step.status === "skipped" || model.steps[index + 1]?.status === "skipped") ? DIM : ACCENT)("  ↓")}`;
+        const dimArrow = step.status === "skipped" || model.steps[index + 1]?.status === "skipped";
+        mounted.arrow.content = index === model.steps.length - 1 ? "" : new StyledText([chunk("  ↓", RGBA.fromIndex(dimArrow ? ANSI.brightBlack : ANSI.cyan), dimArrow ? TextAttributes.DIM : 0)]);
         mounted.arrow.visible = index !== model.steps.length - 1;
       }
       botText.content = model.botLines.join("\n");
