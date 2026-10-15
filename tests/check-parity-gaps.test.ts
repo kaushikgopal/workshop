@@ -66,10 +66,10 @@ describe("public inspection parity", () => {
       expect(status.workflows.find((workflow) => workflow.workflowId === "idle")?.unresolvedRun).toBeNull();
       const statusText = runCli(root, ["status"]);
       expect(statusText.status).toBe(0);
-      expect(statusText.stdout).toMatch(/chain\s+Running\s+—/);
-      expect(statusText.stdout).toMatch(/idle\s+Ready\s+—/);
+      expect(statusText.stdout).toMatch(/chain\s+● Running\s+—/);
+      expect(statusText.stdout).toMatch(/idle\s+○ Ready\s+—/);
       const filteredText = runCli(root, ["status", "chain"]);
-      expect(filteredText.stdout).toMatch(/chain\s+Running\s+—/);
+      expect(filteredText.stdout).toMatch(/chain\s+● Running\s+—/);
       expect(filteredText.stdout).not.toContain("idle");
 
       writeFileSync(releaseFirst, "go", "utf8");
@@ -77,7 +77,7 @@ describe("public inspection parity", () => {
       expect(failed.currentNodeId).toBe("second");
       expect(existsSync(thirdStarted)).toBe(false);
       const settledText = runCli(root, ["status", "chain"]);
-      expect(settledText.stdout).toMatch(/chain\s+Failed\s+—/);
+      expect(settledText.stdout).toMatch(/chain\s+✗ Failed\s+—/);
 
       const logsJson = runCli(root, ["logs", "chain", "--run", runId, "--json"]);
       expect(logsJson.status).toBe(0);

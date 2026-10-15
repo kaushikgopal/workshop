@@ -11,7 +11,8 @@ test("overview has exactly Title, Status, Next run and no old metadata", () => {
   expect(model.rows.every(row => row.length === 3)).toBe(true);
   const table = renderStatusTable(model.rows, 100, "beta").join("\n");
   expect(table.split("\n")[0]?.trim().split(/\s{2,}/)).toEqual(["Title", "Status", "Next run"]);
-  expect(table).toContain("▶ beta");
+  expect(table).toContain("›beta");
+  expect(table).toContain("○ Ready");
   expect(table).not.toMatch(/hash|activation|pid|attempt|duration|tally|history/i);
 });
 

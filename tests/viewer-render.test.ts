@@ -57,7 +57,7 @@ test("fake service updates preserve workflow selection and back navigation", asy
   expect(reduceKey(selection, { name: "q" }, [], [])).toBe("quit");
 });
 
-test("rendered detail places previews beneath boxes and dims skipped steps", async () => {
+test("rendered detail stacks rounded step boxes with aligned status and wrapped previews", async () => {
   const setup = await createTestRenderer({ width: 100, height: 30 });
   try {
     const mount = mountViewer(setup.renderer);
@@ -66,50 +66,145 @@ test("rendered detail places previews beneath boxes and dims skipped steps", asy
       { ...buildNode("second"), status: "waiting", wait: { ...WAIT, nodeId: "second" } },
       { ...buildNode("third"), status: "skipped" },
     ]);
+    const workflow = snapshot.status.workflows[0];
+    if (workflow) workflow.latestRun = buildRun("completed");
     const selection = { ...state(), workflowId: "alpha" };
     await createViewerRefresh({ source: { snapshot: async () => snapshot }, state: selection, paint: model => mount.paint(model) }).refresh();
     await setup.renderOnce();
     const frame = setup.captureCharFrame();
-    expect(frame).toContain("[ first · Completed ]");
-    expect(frame).toContain("[ second · Needs input ]");
-    expect(frame).toContain("[ third · Skipped ]");
-    expect(frame.indexOf("accepted result")).toBeGreaterThan(frame.indexOf("[ first"));
-    expect(frame.indexOf("accepted result")).toBeLessThan(frame.indexOf("[ second"));
+    expect(frame).toContain("WORKSHOP · alpha · ✓ Completed");
+    expect(frame).toContain("╭─ first ─");
+    expect(frame).toContain("✓ Completed");
+    expect(frame).toContain("╭─ second ─");
+    expect(frame).toContain("◆ Needs input");
+    expect(frame).toContain("╭─ third ─");
+    expect(frame).toContain("– Skipped");
+    expect(frame.indexOf("accepted result")).toBeGreaterThan(frame.indexOf("✓ Completed"));
+    expect(frame.indexOf("accepted result")).toBeLessThan(frame.indexOf("╭─ second ─"));
     expect(frame).toContain(WAIT.waitId);
     expect(frame).toContain("Approve this proposal?");
-    expect(frame).toContain("↓");
+    expect(frame).not.toContain("  ↓");
+    expect(frame).not.toContain("▶");
+    expect(frame).not.toContain("█");
+    expect(frame).not.toContain("▄");
     expect(frame).not.toMatch(/activation|attempt|duration|hash|pid|history/i);
     const spans = setup.captureSpans().lines.flatMap(line => line.spans);
-    const skipped = spans.find(span => span.text.includes("third"));
+    const selectedTitle = spans.find(span => span.text.includes("first"));
+    expect((selectedTitle?.attributes ?? 0) & TextAttributes.BOLD).toBe(TextAttributes.BOLD);
+    const skipped = spans.find(span => span.text.includes("– Skipped"));
     expect(skipped?.fg.equals(RGBA.fromIndex(8))).toBe(true);
     expect((skipped?.attributes ?? 0) & TextAttributes.DIM).toBe(TextAttributes.DIM);
-    const arrows = spans.filter(span => span.text.includes("↓"));
-    expect(arrows.some(span => span.fg.equals(RGBA.fromIndex(8)))).toBe(true);
+    expect(spans.every(span => (span.attributes & TextAttributes.INVERSE) === 0)).toBe(true);
   } finally { setup.renderer.destroy(); }
 });
 
-test("step states use ANSI palette colors and selected steps use inverse video", async () => {
-  const setup = await createTestRenderer({ width: 100, height: 30 });
+test("step statuses use ANSI colors and selection changes only the border and bold title", async () => {
+  const setup = await createTestRenderer({ width: 100, height: 50 });
   try {
     const mount = mountViewer(setup.renderer);
     const states = [
-      ["failed", "failed", "Failed", 1],
-      ["blocked", "blocked", "Blocked", 3],
-      ["waiting", "waiting", "Needs input", 3],
-      ["running", "running", "Running", 6],
-      ["succeeded", "succeeded", "Completed", 2],
+      ["failed", "failed", "✗ Failed", 1],
+      ["blocked", "blocked", "■ Blocked", 3],
+      ["waiting", "waiting", "◆ Needs input", 3],
+      ["running", "running", "● Running", 6],
+      ["succeeded", "succeeded", "✓ Completed", 2],
     ] as const;
     const snapshot = buildSnapshot(states.map(([id, status]) => ({ ...buildNode(id), status })));
     const selection = { ...state(), workflowId: "alpha" };
     await createViewerRefresh({ source: { snapshot: async () => snapshot }, state: selection, paint: model => mount.paint(model) }).refresh();
     await setup.renderOnce();
     const spans = setup.captureSpans().lines.flatMap(line => line.spans);
-    for (const [id, , label, colorIndex] of states) {
-      const span = spans.find(candidate => candidate.text.includes("[ " + id + " · " + label + " ]"));
+    for (const [, , label, colorIndex] of states) {
+      const span = spans.find(candidate => candidate.text.includes(label));
       expect(span?.fg.equals(RGBA.fromIndex(colorIndex))).toBe(true);
     }
-    const marker = spans.find(span => span.text === "▶ ");
-    expect((marker?.attributes ?? 0) & TextAttributes.INVERSE).toBe(TextAttributes.INVERSE);
+    const selectedTitle = spans.find(span => span.text.includes("failed"));
+    expect(selectedTitle?.fg.equals(RGBA.defaultForeground())).toBe(true);
+    expect((selectedTitle?.attributes ?? 0) & TextAttributes.BOLD).toBe(TextAttributes.BOLD);
+    const unselectedTitle = spans.find(span => span.text.includes("blocked"));
+    expect(unselectedTitle?.fg.equals(RGBA.fromIndex(8))).toBe(true);
+    expect(spans.every(span => (span.attributes & TextAttributes.INVERSE) === 0)).toBe(true);
+    expect(setup.captureCharFrame()).not.toContain("▶");
+  } finally { setup.renderer.destroy(); }
+});
+
+test("overview selection uses a bold one-column gutter without inverse cells", async () => {
+  const setup = await createTestRenderer({ width: 100, height: 30 });
+  try {
+    const mount = mountViewer(setup.renderer);
+    const selection = state();
+    const snapshot = buildSnapshot();
+    await createViewerRefresh({ source: { snapshot: async () => snapshot }, state: selection, paint: model => mount.paint(model) }).refresh();
+    await setup.renderOnce();
+    const frame = setup.captureCharFrame();
+    const spans = setup.captureSpans().lines.flatMap(line => line.spans);
+    expect(frame).toContain("›alpha");
+    expect(frame).toContain("○ Ready");
+    expect(frame).not.toContain("▶");
+    expect(spans.every(span => (span.attributes & TextAttributes.INVERSE) === 0)).toBe(true);
+    const selectedRow = spans.find(span => span.text.includes("›"));
+    expect((selectedRow?.attributes ?? 0) & TextAttributes.BOLD).toBe(TextAttributes.BOLD);
+  } finally { setup.renderer.destroy(); }
+});
+
+test("detail boxes stack at wide and narrow terminal widths", async () => {
+  for (const width of [100, 50]) {
+    const setup = await createTestRenderer({ width, height: 30 });
+    try {
+      const mount = mountViewer(setup.renderer);
+      const snapshot = buildSnapshot([
+        { ...buildNode("succeeded"), status: "succeeded", successfulOutput: "The rain came off the mountain before dawn." },
+        { ...buildNode("running"), status: "running", liveStderr: "waiting for the next signal" },
+        { ...buildNode("pending"), status: "pending" },
+      ]);
+      const workflow = snapshot.status.workflows[0];
+      if (workflow) workflow.latestRun = buildRun("completed");
+      const selection = { ...state(), workflowId: "alpha", selectedStepId: "succeeded" };
+      await createViewerRefresh({ source: { snapshot: async () => snapshot }, state: selection, paint: model => mount.paint(model) }).refresh();
+      await setup.renderOnce();
+      const frame = setup.captureCharFrame();
+      expect(frame).toContain("╭─ succeeded ─");
+      expect(frame).toContain("● Running");
+      expect(frame).toContain("○ Pending");
+      expect(frame).toContain("╭─ Shared bot feed ─");
+      expect(frame).not.toContain("  ↓");
+      expect(frame).not.toContain("█");
+      expect(frame).not.toContain("▄");
+      const lines = frame.split("\n");
+      const stepTop = lines.find(line => line.startsWith("╭─ succeeded "));
+      const feedTop = lines.find(line => line.startsWith("╭─ Shared bot feed "));
+      const statusLine = lines.find(line => line.startsWith("│ ✓ Completed"));
+      const feedLine = lines.find(line => line.includes("bot message"));
+      expect(stepTop?.length).toBe(width);
+      expect(feedTop?.length).toBe(width);
+      expect(statusLine?.indexOf("✓")).toBe(2);
+      expect(feedLine?.indexOf("bot message")).toBe(2);
+      expect(mount.content.verticalScrollBar.visible).toBe(false);
+      expect(mount.bot.verticalScrollBar.visible).toBe(false);
+    } finally { setup.renderer.destroy(); }
+  }
+});
+
+test("bot feed grows with terminal height and selection has no inverse marker", async () => {
+  const setup = await createTestRenderer({ width: 100, height: 30 });
+  try {
+    const mount = mountViewer(setup.renderer);
+    const selection = { ...state(), workflowId: "alpha" };
+    let model: ReturnType<typeof import("../src/tui/build-panes.js").buildViewerModel> | null = null;
+    const snapshot = buildSnapshot([{ ...buildNode(), status: "succeeded", successfulOutput: "accepted result" }]);
+    const refresh = createViewerRefresh({ source: { snapshot: async () => snapshot }, state: selection,
+      paint: next => { model = next; mount.paint(next); } });
+    await refresh.refresh();
+    await setup.renderOnce();
+    expect(mount.bot.height).toBe(12);
+    setup.resize(100, 60);
+    if (!model) throw new Error("Viewer model was not painted");
+    mount.paint(model);
+    await setup.renderOnce();
+    expect(mount.bot.height).toBe(24);
+    const spans = setup.captureSpans().lines.flatMap(line => line.spans);
+    expect(spans.every(span => (span.attributes & TextAttributes.INVERSE) === 0)).toBe(true);
+    expect(setup.captureCharFrame()).not.toContain("▶");
   } finally { setup.renderer.destroy(); }
 });
 
@@ -126,6 +221,11 @@ test("fake streaming service preserves detail scroll, bot scroll, and focused ty
     const refresh = createViewerRefresh({ source, state: selection, paint: model => mount.paint(model) });
     await refresh.refresh(); await setup.renderOnce();
     expect(mount.bot.scrollTop).toBeGreaterThan(0);
+    await setup.mockMouse.scroll(10, 5, "down"); await setup.renderOnce();
+    expect(mount.content.scrollTop).toBeGreaterThan(0);
+    const feedBottom = mount.bot.scrollTop;
+    await setup.mockMouse.scroll(10, 20, "up"); await setup.renderOnce();
+    expect(mount.bot.scrollTop).toBeLessThan(feedBottom);
     mount.content.scrollTo(15); mount.bot.scrollTo(12);
     await setup.renderOnce();
     const scroll = mount.content.scrollTop;
@@ -144,7 +244,7 @@ test("fake streaming service preserves detail scroll, bot scroll, and focused ty
 });
 
 test("expansion re-reads the selected projection and shows retained evidence beyond 40 lines", async () => {
-  const setup = await createTestRenderer({ width: 100, height: 65 });
+  const setup = await createTestRenderer({ width: 100, height: 90 });
   try {
     const mount = mountViewer(setup.renderer);
     const selection = { ...state(), workflowId: "alpha" };
@@ -155,10 +255,12 @@ test("expansion re-reads the selected projection and shows retained evidence bey
     } };
     const refresh = createViewerRefresh({ source, state: selection, paint: model => mount.paint(model) });
     await refresh.refresh(); await setup.renderOnce();
-    expect(setup.captureCharFrame()).toContain("e expand retained evidence");
     expect(setup.captureCharFrame()).not.toContain("result 44");
+    mount.content.scrollTo(1000); await setup.renderOnce();
+    expect(setup.captureCharFrame()).toContain("e expand retained evidence");
     reduceKey(selection, { name: "e" }, ["alpha"], ["first"]);
-    refresh.invalidate(); await refresh.refresh(); await setup.renderOnce();
+    refresh.invalidate(); await refresh.refresh();
+    mount.content.scrollTo(1000); await setup.renderOnce();
     expect(calls).toEqual([[], ["first"]]);
     expect(setup.captureCharFrame()).toContain("result 44");
     expect(setup.captureCharFrame()).toContain("e collapse");
@@ -174,7 +276,7 @@ test("narrow terminal uses stacked overview and wraps detail previews", async ()
     const refresh = createViewerRefresh({ source, state: selection, paint: model => mount.paint(model) });
     await refresh.refresh(); await setup.renderOnce();
     expect(setup.captureCharFrame()).toContain("Title: alpha");
-    expect(setup.captureCharFrame()).toContain("Status: Ready");
+    expect(setup.captureCharFrame()).toContain("Status: ○ Ready");
     expect(setup.captureCharFrame()).toContain("Next run: —");
     selection.workflowId = "alpha";
     refresh.invalidate(); await refresh.refresh(); await setup.renderOnce();
@@ -240,13 +342,13 @@ test("returning from a short detail keeps a deep overview selection visible", as
     const source: ViewerSource = { snapshot: async workflowId => ({ ...snapshot, detail: workflowId ? snapshot.detail : null }) };
     const refresh = createViewerRefresh({ source, state: selection, paint: model => mount.paint(model) });
     await refresh.refresh(); await setup.flush();
-    expect(setup.captureCharFrame()).toContain("▶ workflow-55");
+    expect(setup.captureCharFrame()).toContain("›workflow-55");
     reduceKey(selection, { name: "enter" }, [], []);
     refresh.invalidate(); await refresh.refresh(); await setup.flush();
-    expect(setup.captureCharFrame()).toContain("[ first");
+    expect(setup.captureCharFrame()).toContain("╭─ first ─");
     reduceKey(selection, { name: "backspace" }, [], []);
     refresh.invalidate(); await refresh.refresh(); await setup.flush();
-    expect(setup.captureCharFrame()).toContain("▶ workflow-55");
+    expect(setup.captureCharFrame()).toContain("›workflow-55");
     expect(selection.selectedId).toBe("workflow-55");
   } finally { setup.renderer.destroy(); }
 });

@@ -5,6 +5,7 @@ export interface ViewerModel {
   readonly screen: "overview" | "detail";
   readonly runId: string | null;
   readonly header: string;
+  readonly runStatus: string | null;
   readonly rows: readonly StatusRow[];
   readonly steps: readonly StepPreview[];
   readonly notice: readonly string[];
@@ -32,6 +33,7 @@ export function buildViewerModel(input: {
     screen: input.workflowId === null ? "overview" : "detail",
     runId: input.snapshot.detail?.diagram.runId ?? null,
     header: input.workflowId ?? "Workflows",
+    runStatus: workflow ? (workflow.configurationError ? "Configuration error" : run?.status ?? "ready") : null,
     rows: statusRows(input.snapshot.status, input.now),
     steps: (input.snapshot.detail?.nodes ?? []).map(node => renderStepPreview(node, input.expanded.includes(node.nodeId))),
     notice,

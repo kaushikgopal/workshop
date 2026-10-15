@@ -1,16 +1,21 @@
 import { BoxRenderable, RGBA, ScrollBoxRenderable, StyledText, TextAttributes, TextRenderable, createCliRenderer, type CliRenderer, type TextChunk } from "@opentui/core";
-import { renderStatusTable, statusLabel } from "../views/render-status.js";
+import { statusGlyph, statusLabel } from "../views/render-status.js";
 import { buildViewerModel, type ViewerModel } from "./build-panes.js";
 import type { ViewerSnapshot, ViewerSource } from "./data-source.js";
 
 const ANSI = { red: 1, green: 2, yellow: 3, cyan: 6, brightBlack: 8 } as const;
 const STATUS_COLORS: Record<string, number> = {
-  skipped: ANSI.brightBlack, pending: ANSI.brightBlack, succeeded: ANSI.green, completed: ANSI.green,
+  skipped: ANSI.brightBlack, pending: ANSI.brightBlack, ready: ANSI.brightBlack, succeeded: ANSI.green, completed: ANSI.green,
   running: ANSI.cyan, waiting: ANSI.yellow, blocked: ANSI.yellow, failed: ANSI.red,
 };
+const DIM = RGBA.fromIndex(ANSI.brightBlack);
 
 function chunk(text: string, color = RGBA.defaultForeground(), attributes = 0): TextChunk {
   return { __isChunk: true, text, fg: color, attributes };
+}
+
+function clip(value: string, width: number): string {
+  return value.length <= width ? value : value.slice(0, Math.max(0, width - 1)) + "…";
 }
 
 function statusColor(status: string): RGBA | null {
@@ -23,29 +28,102 @@ function statusColor(status: string): RGBA | null {
 
 function statusAttributes(status: string): number {
   const normalized = status.toLowerCase();
-  return normalized === "skipped" || normalized === "pending" ? TextAttributes.DIM : 0;
+  return normalized === "skipped" || normalized === "pending" || normalized === "ready" ? TextAttributes.DIM : 0;
 }
 
-function renderOverviewTable(rows: readonly (readonly [string, string, string])[], lines: readonly string[], width: number, selectedId: string | null): StyledText {
-  const narrow = width < 60;
-  const chunks: TextChunk[] = [];
-  for (const [index, line] of lines.entries()) {
-    const rowIndex = narrow ? Math.floor(index / 4) : index - 1;
-    const row = rows[rowIndex];
-    if (row) {
-      const color = statusColor(row[1]) ?? RGBA.defaultForeground();
-      const attributes = statusAttributes(row[1]);
-      const isSelected = row[0] === selectedId && (narrow ? index % 4 === 0 : true);
-      if (isSelected) {
-        chunks.push(chunk(line.slice(0, 2), RGBA.defaultForeground(), TextAttributes.INVERSE));
-        chunks.push(chunk(line.slice(2), color, attributes));
-      } else {
-        chunks.push(chunk(line, color, attributes));
-      }
+interface TablePart {
+  text: string;
+  color?: RGBA;
+  attributes?: number;
+}
+
+function appendTableLine(chunks: TextChunk[], parts: readonly TablePart[], width: number): void {
+  let remaining = width;
+  for (const part of parts) {
+    if (remaining <= 0) break;
+    if (part.text.length <= remaining) {
+      chunks.push(chunk(part.text, part.color, part.attributes));
+      remaining -= part.text.length;
     } else {
-      chunks.push(chunk(line, RGBA.defaultForeground(), index === 0 ? TextAttributes.BOLD : 0));
+      const clipped = remaining === 1 ? "…" : part.text.slice(0, remaining - 1) + "…";
+      chunks.push(chunk(clipped, part.color, part.attributes));
+      remaining = 0;
     }
-    if (index < lines.length - 1) chunks.push(chunk("\n"));
+  }
+  chunks.push(chunk("\n"));
+}
+
+function renderOverviewTable(rows: readonly (readonly [string, string, string])[], width: number, selectedId: string | null): StyledText {
+  const chunks: TextChunk[] = [];
+  if (rows.length === 0) return new StyledText([chunk("No workflows configured")]);
+  if (width < 60) {
+    rows.forEach((row, index) => {
+      const selected = row[0] === selectedId;
+      const rowAttributes = selected ? TextAttributes.BOLD : 0;
+      const color = statusColor(row[1]) ?? RGBA.defaultForeground();
+      const cellAttributes = rowAttributes | statusAttributes(row[1]);
+      appendTableLine(chunks, [
+        { text: selected ? "›" : " ", attributes: rowAttributes },
+        { text: "Title:", color: DIM, attributes: rowAttributes | TextAttributes.DIM },
+        { text: " " + row[0], attributes: rowAttributes },
+      ], width);
+      appendTableLine(chunks, [
+        { text: " ", attributes: rowAttributes },
+        { text: "Status: ", color: DIM, attributes: rowAttributes | TextAttributes.DIM },
+        { text: statusGlyph(row[1]) + " " + row[1], color, attributes: cellAttributes },
+      ], width);
+      appendTableLine(chunks, [
+        { text: " ", attributes: rowAttributes },
+        { text: "Next run: ", color: DIM, attributes: rowAttributes | TextAttributes.DIM },
+        { text: row[2], attributes: rowAttributes },
+      ], width);
+      if (index < rows.length - 1) appendTableLine(chunks, [], width);
+    });
+    return new StyledText(chunks.slice(0, -1));
+  }
+
+  const nextWidth = Math.min(19, Math.max(8, ...rows.map(row => row[2].length)));
+  const titleWidth = Math.max(12, Math.floor((width - nextWidth - 5) / 2));
+  const statusWidth = Math.max(8, width - nextWidth - titleWidth - 5);
+  const field = (value: string, fieldWidth: number) => clip(value, fieldWidth).padEnd(fieldWidth);
+  const heading = TextAttributes.DIM;
+  appendTableLine(chunks, [
+    { text: " " },
+    { text: field("Title", titleWidth), attributes: heading },
+    { text: "  " },
+    { text: field("Status", statusWidth), attributes: heading },
+    { text: "  " },
+    { text: field("Next run", nextWidth), attributes: heading },
+  ], width);
+  rows.forEach(row => {
+    const selected = row[0] === selectedId;
+    const rowAttributes = selected ? TextAttributes.BOLD : 0;
+    const statusColorValue = statusColor(row[1]) ?? RGBA.defaultForeground();
+    appendTableLine(chunks, [
+      { text: selected ? "›" : " ", attributes: rowAttributes },
+      { text: field(row[0], titleWidth), attributes: rowAttributes },
+      { text: "  ", attributes: rowAttributes },
+      { text: field(statusGlyph(row[1]) + " " + row[1], statusWidth), color: statusColorValue,
+        attributes: rowAttributes | statusAttributes(row[1]) },
+      { text: "  ", attributes: rowAttributes },
+      { text: field(row[2], nextWidth), attributes: rowAttributes },
+    ], width);
+  });
+  return new StyledText(chunks.slice(0, -1));
+}
+
+function truncateChunks(parts: readonly TextChunk[], width: number): StyledText {
+  const chunks: TextChunk[] = [];
+  let remaining = width;
+  for (const part of parts) {
+    if (remaining <= 0) break;
+    if (part.text.length <= remaining) {
+      chunks.push(part);
+      remaining -= part.text.length;
+    } else {
+      chunks.push({ ...part, text: remaining === 1 ? "…" : part.text.slice(0, remaining - 1) + "…" });
+      break;
+    }
   }
   return new StyledText(chunks);
 }
@@ -93,17 +171,22 @@ export interface ViewerMount {
 /** Persistent containers preserve scroll and focus across projection updates. */
 export function mountViewer(renderer: CliRenderer): ViewerMount {
   const root = new BoxRenderable(renderer, { width: "100%", height: "100%", flexDirection: "column", shouldFill: false });
-  const header = new TextRenderable(renderer, { height: 1, content: "WORKSHOP" });
-  const content = new ScrollBoxRenderable(renderer, { flexGrow: 1, width: "100%", scrollX: false });
-  const notice = new TextRenderable(renderer, { content: "" });
-  const table = new TextRenderable(renderer, { content: "", wrapMode: "none" });
+  const header = new TextRenderable(renderer, { width: "100%", height: 1, content: "WORKSHOP", wrapMode: "none" });
+  const content = new ScrollBoxRenderable(renderer, { flexGrow: 1, width: "100%", scrollX: false,
+    verticalScrollbarOptions: { visible: false } });
+  // Lock both bars off after ScrollBox's automatic visibility pass.
+  content.verticalScrollBar.visible = false;
+  const notice = new TextRenderable(renderer, { width: "100%", content: "", wrapMode: "word" });
+  const table = new TextRenderable(renderer, { width: "100%", content: "", wrapMode: "none" });
   const chain = new BoxRenderable(renderer, { flexDirection: "column", width: "100%" });
-  const bot = new ScrollBoxRenderable(renderer, { height: Math.max(2, Math.min(8, Math.floor(renderer.terminalHeight / 4))),
-    width: "100%", stickyScroll: true, stickyStart: "bottom", border: true, borderColor: RGBA.defaultForeground(),
-    titleColor: RGBA.defaultForeground(), focusedBorderColor: RGBA.defaultForeground(), title: "Shared bot feed" });
-  const botText = new TextRenderable(renderer, { content: "" });
+  const bot = new ScrollBoxRenderable(renderer, { height: Math.max(6, Math.floor(renderer.terminalHeight * 0.4)),
+    width: "100%", stickyScroll: true, stickyStart: "bottom", border: true, borderStyle: "rounded", borderColor: DIM,
+    titleColor: DIM, focusedBorderColor: DIM, title: " Shared bot feed ", paddingX: 1,
+    verticalScrollbarOptions: { visible: false } });
+  bot.verticalScrollBar.visible = false;
+  const botText = new TextRenderable(renderer, { width: "100%", content: "", wrapMode: "word" });
   bot.add(botText);
-  const footer = new TextRenderable(renderer, { height: 1, content: "" });
+  const footer = new TextRenderable(renderer, { width: "100%", height: 1, content: "", wrapMode: "none" });
   content.add(notice);
   content.add(table);
   content.add(chain);
@@ -112,7 +195,7 @@ export function mountViewer(renderer: CliRenderer): ViewerMount {
   root.add(bot);
   root.add(footer);
   renderer.root.add(root);
-  const steps = new Map<string, { box: BoxRenderable; title: TextRenderable; preview: TextRenderable; arrow: TextRenderable }>();
+  const steps = new Map<string, { box: BoxRenderable; title: TextRenderable; status: TextRenderable; preview: TextRenderable }>();
   let screenKey = "";
   let selection: string | null = null;
   let width = renderer.terminalWidth;
@@ -137,41 +220,57 @@ export function mountViewer(renderer: CliRenderer): ViewerMount {
         screenKey = key;
       }
       const available = Math.max(1, renderer.terminalWidth - 2);
-      header.content = ("WORKSHOP · " + model.header + (error ? " · STALE: " + error : "")).slice(0, available);
+      const headerParts: TextChunk[] = [
+        chunk("WORKSHOP", DIM, TextAttributes.DIM),
+        chunk(" · "),
+        chunk(model.header, RGBA.defaultForeground(), TextAttributes.BOLD),
+      ];
+      if (model.runStatus !== null) {
+        headerParts.push(chunk(" · "));
+        const label = model.runStatus;
+        headerParts.push(chunk(statusGlyph(label) + " " + statusLabel(label), statusColor(label) ?? RGBA.defaultForeground(), statusAttributes(label)));
+      }
+      if (error) headerParts.push(chunk(" · STALE: " + error));
+      header.content = truncateChunks(headerParts, available);
       notice.content = model.notice.join("\n");
       notice.visible = model.notice.length > 0;
       table.visible = model.screen === "overview";
       chain.visible = model.screen === "detail";
-      table.content = renderOverviewTable(model.rows, renderStatusTable(model.rows, available, model.selectedId), available, model.selectedId);
-      for (const [index, step] of model.steps.entries()) {
+      table.content = renderOverviewTable(model.rows, available, model.selectedId);
+      for (const step of model.steps) {
         let mounted = steps.get(step.id);
         if (!mounted) {
-          const box = new BoxRenderable(renderer, { flexDirection: "column", width: "100%" });
-          const title = new TextRenderable(renderer, { content: "" });
-          const preview = new TextRenderable(renderer, { content: "" });
-          const arrow = new TextRenderable(renderer, { content: "" });
-          box.add(title);
+          const box = new BoxRenderable(renderer, { flexDirection: "column", width: "100%", border: true,
+            borderStyle: "rounded", borderColor: DIM, focusedBorderColor: DIM, title: " " + step.id + " ", titleColor: DIM,
+            paddingX: 1, shouldFill: false });
+          const status = new TextRenderable(renderer, { width: "100%", height: 1, content: "", wrapMode: "none" });
+          const preview = new TextRenderable(renderer, { width: "100%", content: "", wrapMode: "word" });
+          const title = new TextRenderable(renderer, { content: "", position: "absolute", left: 1, top: -1,
+            width: Math.max(1, step.id.length + 2), height: 1, wrapMode: "none" });
+          box.add(status);
           box.add(preview);
-          box.add(arrow);
+          box.add(title);
           chain.add(box);
-          mounted = { box, title, preview, arrow };
+          mounted = { box, title, status, preview };
           steps.set(step.id, mounted);
         }
         const selected = step.id === model.selectedStepId;
-        const label = (selected ? "▶ " : "  ") + "[ " + step.id + " · " + statusLabel(step.status) + " ]";
-        const color = statusColor(step.status) ?? RGBA.defaultForeground();
-        const titleChunks = selected
-          ? [chunk(label.slice(0, 2), RGBA.defaultForeground(), TextAttributes.INVERSE), chunk(label.slice(2), color, TextAttributes.BOLD | statusAttributes(step.status))]
-          : [chunk(label, color, TextAttributes.BOLD | statusAttributes(step.status))];
-        mounted.title.content = new StyledText(titleChunks);
+        const borderColor = selected ? RGBA.defaultForeground() : DIM;
+        mounted.box.borderColor = borderColor;
+        mounted.box.focusedBorderColor = borderColor;
+        mounted.box.titleColor = borderColor;
+        const titleText = " " + step.id + " ";
+        const titleWidth = Math.max(1, Math.min(titleText.length, renderer.terminalWidth - 4));
+        mounted.title.width = titleWidth;
+        mounted.title.content = new StyledText([chunk(clip(titleText, titleWidth), RGBA.defaultForeground(), TextAttributes.BOLD)]);
+        mounted.title.visible = selected;
+        mounted.status.content = new StyledText([chunk(statusGlyph(step.status) + " " + statusLabel(step.status),
+          statusColor(step.status) ?? RGBA.defaultForeground(), statusAttributes(step.status))]);
         mounted.preview.content = step.lines.join("\n") + (step.expandable ? "\n" + (step.expanded ? "[e collapse]" : "[e expand retained evidence]") : "");
         mounted.preview.visible = step.lines.length > 0 || step.expandable;
-        const dimArrow = step.status === "skipped" || model.steps[index + 1]?.status === "skipped";
-        mounted.arrow.content = index === model.steps.length - 1 ? "" : new StyledText([chunk("  ↓", RGBA.fromIndex(dimArrow ? ANSI.brightBlack : ANSI.cyan), dimArrow ? TextAttributes.DIM : 0)]);
-        mounted.arrow.visible = index !== model.steps.length - 1;
       }
       botText.content = model.botLines.join("\n");
-      bot.height = Math.max(2, Math.min(8, Math.floor(renderer.terminalHeight / 4)));
+      bot.height = Math.max(6, Math.floor(renderer.terminalHeight * 0.4));
       footer.content = (model.screen === "overview" ? "↑↓ / j k select · Enter open · q quit" : "↑↓ / j k step · e expand · Esc back · q quit").slice(0, available);
       const selected = model.screen === "overview" ? model.selectedId : model.selectedStepId;
       if (selected !== selection || width !== renderer.terminalWidth) {

@@ -10,6 +10,21 @@ export function statusLabel(status: string): string {
   return status.charAt(0).toUpperCase() + status.slice(1);
 }
 
+export function statusGlyph(status: string): string {
+  const normalized = status.toLowerCase();
+  if (normalized.startsWith("configuration error")) return "✗";
+  switch (normalized) {
+    case "succeeded": case "completed": return "✓";
+    case "running": return "●";
+    case "waiting": case "needs input": return "◆";
+    case "blocked": return "■";
+    case "failed": return "✗";
+    case "skipped": return "–";
+    case "pending": case "ready": return "○";
+    default: return "○";
+  }
+}
+
 export function nextRunLabel(workflow: Workflow, now: Date): string {
   const due = workflow.activation?.nextDueAt;
   if (workflow.unresolvedRun || workflow.configurationError || workflow.activation?.state !== "active" || !due) return "—";
@@ -36,17 +51,19 @@ function clip(value: string, width: number): string {
 /** Exactly three fields at every width; small terminals stack each row. */
 export function renderStatusTable(rows: readonly StatusRow[], width: number, selectedId: string | null = null): string[] {
   if (width < 60) return rows.length === 0 ? ["No workflows configured"] : rows.flatMap(row => [
-    clip((row[0] === selectedId ? "▶ " : "  ") + "Title: " + row[0], width),
-    clip("  Status: " + row[1], width),
-    clip("  Next run: " + row[2], width),
+    clip((row[0] === selectedId ? "›" : " ") + "Title: " + row[0], width),
+    clip(" Status: " + statusGlyph(row[1]) + " " + row[1], width),
+    clip(" Next run: " + row[2], width),
     "",
   ]);
   const nextWidth = Math.min(19, Math.max(8, ...rows.map(row => row[2].length)));
-  const titleWidth = Math.max(12, Math.floor((width - nextWidth - 8) / 2));
-  const statusWidth = Math.max(8, width - nextWidth - titleWidth - 8);
+  const titleWidth = Math.max(12, Math.floor((width - nextWidth - 5) / 2));
+  const statusWidth = Math.max(8, width - nextWidth - titleWidth - 5);
   const line = (row: StatusRow, marker: string) => marker + clip(row[0], titleWidth).padEnd(titleWidth) + "  "
-    + clip(row[1], statusWidth).padEnd(statusWidth) + "  " + clip(row[2], nextWidth);
-  return [line(["Title", "Status", "Next run"], "  "), ...rows.map(row => line(row, row[0] === selectedId ? "▶ " : "  "))];
+    + clip(statusGlyph(row[1]) + " " + row[1], statusWidth).padEnd(statusWidth) + "  " + clip(row[2], nextWidth);
+  const heading = " " + clip("Title", titleWidth).padEnd(titleWidth) + "  "
+    + clip("Status", statusWidth).padEnd(statusWidth) + "  " + clip("Next run", nextWidth);
+  return [heading, ...rows.map(row => line(row, row[0] === selectedId ? "›" : " "))];
 }
 
 /** Presentation only. The service remains the authority for resolution. */
