@@ -179,7 +179,8 @@ describe("import boundaries", () => {
 
   test("help and validate load neither the service client nor the viewer", () => {
     const loaded = importClosure(["src/cli/main.ts"], { includeTypes: false, includeDynamic: false });
-    expect(loaded).toContain("src/installation/load-installation.ts");
+    expect(loaded).toContain("src/definition/check-definition.ts");
+    expect(loaded).not.toContain("src/installation/load-installation.ts");
     expect(loaded.filter((path) => path.startsWith("src/tui/") || path.startsWith("src/service/"))).toEqual([]);
   });
 

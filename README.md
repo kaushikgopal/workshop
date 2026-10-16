@@ -41,7 +41,7 @@ results.md file. There is no publish step. A successful first agent attempt
 makes two model calls.
 
 ~~~fish
-workshop validate hemingway-retry
+workshop validate .workshop/workflows/hemingway-retry.yaml
 workshop start hemingway-retry --detach
 workshop watch hemingway-retry
 ~~~
@@ -307,7 +307,7 @@ Command processes and agent tool shells receive these values for their execution
 
 | Command | Does |
 | --- | --- |
-| `validate <workflow>` | Check YAML and resolved settings offline |
+| `validate <path>` | Check a YAML workflow file offline; no installation required |
 | `start <workflow> [--detach]` | Admit a run and enable its schedule; wait unless detached |
 | `pause <workflow>` | Stop new dispatch; let the active step finish |
 | `resume <workflow>` | Resume paused work |
@@ -328,6 +328,11 @@ Command processes and agent tool shells receive these values for their execution
 
 `bun src/cli/main.ts help` lists commands. Except for help and validation,
 commands use the service. Public workflow commands start it when needed.
+
+`validate` reads the exact `.yaml` or `.yml` path supplied. Relative paths resolve
+from the current directory. It checks YAML, workflow structure, and step policies.
+It does not load machine defaults or require an agent model. `start` checks
+resolved runtime settings before admission.
 
 Exit codes: 0 success or a saved human wait; 1 failed or cancelled run; 2 blocked
 run; 3 service unavailable; 64 usage or configuration error.

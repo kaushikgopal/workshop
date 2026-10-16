@@ -34,7 +34,7 @@ describe("recurring Hemingway acceptance", () => {
   test("admits six runs and compares accepted sentences through results.md", async () => {
     const fixture = await createFixture({ id: workflowId, schedule: true, generatorSleepMs: 120, validatorSleepMs: 120 });
     try {
-      expect(runCli(fixture.root, ["validate", workflowId]).status).toBe(0);
+      expect(runCli(fixture.root, ["validate", `.workshop/workflows/${workflowId}.yaml`]).status).toBe(0);
       const started = runCli(fixture.root, ["start", workflowId, "--detach"], 30_000);
       expect(started.status).toBe(0);
       const firstRunId = runIdSchema.parse(started.stdout.match(/Started run (\S+)/)?.[1]);
@@ -168,7 +168,7 @@ describe("recurring Hemingway acceptance", () => {
   test("Continue completes the approval example and stores the answer block", async () => {
     const fixture = await createFixture({ id: "hemingway-approve", schedule: false, needsInput: true, useApprovalExample: true });
     try {
-      expect(runCli(fixture.root, ["validate", "hemingway-approve"]).status).toBe(0);
+      expect(runCli(fixture.root, ["validate", ".workshop/workflows/hemingway-approve.yaml"]).status).toBe(0);
       const runId = await startSingleRun(fixture.root, "hemingway-approve");
       await waitForRunStatus(fixture.root, "hemingway-approve", runId, "waiting");
       const reply = runCli(fixture.root, ["reply", "hemingway-approve", "--continue", "--answer", "Approved."]);

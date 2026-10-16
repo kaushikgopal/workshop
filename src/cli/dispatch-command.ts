@@ -1,4 +1,6 @@
-import { loadCheckedWorkflow, findInstallation } from "../installation/load-installation.js";
+import { readFileSync } from "node:fs";
+import { basename, extname, resolve } from "node:path";
+import { checkDefinitionText } from "../definition/check-definition.js";
 import { errorText } from "./errors.js";
 
 const HELP = `workshop — local agent workflows on a durable background service
@@ -7,8 +9,8 @@ Usage: workshop <command> [args]
 Workflows live in .workshop/workflows/<id>.yaml; machine defaults in .workshop/workshop.yaml.
 
 Commands:
-  validate <workflow>
-      Check workflow YAML and resolved settings without starting the service.
+  validate <path>
+      Check a YAML workflow file directly, without an installation or service.
   start <workflow> [--detach]
       Admit a run; wait for its result unless detached.
   pause <workflow>
@@ -55,12 +57,17 @@ export async function dispatchCommand(args: readonly string[]): Promise<void> {
   }
   if (command === "validate") {
     if (rest.length !== 1) {
-      return usage("usage: workshop validate <workflow>");
+      return usage("usage: workshop validate <path>");
     }
     try {
-      const installation = findInstallation();
-      const workflow = loadCheckedWorkflow(installation, rest[0]!);
-      process.stdout.write(`valid workflow ${JSON.stringify(workflow.workflowId)} (${workflow.chain.order.length} steps)\n`);
+      const sourcePath = resolve(rest[0]!);
+      const extension = extname(sourcePath);
+      if (extension !== ".yaml" && extension !== ".yml") {
+        throw new Error("expected a path to a .yaml or .yml workflow file");
+      }
+      const workflowId = basename(sourcePath, extension);
+      const workflow = checkDefinitionText(readFileSync(sourcePath, "utf8"), sourcePath, workflowId);
+      process.stdout.write(`valid workflow ${JSON.stringify(workflowId)} (${workflow.chain.order.length} steps)\n`);
     } catch (error) {
       console.error(`error: ${errorText(error)}`);
       process.exitCode = 64;

@@ -1,6 +1,6 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
@@ -32,6 +32,7 @@ describe("CLI commands", () => {
         expect(help.status).toBe(0);
         expect(help.stdout).toContain("Usage: workshop <command> [args]");
         expect(help.stdout).toContain("watch [<workflow>]");
+        expect(help.stdout).toContain("validate <path>");
         expect(help.stdout).toContain("service start | serve | status [--json] | stop");
         expect(help.stdout).toContain("Workflows live in .workshop/workflows/<id>.yaml; machine defaults in .workshop/workshop.yaml.");
         expect(help.stdout).toContain("step describe <workflow> <step>");
@@ -74,17 +75,15 @@ describe("CLI commands", () => {
     }
   });
 
-  test("validates every shipped workflow example without creating state", () => {
-    const root = makeRoot({ machine: null, workflows: {} });
+  test("validates every shipped workflow example without an installation or model defaults", () => {
+    const root = mkdtempSync(join(tmpdir(), "workshop-validate-examples-"));
     try {
-      copyFileSync(join(REPO_ROOT, "examples", "workshop.yaml"), join(root, ".workshop", "workshop.yaml"));
       const examples = join(REPO_ROOT, "examples", "workflows");
       const files = readdirSync(examples).filter(file => file.endsWith(".yaml"));
       expect(files.length).toBeGreaterThan(0);
       for (const file of files) {
-        copyFileSync(join(examples, file), join(root, ".workshop", "workflows", file));
         const workflowId = file.slice(0, -5);
-        const result = runCli(root, ["validate", workflowId]);
+        const result = runCli(root, ["validate", join(examples, file)]);
         expect(result.stderr).toBe("");
         expect(result.status).toBe(0);
         expect(result.stdout).toStartWith('valid workflow "' + workflowId + '" (');
@@ -95,7 +94,73 @@ describe("CLI commands", () => {
     }
   });
 
-  test("rejects obsolete versions, accepts an omitted machine version, and explains legacy workflow keys", () => {
+  test("validates relative and absolute YAML paths from the caller's directory", () => {
+    const root = mkdtempSync(join(tmpdir(), "workshop-validate-path-"));
+    try {
+      mkdirSync(join(root, "workflow files"));
+      writeFileSync(join(root, "workflow files", "clock.yaml"), CLOCK_WORKFLOW);
+      writeFileSync(join(root, "workflow files", "clock.yml"), CLOCK_WORKFLOW);
+      for (const [cwd, path] of [
+        [root, "workflow files/clock.yaml"],
+        [root, "./workflow files/clock.yml"],
+        [join(root, "workflow files"), "../workflow files/clock.yaml"],
+        [root, join(root, "workflow files", "clock.yaml")],
+      ] as const) {
+        const result = runCli(cwd, ["validate", path]);
+        expect(result.status).toBe(0);
+        expect(result.stderr).toBe("");
+        expect(result.stdout).toBe('valid workflow "clock" (1 steps)\n');
+      }
+      expect(readdirSync(root).sort()).toEqual(["workflow files"]);
+      expect(readdirSync(join(root, "workflow files")).sort()).toEqual(["clock.yaml", "clock.yml"]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("checks only the supplied file instead of looking up a workflow id", () => {
+    const root = makeRoot({ machine: "invalid: [", workflows: { clock: CLOCK_WORKFLOW } });
+    try {
+      mkdirSync(join(root, "drafts"));
+      writeFileSync(join(root, "drafts", "clock.yaml"), CLOCK_WORKFLOW.replace("retries: 0", "retries: -1"));
+      const result = runCli(root, ["validate", "drafts/clock.yaml"]);
+      expect(result.status).toBe(64);
+      expect(result.stderr).toContain("retries");
+      expect(result.stdout).toBe("");
+      const implicit = runCli(root, ["validate", "clock"]);
+      expect(implicit.status).toBe(64);
+      expect(implicit.stderr).toContain("expected a path to a .yaml or .yml workflow file");
+      expect(existsSync(join(root, ".workshop", "state-v5"))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("reports usage, missing files, malformed YAML, and invalid workflows", () => {
+    const root = mkdtempSync(join(tmpdir(), "workshop-validate-errors-"));
+    try {
+      writeFileSync(join(root, "malformed.yaml"), "steps: [");
+      writeFileSync(join(root, "invalid.yaml"), CLOCK_WORKFLOW.replace("  replay: never\n", ""));
+      for (const [args, message] of [
+        [["validate"], "usage: workshop validate <path>"],
+        [["validate", "one.yaml", "two.yaml"], "usage: workshop validate <path>"],
+        [["validate", "clock.txt"], "expected a path to a .yaml or .yml workflow file"],
+        [["validate", "missing.yaml"], "missing.yaml"],
+        [["validate", "malformed.yaml"], "malformed.yaml"],
+        [["validate", "invalid.yaml"], "replay"],
+      ] as const) {
+        const result = runCli(root, args);
+        expect(result.status).toBe(64);
+        expect(result.stderr).toContain(message);
+        expect(result.stdout).toBe("");
+      }
+      expect(existsSync(join(root, ".workshop"))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects obsolete workflow versions and legacy keys without loading machine settings", () => {
     const oldWorkflow = makeRoot({
       machine: null,
       workflows: { clock: CLOCK_WORKFLOW.replace("version: 4", "version: 1") },
@@ -119,23 +184,23 @@ describe("CLI commands", () => {
       workflows: { clock: ["nodes:", "  tick:", "    run: echo tick", ""].join("\n") },
     });
     try {
-      const workflow = runCli(oldWorkflow, ["validate", "clock"]);
+      const workflow = runCli(oldWorkflow, ["validate", ".workshop/workflows/clock.yaml"]);
       expect(workflow.status).toBe(64);
       expect(workflow.stderr).toContain("workflow version 1 is no longer supported; remove id:, list steps: in order, declare version: 4, replace max_attempts: N with retries: N-1");
 
-      const machine = runCli(oldMachine, ["validate", "clock"]);
-      expect(machine.status).toBe(64);
-      expect(machine.stderr).toContain("machine config version 1 is no longer supported; remove version: (or declare version: 3)");
+      const machine = runCli(oldMachine, ["validate", ".workshop/workflows/clock.yaml"]);
+      expect(machine.status).toBe(0);
+      expect(machine.stderr).toBe("");
 
-      const unversioned = runCli(unversionedMachine, ["validate", "clock"]);
+      const unversioned = runCli(unversionedMachine, ["validate", ".workshop/workflows/clock.yaml"]);
       expect(unversioned.status).toBe(0);
       expect(unversioned.stdout).toBe('valid workflow "clock" (1 steps)\n');
 
-      const legacyIdResult = runCli(legacyId, ["validate", "clock"]);
+      const legacyIdResult = runCli(legacyId, ["validate", ".workshop/workflows/clock.yaml"]);
       expect(legacyIdResult.status).toBe(64);
       expect(legacyIdResult.stderr).toContain("id: is not accepted; the workflow id is the file name");
 
-      const legacyNodesResult = runCli(legacyNodes, ["validate", "clock"]);
+      const legacyNodesResult = runCli(legacyNodes, ["validate", ".workshop/workflows/clock.yaml"]);
       expect(legacyNodesResult.status).toBe(64);
       expect(legacyNodesResult.stderr).toContain("nodes: is replaced by an ordered steps: list");
 

@@ -66,7 +66,7 @@ describe("public service restart", () => {
 
     try {
       const firstService = await startFauxService(root, "restart-progress");
-      const validated = runCli(root, ["validate", "hemingway"]);
+      const validated = runCli(root, ["validate", ".workshop/workflows/hemingway.yaml"]);
       expect(validated.status).toBe(0);
       const started = runCli(root, ["start", "hemingway", "--detach"]);
       expect(started.status).toBe(0);
@@ -177,7 +177,7 @@ describe("public service restart", () => {
 
     try {
       await startFauxService(root, "native-provider-parity", { env: { WORKSHOP_TEST_TRACE_PATH: traceFile } });
-      const validated = runCli(root, ["validate", "provider-parity"]);
+      const validated = runCli(root, ["validate", ".workshop/workflows/provider-parity.yaml"]);
       expect(validated.status).toBe(0);
       const started = runCli(root, ["start", "provider-parity"]);
       if (started.status !== 0) {
