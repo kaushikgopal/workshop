@@ -1,16 +1,14 @@
-version: 4
-description: Draft a sentence and pause for explicit human approval.
+# Native agent example; no external command needs a preflight check.
+version: 4 # Workflow definitions use v4; machine settings use v3.
+description: Draft a sentence and pause for explicit human approval. # Do not accept the proposal without a reply.
 defaults:
-  retries: 1
-  timeout: 10m
-  replay: safe
-environment:
-  preflight:
-    command: 'command -v pi >/dev/null'
+  retries: 1 # Permit one retry after the first attempt.
+  timeout: 10m # Bound the agent step.
+  replay: safe # Permit configured retries and safe crash replay.
 steps:
-  - draft:
-      result: tagged
-      agent: |
+  - draft: # Native worker can request a human decision.
+      result: tagged # Tagged results carry needs_input, its question, and the proposal.
+      agent: | # Agent uses the machine worker model and native Pi tools.
         Draft one original Hemingway-inspired sentence, not a quotation.
         Request human approval (needs_input) with the question: Approve this sentence?
         Put only the draft sentence in output.

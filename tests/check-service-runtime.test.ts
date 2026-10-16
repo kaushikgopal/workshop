@@ -226,7 +226,7 @@ describe("Durable service runtime", () => {
         return statusDtoSchema.parse(response.result);
       };
       await readStatus();
-      const paths = ["results.md", "execution.log"].map(name => join(installation.stateDirectory, "clock", name));
+      const paths = ["results.md", "execution.log"].map(name => join(installation.workshopDirectory, "clock", name));
       const original = paths.map(path => ({ content: readFileSync(path, "utf8"), ino: statSync(path).ino }));
       await readStatus();
       await streamServiceLogChunks(socketPath, "clock", runId, () => {});

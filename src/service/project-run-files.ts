@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { mkdir, open, readdir, readFile, rename, rm } from "node:fs/promises";
+import { lstat, mkdir, open, readdir, readFile, rename, rm } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { gunzipSync, gzipSync } from "node:zlib";
 import type { ConversationId } from "@earendil-works/pi-durable";
@@ -33,7 +33,7 @@ export function createRunFileWriter(options: {
           try {
             const snapshot = await options.load(conversationId);
             const rendered = renderRunFiles(snapshot);
-            await mkdir(directory, { recursive: true });
+            await prepareWorkflowDirectory(directory, snapshot.run.workflowId);
             await projectSection(join(directory, "results.md"), rendered.results, "results", snapshot, options, rotationFloors);
             await projectSection(join(directory, "execution.log"), rendered.executionLog, "execution", snapshot, options, rotationFloors);
             for (const diagnostic of rendered.diagnostics) {
@@ -60,6 +60,26 @@ export function createRunFileWriter(options: {
     },
     async drain(): Promise<void> { await Promise.all([...queues.values()]); },
   };
+}
+
+async function prepareWorkflowDirectory(directory: string, workflowId: string): Promise<void> {
+  const parent = dirname(directory);
+  if (basename(parent) !== ".workshop" || basename(directory) !== workflowId) {
+    throw new Error("workflow projection path is outside its installation namespace");
+  }
+  const parentStat = await lstat(parent);
+  if (!parentStat.isDirectory() || parentStat.isSymbolicLink()) {
+    throw new Error("workflow projection parent must be a real .workshop directory");
+  }
+  try {
+    const stat = await lstat(directory);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) {
+      throw new Error("workflow projection path must be a real directory");
+    }
+  } catch (error) {
+    if (!(error instanceof Error) || !("code" in error) || error.code !== "ENOENT") throw error;
+    await mkdir(directory);
+  }
 }
 
 async function projectSection(
@@ -100,11 +120,17 @@ async function projectSection(
 }
 
 async function readText(path: string): Promise<string> {
-  try { return await readFile(path, "utf8"); }
+  try { return (await readRegularFile(path)).toString("utf8"); }
   catch (error) {
     if (error instanceof Error && "code" in error && error.code === "ENOENT") return "";
     throw error;
   }
+}
+
+async function readRegularFile(path: string): Promise<Buffer> {
+  const stat = await lstat(path);
+  if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("projection file must be a regular file");
+  return readFile(path);
 }
 
 type RunSection = { readonly id: string; readonly admissionSequence: number; readonly mutable: boolean; readonly start: number; readonly end: number };
@@ -150,7 +176,7 @@ async function oldestRotatedSequence(path: string, kind: ProjectionKind, cache: 
   if (cached?.names === signature) return cached.sequence;
   let sequence: number | null = null;
   for (const name of names) {
-    const text = gunzipSync(await readFile(join(directory, name))).toString("utf8");
+    const text = gunzipSync(await readRegularFile(join(directory, name))).toString("utf8");
     for (const section of findRunSections(text)) sequence = sequence === null ? section.admissionSequence : Math.min(sequence, section.admissionSequence);
   }
   cache.set(path, { names: signature, sequence });
@@ -161,7 +187,7 @@ async function sectionIsRotated(path: string, kind: ProjectionKind, runId: strin
   const directory = dirname(path);
   const names = rotationNames(directory, kind, await readdir(directory));
   for (const name of names) {
-    const text = gunzipSync(await readFile(join(directory, name))).toString("utf8");
+    const text = gunzipSync(await readRegularFile(join(directory, name))).toString("utf8");
     if (findRunSections(text, runId).length > 0) return true;
   }
   return false;
@@ -176,7 +202,7 @@ async function rotateFile(path: string, kind: ProjectionKind, content: string, n
   let archived: string | undefined;
   for (const name of names) {
     try {
-      if (gunzipSync(await readFile(join(directory, name))).equals(bytes)) { archived = name; break; }
+      if (gunzipSync(await readRegularFile(join(directory, name))).equals(bytes)) { archived = name; break; }
     } catch { /* Ignore a damaged rotation and preserve the current file. */ }
   }
   if (archived === undefined) {

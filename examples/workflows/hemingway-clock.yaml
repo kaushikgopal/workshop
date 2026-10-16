@@ -1,28 +1,29 @@
-version: 4
-description: Generate and verify original sentences against earlier accepted workflow results.
+# Scheduled example with a command step and native Pi worker and verifier.
+version: 4 # Workflow definitions use v4; machine settings use v3.
+description: Generate and verify original sentences against earlier accepted workflow results. # Avoid repeats across scheduled runs.
 schedule:
-  every: 10m
-  max_runs: 6
+  every: 3m # Admit scheduled runs three minutes apart.
+  max_runs: 6 # Stop after six admitted runs, including the immediate first run.
 defaults:
-  retries: 1
-  timeout: 10m
-  replay: safe
+  retries: 1 # Permit one retry after the first attempt.
+  timeout: 10m # Bound each step and its verifier.
+  replay: safe # Permit retries and safe crash replay.
 environment:
   preflight:
-    command: 'command -v pi >/dev/null'
+    command: 'command -v date >/dev/null' # The timestamp step needs date; native agents do not need a pi executable.
 steps:
-  - timestamp: date -u +%FT%TZ
-  - generate-line:
-      agent: |
+  - timestamp: date -u +%FT%TZ # Command worker records the UTC time.
+  - generate-line: # Native worker and verifier compare against earlier accepted output.
+      agent: | # Native agents return final text; no result mode override is needed.
         Generate one original Hemingway-inspired sentence, not a quotation.
         Read earlier accepted sentences from $WORKSHOP_RESULTS_PATH. Find each
         sentence in a result-<step-id>-<run-tag> block. Older runs may be in
         timestamped .gz files beside results.md. Avoid repeating their scenes,
         images, or wording.
-        Write only the sentence to stdout. Do not add an explanation or commentary.
+        Return only the sentence. Do not add an explanation or commentary.
         Do not edit Workshop files.
       verify:
-        agent: |
+        agent: | # Native verifier returns one decision line and a reason.
           Independently compare the candidate with earlier accepted sentences
           in $WORKSHOP_RESULTS_PATH. Find them by their result tags. Older runs
           may be in timestamped .gz files beside results.md. Accept only one

@@ -124,8 +124,8 @@ describe("workflow and machine schemas", () => {
       modes.set(workflowId, settings.nodes);
     }
     expect(modes.get("hemingway-clock")?.["generate-line"]?.result).toBe("text");
-    expect(modes.get("hemingway-retry")?.["generate-line"]?.result).toBe("text");
-    expect(modes.get("hemingway-approve")?.draft?.result).toBe("tagged");
+    expect(modes.get("hemingway-clock-retry")?.["generate-line"]?.result).toBe("text");
+    expect(modes.get("hemingway-clock-human-approval")?.draft?.result).toBe("tagged");
   });
 
   test("rejects unknown keys at every internal schema depth and prohibits instructions in defaults", () => {

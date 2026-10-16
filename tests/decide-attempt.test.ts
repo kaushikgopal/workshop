@@ -110,7 +110,7 @@ async function executeFixture(directory: string, source: string, check: (run: Ex
     const at = new Date().toISOString();
     const prepared = prepareRunAdmission({
       sourceText: source, sourceLabel: "decisions.yaml", workflowId: "decisions", machineConfig: machine, resolvedSettings,
-      projectCwd: directory, stateDirectory: join(directory, "state"),
+      projectCwd: directory, stateDirectory: join(directory, ".workshop", ".state"),
       runtimeManifest: { durableVersion: "1.0.2", integrationManifestHash: "sha256:" + createHash("sha256").update("decisions").digest("hex"),
         taskVersions: { workflowRun: 11, nodeAttempt: 5, agentExecution: 1, processExecution: 4, capacityGate: 1, scheduleWakeup: 1 } },
       runId: "decisions-" + randomUUID(), eventId: randomUUID(), activationId: "activation", occurrenceId: "occurrence", requestId: randomUUID(), admittedAt: at,

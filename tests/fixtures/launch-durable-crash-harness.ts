@@ -86,7 +86,7 @@ const preparedResult = prepareRunAdmission({
   workflowId: "command-chain",
   machineConfig: machine,
   projectCwd: directory,
-  stateDirectory: join(directory, ".workshop", "state"),
+  stateDirectory: join(directory, ".workshop", ".state"),
   resolvedSettings,
   runtimeManifest: {
     durableVersion: "1.0.2",

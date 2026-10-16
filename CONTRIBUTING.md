@@ -124,8 +124,8 @@ flowchart TD
   AE --> C[durable conversation]
   WR -->|fixed decision table| D[retry / block / fail]
   D --> WR
-  PE --> V[state-v5/captures: temporary bytes]
-  SVC --> RF[state-v5/<workflow>: results.md + execution.log]
+  PE --> V[.state/captures: temporary bytes]
+  SVC --> RF[.workshop/<workflow>: results.md + execution.log]
 ```
 
 ### One run
@@ -170,7 +170,7 @@ conversations run by the `workshop.agent-execution` task.
 
 | Durable concept | How Workshop uses it |
 | --- | --- |
-| `Harness` and `Registry` | `service/open-service-runtime.ts` opens one Harness on `state-v5/durable.db`, registers six task definitions, reconciles leftover processes, then calls `harness.resume()`. |
+| `Harness` and `Registry` | `service/open-service-runtime.ts` opens one Harness on `.state/durable.db`, registers six task definitions, reconciles leftover processes, then calls `harness.resume()`. |
 | Tasks (`defineTask`) | `WorkflowRun`, `NodeAttempt`, `ProcessExecution`, `AgentExecution`, `CapacityGate`, `ScheduleWakeup` (registered as `workshop.workflow-run` and so on). Each task is a set of named phases. A phase ends by committing its next checkpoint, waiting on children, or settling as completed or failed. |
 | Child tasks | A parent creates children with `tx.createTask` and waits for them with `allSettled`. A failed child comes back as data the parent classifies; it does not crash the parent. |
 | Conversations | Admission gives every run its own conversation. The run's tasks and records attach to it, so its history outlives the tasks. Each agent worker and verifier execution gets its own task-owned conversation. The shared bot has one ownerless conversation whose identity and committed event cursors live in a session document. |
@@ -178,7 +178,7 @@ conversations run by the `workshop.agent-execution` task.
 | Entries (`defineEntry`) | Append-only `workshop.event`, `workshop.process`, and `workshop.judgment` evidence for each run. `logs` reads the process and event entries. |
 | `runtime.commit` | The only way state changes. Document edits, new entries, new child tasks, and the task's own checkpoint land in one SQLite transaction. |
 | `runtime.sleep` | The scheduler waits for its next slot. The deadline lives in the checkpoint, so the wait survives restarts. |
-| `models` option (`pi-ai`) | The Harness registry serves the shared bot. Agent workers and verifiers use supervised harness subprocesses. |
+| `models` option (`pi-ai`) | The Harness registry serves the shared bot. Agent workers and verifiers run as native conversations. |
 | `snapshot`, `inspect`, `abortTask`, `close` | Status and log reads, startup compatibility checks, stop intent, and graceful shutdown. |
 
 Durable leaves some work to its caller, and Workshop fills each gap:
@@ -302,6 +302,12 @@ src/
    ├─ parse-units.ts              duration and byte-size parsing
    └─ schema.ts                   shared primitive contracts
 ```
+
+Repository-root entrypoints sit outside this map. The `Makefile` exposes
+`make cli`, which always runs the frozen-lockfile install check in the checkout
+and then opens a fish child shell through `launch-workshop-cli.sh`, with a
+temporary `workshop` function that calls `bun src/cli/main.ts`.
+`tests/check-cli-launcher.test.ts` covers the launcher.
 
 Three boundaries hold. `tests/check-parity-gaps.test.ts` and
 `tests/tui-boundary.test.ts` enforce the import rules:

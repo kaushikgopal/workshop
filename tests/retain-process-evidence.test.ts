@@ -94,22 +94,22 @@ describe("retained process evidence", () => {
 
   test("keeps temporary captures outside the readable folder and separates preflight executions", () => {
     const identity = { role: "preflight" as const, nodeId: null, attemptNumber: null, incarnationNumber: 1, executionId: "one" };
-    const one = locateProcessFiles("/project/.workshop/state-v5/workflow", "run-id", identity);
-    const two = locateProcessFiles("/project/.workshop/state-v5/workflow", "run-id", { ...identity, executionId: "two" });
-    expect(one.stdoutPath).toBe("/project/.workshop/state-v5/captures/run-id/preflight/one/preflight.stdout");
+    const one = locateProcessFiles("/project/.workshop/workflow", "run-id", identity);
+    const two = locateProcessFiles("/project/.workshop/workflow", "run-id", { ...identity, executionId: "two" });
+    expect(one.stdoutPath).toBe("/project/.workshop/.state/captures/run-id/preflight/one/preflight.stdout");
     expect(one.stdoutPath).not.toBe(two.stdoutPath);
-    expect(one.resultsPath).toBe("/project/.workshop/state-v5/workflow/results.md");
-    expect(locateWorkflowDirectory({
+    expect(one.resultsPath).toBe("/project/.workshop/workflow/results.md");
+    expect(() => locateWorkflowDirectory({
       workflowId: "workflow",
       paths: { runDirectory: "/project/.workshop/runs/run-id" },
-    })).toBe("/project/.workshop/state-v5/workflow");
+    })).toThrow("run has no workflow projection directory");
   });
 });
 
 test("old verifier cleanup cannot delete a replacement verifier capture", async () => {
   const directory = mkdtempSync(join(tmpdir(), "workshop-verifier-captures-"));
   try {
-    const workflowDirectory = join(directory, "state", "workflow");
+    const workflowDirectory = join(directory, ".workshop", "workflow");
     const identity = { role: "validator" as const, nodeId: "work", attemptNumber: 1, incarnationNumber: 1, executionId: "old" };
     const old = locateProcessFiles(workflowDirectory, "run-id", identity);
     const replacement = locateProcessFiles(workflowDirectory, "run-id", { ...identity, executionId: "new" });

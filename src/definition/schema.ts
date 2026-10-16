@@ -62,7 +62,8 @@ export const keepFilesValue = z.enum(["failed", "always"]);
 export const workflowIdSchema = z
   .string()
   .max(80, "workflow ids must be at most 80 characters")
-  .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/, "workflow ids must be lowercase slugs separated by single hyphens");
+  .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/, "workflow ids must be lowercase slugs separated by single hyphens")
+  .refine((id) => id !== "state" && id !== "state-v5" && id !== "workflows", "workflow id is reserved for Workshop data");
 
 export const nodeIdSchema = z
   .string()

@@ -39,8 +39,8 @@ const LongCheckpointTask = defineTask<Record<string, never>, { phase: "hold" }, 
 });
 
 describe("service startup reconciliation", () => {
-  test("starts in fresh v5 state without reading legacy state or attaching its service", async () => {
-    const root = mkdtempSync(join(tmpdir(), "workshop-v5-isolation-"));
+  test("starts in fresh private state without reading legacy state or attaching its service", async () => {
+    const root = mkdtempSync(join(tmpdir(), "workshop-private-state-isolation-"));
     const config = join(root, ".workshop");
     const legacyStateDirectory = join(config, "state");
     mkdirSync(join(config, "workflows"), { recursive: true });
@@ -83,7 +83,7 @@ describe("service startup reconciliation", () => {
       const legacyEntries = readdirSync(legacyStateDirectory).sort();
       const installation = loadInstallation(root);
       isolatedRuntimeDirectory = locateServiceSocket(installation.stateDirectory).runtimeDirectory;
-      expect(installation.stateDirectory).toBe(join(config, "state-v5"));
+      expect(installation.stateDirectory).toBe(join(config, ".state"));
       expect(installation.databasePath).toBe(join(installation.stateDirectory, "durable.db"));
       expect(existsSync(installation.databasePath)).toBe(false);
       expect((await probeServiceHealth(installation.stateDirectory)).kind).toBe("not_ready");

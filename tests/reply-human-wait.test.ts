@@ -175,7 +175,7 @@ test("Reject cancels only this run, retains the answer and proposal, and leaves 
     const detail = await f.send({ version: 1, method: "node.describe", workflowId: "approval", nodeId: "prepare", runId: waiting.runId });
     if (!detail.ok) throw new Error(detail.error.message);
     expect(nodeDescriptionDtoSchema.parse(detail.result).node).toMatchObject({ status: "cancelled", wait: { settlement: { kind: "replied", action: "reject", answer: "Do not submit." } } });
-    const results = readFileSync(join(f.root, ".workshop", "state-v5", "approval", "results.md"), "utf8");
+    const results = readFileSync(join(f.root, ".workshop", "approval", "results.md"), "utf8");
     expect(results).toContain('action="reject"');
     expect(results).toContain("Do not submit.");
   });
@@ -292,7 +292,7 @@ for (const kind of ["command", "agent"] as const) test(kind + " successor receiv
     const block = '<result-prepare-' + tag + ' status="needs_input">\n' + proposal + '\n</result-prepare-' + tag + '>\n'
       + '<answer-prepare-' + tag + ' action="continue">\n' + answer + '\n</answer-prepare-' + tag + '>';
     if (kind === "command") expect(readFileSync(join(f.root, "at-launch"), "utf8")).toContain(block);
-    const results = readFileSync(join(f.root, ".workshop", "state-v5", "approval", "results.md"), "utf8");
+    const results = readFileSync(join(f.root, ".workshop", "approval", "results.md"), "utf8");
     expect(results).toContain(block);
     expect(results.match(/<answer-prepare-/gu)).toHaveLength(1);
   }, responses);
@@ -315,7 +315,7 @@ test("pre-approved succeeded actions create no wait or fabricated answer", async
     const admitted = await f.start();
     const completed = await f.run("approval", "completed");
     expect(completed.wait).toBeNull();
-    const results = readFileSync(join(f.root, ".workshop", "state-v5", "approval", "results.md"), "utf8");
+    const results = readFileSync(join(f.root, ".workshop", "approval", "results.md"), "utf8");
     expect(results).not.toContain("<answer-");
   });
 });

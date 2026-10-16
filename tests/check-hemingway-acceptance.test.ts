@@ -133,7 +133,7 @@ describe("recurring Hemingway acceptance", () => {
     const paraphrase = "The old man rowed as night fell beyond the shore.";
     const reference = "The old man rowed until the sea forgot the shore.";
     const fixture = await createFixture({ id: "hemingway-reject", schedule: false, fixedOutput: paraphrase });
-    mkdirSync(join(fixture.stateDirectory, "hemingway-reject"), { recursive: true });
+    mkdirSync(join(fixture.root, ".workshop", "hemingway-reject"), { recursive: true });
     writeFileSync(fixture.resultsPath, '<workshop-run id="prior-run" tag="abcdef01" admitted-at="2026-10-13T00:00:00.000Z">\n'
       + '<result-generate-abcdef01 status="succeeded">\n' + reference + '\n</result-generate-abcdef01>\n</workshop-run>\n', "utf8");
     try {
@@ -166,14 +166,14 @@ describe("recurring Hemingway acceptance", () => {
   }, 30_000);
 
   test("Continue completes the approval example and stores the answer block", async () => {
-    const fixture = await createFixture({ id: "hemingway-approve", schedule: false, needsInput: true, useApprovalExample: true });
+    const fixture = await createFixture({ id: "hemingway-clock-human-approval", schedule: false, needsInput: true, useApprovalExample: true });
     try {
-      expect(runCli(fixture.root, ["validate", ".workshop/workflows/hemingway-approve.yaml"]).status).toBe(0);
-      const runId = await startSingleRun(fixture.root, "hemingway-approve");
-      await waitForRunStatus(fixture.root, "hemingway-approve", runId, "waiting");
-      const reply = runCli(fixture.root, ["reply", "hemingway-approve", "--continue", "--answer", "Approved."]);
+      expect(runCli(fixture.root, ["validate", ".workshop/workflows/hemingway-clock-human-approval.yaml"]).status).toBe(0);
+      const runId = await startSingleRun(fixture.root, "hemingway-clock-human-approval");
+      await waitForRunStatus(fixture.root, "hemingway-clock-human-approval", runId, "waiting");
+      const reply = runCli(fixture.root, ["reply", "hemingway-clock-human-approval", "--continue", "--answer", "Approved."]);
       expect(reply.status).toBe(0);
-      await waitForRunStatus(fixture.root, "hemingway-approve", runId, "completed");
+      await waitForRunStatus(fixture.root, "hemingway-clock-human-approval", runId, "completed");
       const results = readFileSync(fixture.resultsPath, "utf8");
       const runTag = createHash("sha256").update(runId).digest("hex").slice(0, 8);
       expect(results).toContain("<answer-draft-" + runTag + ' action="continue">\nApproved.\n</answer-draft-' + runTag + ">");
@@ -199,9 +199,9 @@ async function createFixture(options: {
   const root = mkdtempSync(join(tmpdir(), "workshop-" + options.id + "-"));
   const workshopDirectory = join(root, ".workshop");
   const workflowsDirectory = join(workshopDirectory, "workflows");
-  const stateDirectory = join(workshopDirectory, "state-v5");
-  const resultsPath = join(stateDirectory, options.id, "results.md");
-  const activityLog = join(stateDirectory, options.id, "mock-activity.jsonl");
+  const stateDirectory = join(workshopDirectory, ".state");
+  const resultsPath = join(workshopDirectory, options.id, "results.md");
+  const activityLog = join(workshopDirectory, options.id, "mock-activity.jsonl");
   mkdirSync(workflowsDirectory, { recursive: true });
   mkdirSync(stateDirectory, { recursive: true });
 
@@ -215,7 +215,7 @@ async function createFixture(options: {
   ].join("\n"), "utf8");
 
   const source = options.useApprovalExample === true
-    ? readFileSync(join(REPO_ROOT, "examples/workflows/hemingway-approve.yaml"), "utf8")
+    ? readFileSync(join(REPO_ROOT, "examples/workflows/hemingway-clock-human-approval.yaml"), "utf8")
     : [
       "version: 4",
       "description: Exercise scheduled Hemingway generation and independent validation.",
@@ -256,7 +256,7 @@ async function startFauxService(root: string, options: Record<string, unknown>):
   });
   if (child.pid === undefined) throw new Error("test-owned faux service did not start");
   child.unref();
-  const metadataPath = join(root, ".workshop", "state-v5", "service.json");
+  const metadataPath = join(root, ".workshop", ".state", "service.json");
   const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {
     if (child.exitCode !== null) throw new Error("test-owned faux service exited during startup");
@@ -287,7 +287,7 @@ async function waitForCompletedRuns(root: string, id: string, count: number) {
     const failed = history.runs.find((run) => run.status === "blocked" || run.status === "failed");
     if (failed !== undefined) {
       const logs = runCli(root, ["logs", id, "--run", failed.runId, "--json"]).stdout;
-      const activityPath = join(root, ".workshop", "state-v5", id, "mock-activity.jsonl");
+      const activityPath = join(root, ".workshop", id, "mock-activity.jsonl");
       const activity = existsSync(activityPath) ? readFileSync(activityPath, "utf8") : "";
       throw new Error("run ended before expected completion: " + JSON.stringify({ run: failed, logs, activity }));
     }
@@ -307,7 +307,7 @@ async function waitForRunStatus(root: string, id: string, runId: string, expecte
     if (run?.status === expected) return run;
     if (run?.status === "failed" || run?.status === "blocked") {
       const logs = runCli(root, ["logs", id, "--run", runId, "--json"]).stdout;
-      const activityPath = join(root, ".workshop", "state-v5", id, "mock-activity.jsonl");
+      const activityPath = join(root, ".workshop", id, "mock-activity.jsonl");
       const activity = existsSync(activityPath) ? readFileSync(activityPath, "utf8") : "";
       throw new Error("run ended before expected status: " + JSON.stringify({ run, logs, activity }));
     }
@@ -344,7 +344,7 @@ function runCli(root: string, args: readonly string[], timeoutMs = 10_000) {
 }
 
 async function stopService(root: string): Promise<void> {
-  const metadataPath = join(root, ".workshop", "state-v5", "service.json");
+  const metadataPath = join(root, ".workshop", ".state", "service.json");
   if (!existsSync(metadataPath)) return;
   const metadata = JSON.parse(readFileSync(metadataPath, "utf8")) as { pid?: unknown };
   if (typeof metadata.pid !== "number") return;

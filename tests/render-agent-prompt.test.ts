@@ -9,8 +9,8 @@ const identity = {
   attemptNumber: 2,
   workflowInstructions: "Shared workflow rules.",
   stepInstructions: "Write one result.",
-  resultsPath: "/state/workflow/results.md",
-  logPath: "/state/workflow/execution.log",
+  resultsPath: "/project/.workshop/workflow/results.md",
+  logPath: "/project/.workshop/workflow/execution.log",
   previousOutput: { stepId: "draft", output: "Earlier approved text." },
 };
 
@@ -29,8 +29,8 @@ describe("format 4 agent prompts", () => {
     expect(prompt).toContain("Run tag: " + runTag);
     expect(prompt).toContain("Step: write");
     expect(prompt).toContain("Attempt: 2");
-    expect(prompt).toContain("WORKSHOP_RESULTS_PATH: /state/workflow/results.md");
-    expect(prompt).toContain("WORKSHOP_LOG_PATH: /state/workflow/execution.log");
+    expect(prompt).toContain("WORKSHOP_RESULTS_PATH: /project/.workshop/workflow/results.md");
+    expect(prompt).toContain("WORKSHOP_LOG_PATH: /project/.workshop/workflow/execution.log");
     expect(prompt).toContain("result-<step-id>-<run-tag>");
     expect(prompt).toContain("Older runs are in timestamped .gz files beside results.md.");
     expect(prompt).toContain("\n<status>succeeded|success_and_complete|needs_input</status>");

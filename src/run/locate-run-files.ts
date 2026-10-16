@@ -18,15 +18,12 @@ export interface ProcessFiles {
   readonly logPath: string;
 }
 
-/** Return the current workflow projection directory, including for stored pre-upgrade records. */
+/** Return the stored workflow projection directory. */
 export function locateWorkflowDirectory(run: {
   readonly workflowId: string;
   readonly paths: { readonly workflowDirectory?: unknown; readonly runDirectory?: unknown };
 }): string {
   if (typeof run.paths.workflowDirectory === "string") return run.paths.workflowDirectory;
-  if (typeof run.paths.runDirectory === "string") {
-    return join(dirname(dirname(run.paths.runDirectory)), "state-v5", run.workflowId);
-  }
   throw new Error("run has no workflow projection directory");
 }
 
@@ -36,7 +33,7 @@ export function locateProcessFiles(
   runId: string,
   identity: ProcessFileIdentity,
 ): ProcessFiles {
-  const captureDirectory = join(dirname(workflowDirectory), "captures", runId);
+  const captureDirectory = join(dirname(workflowDirectory), ".state", "captures", runId);
   const directory = identity.role === "preflight"
     ? join(captureDirectory, "preflight", identity.executionId)
     : join(captureDirectory, requireValue(identity.nodeId) + "." + requireValue(identity.attemptNumber), identity.executionId);

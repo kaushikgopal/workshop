@@ -51,7 +51,30 @@ describe("CLI commands", () => {
       const result = runCli(root, ["chat"]);
       expect(result.status).toBe(64);
       expect(result.stderr).toContain("workshop chat requires a TTY");
-      expect(existsSync(join(root, ".workshop", "state-v5"))).toBe(false);
+      expect(existsSync(join(root, ".workshop", ".state"))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects workflow IDs that collide with installation directories before service startup", () => {
+    const reserved = ["state", "state-v5", "workflows"];
+    const root = makeRoot({
+      machine: "shell: /bin/bash\n",
+      workflows: Object.fromEntries(reserved.map((id) => [id, CLOCK_WORKFLOW])),
+    });
+    try {
+      const entries = readdirSync(join(root, ".workshop")).sort();
+      const workflowEntries = readdirSync(join(root, ".workshop", "workflows")).sort();
+      for (const id of reserved) {
+        const result = runCli(root, ["start", id, "--detach"]);
+        expect(result.status).toBe(64);
+        expect(result.stderr).toContain("workflow id is reserved for Workshop data");
+        if (id !== "workflows") expect(existsSync(join(root, ".workshop", id))).toBe(false);
+      }
+      expect(existsSync(join(root, ".workshop", ".state"))).toBe(false);
+      expect(readdirSync(join(root, ".workshop")).sort()).toEqual(entries);
+      expect(readdirSync(join(root, ".workshop", "workflows")).sort()).toEqual(workflowEntries);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -88,7 +111,7 @@ describe("CLI commands", () => {
         expect(result.status).toBe(0);
         expect(result.stdout).toStartWith('valid workflow "' + workflowId + '" (');
       }
-      expect(existsSync(join(root, ".workshop", "state-v5"))).toBe(false);
+      expect(existsSync(join(root, ".workshop", ".state"))).toBe(false);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -130,7 +153,7 @@ describe("CLI commands", () => {
       const implicit = runCli(root, ["validate", "clock"]);
       expect(implicit.status).toBe(64);
       expect(implicit.stderr).toContain("expected a path to a .yaml or .yml workflow file");
-      expect(existsSync(join(root, ".workshop", "state-v5"))).toBe(false);
+      expect(existsSync(join(root, ".workshop", ".state"))).toBe(false);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -205,7 +228,7 @@ describe("CLI commands", () => {
       expect(legacyNodesResult.stderr).toContain("nodes: is replaced by an ordered steps: list");
 
       for (const root of [oldWorkflow, oldMachine, unversionedMachine, legacyId, legacyNodes]) {
-        expect(existsSync(join(root, ".workshop", "state-v5"))).toBe(false);
+        expect(existsSync(join(root, ".workshop", ".state"))).toBe(false);
       }
     } finally {
       for (const root of [oldWorkflow, oldMachine, unversionedMachine, legacyId, legacyNodes]) {
@@ -216,7 +239,7 @@ describe("CLI commands", () => {
 
   test("service start, status, and stop manage one owner idempotently", async () => {
     const root = makeRoot({ machine: "shell: /bin/bash\n", workflows: { clock: CLOCK_WORKFLOW } });
-    const metadataPath = join(root, ".workshop", "state-v5", "service.json");
+    const metadataPath = join(root, ".workshop", ".state", "service.json");
     try {
       const absent = runCli(root, ["service", "status", "--json"]);
       expect(absent.status).toBe(3);
@@ -266,7 +289,7 @@ describe("CLI commands", () => {
 
   test("service stop never signals a PID it cannot verify as the healthy owner", async () => {
     const root = makeRoot({ machine: "shell: /bin/bash\n", workflows: {} });
-    const stateDirectory = join(root, ".workshop", "state-v5");
+    const stateDirectory = join(root, ".workshop", ".state");
     mkdirSync(stateDirectory, { recursive: true });
     const bystander = spawn("sleep", ["30"], { stdio: "ignore" });
     try {
@@ -575,7 +598,7 @@ function killRecordedService(metadataPath: string): void {
 }
 
 async function stopService(root: string): Promise<void> {
-  const metadataPath = join(root, ".workshop", "state-v5", "service.json");
+  const metadataPath = join(root, ".workshop", ".state", "service.json");
   if (!existsSync(metadataPath)) return;
   const metadata = JSON.parse(readFileSync(metadataPath, "utf8")) as { pid?: unknown; status?: unknown };
   if (typeof metadata.pid !== "number") return;

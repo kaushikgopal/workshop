@@ -1,9 +1,11 @@
-# Machine defaults. Copy to .workshop/workshop.yaml.
-# Replace the placeholder model with one your Pi installation can use.
-shell: /bin/bash
-max_concurrent_runs: 1
-default_timeout: 10m
-stream_cap: 256kb
-agent:
-  harness: pi
-  model: "example/pi-model:medium"
+# Machine defaults. Copy this file to .workshop/workshop.yaml.
+# Replace both model placeholders with models available in the local Pi catalog.
+version: 3 # Machine configuration uses v3; workflow files use v4.
+shell: /bin/bash # Command steps and native agent tool shells use this shell.
+max_concurrent_runs: 1 # Limit concurrently executing workflow runs.
+default_timeout: 5m # Bound each step unless workflow settings override it.
+stream_cap: 256kb # Bound retained stderr for each command process.
+agent: # Native worker and verifier defaults; this is not the shared chat bot.
+  model: "example/pi-model:medium" # Provider-neutral Pi model placeholder.
+bot: # Shared chat has its own model setting and no agent-model fallback.
+  model: "example/pi-model:medium" # Provider-neutral Pi model placeholder.

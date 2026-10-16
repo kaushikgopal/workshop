@@ -30,7 +30,7 @@ const runtimeManifest = {
 describe("event-driven durable waits", () => {
   test("far-future scheduler sleeps without checkpoint churn and reacquires its watch after reopen", async () => {
     const root = createRoot("scheduler-wait");
-    const stateDirectory = join(root, ".workshop", "state-v5");
+    const stateDirectory = join(root, ".workshop", ".state");
     mkdirSync(stateDirectory, { recursive: true });
     writeFileSync(join(root, ".workshop", "workflows", "scheduled.yaml"), [
       "version: 4",
@@ -168,7 +168,7 @@ describe("event-driven durable waits", () => {
 
   test("parks workflow admission through stop and resumes it after reopen", async () => {
     const root = createRoot("launch-admission");
-    const stateDirectory = join(root, ".workshop", "state-v5");
+    const stateDirectory = join(root, ".workshop", ".state");
     mkdirSync(stateDirectory, { recursive: true });
     writeFileSync(join(root, ".workshop", "workflows", "worker.yaml"), simpleWorkflow(), "utf8");
     const installation = loadInstallation(root);
@@ -232,7 +232,7 @@ describe("event-driven durable waits", () => {
 
   test("paused workflow watch survives graceful close and resumes after reopen", async () => {
     const root = createRoot("workflow-pause-watch");
-    const stateDirectory = join(root, ".workshop", "state-v5");
+    const stateDirectory = join(root, ".workshop", ".state");
     mkdirSync(stateDirectory, { recursive: true });
     writeFileSync(join(root, ".workshop", "workflows", "worker.yaml"), simpleWorkflow(), "utf8");
     const installation = loadInstallation(root);
@@ -311,7 +311,7 @@ describe("event-driven durable waits", () => {
 
   test("keeps a due scheduler live through shutdown and admits after reopen", async () => {
     const root = createRoot("scheduler-shutdown-wait");
-    const stateDirectory = join(root, ".workshop", "state-v5");
+    const stateDirectory = join(root, ".workshop", ".state");
     mkdirSync(stateDirectory, { recursive: true });
     writeFileSync(join(root, ".workshop", "workflows", "scheduled.yaml"), [
       "version: 4",
@@ -395,7 +395,7 @@ describe("event-driven durable waits", () => {
 
   test("capacity gate does not checkpoint while full, then wakes after reopen and slot release", async () => {
     const root = createRoot("capacity-wait");
-    const stateDirectory = join(root, ".workshop", "state-v5");
+    const stateDirectory = join(root, ".workshop", ".state");
     mkdirSync(stateDirectory, { recursive: true });
     writeFileSync(join(root, ".workshop", "workflows", "holder.yaml"), simpleWorkflow(), "utf8");
     writeFileSync(join(root, ".workshop", "workflows", "waiter.yaml"), simpleWorkflow(), "utf8");

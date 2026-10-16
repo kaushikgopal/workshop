@@ -128,7 +128,7 @@ function prepare(
     workflowId,
     machineConfig: machine,
     projectCwd: directory,
-    stateDirectory: join(directory, ".workshop", "state"),
+    stateDirectory: join(directory, ".workshop", ".state"),
     resolvedSettings,
     runtimeManifest: {
       durableVersion: "1.0.2",
@@ -505,7 +505,7 @@ describe("canonical worker output views", () => {
     let opened: CommandHarness | undefined;
     let conversationId: ConversationId | undefined;
     const prepared = prepare(directory, "canonical-output-request-001", "command-chain-run-001");
-    const staleInputPath = join(directory, ".workshop", "state", "captures", prepared.runId, "second.1", "legacy-input-poison.txt");
+    const staleInputPath = join(directory, ".workshop", ".state", "captures", prepared.runId, "second.1", "legacy-input-poison.txt");
     try {
       const candidate = nodeResultSchema.parse({
         version: 2,
@@ -601,7 +601,7 @@ describe("canonical worker output views", () => {
       await opened.harness.close(BACKGROUND_CONTEXT);
       opened = undefined;
 
-      mkdirSync(join(directory, ".workshop", "state", "captures", prepared.runId, "second.1"), { recursive: true });
+      mkdirSync(join(directory, ".workshop", ".state", "captures", prepared.runId, "second.1"), { recursive: true });
       writeFileSync(staleInputPath, "stale input from disk", "utf8");
 
       opened = await openCommandHarness(databasePath);

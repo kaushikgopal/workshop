@@ -82,7 +82,7 @@ describe("service run projections", () => {
       writeFileSync(join(root, "release-first"), "");
       const completed = await until(async () => { const value = await node(socket, runId, "second"); return value.runStatus === "completed" ? value : undefined; });
       expect(completed.node.status).toBe("succeeded");
-      const directory = join(configured.stateDirectory, "projection");
+      const directory = join(configured.workshopDirectory, "projection");
       const resultsPath = join(directory, "results.md");
       const logPath = join(directory, "execution.log");
       const runTag = createHash("sha256").update(runId).digest("hex").slice(0, 8);
@@ -133,7 +133,7 @@ describe("service run projections", () => {
       if (!response.ok) throw new Error(response.error.message);
       const { runId } = serviceStartResultV1Schema.parse(response.result);
       await until(async () => existsSync(join(root, "first-started")) ? true : undefined);
-      const directory = join(configured.stateDirectory, "projection");
+      const directory = join(configured.workshopDirectory, "projection");
       const resultsPath = join(directory, "results.md");
       rmSync(resultsPath, { force: true });
       mkdirSync(resultsPath);
@@ -356,7 +356,7 @@ describe("service run projections", () => {
       const configured = installation(root);
       const runId = runIdSchema.parse(cli(["start", "projection", "--detach"]).match(/Started run (\S+)/u)?.[1]);
       await until(async () => existsSync(join(root, "first-started")) ? true : undefined);
-      const resultsPath = join(configured.stateDirectory, "projection", "results.md");
+      const resultsPath = join(configured.workshopDirectory, "projection", "results.md");
       rmSync(resultsPath, { force: true });
       mkdirSync(resultsPath);
       writeFileSync(join(root, "release-first"), "");

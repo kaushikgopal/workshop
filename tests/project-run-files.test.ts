@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gunzipSync, gzipSync } from "node:zlib";
@@ -16,13 +16,14 @@ const slot = (stepId: string, output: string | null, skipped = false): ResultFil
 const tag = (runId: string) => createHash("sha256").update(runId).digest("hex").slice(0, 8);
 
 function snapshot(directory: string, runId = "fixture-run-one", sequence = 1, status: "running" | "completed" = "running"): RunFileSnapshot {
+  mkdirSync(join(directory, ".workshop"), { recursive: true });
   const sourceText = "version: 4\ndefaults: { retries: 0, replay: never }\nsteps:\n  - first: printf first\n";
   const admittedAt = new Date(Date.UTC(2026, 9, 13, 0, 0, sequence)).toISOString();
   const prepared = prepareRunAdmission({
     workflowId: "fixture", sourceLabel: "fixture.yaml", sourceText,
     resolvedSettings: resolveWorkflowSettings({ definition: checkDefinitionText(sourceText, "fixture.yaml", "fixture").def, machine: { shell: "/bin/sh" }, projectCwd: directory }),
     machineConfig: { shell: "/bin/sh" }, projectCwd: directory,
-    stateDirectory: directory,
+    stateDirectory: join(directory, ".workshop", ".state"),
     runId, eventId: "event-" + runId, activationId: "activation-fixture", occurrenceId: "occurrence-" + runId,
     requestId: null, admittedAt,
     runtimeManifest: { durableVersion: "1.0.2", integrationManifestHash: "sha256:" + "a".repeat(64),
@@ -112,7 +113,7 @@ describe("workflow file projection", () => {
       ]);
       const writer = writerFor(snapshots);
       expect(await writer.project(1 as ConversationId)).toEqual({ available: true });
-      const path = join(directory, "fixture", "results.md");
+      const path = join(directory, ".workshop", "fixture", "results.md");
       const firstSection = readFileSync(path, "utf8");
       expect(await writer.project(2 as ConversationId)).toEqual({ available: true });
       expect(await writer.project(2 as ConversationId)).toEqual({ available: true });
@@ -123,7 +124,37 @@ describe("workflow file projection", () => {
       expect(text.match(new RegExp("<result-first-" + tag(firstId), "gu"))).toHaveLength(1);
       expect(text.match(new RegExp("<result-first-" + tag(secondId), "gu"))).toHaveLength(1);
       expect(text.startsWith(firstSection)).toBe(true);
-      expect(readFileSync(join(directory, "fixture", "execution.log"), "utf8").match(/<workshop-run id="/gu)).toHaveLength(2);
+      expect(readFileSync(join(directory, ".workshop", "fixture", "execution.log"), "utf8").match(/<workshop-run id="/gu)).toHaveLength(2);
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  test("refuses a symlink at a workflow output root", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "workshop-project-symlink-"));
+    const outside = join(directory, "outside");
+    try {
+      mkdirSync(join(directory, ".workshop"), { recursive: true });
+      mkdirSync(outside);
+      symlinkSync(outside, join(directory, ".workshop", "fixture"));
+      const value = withOutput(snapshot(directory, "fixture-run-symlink", 1), "must not escape");
+      const result = await writerFor(new Map([[1, value]])).project(1 as ConversationId);
+      expect(result.available).toBe(false);
+      expect(readdirSync(outside)).toEqual([]);
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  test("refuses a symlinked results file", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "workshop-project-file-symlink-"));
+    const workflowDirectory = join(directory, ".workshop", "fixture");
+    const outside = join(directory, "outside-results.md");
+    try {
+      mkdirSync(workflowDirectory, { recursive: true });
+      writeFileSync(outside, "outside content", "utf8");
+      symlinkSync(outside, join(workflowDirectory, "results.md"));
+      const value = withOutput(snapshot(directory, "fixture-run-file-symlink", 1), "must not copy");
+      const result = await writerFor(new Map([[1, value]])).project(1 as ConversationId);
+      expect(result.available).toBe(false);
+      expect(readFileSync(outside, "utf8")).toBe("outside content");
+      expect(existsSync(join(workflowDirectory, "execution.log"))).toBe(false);
     } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 
@@ -137,12 +168,12 @@ describe("workflow file projection", () => {
       expect(await writerFor(snapshots).project(1 as ConversationId)).toEqual({ available: true });
       snapshots.set(1, committed);
       expect(await writerFor(snapshots).project(1 as ConversationId)).toEqual({ available: true });
-      const path = join(directory, "fixture", "results.md");
+      const path = join(directory, ".workshop", "fixture", "results.md");
       const text = readFileSync(path, "utf8");
       expect(text).toContain("accepted after restart");
       expect(text.match(new RegExp('<workshop-run id="' + runId + '"', "gu"))).toHaveLength(1);
       expect(text.match(new RegExp("<result-first-" + tag(runId), "gu"))).toHaveLength(1);
-      expect(existsSync(join(directory, "fixture", "execution.log"))).toBe(true);
+      expect(existsSync(join(directory, ".workshop", "fixture", "execution.log"))).toBe(true);
     } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 
@@ -155,7 +186,7 @@ describe("workflow file projection", () => {
       const snapshots = new Map<number, RunFileSnapshot>([[1, first], [2, second]]);
       const writer = writerFor(snapshots, { maxFileBytes: Buffer.byteLength(previous) + 8, now: () => new Date("2026-10-13T00:00:00.000Z") });
       await writer.project(1 as ConversationId);
-      const workflowDirectory = join(directory, "fixture");
+      const workflowDirectory = join(directory, ".workshop", "fixture");
       const interruptedRotation = join(workflowDirectory, "results-2026-10-13T00-00-00.000Z-interrupted.md.gz");
       writeFileSync(interruptedRotation, gzipSync(readFileSync(join(workflowDirectory, "results.md"))));
       await writer.project(2 as ConversationId);
@@ -181,12 +212,12 @@ describe("workflow file projection", () => {
       }
       const writer = writerFor(snapshots, { maxFileBytes: 1, now: () => new Date("2026-10-13T00:00:00.000Z") });
       for (let i = 1; i <= 8; i += 1) await writer.project(i as ConversationId);
-      const names = readdirSync(join(directory, "fixture"));
+      const names = readdirSync(join(directory, ".workshop", "fixture"));
       expect(names.filter((name) => name.startsWith("results-") && name.endsWith(".md.gz"))).toHaveLength(5);
       expect(names.filter((name) => name.startsWith("execution-") && name.endsWith(".log.gz"))).toHaveLength(5);
       const restarted = writerFor(snapshots);
       for (let i = 1; i <= 8; i += 1) await restarted.project(i as ConversationId);
-      const current = readFileSync(join(directory, "fixture", "results.md"), "utf8");
+      const current = readFileSync(join(directory, ".workshop", "fixture", "results.md"), "utf8");
       expect([...current.matchAll(/<workshop-run id="([a-z0-9-]+)"/gu)].map((match) => match[1])).toEqual(["fixture-run-08"]);
       expect(current).toContain("fixture-run-08");
       expect(current).not.toContain("accepted 1");
@@ -212,7 +243,7 @@ describe("workflow file projection", () => {
       const second = writer.project(1 as ConversationId);
       release();
       await Promise.all([first, second]);
-      expect(readFileSync(join(directory, "fixture", "execution.log"), "utf8")).toContain("newer committed state");
+      expect(readFileSync(join(directory, ".workshop", "fixture", "execution.log"), "utf8")).toContain("newer committed state");
       await writer.drain();
     } finally { rmSync(directory, { recursive: true, force: true }); }
   });

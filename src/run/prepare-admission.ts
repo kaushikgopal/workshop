@@ -1,4 +1,4 @@
-import { isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { z } from "zod";
 import { canonicalHash, hashSourceText } from "../definition/hash-canonical-json.js";
 import { checkDefinitionText } from "../definition/check-definition.js";
@@ -16,6 +16,10 @@ import { utcTimestampSchema } from "../util/schema.js";
 const safeRunId = z.string().max(160).regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/);
 const maxSourceBytes = 1024 * 1024;
 const absolutePath = z.string().min(1).refine((path) => isAbsolute(path) && !path.includes("\u0000"));
+const privateStatePath = absolutePath.refine((path) => {
+  const canonical = resolve(path);
+  return basename(canonical) === ".state" && basename(dirname(canonical)) === ".workshop";
+}, "state directory must be .workshop/.state");
 
 const admissionRequestSchema = z.strictObject({
   sourceText: z.string().refine(
@@ -26,7 +30,7 @@ const admissionRequestSchema = z.strictObject({
   workflowId: z.string().min(1).max(80),
   machineConfig: z.unknown(),
   projectCwd: absolutePath,
-  stateDirectory: absolutePath,
+  stateDirectory: privateStatePath,
   resolvedSettings: z.unknown(),
   runtimeManifest: z.unknown(),
   runId: safeRunId,
@@ -187,7 +191,7 @@ export function prepareRunAdmission(input: unknown): AdmissionPreparation {
       admittedAt: raw.admittedAt,
       projectCwd,
       stateDirectory,
-      paths: { projectCwd, workflowDirectory: join(stateDirectory, checked.def.id) },
+      paths: { projectCwd, workflowDirectory: join(dirname(stateDirectory), checked.def.id) },
       preflightCacheKey,
     },
   };

@@ -1,35 +1,35 @@
-version: 4
-description: A command verifier rejects the first attempt before the agent checks earlier accepted results.
+# Shows a command verifier rejection, configured retry, and native agent check.
+version: 4 # Workflow definitions use v4; machine settings use v3.
+description: A command verifier rejects the first attempt before the agent checks earlier accepted results. # Demonstrate configured retry behavior.
 schedule:
-  every: 10m
-  max_runs: 1
+  every: 10m # Admit scheduled runs ten minutes apart.
+  max_runs: 1 # Limit this workflow to one run total.
 defaults:
-  retries: 1
-  timeout: 10m
-  replay: safe
+  retries: 1 # Permit one retry after the first attempt.
+  timeout: 10m # Bound each step and its verifier.
+  replay: safe # Permit configured retries and safe crash replay.
 environment:
   preflight:
-    command: 'command -v pi >/dev/null'
+    command: 'command -v date >/dev/null' # The timestamp step needs date; native agents do not need a pi executable.
 steps:
-  - timestamp:
-      run: date -u +%FT%TZ
-      # Attempt 1 fails verification. Attempt 2 passes without a model call.
-      verify: |
+  - timestamp: # Command worker retries after the first verifier rejection.
+      run: date -u +%FT%TZ # Command workers execute through the configured shell.
+      verify: | # Command verifier rejects attempt one and accepts attempt two.
         if [ "$WORKSHOP_ATTEMPT" -lt 2 ]; then
           echo "transient gate: attempt $WORKSHOP_ATTEMPT is rejected; the configured retry will pass" >&2
           exit 1
         fi
-  - generate-line:
-      agent: |
+  - generate-line: # Native worker and verifier use the machine agent model.
+      agent: | # Native agents return final text; no result mode override is needed.
         Generate one original Hemingway-inspired sentence, not a quotation.
         Read earlier accepted sentences from $WORKSHOP_RESULTS_PATH. Find each
         sentence in a result-<step-id>-<run-tag> block. Older runs may be in
         timestamped .gz files beside results.md. Avoid repeating their scenes,
         images, or wording.
-        Write only the sentence to stdout. Do not add an explanation or commentary.
+        Return only the sentence. Do not add an explanation or commentary.
         Do not edit Workshop files.
       verify:
-        agent: |
+        agent: | # Native verifier returns one decision line and a reason.
           Independently compare the candidate with earlier accepted sentences
           in $WORKSHOP_RESULTS_PATH. Find them by their result tags. Older runs
           may be in timestamped .gz files beside results.md. Accept only one

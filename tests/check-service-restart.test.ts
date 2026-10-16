@@ -35,8 +35,7 @@ describe("public service restart", () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-hemingway-cli-"));
     const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
-    const state = join(config, "state-v5");
-    const workflowState = join(state, "hemingway");
+    const workflowState = join(config, "hemingway");
     const receipt = join(workflowState, "agent-receipt.txt");
     const afterReceipt = join(workflowState, "after-receipt.txt");
     const activity = join(workflowState, "mock-activity.jsonl");
@@ -449,7 +448,7 @@ describe("public service restart", () => {
       expect(pausedRun.currentNodeId).toBe("second");
       expect(existsSync(successorStarted)).toBe(false);
 
-      const metadataPath = join(root, ".workshop", "state-v5", "service.json");
+      const metadataPath = join(root, ".workshop", ".state", "service.json");
       const oldService = JSON.parse(readFileSync(metadataPath, "utf8")) as { pid: number; bootId: string };
       process.kill(oldService.pid, "SIGKILL");
       await waitForPidGone(oldService.pid);
@@ -557,7 +556,7 @@ describe("public service restart", () => {
 
       const pause = runCli(root, ["pause", "safe-replay"]);
       expect(pause.status).toBe(0);
-      const oldService = JSON.parse(readFileSync(join(root, ".workshop", "state-v5", "service.json"), "utf8")) as { pid: number; bootId: string };
+      const oldService = JSON.parse(readFileSync(join(root, ".workshop", ".state", "service.json"), "utf8")) as { pid: number; bootId: string };
       process.kill(oldService.pid, "SIGKILL");
       await waitForPidGone(oldService.pid);
 
@@ -638,7 +637,7 @@ describe("public service restart", () => {
       expect(missingOverrides.status).not.toBe(0);
       expect(missingOverrides.stderr).toContain("requires --allow-repeat");
       expect(missingOverrides.stdout).toContain(`Resolving run ${retry.runId}`);
-      const retryService = JSON.parse(readFileSync(join(retryRoot, ".workshop", "state-v5", "service.json"), "utf8")) as { socketPath: string };
+      const retryService = JSON.parse(readFileSync(join(retryRoot, ".workshop", ".state", "service.json"), "utf8")) as { socketPath: string };
       const retryRequest = { version: 1 as const, requestId: randomUUID(), method: "resolve" as const, workflowId: "retryable", action: "retry" as const, reason: "retry after checking the external effect", allowRepeat: true };
       await dropFirstServiceReply(retryService.socketPath, retryRequest);
       await waitForFileLength(retryMarker, 2);
@@ -687,7 +686,7 @@ describe("public service restart", () => {
       expect(cliAcceptance.status).toBe(0);
       await waitForFile(acceptedValidatorStarted);
 
-      const acceptService = JSON.parse(readFileSync(join(acceptRoot, ".workshop", "state-v5", "service.json"), "utf8")) as { socketPath: string };
+      const acceptService = JSON.parse(readFileSync(join(acceptRoot, ".workshop", ".state", "service.json"), "utf8")) as { socketPath: string };
       const acceptRequest = {
         version: 1 as const,
         requestId: randomUUID(),
@@ -719,7 +718,7 @@ describe("public service restart", () => {
     const failMarker = join(failRoot, "worker-launches.txt");
     try {
       const blocked = await startBlockedCommandRun(failRoot, "fail-run", `printf w >> '${failMarker}'; sleep 60`);
-      const service = JSON.parse(readFileSync(join(failRoot, ".workshop", "state-v5", "service.json"), "utf8")) as { socketPath: string };
+      const service = JSON.parse(readFileSync(join(failRoot, ".workshop", ".state", "service.json"), "utf8")) as { socketPath: string };
       const request = { version: 1 as const, requestId: randomUUID(), method: "resolve" as const, workflowId: "fail-run", action: "fail" as const, reason: "the external effect cannot be safely repeated" };
       await dropFirstServiceReply(service.socketPath, request);
       const firstResolution = await sendServiceRequest(service.socketPath, request);
@@ -808,7 +807,7 @@ describe("public service restart", () => {
       expect(pausedWaiting.waitingForCapacity).toBe(true);
       expect(existsSync(successorStarted)).toBe(false);
 
-      const metadataPath = join(root, ".workshop", "state-v5", "service.json");
+      const metadataPath = join(root, ".workshop", ".state", "service.json");
       const oldService = JSON.parse(readFileSync(metadataPath, "utf8")) as { pid: number; bootId: string };
       await stopService(root);
       const stoppedService = JSON.parse(readFileSync(metadataPath, "utf8")) as { status?: unknown };
@@ -1078,7 +1077,7 @@ describe("public service restart", () => {
       const workerPid = await waitForPositiveIntegerFile(pidPath);
       expect(Number.isSafeInteger(workerPid)).toBe(true);
       if (!Number.isSafeInteger(workerPid) || workerPid <= 0) throw new Error("worker pid fixture did not record a positive process id");
-      const serviceMetadataPath = join(root, ".workshop", "state-v5", "service.json");
+      const serviceMetadataPath = join(root, ".workshop", ".state", "service.json");
       const oldService = JSON.parse(readFileSync(serviceMetadataPath, "utf8")) as { pid: number; bootId: string };
       process.kill(oldService.pid, "SIGKILL");
       await waitForPidGone(oldService.pid);
@@ -1108,7 +1107,7 @@ describe("public service restart", () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-retention-reopen-"));
     const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
-    const state = join(root, ".workshop", "state-v5");
+    const state = join(root, ".workshop", ".state");
     const validatorLaunches = join(root, "validator-launches.txt");
     const successorLaunches = join(root, "successor-launches.txt");
     const capBytes = 32 * 1024 * 1024;
@@ -1217,7 +1216,7 @@ describe("public service restart", () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-startup-launch-gate-"));
     const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
-    const state = join(root, ".workshop", "state-v5");
+    const state = join(root, ".workshop", ".state");
     const oldPidPath = join(root, "old-worker.pid");
     const termPath = join(root, "old-worker-term.txt");
     const queuedStartPath = join(root, "queued-worker-started.txt");
@@ -1350,7 +1349,7 @@ describe("public service restart", () => {
       expect(historicalDiagram.stdout).toContain('first["first [succeeded]"]');
       expect(historicalDiagram.stdout).toContain('second["second [succeeded]"]');
       expect(historicalDiagram.stdout).not.toContain("replacement");
-      const service = JSON.parse(readFileSync(join(root, ".workshop", "state-v5", "service.json"), "utf8")) as { socketPath: string };
+      const service = JSON.parse(readFileSync(join(root, ".workshop", ".state", "service.json"), "utf8")) as { socketPath: string };
       const viewerSource = createViewerSource(service.socketPath);
       const latestView = await viewerSource.snapshot("frozen-chain");
       expect(latestView.detail?.nodes.map(node => node.nodeId)).toEqual(["replacement"]);
@@ -1827,7 +1826,7 @@ describe("public service restart", () => {
         .toMatchObject({ activationId: activation.activationId, state: "active", admittedCount: 1, nextDueAt: activation.nextDueAt });
       expect(readFileSync(holderLaunches, "utf8")).toBe("launch\n");
 
-      const serviceMetadataPath = join(root, ".workshop", "state-v5", "service.json");
+      const serviceMetadataPath = join(root, ".workshop", ".state", "service.json");
       const oldService = JSON.parse(readFileSync(serviceMetadataPath, "utf8")) as { pid: number; bootId: string };
       process.kill(oldService.pid, "SIGKILL");
       await waitForPidGone(oldService.pid);
@@ -2021,7 +2020,7 @@ async function startBlockedCommandRun(
   if (started.status !== 0) throw new Error(started.stderr);
   const runId = runIdSchema.parse(started.stdout.match(/Started run (\S+)/)?.[1]);
   await waitForFile(launchMarker);
-  const service = JSON.parse(readFileSync(join(root, ".workshop", "state-v5", "service.json"), "utf8")) as { pid: number };
+  const service = JSON.parse(readFileSync(join(root, ".workshop", ".state", "service.json"), "utf8")) as { pid: number };
   process.kill(service.pid, "SIGKILL");
   await waitForPidGone(service.pid);
   const reopened = runCli(root, ["status", workflowId, "--json"]);
@@ -2255,7 +2254,7 @@ async function startFauxService(
   });
   if (child.pid === undefined) throw new Error("test-owned faux service did not start");
   child.unref();
-  const metadataPath = join(root, ".workshop", "state-v5", "service.json");
+  const metadataPath = join(root, ".workshop", ".state", "service.json");
   const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {
     if (child.exitCode !== null) throw new Error("test-owned faux service exited during startup");
@@ -2297,7 +2296,7 @@ function readLaunches(path: string): number {
 }
 
 async function stopService(root: string): Promise<void> {
-  const metadataPath = join(root, ".workshop", "state-v5", "service.json");
+  const metadataPath = join(root, ".workshop", ".state", "service.json");
   if (!existsSync(metadataPath)) return;
   const metadata = JSON.parse(readFileSync(metadataPath, "utf8")) as { pid?: unknown };
   if (typeof metadata.pid !== "number") return;

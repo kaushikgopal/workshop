@@ -10,70 +10,65 @@ only agent workers and agent verifiers make model calls.
 
 ## Quick start
 
-Workshop keeps configuration and state in a project's `.workshop/` directory.
-Run these commands from this repository in fish:
+From this checkout, run `make cli`:
 
-```fish
-bun install
-set -g workshop_repo $PWD
-function workshop
-    bun "$workshop_repo/src/cli/main.ts" $argv
-end
-mkdir -p ~/scratch/hemingway/.workshop/workflows
-cp "$workshop_repo/examples/workshop.yaml" ~/scratch/hemingway/.workshop/
-cp "$workshop_repo"/examples/workflows/*.yaml ~/scratch/hemingway/.workshop/workflows/
-cd ~/scratch/hemingway
-```
+~~~fish
+make cli
+~~~
 
-Set `agent.model` in `.workshop/workshop.yaml` to a model your Pi installation
-can use. The example model is a placeholder.
-
-WARNING: Workflows use your permissions. Review commands and agent instructions
-before starting a workflow. Agent workers and verifiers run coding tools
-without asking.
+`make cli` runs `bun install --frozen-lockfile` in the checkout, then opens a
+fish child shell. Its temporary `workshop` function calls
+`bun <checkout>/src/cli/main.ts`, and `$workshop_repo` points to this checkout.
+The `workshop` function works from any directory, including `/tmp`. The parent
+shell stays unchanged. `exit` returns to it, but does not stop the service.
 
 ### Watch it work
 
-hemingway-retry rejects the timestamp's first attempt with a command verifier.
-The retry passes. An agent writes an original sentence, and an agent verifier
-checks it. Both agents read earlier accepted sentences from the workflow's
-results.md file. There is no publish step. A successful first agent attempt
-makes two model calls.
+Run these commands inside the child shell. They run from the demo directory,
+the project root that contains `.workshop` — never from inside `.workshop`:
 
 ~~~fish
-workshop validate .workshop/workflows/hemingway-retry.yaml
-workshop start hemingway-retry --detach
-workshop watch hemingway-retry
+mkdir -p /tmp/workshop-demo-hemingway/.workshop/workflows
+cd /tmp/workshop-demo-hemingway
+set -l model 'PROVIDER/MODEL:THINKING'
+# Replace the placeholder with a registered Pi catalog model before start.
+printf '%s\n' \
+  'version: 3' \
+  'shell: /bin/bash' \
+  'max_concurrent_runs: 1' \
+  'agent:' \
+  "  model: \"$model\"" \
+  'bot:' \
+  "  model: \"$model\"" \
+  > .workshop/workshop.yaml
+cp "$workshop_repo"/examples/workflows/hemingway-clock.yaml .workshop/workflows/
+workshop validate .workshop/workflows/hemingway-clock.yaml
+workshop start hemingway-clock --detach
+workshop watch hemingway-clock
 ~~~
 
-Press q to close the viewer. Inspect the completed run:
+The same model fills both roles here, but the blocks are separate roles:
+`agent` configures workers and verifiers, `bot` the shared chat bot. Run
+`start` once. It admits the first run immediately. The `schedule` in the copied
+YAML admits up to five more runs, three minutes apart (about 15 minutes total).
+Wait until the first run finishes. Press `q` to leave the viewer.
+
+Inspect receipts with `workshop logs hemingway-clock --verbose`. Accepted
+sentences appear in `.workshop/hemingway-clock/results.md`. Optionally
+open `workshop chat` after the first run. Chat requires a TTY. Press Enter to
+send a message. Press Escape to leave.
+
+After six runs, or when you stop early, stop the workflow and service before
+leaving the child shell:
 
 ~~~fish
-workshop status
-workshop diagram hemingway-retry
-workshop step describe hemingway-retry timestamp --json
-workshop logs hemingway-retry
-cat .workshop/state-v5/hemingway-retry/results.md
+workshop stop hemingway-clock
 workshop service stop
+exit
 ~~~
 
-The other example, hemingway-clock, schedules six runs ten minutes apart.
-Each run adds a tagged section to the same results.md and execution.log files.
-workshop stop hemingway-clock disables its schedule and cancels its open run
-after safe process cleanup. service stop shuts down the service, not the saved
-schedule.
-
-Try the human approval example:
-
-~~~fish
-workshop start hemingway-approve --detach
-workshop status hemingway-approve
-workshop reply hemingway-approve --continue --answer 'Approved.'
-cat .workshop/state-v5/hemingway-approve/results.md
-~~~
-
-Continue completes the draft run. The answer appears after its result block.
-The workflow needs no publish step.
+WARNING: Workflows use your permissions. Review commands and agent instructions
+before starting. Agent workers and verifiers run coding tools without asking.
 
 ## How it works
 
@@ -136,8 +131,8 @@ See [CONTRIBUTING](CONTRIBUTING.md#how-the-code-works) for the architecture.
 ## A workflow
 
 Save this as `.workshop/workflows/hemingway-clock.yaml`. The filename is the
-workflow ID. The full example checks for Pi and compares earlier accepted
-sentences in results.md.
+workflow ID. The full example compares earlier accepted sentences in
+results.md.
 
 ~~~yaml
 version: 4
@@ -146,8 +141,6 @@ defaults:
   retries: 1
   timeout: 10m
   replay: safe
-environment:
-  preflight: { command: 'command -v pi >/dev/null' }
 steps:
   - timestamp: date -u +%FT%TZ
   - generate-line:
@@ -295,7 +288,7 @@ Final-step Continue completes even while paused. Stop cancels a waiting run.
 | `WORKSHOP_RUN_ID`, `WORKSHOP_WORKFLOW_ID` | Run and workflow identity |
 | `WORKSHOP_STEP_ID`, `WORKSHOP_ATTEMPT` | Step and attempt number; preflight uses empty step and attempt 0 |
 | `WORKSHOP_EXECUTION_ID` | Process execution identity |
-| WORKSHOP_RESULTS_PATH, WORKSHOP_LOG_PATH | The workflow's single live results.md and execution.log files in .workshop/state-v5/<workflow-id>/ |
+| WORKSHOP_RESULTS_PATH, WORKSHOP_LOG_PATH | The workflow's single live results.md and execution.log files in .workshop/<workflow-id>/ |
 | `WORKSHOP_CANDIDATE_STATUS`, `WORKSHOP_RETRIES_LEFT` | Command verifier candidate status and retries left (`n` or `unlimited`) |
 | `WORKSHOP_ANSWER` | Committed answer for an answered wait's immediate successor and its verifier |
 | `WORKSHOP_PROVIDER`, `WORKSHOP_MODEL_ID`, `WORKSHOP_MODEL` | Agent provider, bare model ID, and provider/model |
@@ -327,7 +320,8 @@ Command processes and agent tool shells receive these values for their execution
 | `service stop` | Graceful, idempotent service shutdown |
 
 `bun src/cli/main.ts help` lists commands. Except for help and validation,
-commands use the service. Public workflow commands start it when needed.
+commands use the service. Public workflow commands start it when needed;
+`service status` never does.
 
 `validate` reads the exact `.yaml` or `.yml` path supplied. Relative paths resolve
 from the current directory. It checks YAML, workflow structure, and step policies.
@@ -425,19 +419,20 @@ unchanged. Action commands must enforce limits and prevent duplicates themselves
 .workshop/
 ├─ workshop.yaml                    optional machine defaults
 ├─ workflows/<workflow>.yaml        workflow definitions
-└─ state-v5/
-   ├─ durable.db                    service-owned database
-   ├─ service.json  service.lock    service identity and ownership
-   ├─ captures/<run-id>/            temporary process captures
-   └─ <workflow-id>/
-      ├─ results.md                 accepted outputs and human answers
-      ├─ execution.log              labeled execution evidence
-      ├─ results-<UTC timestamp>-<admission-sequence>-<rotation-id>.md.gz  rotated results
-      └─ execution-<UTC timestamp>-<admission-sequence>-<rotation-id>.log.gz  rotated execution evidence
+├─ .state/                          private service state; never edit it
+│  ├─ durable.db                    service-owned database
+│  ├─ service.json  service.lock    service identity and ownership
+│  └─ captures/<run-id>/            temporary process captures
+└─ <workflow-id>/                   readable projections, one per workflow
+   ├─ results.md                    accepted outputs and human answers
+   ├─ execution.log                 labeled execution evidence
+   ├─ results-<UTC timestamp>-<admission-sequence>-<rotation-id>.md.gz  rotated results
+   └─ execution-<UTC timestamp>-<admission-sequence>-<rotation-id>.log.gz  rotated execution evidence
 ~~~
 
-The private socket may live outside state-v5/ to meet Unix socket path limits.
-Ignore .workshop/ in Git.
+The private socket may live outside .state/ to meet Unix socket path limits.
+Git ignores `.state/` and the per-workflow projection directories; workflow
+definitions and machine config stay trackable.
 
 Each workflow has one live results.md and one live execution.log. Each file
 holds whole run sections in admission order. Each wrapper shows the run ID,
@@ -470,9 +465,10 @@ captures across restart.
 These live files are read-only views of committed state. Deleting them lets the
 service rebuild missing sections without repeating work. Refreshes add missing
 sections, update open sections, and preserve existing finished sections. Editing a
-file changes neither accepted output nor run state. The service never deletes existing
-.workshop/runs/ or .workshop/archive/ directories from older installations; it
-leaves them in place and does not use them.
+file changes neither accepted output nor run state. The service never deletes
+older installation directories such as `.workshop/state/`, `.workshop/state-v5/`,
+`.workshop/runs/`, or `.workshop/archive/`; it leaves them in place and does not
+use them.
 
 CAUTION: Workshop adds no automatic expiration or database purging. Evidence
 grows with each attempt, including unlimited retries.
@@ -538,11 +534,13 @@ new runs can repeat external effects. v5 cannot enforce draining because it
 never reads the old state.
 
 Finish or stop open runs and stop the old service using the old build first.
-Then start the new build. v5 keeps all state in `.workshop/state-v5/`. It never
-opens, migrates, or deletes older state directories. Existing `.workshop/runs/`
-and `.workshop/archive/` folders stay in place, unused. Incompatible task
-definitions still block as `runtime_incompatible` instead of continuing under
-different code.
+Then start the new build against a fresh project root. The new build keeps
+private state in `.workshop/.state/` and projections in
+`.workshop/<workflow-id>/`. It never opens, migrates, or falls back to older
+state directories. Existing `.workshop/state/`, `.workshop/state-v5/`,
+`.workshop/runs/`, and `.workshop/archive/` folders stay in place, unused.
+Incompatible task definitions still block as `runtime_incompatible` instead of
+continuing under different code.
 
 Migrate workflow files to `version: 4`. Replace `max_attempts: N` with
 `retries: N-1`. Replace `check` with `verify`. Remove machine and workflow
@@ -550,7 +548,7 @@ Migrate workflow files to `version: 4`. Replace `max_attempts: N` with
 when you want the shared bot. Declare `retries` and `replay` for every step
 or in `defaults`. Remove custom uses of WORKSHOP_ARCHIVE. WORKSHOP_RESULTS_PATH
 and WORKSHOP_LOG_PATH point to workflow-owned files in
-state-v5/<workflow-id>/.
+`.workshop/<workflow-id>`.
 
 ## Contributing
 

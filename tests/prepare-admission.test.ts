@@ -36,7 +36,7 @@ function preparedRequest(resolvedSettings = resolveWorkflowSettings({
     workflowId: "release",
     machineConfig,
     projectCwd,
-    stateDirectory: "/tmp/workshop-state",
+    stateDirectory: "/tmp/workshop-project/.workshop/.state",
     resolvedSettings,
     runtimeManifest: {
       durableVersion: "1.0.2",
@@ -84,8 +84,15 @@ describe("prepareRunAdmission", () => {
     });
     expect(result.value.paths).toEqual({
       projectCwd,
-      workflowDirectory: "/tmp/workshop-state/release",
+      workflowDirectory: "/tmp/workshop-project/.workshop/release",
     });
+  });
+
+  test("rejects private state paths outside the .workshop namespace", () => {
+    const result = prepareRunAdmission({ ...preparedRequest(), stateDirectory: "/tmp/workshop-state" });
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("noncanonical state directory was accepted");
+    expect(result.failure.kind).toBe("admission_input_invalid");
   });
 
   test("keys preflight passes by definition, effective settings, and project cwd", () => {
