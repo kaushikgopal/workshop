@@ -10,6 +10,8 @@ const STATUS_COLORS: Record<string, number> = {
 };
 const DIM = RGBA.fromIndex(ANSI.brightBlack);
 const SPLIT_WIDTH = 96;
+const TABLE_MIN_WIDTH = 40;
+const BOT_FEED_TITLE = "BOT FEED (all workflows)";
 
 function chunk(text: string, color = RGBA.defaultForeground(), attributes = 0): TextChunk {
   return { __isChunk: true, text, fg: color, attributes };
@@ -57,7 +59,7 @@ function appendTableLine(chunks: TextChunk[], parts: readonly TablePart[], width
 function renderOverviewTable(rows: readonly (readonly [string, string, string])[], width: number, selectedId: string | null): StyledText {
   const chunks: TextChunk[] = [];
   if (rows.length === 0) return new StyledText([chunk("No workflows configured")]);
-  if (width < 60) {
+  if (width < TABLE_MIN_WIDTH) {
     rows.forEach((row, index) => {
       const selected = row[0] === selectedId;
       const rowAttributes = selected ? TextAttributes.BOLD : 0;
@@ -65,7 +67,7 @@ function renderOverviewTable(rows: readonly (readonly [string, string, string])[
       const cellAttributes = rowAttributes | statusAttributes(row[1]);
       appendTableLine(chunks, [
         { text: selected ? "›" : " ", attributes: rowAttributes },
-        { text: "Title:", color: DIM, attributes: rowAttributes | TextAttributes.DIM },
+        { text: "Workflow:", color: DIM, attributes: rowAttributes | TextAttributes.DIM },
         { text: " " + row[0], attributes: rowAttributes },
       ], width);
       appendTableLine(chunks, [
@@ -83,14 +85,14 @@ function renderOverviewTable(rows: readonly (readonly [string, string, string])[
     return new StyledText(chunks.slice(0, -1));
   }
 
-  const nextWidth = Math.min(19, Math.max(8, ...rows.map(row => row[2].length)));
+  const nextWidth = Math.min(19, width - 25, Math.max(8, ...rows.map(row => row[2].length)));
   const titleWidth = Math.max(12, Math.floor((width - nextWidth - 5) / 2));
   const statusWidth = Math.max(8, width - nextWidth - titleWidth - 5);
   const field = (value: string, fieldWidth: number) => clip(value, fieldWidth).padEnd(fieldWidth);
   const heading = TextAttributes.DIM;
   appendTableLine(chunks, [
     { text: " " },
-    { text: field("Title", titleWidth), attributes: heading },
+    { text: field("Workflow", titleWidth), attributes: heading },
     { text: "  " },
     { text: field("Status", statusWidth), attributes: heading },
     { text: "  " },
@@ -219,8 +221,6 @@ export function mountViewer(renderer: CliRenderer): ViewerMount {
   const middle = new BoxRenderable(renderer, { flexGrow: 1, width: "100%", flexDirection: "row", shouldFill: false });
   const leftPane = new BoxRenderable(renderer, { width: 1, flexGrow: 1, flexBasis: 0, flexDirection: "column", shouldFill: false });
   const rightPane = new BoxRenderable(renderer, { width: 1, flexGrow: 1, flexBasis: 0, flexDirection: "column", shouldFill: false });
-  const leftTitle = new TextRenderable(renderer, { width: "100%", height: 2, wrapMode: "none" });
-  const rightTitle = new TextRenderable(renderer, { width: "100%", height: 2, wrapMode: "none" });
   const content = new ScrollBoxRenderable(renderer, { flexGrow: 1, flexBasis: 0, width: "100%", scrollX: false,
     verticalScrollbarOptions: { visible: false } });
   content.verticalScrollBar.visible = false;
@@ -229,8 +229,9 @@ export function mountViewer(renderer: CliRenderer): ViewerMount {
   const chain = new BoxRenderable(renderer, { flexDirection: "column", width: "100%" });
   const divider = new BoxRenderable(renderer, { width: 1, flexGrow: 0, border: ["left"], borderStyle: "single",
     borderColor: DIM, focusedBorderColor: DIM, shouldFill: false });
-  const bot = new ScrollBoxRenderable(renderer, { flexGrow: 1, flexBasis: 0, width: "100%", scrollX: false, paddingX: 2, paddingY: 1,
-    verticalScrollbarOptions: { visible: false } });
+  const bot = new ScrollBoxRenderable(renderer, { flexGrow: 1, flexBasis: 0, width: "100%", scrollX: false, paddingX: 1, paddingY: 1,
+    border: true, borderStyle: "rounded", borderColor: DIM, focusedBorderColor: DIM, shouldFill: false,
+    title: " " + BOT_FEED_TITLE + " ", titleColor: DIM, verticalScrollbarOptions: { visible: false } });
   bot.verticalScrollBar.visible = false;
   const botText = new TextRenderable(renderer, { width: "100%", content: "", wrapMode: "word" });
   bot.add(botText);
@@ -238,9 +239,7 @@ export function mountViewer(renderer: CliRenderer): ViewerMount {
   content.add(notice);
   content.add(table);
   content.add(chain);
-  leftPane.add(leftTitle);
   leftPane.add(content);
-  rightPane.add(rightTitle);
   rightPane.add(bot);
   middle.add(leftPane);
   middle.add(divider);
@@ -255,13 +254,12 @@ export function mountViewer(renderer: CliRenderer): ViewerMount {
   let width = renderer.terminalWidth;
   let activeScrollTarget: ScrollTarget = "left";
   let footerHint = "";
-  let leftHeading = "STATUS";
   const updateChrome = () => {
     const leftActive = activeScrollTarget === "left";
-    leftTitle.content = new StyledText([chunk(leftHeading + (leftActive ? " [scroll]" : ""),
-      leftActive ? RGBA.defaultForeground() : DIM, leftActive ? TextAttributes.BOLD : 0)]);
-    rightTitle.content = new StyledText([chunk("  SHARED BOT FEED" + (leftActive ? "" : " [scroll]"),
-      leftActive ? DIM : RGBA.defaultForeground(), leftActive ? 0 : TextAttributes.BOLD), chunk("\n  All workflows", DIM)]);
+    const feedBorder = leftActive ? DIM : RGBA.defaultForeground();
+    bot.borderColor = feedBorder;
+    bot.focusedBorderColor = feedBorder;
+    bot.titleColor = feedBorder;
     footer.content = clip(footerHint + " · scroll " + (activeScrollTarget === "left" ? "LEFT" : "FEED"), Math.max(1, renderer.terminalWidth));
   };
   let revealSelection: (() => void) | null = null;
@@ -305,25 +303,22 @@ export function mountViewer(renderer: CliRenderer): ViewerMount {
       leftPane.flexGrow = 1;
       rightPane.flexGrow = split ? 1 : 0;
       const leftWidth = split ? Math.max(1, Math.floor((terminalWidth - 1) / 2)) : terminalWidth;
+      const feedWidth = split ? terminalWidth - leftWidth - 1 : terminalWidth;
+      // Native borders hide titles that exceed their four-cell title margin.
+      bot.title = feedWidth >= BOT_FEED_TITLE.length + 6 ? " " + BOT_FEED_TITLE + " " : BOT_FEED_TITLE;
       if (split) {
         rightPane.height = "100%";
         bot.height = 1;
       } else {
-        const botHeight = Math.max(4, Math.floor(renderer.terminalHeight * 0.4) - 2);
-        rightPane.height = botHeight + 2;
+        const botHeight = Math.max(6, Math.floor(renderer.terminalHeight * 0.4));
+        rightPane.height = botHeight;
         bot.height = botHeight;
       }
-      const headerParts: TextChunk[] = [
-        chunk("WORKSHOP", DIM), chunk(" · "), chunk(model.header, RGBA.defaultForeground(), TextAttributes.BOLD),
-      ];
-      if (model.runStatus !== null) {
-        headerParts.push(chunk(" · "));
-        const label = model.runStatus;
-        headerParts.push(chunk(statusGlyph(label) + " " + statusLabel(label), statusColor(label) ?? RGBA.defaultForeground(), statusAttributes(label)));
-      }
-      if (error) headerParts.push(chunk(" · STALE: " + error));
+      const headerParts: TextChunk[] = [chunk("WORKSHOP", RGBA.defaultForeground(), TextAttributes.BOLD)];
+      if (error) headerParts.push(chunk(" • STALE: " + error, RGBA.fromIndex(ANSI.red), TextAttributes.BOLD));
+      if (model.screen === "detail") headerParts.push(chunk(" • WORKFLOW [" + model.header + "]",
+        RGBA.defaultForeground(), TextAttributes.BOLD));
       header.content = truncateChunks(headerParts, Math.max(1, terminalWidth));
-      leftHeading = model.screen === "overview" ? "STATUS" : "NODES";
       notice.content = model.notice.join("\n");
       notice.visible = model.notice.length > 0;
       table.visible = model.screen === "overview";
@@ -373,7 +368,7 @@ export function mountViewer(renderer: CliRenderer): ViewerMount {
           const row = model.rows.findIndex(entry => entry[0] === selected);
           const tableBase = table.y - content.viewport.y + content.scrollTop;
           const y = model.screen === "overview"
-            ? tableBase + (leftWidth < 60 ? 0 : 1) + row * (leftWidth < 60 ? 4 : 1)
+            ? tableBase + (leftWidth < TABLE_MIN_WIDTH ? 0 : 1) + row * (leftWidth < TABLE_MIN_WIDTH ? 4 : 1)
             : (steps.get(selected ?? "")?.box.y ?? content.viewport.y) - content.viewport.y + content.scrollTop;
           if (y < content.scrollTop || y >= content.scrollTop + content.viewport.height) content.scrollTo(Math.max(0, y));
         };

@@ -72,7 +72,7 @@ test("rendered detail stacks rounded step boxes with aligned status and wrapped 
     await createViewerRefresh({ source: { snapshot: async () => snapshot }, state: selection, paint: model => mount.paint(model) }).refresh();
     await setup.renderOnce();
     const frame = setup.captureCharFrame();
-    expect(frame).toContain("WORKSHOP · alpha · ✓ Completed");
+    expect(frame.split("\n")[0]?.trim()).toBe("WORKSHOP • WORKFLOW [alpha]");
     expect(frame).toContain("╭─ first ─");
     expect(frame).toContain("✓ Completed");
     expect(frame).toContain("╭─ second ─");
@@ -138,7 +138,9 @@ test("overview selection uses a bold one-column gutter without inverse cells", a
     await setup.renderOnce();
     const frame = setup.captureCharFrame();
     const spans = setup.captureSpans().lines.flatMap(line => line.spans);
-    expect(frame).toContain("›Title: alpha");
+    expect(frame.split("\n")[0]?.trim()).toBe("WORKSHOP");
+    expect(frame).toContain("›alpha");
+    expect(frame).toMatch(/Workflow\s+Status\s+Next run/);
     expect(frame).toContain("○ Ready");
     expect(frame).not.toContain("▶");
     expect(spans.every(span => (span.attributes & TextAttributes.INVERSE) === 0)).toBe(true);
@@ -147,8 +149,43 @@ test("overview selection uses a bold one-column gutter without inverse cells", a
   } finally { setup.renderer.destroy(); }
 });
 
-test("compact overview reveals a middle selection in a 60-workflow list", async () => {
-  const setup = await createTestRenderer({ width: 100, height: 32 });
+test("overview keeps three aligned columns at narrow table widths", async () => {
+  for (const width of [100, 40, 39]) {
+    const setup = await createTestRenderer({ width, height: 30 });
+    try {
+      const mount = mountViewer(setup.renderer);
+      const snapshot = buildSnapshot();
+      const workflow = snapshot.status.workflows[0];
+      if (!workflow) throw new Error("Missing fixture workflow");
+      workflow.activation = { activationId: buildRun().activationId, state: "active", admittedCount: 1,
+        maxRuns: 6, activatedAt: "2026-10-10T12:00:00.000Z", nextDueAt: "2100-12-31T23:59:59.000Z",
+        skippedSlots: 0, lastSkippedSlotAt: null };
+      await createViewerRefresh({ source: { snapshot: async () => snapshot }, state: state(),
+        paint: model => mount.paint(model) }).refresh();
+      await setup.flush();
+      const rows = setup.captureCharFrame().split("\n");
+      expect(rows[0]?.trim()).toBe("WORKSHOP");
+      if (width >= 40) {
+        const heading = rows[1]?.slice(0, mount.content.width) ?? "";
+        const value = rows[2]?.slice(0, mount.content.width) ?? "";
+        expect(heading).toMatch(/Workflow\s+Status\s+Next run/);
+        expect(value.indexOf("○")).toBe(heading.indexOf("Status"));
+        expect(value[heading.indexOf("Next run")]).toBe("2");
+        expect(value.trimStart()).toStartWith("›alpha");
+        expect(value.length).toBe(mount.content.width);
+        if (width === 40) expect(value).toEndWith("…");
+      } else {
+        expect(rows[1]).toContain("›Workflow: alpha");
+        expect(rows[2]).toContain("Status: ○ Ready");
+        expect(rows[3]).toContain("Next run:");
+      }
+      expect(setup.captureCharFrame()).not.toContain("[scroll]");
+    } finally { setup.renderer.destroy(); }
+  }
+});
+
+test("stacked overview reveals a middle selection in a 60-workflow list", async () => {
+  const setup = await createTestRenderer({ width: 28, height: 32 });
   try {
     const mount = mountViewer(setup.renderer);
     const snapshot = buildSnapshot();
@@ -163,7 +200,7 @@ test("compact overview reveals a middle selection in a 60-workflow list", async 
       paint: model => mount.paint(model) }).refresh();
     await setup.flush();
     expect(mount.content.scrollTop).toBeGreaterThan(0);
-    expect(setup.captureCharFrame()).toContain("›Title: workflow-30");
+    expect(setup.captureCharFrame()).toContain("›Workflow: workflow-30");
   } finally { setup.renderer.destroy(); }
 });
 
@@ -244,26 +281,60 @@ test("shared feed groups headings and bodies with padding and a blank row betwee
       await setup.renderOnce();
       const rows = setup.captureCharFrame().split("\n");
       const paneRows = rows.map(line => line.slice(mount.bot.x, mount.bot.x + mount.bot.width));
-      const input = paneRows.findIndex(line => line.trim() === "INPUT");
-      const bot = paneRows.findIndex(line => line.trim() === "BOT");
-      expect(input).toBe(mount.bot.y + 1);
+      const input = paneRows.findIndex(line => line.slice(1, -1).trim() === "INPUT");
+      const bot = paneRows.findIndex(line => line.slice(1, -1).trim() === "BOT");
+      expect(input).toBe(mount.bot.y + 2);
       expect(paneRows[input]?.indexOf("INPUT")).toBe(2);
-      expect(paneRows[input + 1]?.trim()).toBe("first message");
-      expect(paneRows[input + 2]?.trim()).toBe("");
+      expect(paneRows[input + 1]?.slice(1, -1).trim()).toBe("first message");
+      expect(paneRows[input + 2]?.slice(1, -1).trim()).toBe("");
       expect(bot).toBe(input + 3);
-      expect(paneRows[bot + 1]?.trim()).toBe("second message");
+      expect(paneRows[bot + 1]?.slice(1, -1).trim()).toBe("second message");
       expect(paneRows[bot + 1]?.indexOf("second message")).toBe(2);
-      expect(paneRows[mount.bot.y + mount.bot.height - 1]?.trim()).toBe("");
-      expect(paneRows.some(line => line.trim() === "All workflows")).toBe(true);
-      expect(paneRows.find(line => line.includes("SHARED BOT FEED"))?.indexOf("SHARED BOT FEED")).toBe(2);
+      expect(paneRows[mount.bot.y + mount.bot.height - 2]?.slice(1, -1).trim()).toBe("");
+      const top = paneRows[mount.bot.y];
+      const bottom = paneRows[mount.bot.y + mount.bot.height - 1];
+      expect(top?.startsWith("╭")).toBe(true);
+      expect(top?.endsWith("╮")).toBe(true);
+      expect(bottom?.startsWith("╰")).toBe(true);
+      expect(bottom?.endsWith("╯")).toBe(true);
+      expect(top).toContain("BOT FEED (all workflows)");
+      expect(paneRows.filter(line => line.includes("all workflows"))).toHaveLength(1);
+      expect(mount.bot.borderColor.equals(RGBA.fromIndex(8))).toBe(true);
       mount.toggleScrollTarget();
       await setup.renderOnce();
-      const activeHeading = setup.captureCharFrame().split("\n").find(line => line.includes("SHARED BOT FEED"));
-      expect(activeHeading).toContain("SHARED BOT FEED [scroll]");
+      expect(mount.bot.borderColor.equals(RGBA.defaultForeground())).toBe(true);
+      const activeRows = setup.captureCharFrame().split("\n");
+      expect(activeRows[mount.bot.y]).toContain("BOT FEED (all workflows)");
+      expect(activeRows[mount.bot.y + mount.bot.height - 1]).not.toContain("[scroll]");
       const headingSpan = setup.captureSpans().lines.flatMap(line => line.spans)
-        .find(span => span.text.includes("SHARED BOT FEED"));
+        .find(span => span.text.includes("BOT FEED (all workflows)"));
       expect(headingSpan?.fg.equals(RGBA.defaultForeground())).toBe(true);
-      expect((headingSpan?.attributes ?? 0) & TextAttributes.BOLD).toBe(TextAttributes.BOLD);
+      mount.toggleScrollTarget();
+      await setup.renderOnce();
+      expect(mount.bot.borderColor.equals(RGBA.fromIndex(8))).toBe(true);
+      expect(setup.captureCharFrame().split("\n")[mount.bot.y + mount.bot.height - 1]).not.toContain("[scroll]");
+    } finally { setup.renderer.destroy(); }
+  }
+});
+
+test("feed border and single-line scope title stay fixed while scrolling", async () => {
+  for (const width of [160, 95, 28]) {
+    const setup = await createTestRenderer({ width, height: 32 });
+    try {
+      const mount = mountViewer(setup.renderer);
+      const snapshot = buildSnapshot();
+      await createViewerRefresh({ source: { snapshot: async () => snapshot }, state: state(),
+        paint: model => mount.paint(model) }).refresh();
+      await setup.flush();
+      expect(setup.captureCharFrame()).toContain("bot message 99");
+      const title = setup.captureCharFrame().split("\n")[mount.bot.y];
+      expect(title).toContain("BOT FEED (all workflows)");
+      mount.bot.scrollTo(0);
+      await setup.flush();
+      const rows = setup.captureCharFrame().split("\n");
+      expect(rows[mount.bot.y]).toBe(title);
+      expect(setup.captureCharFrame()).toContain("bot message 0");
+      expect(rows[mount.bot.y + mount.bot.height - 1]?.[mount.bot.x]).toBe("╰");
     } finally { setup.renderer.destroy(); }
   }
 });
@@ -307,6 +378,33 @@ test("empty and stale bot feeds keep a clear status and the last committed messa
   } finally { setup.renderer.destroy(); }
 });
 
+test("narrow detail keeps stale-read warnings visible and restores the clean heading after recovery", async () => {
+  const setup = await createTestRenderer({ width: 28, height: 32 });
+  try {
+    const mount = mountViewer(setup.renderer);
+    let poll = 0;
+    const snapshot = { ...buildSnapshot([buildNode()]), botEntries: [{
+      id: "reply", role: "assistant" as const, kind: "message" as const, text: "last committed reply",
+    }] };
+    const source: ViewerSource = { snapshot: async () => {
+      if (++poll === 2) throw new Error("Service read failed");
+      return snapshot;
+    } };
+    const refresh = createViewerRefresh({ source, state: { ...state(), workflowId: "alpha" },
+      paint: (model, error) => mount.paint(model, error) });
+    await refresh.refresh(); await setup.flush();
+    expect(setup.captureCharFrame().split("\n")[0]?.trim()).toBe("WORKSHOP • WORKFLOW [alpha]");
+    await refresh.refresh(); await setup.flush();
+    const stale = setup.captureCharFrame();
+    expect(stale.split("\n")[0]).toContain("WORKSHOP • STALE:");
+    expect(stale).toContain("last committed reply");
+    const warning = setup.captureSpans().lines[0]?.spans.find(span => span.text.includes("STALE:"));
+    expect(warning?.fg.equals(RGBA.fromIndex(1))).toBe(true);
+    await refresh.refresh(); await setup.flush();
+    expect(setup.captureCharFrame().split("\n")[0]?.trim()).toBe("WORKSHOP • WORKFLOW [alpha]");
+  } finally { setup.renderer.destroy(); }
+});
+
 test("detail and feed stay in equal vertical panes above 95 columns and stack below", async () => {
   for (const width of [160, 100, 96, 95, 50, 28]) {
     const setup = await createTestRenderer({ width, height: 30 });
@@ -329,7 +427,7 @@ test("detail and feed stay in equal vertical panes above 95 columns and stack be
       expect(frame).toContain("╭─ succeeded ─");
       expect(frame).toContain("● Running");
       expect(frame).toContain("○ Pending");
-      expect(frame).toContain("SHARED BOT FEED");
+      expect(frame).toContain("BOT FEED (all workflows)");
       expect(frame).not.toContain("  ↓");
       expect(frame).not.toContain("█");
       expect(frame).not.toContain("▄");
@@ -337,7 +435,9 @@ test("detail and feed stay in equal vertical panes above 95 columns and stack be
       expect(mount.bot.verticalScrollBar.visible).toBe(false);
       if (width >= 96) {
         expect(Math.abs(mount.content.width - mount.bot.width)).toBeLessThanOrEqual(1);
-        expect(mount.content.height).toBe(mount.bot.height);
+        expect(mount.bot.height).toBe(mount.content.height);
+        expect(mount.bot.y).toBe(mount.content.y);
+        expect(mount.bot.y + mount.bot.height).toBe(mount.content.y + mount.content.height);
         expect(mount.bot.x - (mount.content.x + mount.content.width)).toBe(1);
         const dividerX = mount.content.width;
         expect(frame.split("\n").slice(2, -1).some(line => line[dividerX] === "│")).toBe(true);
@@ -430,7 +530,7 @@ test("resize keeps selected workflow visible while the viewer switches pane layo
     setup.resize(96, 32);
     mount.paint(model); await setup.flush();
     expect(mount.bot.x).toBeGreaterThan(mount.content.x + mount.content.width);
-    expect(setup.captureCharFrame()).toContain("›Title: workflow-55");
+    expect(setup.captureCharFrame()).toContain("›workflow-55");
     expect(selection.selectedId).toBe("workflow-55");
   } finally { setup.renderer.destroy(); }
 });
@@ -490,7 +590,7 @@ test("narrow terminal uses stacked overview and wraps detail previews", async ()
     const source: ViewerSource = { snapshot: async () => buildSnapshot([{ ...buildNode(), status: "succeeded", successfulOutput: "long output with enough words to wrap across the narrow viewport" }]) };
     const refresh = createViewerRefresh({ source, state: selection, paint: model => mount.paint(model) });
     await refresh.refresh(); await setup.renderOnce();
-    expect(setup.captureCharFrame()).toContain("Title: alpha");
+    expect(setup.captureCharFrame()).toContain("Workflow: alpha");
     expect(setup.captureCharFrame()).toContain("Status: ○ Ready");
     expect(setup.captureCharFrame()).toContain("Next run: —");
     selection.workflowId = "alpha";
@@ -557,13 +657,13 @@ test("returning from a short detail keeps a deep overview selection visible", as
     const source: ViewerSource = { snapshot: async workflowId => ({ ...snapshot, detail: workflowId ? snapshot.detail : null }) };
     const refresh = createViewerRefresh({ source, state: selection, paint: model => mount.paint(model) });
     await refresh.refresh(); await setup.flush();
-    expect(setup.captureCharFrame()).toContain("›Title: workflow-55");
+    expect(setup.captureCharFrame()).toContain("›workflow-55");
     reduceKey(selection, { name: "enter" }, [], []);
     refresh.invalidate(); await refresh.refresh(); await setup.flush();
     expect(setup.captureCharFrame()).toContain("╭─ first ─");
     reduceKey(selection, { name: "backspace" }, [], []);
     refresh.invalidate(); await refresh.refresh(); await setup.flush();
-    expect(setup.captureCharFrame()).toContain("›Title: workflow-55");
+    expect(setup.captureCharFrame()).toContain("›workflow-55");
     expect(selection.selectedId).toBe("workflow-55");
   } finally { setup.renderer.destroy(); }
 });
