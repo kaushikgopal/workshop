@@ -52,35 +52,41 @@ export function pendingDecisionActions(blockKind: string): ("retry" | "accept" |
 export type PendingDecision = BotPendingDecisionV1;
 
 function mapMessage(entry: EntryRecord, index: number, message: Message, includeKinds: boolean): BotChatEntryV1 | null {
+  const id = String(entry.id) + ":" + index;
   if (message.role === "user") {
     const text = readContent(message.content);
-    return text.length === 0 ? null : { id: String(entry.id) + ":" + index, role: "user", ...(includeKinds ? { kind: "input" as const } : {}), text };
+    return text.length === 0 ? null : { id, role: "user", ...(includeKinds ? { kind: "input" as const } : {}), text };
   }
-  if (message.role === "assistant") {
-    const content = message.content as unknown as readonly Record<string, unknown>[];
-    const lines: string[] = [];
-    let hasToolCall = false;
-    for (const block of content) {
-      if (block.type === "text" && typeof block.text === "string" && block.text.length > 0) lines.push(block.text);
-      else if (block.type === "toolCall") {
-        hasToolCall = true;
-        if (typeof block.name === "string") lines.push("Used " + block.name);
-      }
+  if (message.role === "assistant") return mapAssistantMessage(id, message, includeKinds);
+  if (message.role !== "toolResult") return null;
+
+  const tool = "toolName" in message && typeof message.toolName === "string" ? message.toolName : "tool";
+  if (!includeKinds) return { id, role: "activity", text: "Completed " + tool };
+  const output = previewToolResult(readContent(message.content));
+  return {
+    id, role: "activity", kind: message.isError ? "error" : "tool_result",
+    text: tool + (output.length === 0 ? "" : "\n" + output),
+  };
+}
+
+function mapAssistantMessage(
+  id: string,
+  message: Extract<Message, { role: "assistant" }>,
+  includeKinds: boolean,
+): BotChatEntryV1 | null {
+  const content = message.content as unknown as readonly Record<string, unknown>[];
+  const lines: string[] = [];
+  let hasToolCall = false;
+  for (const block of content) {
+    if (block.type === "text" && typeof block.text === "string" && block.text.length > 0) lines.push(block.text);
+    else if (block.type === "toolCall") {
+      hasToolCall = true;
+      if (typeof block.name === "string") lines.push("Used " + block.name);
     }
-    return lines.length === 0 ? null : {
-      id: String(entry.id) + ":" + index, role: "assistant", ...(includeKinds ? { kind: hasToolCall ? "tool_call" as const : "message" as const } : {}), text: lines.join("\n"),
-    };
   }
-  if (message.role === "toolResult") {
-    const tool = "toolName" in message && typeof message.toolName === "string" ? message.toolName : "tool";
-    if (!includeKinds) return { id: String(entry.id) + ":" + index, role: "activity", text: "Completed " + tool };
-    const output = previewToolResult(readContent(message.content));
-    return {
-      id: String(entry.id) + ":" + index, role: "activity", kind: message.isError ? "error" : "tool_result",
-      text: tool + (output.length === 0 ? "" : "\n" + output),
-    };
-  }
-  return null;
+  return lines.length === 0 ? null : {
+    id, role: "assistant", ...(includeKinds ? { kind: hasToolCall ? "tool_call" as const : "message" as const } : {}), text: lines.join("\n"),
+  };
 }
 
 function previewToolResult(text: string): string {

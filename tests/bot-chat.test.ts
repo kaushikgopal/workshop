@@ -49,6 +49,7 @@ test("bot chat feed keeps the V1 mapping by default and labels entries only on o
       content: [{ type: "text", text: "Error: this is successful tool output." }], isError: false, timestamp: 5,
     },
     { role: "toolResult", toolCallId: "call-4", toolName: "workshop_status", content: [], isError: false, timestamp: 6 },
+    fauxAssistantMessage([]),
   ];
   const record = {
     id: 17 as EntryRecord["id"], conversationId: 5 as EntryRecord["conversationId"], kind: "message", model: messages,
