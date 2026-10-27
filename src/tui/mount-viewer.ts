@@ -1,4 +1,4 @@
-import { BoxRenderable, RGBA, ScrollBoxRenderable, StyledText, TextAttributes, TextRenderable, createCliRenderer, type CliRenderer, type TextChunk } from "@opentui/core";
+import { BoxRenderable, RGBA, ScrollBoxRenderable, StyledText, TextAttributes, TextRenderable, TextTableRenderable, createCliRenderer, type CliRenderer, type TextChunk, type TextTableContent } from "@opentui/core";
 import { statusGlyph, statusLabel } from "../views/render-status.js";
 import { buildViewerModel, type ViewerModel } from "./build-panes.js";
 import type { ViewerChatEntry, ViewerSnapshot, ViewerSource } from "./data-source.js";
@@ -10,7 +10,6 @@ const STATUS_COLORS: Record<string, number> = {
 };
 const DIM = RGBA.fromIndex(ANSI.brightBlack);
 const SPLIT_WIDTH = 96;
-const TABLE_MIN_WIDTH = 40;
 const BOT_FEED_TITLE = "BOT FEED (all workflows)";
 
 function chunk(text: string, color = RGBA.defaultForeground(), attributes = 0): TextChunk {
@@ -34,85 +33,39 @@ function statusAttributes(status: string): number {
   return normalized === "skipped" || normalized === "pending" || normalized === "ready" ? TextAttributes.DIM : 0;
 }
 
-interface TablePart {
-  text: string;
-  color?: RGBA;
-  attributes?: number;
+function clipTableCell(value: string, width: number): string {
+  if (Bun.stringWidth(value) <= width) return value;
+  let text = "";
+  let remaining = width - 1;
+  for (const { segment } of new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(value)) {
+    const cells = Bun.stringWidth(segment);
+    if (cells > remaining) break;
+    text += segment;
+    remaining -= cells;
+  }
+  return text + "…";
 }
 
-function appendTableLine(chunks: TextChunk[], parts: readonly TablePart[], width: number): void {
-  let remaining = width;
-  for (const part of parts) {
-    if (remaining <= 0) break;
-    if (part.text.length <= remaining) {
-      chunks.push(chunk(part.text, part.color, part.attributes));
-      remaining -= part.text.length;
-    } else {
-      const clipped = remaining === 1 ? "…" : part.text.slice(0, remaining - 1) + "…";
-      chunks.push(chunk(clipped, part.color, part.attributes));
-      remaining = 0;
-    }
+function buildOverviewCells(rows: readonly (readonly [string, string, string])[], width: number, selectedId: string | null): TextTableContent {
+  const padding = width >= 40 ? 1 : 0;
+  const available = Math.max(3, width - 4 - padding * 6);
+  const statusWidth = Math.min(Math.max(6, ...rows.map(row => Bun.stringWidth(statusGlyph(row[1]) + " " + row[1]))),
+    Math.max(1, Math.min(Math.floor(available / 3), available - 17)));
+  const nextWidth = Math.min(19, Math.max(8, ...rows.map(row => Bun.stringWidth(row[2]))), Math.max(1, available - statusWidth - 9));
+  const widths = [Math.max(1, available - statusWidth - nextWidth), statusWidth, nextWidth];
+  const cells: TextTableContent = [[" Workflow", "Status", "Next run"].map((label, index) =>
+    [chunk(clipTableCell(label, widths[index]!), RGBA.defaultForeground(), TextAttributes.BOLD)])];
+  // Bound unwrapped cells: the native table otherwise keeps its content's minimum width and hides later columns.
+  for (const row of rows) {
+    const rowAttributes = row[0] === selectedId ? TextAttributes.BOLD : 0;
+    cells.push([
+      [chunk(clipTableCell((row[0] === selectedId ? "›" : " ") + row[0], widths[0]!), RGBA.defaultForeground(), rowAttributes)],
+      [chunk(clipTableCell(statusGlyph(row[1]) + " " + row[1], widths[1]!),
+        statusColor(row[1]) ?? RGBA.defaultForeground(), rowAttributes | statusAttributes(row[1]))],
+      [chunk(clipTableCell(row[2], widths[2]!), RGBA.defaultForeground(), rowAttributes)],
+    ]);
   }
-  chunks.push(chunk("\n"));
-}
-
-function renderOverviewTable(rows: readonly (readonly [string, string, string])[], width: number, selectedId: string | null): StyledText {
-  const chunks: TextChunk[] = [];
-  if (rows.length === 0) return new StyledText([chunk("No workflows configured")]);
-  if (width < TABLE_MIN_WIDTH) {
-    rows.forEach((row, index) => {
-      const selected = row[0] === selectedId;
-      const rowAttributes = selected ? TextAttributes.BOLD : 0;
-      const color = statusColor(row[1]) ?? RGBA.defaultForeground();
-      const cellAttributes = rowAttributes | statusAttributes(row[1]);
-      appendTableLine(chunks, [
-        { text: selected ? "›" : " ", attributes: rowAttributes },
-        { text: "Workflow:", color: DIM, attributes: rowAttributes | TextAttributes.DIM },
-        { text: " " + row[0], attributes: rowAttributes },
-      ], width);
-      appendTableLine(chunks, [
-        { text: " ", attributes: rowAttributes },
-        { text: "Status: ", color: DIM, attributes: rowAttributes | TextAttributes.DIM },
-        { text: statusGlyph(row[1]) + " " + row[1], color, attributes: cellAttributes },
-      ], width);
-      appendTableLine(chunks, [
-        { text: " ", attributes: rowAttributes },
-        { text: "Next run: ", color: DIM, attributes: rowAttributes | TextAttributes.DIM },
-        { text: row[2], attributes: rowAttributes },
-      ], width);
-      if (index < rows.length - 1) appendTableLine(chunks, [], width);
-    });
-    return new StyledText(chunks.slice(0, -1));
-  }
-
-  const nextWidth = Math.min(19, width - 25, Math.max(8, ...rows.map(row => row[2].length)));
-  const titleWidth = Math.max(12, Math.floor((width - nextWidth - 5) / 2));
-  const statusWidth = Math.max(8, width - nextWidth - titleWidth - 5);
-  const field = (value: string, fieldWidth: number) => clip(value, fieldWidth).padEnd(fieldWidth);
-  const heading = TextAttributes.DIM;
-  appendTableLine(chunks, [
-    { text: " " },
-    { text: field("Workflow", titleWidth), attributes: heading },
-    { text: "  " },
-    { text: field("Status", statusWidth), attributes: heading },
-    { text: "  " },
-    { text: field("Next run", nextWidth), attributes: heading },
-  ], width);
-  rows.forEach(row => {
-    const selected = row[0] === selectedId;
-    const rowAttributes = selected ? TextAttributes.BOLD : 0;
-    const statusColorValue = statusColor(row[1]) ?? RGBA.defaultForeground();
-    appendTableLine(chunks, [
-      { text: selected ? "›" : " ", attributes: rowAttributes },
-      { text: field(row[0], titleWidth), attributes: rowAttributes },
-      { text: "  ", attributes: rowAttributes },
-      { text: field(statusGlyph(row[1]) + " " + row[1], statusWidth), color: statusColorValue,
-        attributes: rowAttributes | statusAttributes(row[1]) },
-      { text: "  ", attributes: rowAttributes },
-      { text: field(row[2], nextWidth), attributes: rowAttributes },
-    ], width);
-  });
-  return new StyledText(chunks.slice(0, -1));
+  return cells;
 }
 
 function truncateChunks(parts: readonly TextChunk[], width: number): StyledText {
@@ -225,10 +178,11 @@ export function mountViewer(renderer: CliRenderer): ViewerMount {
     verticalScrollbarOptions: { visible: false } });
   content.verticalScrollBar.visible = false;
   const notice = new TextRenderable(renderer, { width: "100%", content: "", wrapMode: "word" });
-  const table = new TextRenderable(renderer, { width: "100%", content: "", wrapMode: "none" });
+  const table = new TextTableRenderable(renderer, { width: "100%", wrapMode: "none", selectable: false,
+    columnWidthMode: "full", columnFitter: "balanced", cellPaddingX: 1, cellPaddingY: 0,
+    showBorders: true, outerBorder: true, borderStyle: "single", borderColor: DIM });
   const chain = new BoxRenderable(renderer, { flexDirection: "column", width: "100%" });
-  const divider = new BoxRenderable(renderer, { width: 1, flexGrow: 0, border: ["left"], borderStyle: "single",
-    borderColor: DIM, focusedBorderColor: DIM, shouldFill: false });
+  const paneGap = new BoxRenderable(renderer, { width: 1, flexGrow: 0, shouldFill: false });
   const bot = new ScrollBoxRenderable(renderer, { flexGrow: 1, flexBasis: 0, width: "100%", scrollX: false, paddingX: 1, paddingY: 1,
     border: true, borderStyle: "rounded", borderColor: DIM, focusedBorderColor: DIM, shouldFill: false,
     title: " " + BOT_FEED_TITLE + " ", titleColor: DIM, verticalScrollbarOptions: { visible: false } });
@@ -242,7 +196,7 @@ export function mountViewer(renderer: CliRenderer): ViewerMount {
   leftPane.add(content);
   rightPane.add(bot);
   middle.add(leftPane);
-  middle.add(divider);
+  middle.add(paneGap);
   middle.add(rightPane);
   root.add(header);
   root.add(middle);
@@ -295,7 +249,7 @@ export function mountViewer(renderer: CliRenderer): ViewerMount {
         screenKey = key;
       }
       middle.flexDirection = split ? "row" : "column";
-      divider.visible = split;
+      paneGap.visible = split;
       leftPane.flexBasis = split ? 0 : "auto";
       rightPane.flexBasis = split ? 0 : "auto";
       leftPane.width = split ? 0 : "100%";
@@ -319,11 +273,14 @@ export function mountViewer(renderer: CliRenderer): ViewerMount {
       if (model.screen === "detail") headerParts.push(chunk(" • WORKFLOW [" + model.header + "]",
         RGBA.defaultForeground(), TextAttributes.BOLD));
       header.content = truncateChunks(headerParts, Math.max(1, terminalWidth));
-      notice.content = model.notice.join("\n");
-      notice.visible = model.notice.length > 0;
-      table.visible = model.screen === "overview";
+      const notices = model.screen === "overview" && model.rows.length === 0
+        ? [...model.notice, "No workflows configured"] : model.notice;
+      notice.content = notices.join("\n");
+      notice.visible = notices.length > 0;
+      table.visible = model.screen === "overview" && model.rows.length > 0;
       chain.visible = model.screen === "detail";
-      table.content = renderOverviewTable(model.rows, leftWidth, model.selectedId);
+      table.cellPaddingX = leftWidth >= 40 ? 1 : 0;
+      table.content = buildOverviewCells(model.rows, leftWidth, model.selectedId);
       for (const step of model.steps) {
         let mounted = steps.get(step.id);
         if (!mounted) {
@@ -367,8 +324,9 @@ export function mountViewer(renderer: CliRenderer): ViewerMount {
         revealSelection = () => {
           const row = model.rows.findIndex(entry => entry[0] === selected);
           const tableBase = table.y - content.viewport.y + content.scrollTop;
+          // The native grid has a top border, heading, and divider; each one-line data row adds a bottom border.
           const y = model.screen === "overview"
-            ? tableBase + (leftWidth < TABLE_MIN_WIDTH ? 0 : 1) + row * (leftWidth < TABLE_MIN_WIDTH ? 4 : 1)
+            ? tableBase + 3 + row * 2
             : (steps.get(selected ?? "")?.box.y ?? content.viewport.y) - content.viewport.y + content.scrollTop;
           if (y < content.scrollTop || y >= content.scrollTop + content.viewport.height) content.scrollTo(Math.max(0, y));
         };
