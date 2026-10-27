@@ -3,8 +3,9 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { InputRenderable, RGBA, TextAttributes } from "@opentui/core";
 import { createTestRenderer } from "@opentui/core/testing";
-import { createViewerRefresh, makeShutdown, mountViewer, reduceKey, type ViewerState } from "../src/tui/mount-viewer.js";
+import { createViewerRefresh, handleViewerKey, makeShutdown, mountViewer, reduceKey, type ViewerState } from "../src/tui/mount-viewer.js";
 import type { ViewerChatEntry, ViewerSource, ViewerSnapshot } from "../src/tui/data-source.js";
+import { runSummaryDtoSchema } from "../src/views/schema.js";
 import { buildViewerModel } from "../src/tui/build-panes.js";
 import { buildNode, buildRun, buildSnapshot, WAIT } from "./build-viewer-fixture.js";
 
@@ -37,7 +38,7 @@ test("fake service updates preserve workflow selection and back navigation", asy
   const frames: string[] = [];
   const refresh = createViewerRefresh({ source, state: selection, paint: model => frames.push(model.header) });
   await refresh.refresh();
-  reduceKey(selection, { name: "j" }, ["alpha", "beta"], []);
+  reduceKey(selection, { name: "down" }, ["alpha", "beta"], []);
   await refresh.refresh();
   expect(selection.selectedId).toBe("beta");
   snapshot.status.workflows.reverse();
@@ -607,7 +608,9 @@ test("Tab changes the page-scroll target without changing workflow selection", a
     mount.toggleScrollTarget();
     expect(mount.scrollTarget).toBe("feed");
     await setup.renderOnce();
-    expect(setup.captureCharFrame()).toContain("scroll FEED");
+    expect(setup.captureCharFrame()).toContain("j/k scroll");
+    expect(setup.captureCharFrame()).not.toContain("scroll FEED");
+    expect(setup.captureCharFrame()).not.toContain("scroll LEFT");
     const feedBefore = mount.bot.scrollTop;
     mount.scrollByPage(-1);
     expect(mount.bot.scrollTop).toBeLessThan(feedBefore);
@@ -654,6 +657,150 @@ test("narrow terminal keeps the overview grid and wraps detail previews", async 
     const frame = setup.captureCharFrame();
     expect(frame).toContain("long output");
     expect(frame).toContain("narrow viewport");
+  } finally { setup.renderer.destroy(); }
+});
+
+test("j/k scroll only the focused pane while arrows select nodes and runs", async () => {
+  const setup = await createTestRenderer({ width: 160, height: 24 });
+  try {
+    const mount = mountViewer(setup.renderer);
+    const selection = { ...state(), workflowId: "alpha", selectedStepId: "step-0" };
+    const steps = Array.from({ length: 15 }, (_, i) => "step-" + i);
+    const snapshot = buildSnapshot(steps.map(id => ({ ...buildNode(id), status: "running", liveStderr: "line\n".repeat(5) })));
+    await createViewerRefresh({ source: { snapshot: async () => snapshot }, state: selection,
+      paint: model => mount.paint(model) }).refresh();
+    await setup.flush();
+    const press = (name: string) => handleViewerKey({ state: selection, key: { name }, mount,
+      workflowIds: ["alpha"], stepIds: steps, runId: "run-current" });
+    expect(press("j")).toBeNull();
+    expect(mount.content.scrollTop).toBe(1);
+    expect(selection.selectedStepId).toBe("step-0");
+    press("k");
+    expect(mount.content.scrollTop).toBe(0);
+    press("tab");
+    expect(mount.scrollTarget).toBe("feed");
+    mount.bot.scrollTo(10);
+    press("j");
+    expect(mount.bot.scrollTop).toBe(11);
+    press("k");
+    expect(mount.bot.scrollTop).toBe(10);
+    expect(mount.content.scrollTop).toBe(0);
+    expect(press("down")).toBe("refresh");
+    expect(selection.selectedStepId).toBe("step-1");
+    expect(press("up")).toBe("refresh");
+    expect(selection.selectedStepId).toBe("step-0");
+    expect(press("left")).toBe("refresh");
+    expect(selection.runId).toBe("run-current");
+    expect(selection.runDirection).toBe("older");
+    expect(selection.selectedStepId).toBe("step-0");
+    expect(press("right")).toBe("refresh");
+    expect(selection.runDirection).toBe("newer");
+    await setup.flush();
+    expect(setup.captureCharFrame()).toContain("↑↓ nodes · ←→ runs · j/k scroll");
+    expect(setup.captureCharFrame()).not.toContain("scroll FEED");
+    expect(mount.bot.borderColor.equals(RGBA.defaultForeground())).toBe(true);
+  } finally { setup.renderer.destroy(); }
+});
+
+test("overview j/k scroll without changing workflow selection and run arrows do nothing", async () => {
+  const setup = await createTestRenderer({ width: 100, height: 24 });
+  try {
+    const mount = mountViewer(setup.renderer);
+    const selection = state();
+    const snapshot = buildSnapshot();
+    const workflow = snapshot.status.workflows[0]!;
+    snapshot.status.workflows = Array.from({ length: 40 }, (_, i) => ({ ...workflow, workflowId: "workflow-" + i }));
+    selection.selectedId = "workflow-0";
+    await createViewerRefresh({ source: { snapshot: async () => snapshot }, state: selection,
+      paint: model => mount.paint(model) }).refresh();
+    await setup.flush();
+    const press = (name: string) => handleViewerKey({ state: selection, key: { name }, mount,
+      workflowIds: snapshot.status.workflows.map(workflow => workflow.workflowId), stepIds: [], runId: null });
+    press("j");
+    expect(mount.content.scrollTop).toBe(1);
+    expect(selection.selectedId).toBe("workflow-0");
+    press("k");
+    expect(mount.content.scrollTop).toBe(0);
+    expect(press("left")).toBeNull();
+    expect(press("right")).toBeNull();
+    press("down");
+    expect(selection.selectedId).toBe("workflow-1");
+    press("enter");
+    expect(selection.workflowId).toBe("workflow-1");
+    expect(selection.runId).toBeNull();
+  } finally { setup.renderer.destroy(); }
+});
+
+test("refresh commits run selection and uses historical metadata instead of the latest failure", async () => {
+  const setup = await createTestRenderer({ width: 160, height: 32 });
+  try {
+    const mount = mountViewer(setup.renderer);
+    const selection: ViewerState = { ...state(), workflowId: "alpha" };
+    const latest = runSummaryDtoSchema.parse({ ...buildRun("failed"), runId: "run-latest" });
+    const older = runSummaryDtoSchema.parse({ ...buildRun(), runId: "run-older" });
+    const snapshotFor = (run: typeof latest, index: number): ViewerSnapshot => {
+      const snapshot = buildSnapshot([{ ...buildNode(), status: run.status === "completed" ? "succeeded" : "failed",
+        successfulOutput: run.status === "completed" ? "older accepted output" : null }]);
+      snapshot.status.workflows[0]!.latestRun = latest;
+      return { ...snapshot, selectedRun: run, runPosition: { index, total: 2, followingLatest: index === 0 },
+        detail: { ...snapshot.detail!, diagram: { ...snapshot.detail!.diagram, runId: run.runId } } };
+    };
+    let snapshot = snapshotFor(latest, 0);
+    const requests: unknown[] = [];
+    const refresh = createViewerRefresh({ source: { snapshot: async (_workflowId, expanded, requested) => {
+      requests.push({ expanded, requested }); return snapshot;
+    } }, state: selection, paint: (model, error) => mount.paint(model, error) });
+    await refresh.refresh(); await setup.flush();
+    expect(setup.captureCharFrame()).toContain("Run 2/2 (latest) · Failed");
+    expect(selection.runId).toBeNull();
+    selection.expanded = ["first"];
+    reduceKey(selection, { name: "left" }, ["alpha"], ["first"], latest.runId);
+    snapshot = snapshotFor(older, 1);
+    refresh.invalidate(); await refresh.refresh(); await setup.flush();
+    expect(requests.at(-1)).toEqual({ expanded: [], requested: { runId: latest.runId, direction: "older" } });
+    expect(selection.runId).toBe(older.runId);
+    expect(selection.runDirection).toBeUndefined();
+    expect(setup.captureCharFrame()).toContain("Run 1/2 · Completed");
+    expect(setup.captureCharFrame()).toContain("older accepted output");
+    expect(setup.captureCharFrame()).not.toContain("Run 2/2");
+    await refresh.refresh();
+    expect(requests.at(-1)).toEqual({ expanded: [], requested: { runId: older.runId } });
+    reduceKey(selection, { name: "right" }, ["alpha"], ["first"], older.runId);
+    snapshot = snapshotFor(latest, 0);
+    refresh.invalidate(); await refresh.refresh();
+    expect(selection.runId).toBeNull();
+    reduceKey(selection, { name: "escape" }, ["alpha"], []);
+    expect(selection.workflowId).toBeNull();
+    expect(selection.runId).toBeNull();
+  } finally { setup.renderer.destroy(); }
+});
+
+test("failed historical reads retain the last good run label and evidence before recovery", async () => {
+  const setup = await createTestRenderer({ width: 160, height: 30 });
+  try {
+    const mount = mountViewer(setup.renderer);
+    const selection: ViewerState = { ...state(), workflowId: "alpha" };
+    const run = buildRun();
+    const snapshot = buildSnapshot([{ ...buildNode(), status: "succeeded", successfulOutput: "last good run evidence" }]);
+    const committed: ViewerSnapshot = { ...snapshot, selectedRun: run,
+      runPosition: { index: 0, total: 3, followingLatest: true },
+      detail: { ...snapshot.detail!, diagram: { ...snapshot.detail!.diagram, runId: run.runId } } };
+    let fail = false;
+    const refresh = createViewerRefresh({ source: { snapshot: async () => {
+      if (fail) throw new Error("History unavailable");
+      return committed;
+    } }, state: selection, paint: (model, error) => mount.paint(model, error) });
+    await refresh.refresh(); await setup.flush();
+    reduceKey(selection, { name: "left" }, ["alpha"], ["first"], run.runId);
+    fail = true;
+    refresh.invalidate(); await refresh.refresh(); await setup.flush();
+    expect(setup.captureCharFrame()).toContain("STALE: History unavailable");
+    expect(setup.captureCharFrame()).toContain("Run 3/3 (latest)");
+    expect(setup.captureCharFrame()).toContain("last good run evidence");
+    expect(selection.runDirection).toBe("older");
+    fail = false;
+    await refresh.refresh();
+    expect(selection.runDirection).toBeUndefined();
   } finally { setup.renderer.destroy(); }
 });
 

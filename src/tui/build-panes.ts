@@ -6,6 +6,8 @@ export interface ViewerModel {
   readonly runId: string | null;
   readonly header: string;
   readonly runStatus: string | null;
+  readonly runLabel: string | null;
+  readonly runAdmittedAt: string | null;
   readonly rows: readonly StatusRow[];
   readonly steps: readonly StepPreview[];
   readonly notice: readonly string[];
@@ -24,7 +26,9 @@ export function buildViewerModel(input: {
   readonly now?: Date;
 }): ViewerModel {
   const workflow = input.snapshot.status.workflows.find(entry => entry.workflowId === input.workflowId);
-  const run = workflow?.unresolvedRun ?? workflow?.latestRun;
+  const run = input.snapshot.selectedRun === undefined ? workflow?.unresolvedRun ?? workflow?.latestRun : input.snapshot.selectedRun;
+  const position = input.snapshot.runPosition;
+  const displaysRun = run != null && input.snapshot.detail?.diagram.runId === run.runId;
   const notice: string[] = [];
   if (workflow?.configurationError) notice.push("Configuration error: " + workflow.configurationError);
   if (run?.block?.nodeId === null) notice.push("Block: " + run.block.kind, "Reason: " + run.block.reason, "Allowed actions: " + blockActions(run.block.kind));
@@ -36,7 +40,11 @@ export function buildViewerModel(input: {
     screen: input.workflowId === null ? "overview" : "detail",
     runId: input.snapshot.detail?.diagram.runId ?? null,
     header: input.workflowId ?? "Workflows",
-    runStatus: workflow ? (workflow.configurationError ? "Configuration error" : run?.status ?? "ready") : null,
+    runStatus: workflow ? run?.status ?? (workflow.configurationError ? "Configuration error" : "ready") : null,
+    runLabel: !displaysRun ? null : position
+      ? "Run " + (position.total - position.index) + "/" + position.total + (position.followingLatest ? " (latest)" : "")
+      : "Run " + run.runId,
+    runAdmittedAt: displaysRun ? run.admittedAt : null,
     rows: statusRows(input.snapshot.status, input.now),
     steps: (input.snapshot.detail?.nodes ?? []).map(node => renderStepPreview(node, input.expanded.includes(node.nodeId))),
     notice,

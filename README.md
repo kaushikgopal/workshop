@@ -53,6 +53,12 @@ The same model fills both roles here, but the blocks are separate roles:
 YAML admits up to five more runs, three minutes apart (about 15 minutes total).
 Wait until the first run finishes. Press `q` to leave the viewer.
 
+In workflow watch, use `↑`/`↓` to select nodes and `←`/`→` to browse runs.
+The viewer starts with the newest run. A historical selection stays on that run.
+Return to the newest run to follow new admissions again. Use `j`/`k` to scroll
+the active pane and Tab to switch panes. The bot feed remains installation-wide;
+run selection does not filter or reposition it.
+
 Inspect receipts with `workshop logs hemingway-clock --verbose`. Accepted
 sentences appear in `.workshop/hemingway-clock/results.md`. Optionally
 open `workshop chat` after the first run. Chat requires a TTY. Press Enter to

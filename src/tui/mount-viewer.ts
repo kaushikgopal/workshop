@@ -127,17 +127,19 @@ export interface ViewerState {
   selectedId: string | null;
   selectedStepId: string | null;
   expanded: string[];
+  runId?: string | null;
+  runDirection?: "older" | "newer";
 }
 
-export function reduceKey(state: ViewerState, key: { name: string; ctrl?: boolean }, workflowIds: readonly string[], stepIds: readonly string[]): "quit" | "refresh" | null {
+export function reduceKey(state: ViewerState, key: { name: string; ctrl?: boolean }, workflowIds: readonly string[], stepIds: readonly string[], currentRunId: string | null = state.runId ?? null): "quit" | "refresh" | null {
   const name = key.name.toLowerCase();
   if (name === "q" || (name === "c" && key.ctrl)) return "quit";
   if (name === "escape" || name === "backspace") {
-    if (state.workflowId !== null) { state.workflowId = null; state.selectedStepId = null; state.expanded = []; return "refresh"; }
+    if (state.workflowId !== null) { state.workflowId = null; state.selectedStepId = null; state.expanded = []; state.runId = null; delete state.runDirection; return "refresh"; }
     return null;
   }
   if (name === "enter" || name === "return") {
-    if (state.workflowId === null && state.selectedId) { state.workflowId = state.selectedId; return "refresh"; }
+    if (state.workflowId === null && state.selectedId) { state.workflowId = state.selectedId; state.runId = null; delete state.runDirection; return "refresh"; }
     return null;
   }
   if (name === "e" && state.workflowId && state.selectedStepId) {
@@ -145,7 +147,13 @@ export function reduceKey(state: ViewerState, key: { name: string; ctrl?: boolea
       ? state.expanded.filter(id => id !== state.selectedStepId) : [...state.expanded, state.selectedStepId];
     return "refresh";
   }
-  const direction = name === "j" || name === "down" ? 1 : name === "k" || name === "up" ? -1 : 0;
+  if ((name === "left" || name === "right") && state.workflowId && currentRunId) {
+    state.runId = currentRunId;
+    state.runDirection = name === "left" ? "older" : "newer";
+    state.expanded = [];
+    return "refresh";
+  }
+  const direction = name === "down" ? 1 : name === "up" ? -1 : 0;
   if (!direction) return name === "r" ? "refresh" : null;
   const ids = state.workflowId === null ? workflowIds : stepIds;
   const selected = state.workflowId === null ? state.selectedId : state.selectedStepId;
@@ -165,6 +173,18 @@ export interface ViewerMount {
   readonly scrollTarget: ScrollTarget;
   toggleScrollTarget(): void;
   scrollByPage(direction: -1 | 1): void;
+  scrollByLine(direction: -1 | 1): void;
+}
+
+export function handleViewerKey(input: {
+  state: ViewerState; key: { name: string; ctrl?: boolean }; mount: ViewerMount;
+  workflowIds: readonly string[]; stepIds: readonly string[]; runId: string | null;
+}): "quit" | "refresh" | null {
+  const name = input.key.name.toLowerCase();
+  if (name === "tab") { input.mount.toggleScrollTarget(); return null; }
+  if (name === "pagedown" || name === "pageup") { input.mount.scrollByPage(name === "pagedown" ? 1 : -1); return null; }
+  if (!input.key.ctrl && (name === "j" || name === "k")) { input.mount.scrollByLine(name === "j" ? 1 : -1); return null; }
+  return reduceKey(input.state, input.key, input.workflowIds, input.stepIds, input.runId);
 }
 
 /** Persistent pane containers retain independent scroll positions across projection updates. */
@@ -193,6 +213,8 @@ export function mountViewer(renderer: CliRenderer): ViewerMount {
   content.add(notice);
   content.add(table);
   content.add(chain);
+  const runInfo = new TextRenderable(renderer, { width: "100%", height: 1, content: "", wrapMode: "none", visible: false });
+  leftPane.add(runInfo);
   leftPane.add(content);
   rightPane.add(bot);
   middle.add(leftPane);
@@ -214,7 +236,7 @@ export function mountViewer(renderer: CliRenderer): ViewerMount {
     bot.borderColor = feedBorder;
     bot.focusedBorderColor = feedBorder;
     bot.titleColor = feedBorder;
-    footer.content = clip(footerHint + " · scroll " + (activeScrollTarget === "left" ? "LEFT" : "FEED"), Math.max(1, renderer.terminalWidth));
+    footer.content = clip(footerHint, Math.max(1, renderer.terminalWidth));
   };
   let revealSelection: (() => void) | null = null;
   let stickFeedToBottom = false;
@@ -237,6 +259,7 @@ export function mountViewer(renderer: CliRenderer): ViewerMount {
       updateChrome();
     },
     scrollByPage(direction) { (activeScrollTarget === "left" ? content : bot).scrollBy(direction, "viewport"); },
+    scrollByLine(direction) { (activeScrollTarget === "left" ? content : bot).scrollBy(direction); },
     paint(model, error) {
       const terminalWidth = renderer.terminalWidth;
       const split = terminalWidth >= SPLIT_WIDTH;
@@ -273,6 +296,12 @@ export function mountViewer(renderer: CliRenderer): ViewerMount {
       if (model.screen === "detail") headerParts.push(chunk(" • WORKFLOW [" + model.header + "]",
         RGBA.defaultForeground(), TextAttributes.BOLD));
       header.content = truncateChunks(headerParts, Math.max(1, terminalWidth));
+      runInfo.visible = model.screen === "detail" && model.runLabel !== null;
+      runInfo.content = truncateChunks([
+        chunk(model.runLabel ?? "", RGBA.defaultForeground(), TextAttributes.BOLD),
+        chunk(model.runStatus ? " · " + statusLabel(model.runStatus) : "", statusColor(model.runStatus ?? "") ?? RGBA.defaultForeground()),
+        chunk(model.runAdmittedAt ? " · " + model.runAdmittedAt.slice(0, 19).replace("T", " ") + "Z" : "", DIM),
+      ], leftWidth);
       const notices = model.screen === "overview" && model.rows.length === 0
         ? [...model.notice, "No workflows configured"] : model.notice;
       notice.content = notices.join("\n");
@@ -316,8 +345,8 @@ export function mountViewer(renderer: CliRenderer): ViewerMount {
       stickFeedToBottom = bot.scrollTop + bot.viewport.height >= bot.scrollHeight;
       botText.content = renderBotFeed(model.botEntries, model.botEmptyMessage);
       footerHint = model.screen === "overview"
-        ? "Tab pane · PgUp/Dn scroll active pane · ↑↓/j k select · Enter open · q quit"
-        : "Tab pane · PgUp/Dn scroll active pane · ↑↓/j k step · e expand · Esc back · q quit";
+        ? "↑↓ workflows · j/k scroll · Tab pane · PgUp/Dn page · Enter open · q quit"
+        : "↑↓ nodes · ←→ runs · j/k scroll · Tab pane · PgUp/Dn page · e expand · Esc back · q quit";
       updateChrome();
       const selected = model.screen === "overview" ? model.selectedId : model.selectedStepId;
       if (selected !== selection || width !== terminalWidth) {
@@ -351,12 +380,17 @@ export function createViewerRefresh(input: {
     const requestGeneration = generation;
     const selection = { ...input.state, expanded: [...input.state.expanded] };
     try {
-      const snapshot = await input.source.snapshot(selection.workflowId, selection.expanded);
+      const snapshot = await input.source.snapshot(selection.workflowId, selection.expanded,
+        { runId: selection.runId ?? null, ...(selection.runDirection ? { direction: selection.runDirection } : {}) });
       if (requestGeneration !== generation) return;
       const ids = snapshot.status.workflows.map(entry => entry.workflowId);
       if (!ids.includes(input.state.selectedId ?? "")) input.state.selectedId = ids[0] ?? null;
       const steps = snapshot.detail?.nodes.map(node => node.nodeId) ?? [];
       if (!steps.includes(input.state.selectedStepId ?? "")) input.state.selectedStepId = steps[0] ?? null;
+      if (snapshot.runPosition) {
+        input.state.runId = snapshot.runPosition.followingLatest ? null : snapshot.selectedRun?.runId ?? null;
+        delete input.state.runDirection;
+      }
       const model = buildViewerModel({ snapshot, ...input.state });
       input.commit?.(snapshot);
       input.paint(model);
@@ -395,20 +429,36 @@ export async function openViewer(opts: { workflowId: string | null; source: View
   const state: ViewerState = { workflowId: opts.workflowId, selectedId: opts.workflowId, selectedStepId: null, expanded: [] };
   let workflows: string[] = [];
   let steps: string[] = [];
+  let runId: string | null = null;
   const mount = mountViewer(renderer);
   const refresh = createViewerRefresh({ source: opts.source, state, paint: (model, error) => mount.paint(model, error),
-    commit: snapshot => { workflows = snapshot.status.workflows.map(entry => entry.workflowId); steps = snapshot.detail?.nodes.map(node => node.nodeId) ?? []; } });
-  const timer = setInterval(() => void refresh.refresh(), opts.refreshMs ?? 1000);
+    commit: snapshot => { workflows = snapshot.status.workflows.map(entry => entry.workflowId); steps = snapshot.detail?.nodes.map(node => node.nodeId) ?? []; runId = snapshot.detail?.diagram.runId ?? null; } });
+  let navigatingRun = false;
+  const timer = setInterval(() => { if (!navigatingRun) void refresh.refresh(); }, opts.refreshMs ?? 1000);
   const shutdown = makeShutdown({ clear: () => clearInterval(timer), detach: () => {
     process.off("SIGINT", onSignal); process.off("SIGTERM", onSignal);
   }, stop: () => renderer.stop(), destroy: () => renderer.destroy(), exit: code => process.exit(code) });
   function onSignal() { shutdown(); }
-  renderer.keyInput.on("keypress", key => {
-    if (key.name === "tab") { mount.toggleScrollTarget(); return; }
-    if (key.name === "pagedown" || key.name === "pageup") { mount.scrollByPage(key.name === "pagedown" ? 1 : -1); return; }
-    const action = reduceKey(state, key, workflows, steps);
+  let navigationGeneration = 0;
+  const dispatchKey = async (key: { name: string; ctrl?: boolean }) => {
+    const previousWorkflowId = state.workflowId;
+    const action = handleViewerKey({ state, key, workflowIds: workflows, stepIds: steps, mount, runId });
+    if (state.workflowId !== previousWorkflowId) navigationGeneration++;
     if (action === "quit") return shutdown();
-    if (action === "refresh") { refresh.invalidate(); void refresh.refresh(); }
+    if (action === "refresh") { refresh.invalidate(); await refresh.refresh(); }
+  };
+  let runNavigation = Promise.resolve();
+  renderer.keyInput.on("keypress", key => {
+    if (key.name === "left" || key.name === "right") {
+      const requestGeneration = navigationGeneration;
+      // Resolve each run before applying the next arrow; leaving detail cancels the remaining keys.
+      runNavigation = runNavigation.then(async () => {
+        if (navigationGeneration !== requestGeneration) return;
+        // Pause poll admission so a slow read cannot keep the coalesced refresh promise active forever.
+        navigatingRun = true;
+        try { await dispatchKey(key); } finally { navigatingRun = false; }
+      });
+    } else void dispatchKey(key);
   });
   renderer.on("resize", () => void refresh.refresh());
   process.once("SIGINT", onSignal);
