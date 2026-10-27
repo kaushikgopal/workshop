@@ -98,6 +98,33 @@ describe("CLI commands", () => {
     }
   });
 
+  test("resolve preserves argument error precedence before installation lookup", () => {
+    const root = mkdtempSync(join(tmpdir(), "workshop-resolve-errors-"));
+    const required = ["clock", "--action", "retry", "--reason", "checked"];
+    const cases = [
+      { args: ["--action", "retry", "--action", "accept", "--unknown"], error: "--action requires retry, accept, or fail" },
+      { args: ["--unknown", "--action", "invalid"], error: "unsupported resolve option: --unknown" },
+      { args: ["--action", "invalid", "--unknown"], error: "--action requires retry, accept, or fail" },
+      { args: ["--run", "", "--unknown"], error: "Too small: expected string to have >=1 characters" },
+      { args: [...required, "--reason"], error: "--reason requires one text value" },
+      { args: [...required, "--reason", "again"], error: "--reason requires one text value" },
+      { args: [...required, "--result-file", "candidate"], error: "accept-only flags cannot be used with retry or fail" },
+      { args: [...required, "--result-file", "candidate", "--acknowledge-effects"], error: "accept requires both --result-file and --acknowledge-effects" },
+      { args: [...required, "--target", "judgment", "--allow-repeat"], error: "--target judgment cannot be combined with --allow-repeat or --extra-attempt" },
+    ];
+    try {
+      for (const { args, error } of cases) {
+        const result = runCli(root, ["resolve", ...args]);
+        expect(result.status).toBe(64);
+        expect(result.stderr).toContain(error);
+        expect(result.stdout).toBe("");
+      }
+      expect(existsSync(join(root, ".workshop"))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("validates every shipped workflow example without an installation or model defaults", () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-validate-examples-"));
     try {

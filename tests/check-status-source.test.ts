@@ -353,35 +353,97 @@ test("viewer paginates only far enough to resolve the selected run and its older
     expect(pages).toHaveLength(2);
     expect(pages.map(request => request.method === "runs" ? request.cursor : null)).toEqual([undefined, "page-100"]);
     expect(pages.every(request => request.method === "runs" && request.limit === 100)).toBe(true);
+
+    const source = createViewerSource(socket);
+    const pinned = await source.snapshot("alpha", [], { runId: history[205]!.runId });
+    expect(pinned.selectedRun).toEqual(history[205]);
+    expect(pinned.runPosition).toEqual({ index: 205, total: 230, followingLatest: false });
+    expect(requests.filter(request => request.method === "runs")).toHaveLength(5);
+    await expect(source.snapshot("alpha", [], { runId: "missing" }))
+      .rejects.toThrow("service no longer lists admitted run missing");
+    expect(requests.filter(request => request.method === "runs")).toHaveLength(8);
   });
 });
 
-test("viewer rejects truncated, cyclic, changing, and mismatched run pages", async () => {
-  const scenarios = ["truncated", "cycle", "changed", "workflow", "runWorkflow"] as const;
-  for (const scenario of scenarios) {
-    const status = buildStatus();
-    const newest = makeRun("page-newest", "2026-10-10T12:00:03.000Z");
-    const middle = makeRun("page-middle", "2026-10-10T12:00:02.000Z");
-    const oldest = makeRun("page-oldest", "2026-10-10T12:00:01.000Z");
+test("viewer checks complete pages before selecting a run and preserves validation precedence", async () => {
+  const newest = makeRun("page-newest", "2026-10-10T12:00:03.000Z");
+  const middle = makeRun("page-middle", "2026-10-10T12:00:02.000Z");
+  const oldest = makeRun("page-oldest", "2026-10-10T12:00:01.000Z");
+  const wrongWorkflow = runSummaryDtoSchema.parse({ ...newest, workflowId: "beta" });
+  const scenarios: { pages: ReturnType<typeof makeRunsPage>[]; error: string; runId?: string }[] = [
+    { pages: [makeRunsPage([newest], 3)], error: "service ended run history before its snapshot was complete" },
+    { pages: [makeRunsPage([], 3, "next")], error: "service returned a truncated run page" },
+    { pages: [makeRunsPage([newest], 1, "next")], error: "service returned a truncated run page" },
+    { pages: [makeRunsPage([newest], 2, "next"), makeRunsPage([middle, oldest], 2, "last")],
+      error: "service returned a truncated run page" },
+    { pages: [makeRunsPage([newest], 3, "cycle"), makeRunsPage([middle], 3, "cycle")],
+      error: "service repeated a run-page cursor", runId: middle.runId },
+    { pages: [makeRunsPage([newest], 3, "next"), makeRunsPage([middle], 2, "last", 3)],
+      error: "run pages changed their admission snapshot" },
+    { pages: [makeRunsPage([newest], 3, "next"), makeRunsPage([newest], 3, "last", 4)],
+      error: "run pages changed their admission snapshot" },
+    { pages: [makeRunsPage([newest], 3, "next"), { ...makeRunsPage([wrongWorkflow], 3, "next", 4), workflowId: "beta" }],
+      error: "service returned run history for a different workflow" },
+    { pages: [makeRunsPage([newest], 3, "next"), makeRunsPage([wrongWorkflow], 3, "last")],
+      error: "service returned a run for a different workflow" },
+    { pages: [makeRunsPage([newest, newest])], error: "service repeated a run in its history" },
+    { pages: [makeRunsPage([middle, newest])], error: "service returned run history out of newest-first order" },
+    { pages: [makeRunsPage([middle], 3, "next"), makeRunsPage([newest], 3, "last")],
+      error: "service returned run history out of newest-first order" },
+    { pages: [makeRunsPage([makeRun("tie-z", TIME), makeRun("tie-a", TIME)])],
+      error: "service returned run history out of newest-first order" },
+  ];
+  for (const { pages, error, runId = "not-listed" } of scenarios) {
+    let pageIndex = 0;
     await fakeService(request => {
-      if (request.method === "status") return status;
-      if (request.method !== "runs") return undefined;
-      if (scenario === "truncated") return makeRunsPage([newest], 3, null, 3);
-      if (scenario === "workflow") return { version: 1, workflowId: "beta", total: 0, highWaterMark: 0, nextCursor: null, runs: [] };
-      if (scenario === "runWorkflow") return makeRunsPage([runSummaryDtoSchema.parse({ ...newest, workflowId: "beta" })]);
-      if (scenario === "cycle") {
-        return request.cursor === undefined
-          ? makeRunsPage([newest], 3, "cycle", 3)
-          : makeRunsPage([middle], 3, "cycle", 3);
-      }
-      return request.cursor === undefined
-        ? makeRunsPage([newest], 3, "next", 3)
-        : makeRunsPage([middle], 3, "last", 4);
+      if (request.method === "status") return buildStatus();
+      if (request.method === "runs") return pages[pageIndex++]
+        ?? fakeProtocolResponse(serviceError(null, "request_failed", "unexpected history page"));
+      return viewerDetailResponse(request, pages.flatMap(page => page.runs));
+    }, async (socket, requests) => {
+      // A selectable first run must not bypass checks on the rest of its page.
+      const selection = pages.length === 1 ? undefined : { runId };
+      await expect(createViewerSource(socket).snapshot("alpha", [], selection)).rejects.toThrow(error);
+      expect(requests.filter(request => request.method === "runs")).toHaveLength(pages.length);
+      expect(requests.some(request => request.method === "diagram" || request.method === "node.describe")).toBe(false);
+    });
+  }
+});
+
+test("viewer preserves service and schema errors before run-page identity checks", async () => {
+  const scenarios = [
+    { result: fakeProtocolResponse(serviceError(null, "request_failed", "history unavailable")), error: "request_failed: history unavailable" },
+    { result: { ...makeRunsPage([], 1, null, 0), workflowId: "beta" }, error: "page total fits within its admission high-water mark" },
+  ];
+  for (const { result, error } of scenarios) {
+    await fakeService(request => {
+      if (request.method === "status") return buildStatus();
+      if (request.method === "runs") return result;
+      return viewerDetailResponse(request, []);
+    }, async (socket, requests) => {
+      await expect(createViewerSource(socket).snapshot("alpha")).rejects.toThrow(error);
+      expect(requests.map(request => request.method)).toEqual(["status", "chat.view", "runs"]);
+    });
+  }
+});
+
+test("viewer handles unpinned directions, empty history, ties, and a missing pinned run", async () => {
+  const history = [makeRun("tie-a", TIME), makeRun("tie-z", TIME)];
+  for (const runs of [history, history.slice(0, 1), []]) {
+    await fakeService(request => {
+      if (request.method === "status") return buildStatus();
+      if (request.method === "runs") return makeRunsPage(runs);
+      return viewerDetailResponse(request, runs);
     }, async socket => {
-      const expected = scenario === "truncated" ? "before its snapshot was complete"
-        : scenario === "cycle" ? "repeated a run-page cursor"
-          : scenario === "workflow" || scenario === "runWorkflow" ? "different workflow" : "changed their admission snapshot";
-      await expect(createViewerSource(socket).snapshot("alpha", [], { runId: "not-listed" })).rejects.toThrow(expected);
+      const source = createViewerSource(socket);
+      for (const direction of [undefined, "older", "newer"] as const) {
+        const snapshot = await source.snapshot("alpha", [], { runId: null, direction });
+        const index = direction === "older" && runs.length > 1 ? 1 : 0;
+        expect(snapshot.selectedRun).toEqual(runs[index] ?? null);
+        expect(snapshot.runPosition).toEqual({ index, total: runs.length, followingLatest: index === 0 });
+      }
+      await expect(source.snapshot("alpha", [], { runId: "missing", direction: "older" }))
+        .rejects.toThrow("service no longer lists admitted run missing");
     });
   }
 });

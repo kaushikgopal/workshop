@@ -191,6 +191,7 @@ async function resolveCommand(args: readonly string[]): Promise<void> {
   let extraAttempt = false;
   let acknowledgeEffects = false;
   const positional: string[] = [];
+  // Check each option as it is consumed; duplicate or invalid values precede later argument errors.
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index]!;
     if (argument === "--action") {

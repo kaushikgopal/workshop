@@ -1,5 +1,5 @@
 import { sendServiceRequest, streamServiceLogChunks } from "../service/send-service-request.js";
-import { serviceRunsPageV1Schema, type ServiceRequestV1, type ServiceResponseV1 } from "../service/schema.js";
+import { serviceRunsPageV1Schema, type ServiceRequestV1, type ServiceResponseV1, type ServiceRunsPageV1 } from "../service/schema.js";
 import type { ViewerRunSelection, ViewerSource } from "../tui/data-source.js";
 import { diagramDtoSchema, nodeDescriptionDtoSchema, statusDtoSchema, type RunSummaryDto } from "../views/schema.js";
 import { botChatViewV1Schema } from "../bot/schema.js";
@@ -56,66 +56,26 @@ export function createViewerSource(socketPath: string): ViewerSource {
     const runIds = new Set<string>();
     const cursors = new Set<string>();
     let cursor: string | undefined;
-    let total: number | undefined;
-    let highWaterMark: number | undefined;
+    let previousPage: ServiceRunsPageV1 | undefined;
 
     for (;;) {
       if (cursor !== undefined) {
         if (cursors.has(cursor)) throw new Error("service repeated a run-page cursor");
         cursors.add(cursor);
       }
-      const response = await sendServiceRequest(socketPath, {
+      const page = serviceRunsPageV1Schema.parse(await read({
         version: 1, method: "runs", workflowId, limit: 100,
         ...(cursor === undefined ? {} : { cursor }),
-      });
-      if (!response.ok) throw new Error(response.error.code + ": " + response.error.message);
-      const page = serviceRunsPageV1Schema.parse(response.result);
-      if (page.workflowId !== workflowId) throw new Error("service returned run history for a different workflow");
-      if (total !== undefined && (page.total !== total || page.highWaterMark !== highWaterMark)) {
-        throw new Error("run pages changed their admission snapshot");
-      }
-      total = page.total;
-      highWaterMark = page.highWaterMark;
-      for (const run of page.runs) {
-        if (run.workflowId !== workflowId) throw new Error("service returned a run for a different workflow");
-        if (runIds.has(run.runId)) throw new Error("service repeated a run in its history");
-        const previous = runs.at(-1);
-        if (previous !== undefined && (previous.admittedAt < run.admittedAt
-          || (previous.admittedAt === run.admittedAt && previous.runId >= run.runId))) {
-          throw new Error("service returned run history out of newest-first order");
-        }
-        runIds.add(run.runId);
-        runs.push(run);
-      }
-      if (page.nextCursor === null) {
-        if (runs.length !== page.total) throw new Error("service ended run history before its snapshot was complete");
-      } else {
-        if (page.runs.length === 0 || runs.length >= page.total) throw new Error("service returned a truncated run page");
-        if (cursors.has(page.nextCursor)) throw new Error("service repeated a run-page cursor");
-      }
+      }));
+      // Later entries can invalidate a page even when its first run is selectable.
+      checkRunPageSnapshot(page, workflowId, previousPage);
+      previousPage = page;
+      appendRunPage(page, workflowId, runs, runIds);
+      checkRunPageEnd(page, runs.length, cursors);
 
-      let baseIndex = requestedRunId === null ? 0 : runs.findIndex(run => run.runId === requestedRunId);
-      if (requestedRunId === null && direction === "older") baseIndex = 1;
-      if (baseIndex >= 0) {
-        let selectedIndex = baseIndex;
-        if (requestedRunId !== null && direction === "older") selectedIndex += 1;
-        else if (requestedRunId !== null && direction === "newer") selectedIndex = Math.max(0, selectedIndex - 1);
-        if (selectedIndex < runs.length) {
-          return { selectedRun: runs[selectedIndex]!, index: selectedIndex, total: page.total, followingLatest: selectedIndex === 0 };
-        }
-        if (page.nextCursor === null) {
-          const selectedIndexAtEdge = Math.max(0, page.total - 1);
-          return { selectedRun: runs[selectedIndexAtEdge] ?? null, index: selectedIndexAtEdge, total: page.total,
-            followingLatest: selectedIndexAtEdge === 0 };
-        }
-      } else if (page.nextCursor === null) {
-        throw new Error(`service no longer lists admitted run ${requestedRunId}`);
-      }
-
-      if (page.nextCursor === null) {
-        return { selectedRun: null, index: 0, total: 0, followingLatest: true };
-      }
-      cursor = page.nextCursor;
+      const runSelection = selectRunFromHistory(runs, page, requestedRunId, direction);
+      if (runSelection !== undefined) return runSelection;
+      cursor = page.nextCursor!;
     }
   };
   return {
@@ -166,6 +126,55 @@ export function createViewerSource(socketPath: string): ViewerSource {
         detail: { diagram, nodes }, botEntries, botConfigured: bot.configured };
     },
   };
+}
+
+function checkRunPageSnapshot(page: ServiceRunsPageV1, workflowId: string, previousPage: ServiceRunsPageV1 | undefined): void {
+  if (page.workflowId !== workflowId) throw new Error("service returned run history for a different workflow");
+  if (previousPage !== undefined && (page.total !== previousPage.total || page.highWaterMark !== previousPage.highWaterMark)) {
+    throw new Error("run pages changed their admission snapshot");
+  }
+}
+
+function appendRunPage(page: ServiceRunsPageV1, workflowId: string, runs: RunSummaryDto[], runIds: Set<string>): void {
+  for (const run of page.runs) {
+    if (run.workflowId !== workflowId) throw new Error("service returned a run for a different workflow");
+    if (runIds.has(run.runId)) throw new Error("service repeated a run in its history");
+    const previous = runs.at(-1);
+    if (previous !== undefined && (previous.admittedAt < run.admittedAt
+      || (previous.admittedAt === run.admittedAt && previous.runId >= run.runId))) {
+      throw new Error("service returned run history out of newest-first order");
+    }
+    runIds.add(run.runId);
+    runs.push(run);
+  }
+}
+
+function checkRunPageEnd(page: ServiceRunsPageV1, loadedCount: number, cursors: ReadonlySet<string>): void {
+  if (page.nextCursor === null) {
+    if (loadedCount !== page.total) throw new Error("service ended run history before its snapshot was complete");
+  } else {
+    if (page.runs.length === 0 || loadedCount >= page.total) throw new Error("service returned a truncated run page");
+    if (cursors.has(page.nextCursor)) throw new Error("service repeated a run-page cursor");
+  }
+}
+
+function selectRunFromHistory(
+  runs: readonly RunSummaryDto[], page: ServiceRunsPageV1, requestedRunId: string | null, direction: ViewerRunSelection["direction"],
+) {
+  let selectedIndex = requestedRunId === null ? 0 : runs.findIndex(run => run.runId === requestedRunId);
+  if (selectedIndex < 0) {
+    if (page.nextCursor === null) throw new Error("service no longer lists admitted run " + requestedRunId);
+    return undefined;
+  }
+  if (direction === "older") selectedIndex += 1;
+  else if (direction === "newer") selectedIndex = Math.max(0, selectedIndex - 1);
+
+  if (selectedIndex >= runs.length) {
+    // An older neighbor can be on the next page; clamp only at the history edge.
+    if (page.nextCursor !== null) return undefined;
+    selectedIndex = Math.max(0, page.total - 1);
+  }
+  return { selectedRun: runs[selectedIndex] ?? null, index: selectedIndex, total: page.total, followingLatest: selectedIndex === 0 };
 }
 
 function isUnsupportedIncludeKindsError(error: Extract<ServiceResponseV1, { readonly ok: false }>["error"]): boolean {
