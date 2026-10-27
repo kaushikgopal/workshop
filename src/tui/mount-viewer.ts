@@ -1,7 +1,7 @@
 import { BoxRenderable, RGBA, ScrollBoxRenderable, StyledText, TextAttributes, TextRenderable, createCliRenderer, type CliRenderer, type TextChunk } from "@opentui/core";
 import { statusGlyph, statusLabel } from "../views/render-status.js";
 import { buildViewerModel, type ViewerModel } from "./build-panes.js";
-import type { ViewerSnapshot, ViewerSource } from "./data-source.js";
+import type { ViewerChatEntry, ViewerSnapshot, ViewerSource } from "./data-source.js";
 
 const ANSI = { red: 1, green: 2, yellow: 3, cyan: 6, brightBlack: 8 } as const;
 const STATUS_COLORS: Record<string, number> = {
@@ -9,6 +9,7 @@ const STATUS_COLORS: Record<string, number> = {
   running: ANSI.cyan, waiting: ANSI.yellow, blocked: ANSI.yellow, failed: ANSI.red,
 };
 const DIM = RGBA.fromIndex(ANSI.brightBlack);
+const SPLIT_WIDTH = 96;
 
 function chunk(text: string, color = RGBA.defaultForeground(), attributes = 0): TextChunk {
   return { __isChunk: true, text, fg: color, attributes };
@@ -128,6 +129,44 @@ function truncateChunks(parts: readonly TextChunk[], width: number): StyledText 
   return new StyledText(chunks);
 }
 
+function feedLabel(entry: ViewerChatEntry): { text: string; color: RGBA } {
+  if (entry.kind === "input") return { text: "INPUT", color: RGBA.fromIndex(ANSI.brightBlack) };
+  if (entry.kind === "message") return { text: "BOT", color: RGBA.fromIndex(ANSI.cyan) };
+  if (entry.kind === "tool_call") return { text: "TOOL", color: RGBA.fromIndex(ANSI.yellow) };
+  if (entry.kind === "tool_result") return { text: "OUTPUT", color: RGBA.fromIndex(ANSI.green) };
+  if (entry.kind === "error") return { text: "ERROR", color: RGBA.fromIndex(ANSI.red) };
+  if (entry.role === "user") return { text: "INPUT", color: RGBA.fromIndex(ANSI.brightBlack) };
+  if (entry.role === "assistant") return { text: "BOT", color: RGBA.fromIndex(ANSI.cyan) };
+  return { text: "ACTIVITY", color: RGBA.fromIndex(ANSI.brightBlack) };
+}
+
+function previewToolOutput(value: string): { text: string; truncated: boolean } {
+  const lines = value.split("\n");
+  let text = lines.slice(0, 8).join("\n");
+  let truncated = lines.length > 8;
+  const characters = Array.from(text);
+  if (characters.length > 1024) {
+    text = characters.slice(0, 1023).join("") + "…";
+    truncated = true;
+  }
+  return { text, truncated };
+}
+
+function renderBotFeed(entries: readonly ViewerChatEntry[], emptyMessage: string | null): StyledText {
+  if (entries.length === 0) return new StyledText([chunk(emptyMessage ?? "No bot activity yet")]);
+  const chunks: TextChunk[] = [];
+  entries.forEach((entry, index) => {
+    const label = feedLabel(entry);
+    const preview = entry.kind === "tool_result" || entry.kind === "error"
+      ? previewToolOutput(entry.text)
+      : { text: entry.text, truncated: false };
+    chunks.push(chunk(label.text + "\n", label.color, TextAttributes.BOLD), chunk(preview.text, label.color));
+    if (preview.truncated) chunks.push(chunk("\n[output truncated in viewer]", label.color));
+    if (index < entries.length - 1) chunks.push(chunk("\n\n"));
+  });
+  return new StyledText(chunks);
+}
+
 export interface ViewerState {
   workflowId: string | null;
   selectedId: string | null;
@@ -162,26 +201,35 @@ export function reduceKey(state: ViewerState, key: { name: string; ctrl?: boolea
   return "refresh";
 }
 
+export type ScrollTarget = "left" | "feed";
+
 export interface ViewerMount {
   paint(model: ViewerModel, error?: string | null): void;
   readonly content: ScrollBoxRenderable;
   readonly bot: ScrollBoxRenderable;
+  readonly scrollTarget: ScrollTarget;
+  toggleScrollTarget(): void;
+  scrollByPage(direction: -1 | 1): void;
 }
 
-/** Persistent containers preserve scroll and focus across projection updates. */
+/** Persistent pane containers retain independent scroll positions across projection updates. */
 export function mountViewer(renderer: CliRenderer): ViewerMount {
   const root = new BoxRenderable(renderer, { width: "100%", height: "100%", flexDirection: "column", shouldFill: false });
   const header = new TextRenderable(renderer, { width: "100%", height: 1, content: "WORKSHOP", wrapMode: "none" });
-  const content = new ScrollBoxRenderable(renderer, { flexGrow: 1, width: "100%", scrollX: false,
+  const middle = new BoxRenderable(renderer, { flexGrow: 1, width: "100%", flexDirection: "row", shouldFill: false });
+  const leftPane = new BoxRenderable(renderer, { width: 1, flexGrow: 1, flexBasis: 0, flexDirection: "column", shouldFill: false });
+  const rightPane = new BoxRenderable(renderer, { width: 1, flexGrow: 1, flexBasis: 0, flexDirection: "column", shouldFill: false });
+  const leftTitle = new TextRenderable(renderer, { width: "100%", height: 2, wrapMode: "none" });
+  const rightTitle = new TextRenderable(renderer, { width: "100%", height: 2, wrapMode: "none" });
+  const content = new ScrollBoxRenderable(renderer, { flexGrow: 1, flexBasis: 0, width: "100%", scrollX: false,
     verticalScrollbarOptions: { visible: false } });
-  // Lock both bars off after ScrollBox's automatic visibility pass.
   content.verticalScrollBar.visible = false;
   const notice = new TextRenderable(renderer, { width: "100%", content: "", wrapMode: "word" });
   const table = new TextRenderable(renderer, { width: "100%", content: "", wrapMode: "none" });
   const chain = new BoxRenderable(renderer, { flexDirection: "column", width: "100%" });
-  const bot = new ScrollBoxRenderable(renderer, { height: Math.max(6, Math.floor(renderer.terminalHeight * 0.4)),
-    width: "100%", stickyScroll: true, stickyStart: "bottom", border: true, borderStyle: "rounded", borderColor: DIM,
-    titleColor: DIM, focusedBorderColor: DIM, title: " Shared bot feed ", paddingX: 1,
+  const divider = new BoxRenderable(renderer, { width: 1, flexGrow: 0, border: ["left"], borderStyle: "single",
+    borderColor: DIM, focusedBorderColor: DIM, shouldFill: false });
+  const bot = new ScrollBoxRenderable(renderer, { flexGrow: 1, flexBasis: 0, width: "100%", scrollX: false, paddingX: 2, paddingY: 1,
     verticalScrollbarOptions: { visible: false } });
   bot.verticalScrollBar.visible = false;
   const botText = new TextRenderable(renderer, { width: "100%", content: "", wrapMode: "word" });
@@ -190,18 +238,39 @@ export function mountViewer(renderer: CliRenderer): ViewerMount {
   content.add(notice);
   content.add(table);
   content.add(chain);
+  leftPane.add(leftTitle);
+  leftPane.add(content);
+  rightPane.add(rightTitle);
+  rightPane.add(bot);
+  middle.add(leftPane);
+  middle.add(divider);
+  middle.add(rightPane);
   root.add(header);
-  root.add(content);
-  root.add(bot);
+  root.add(middle);
   root.add(footer);
   renderer.root.add(root);
   const steps = new Map<string, { box: BoxRenderable; title: TextRenderable; status: TextRenderable; preview: TextRenderable }>();
   let screenKey = "";
   let selection: string | null = null;
   let width = renderer.terminalWidth;
+  let activeScrollTarget: ScrollTarget = "left";
+  let footerHint = "";
+  let leftHeading = "STATUS";
+  const updateChrome = () => {
+    const leftActive = activeScrollTarget === "left";
+    leftTitle.content = new StyledText([chunk(leftHeading + (leftActive ? " [scroll]" : ""),
+      leftActive ? RGBA.defaultForeground() : DIM, leftActive ? TextAttributes.BOLD : 0)]);
+    rightTitle.content = new StyledText([chunk("  SHARED BOT FEED" + (leftActive ? "" : " [scroll]"),
+      leftActive ? DIM : RGBA.defaultForeground(), leftActive ? 0 : TextAttributes.BOLD), chunk("\n  All workflows", DIM)]);
+    footer.content = clip(footerHint + " · scroll " + (activeScrollTarget === "left" ? "LEFT" : "FEED"), Math.max(1, renderer.terminalWidth));
+  };
   let revealSelection: (() => void) | null = null;
-  // Scroll bounds exist only after layout. Do not re-reveal on streaming updates.
+  let stickFeedToBottom = false;
   const revealAfterLayout = () => {
+    if (stickFeedToBottom) {
+      bot.scrollTo(bot.scrollHeight);
+      stickFeedToBottom = false;
+    }
     const reveal = revealSelection;
     revealSelection = null;
     reveal?.();
@@ -210,7 +279,15 @@ export function mountViewer(renderer: CliRenderer): ViewerMount {
   renderer.once("destroy", () => renderer.removePostProcessFn(revealAfterLayout));
   return {
     content, bot,
+    get scrollTarget() { return activeScrollTarget; },
+    toggleScrollTarget() {
+      activeScrollTarget = activeScrollTarget === "left" ? "feed" : "left";
+      updateChrome();
+    },
+    scrollByPage(direction) { (activeScrollTarget === "left" ? content : bot).scrollBy(direction, "viewport"); },
     paint(model, error) {
+      const terminalWidth = renderer.terminalWidth;
+      const split = terminalWidth >= SPLIT_WIDTH;
       const key = model.screen + ":" + model.header + ":" + model.runId;
       if (key !== screenKey) {
         content.scrollTop = 0;
@@ -219,11 +296,25 @@ export function mountViewer(renderer: CliRenderer): ViewerMount {
         steps.clear();
         screenKey = key;
       }
-      const available = Math.max(1, renderer.terminalWidth - 2);
+      middle.flexDirection = split ? "row" : "column";
+      divider.visible = split;
+      leftPane.flexBasis = split ? 0 : "auto";
+      rightPane.flexBasis = split ? 0 : "auto";
+      leftPane.width = split ? 0 : "100%";
+      rightPane.width = split ? 0 : "100%";
+      leftPane.flexGrow = 1;
+      rightPane.flexGrow = split ? 1 : 0;
+      const leftWidth = split ? Math.max(1, Math.floor((terminalWidth - 1) / 2)) : terminalWidth;
+      if (split) {
+        rightPane.height = "100%";
+        bot.height = 1;
+      } else {
+        const botHeight = Math.max(4, Math.floor(renderer.terminalHeight * 0.4) - 2);
+        rightPane.height = botHeight + 2;
+        bot.height = botHeight;
+      }
       const headerParts: TextChunk[] = [
-        chunk("WORKSHOP", DIM, TextAttributes.DIM),
-        chunk(" · "),
-        chunk(model.header, RGBA.defaultForeground(), TextAttributes.BOLD),
+        chunk("WORKSHOP", DIM), chunk(" · "), chunk(model.header, RGBA.defaultForeground(), TextAttributes.BOLD),
       ];
       if (model.runStatus !== null) {
         headerParts.push(chunk(" · "));
@@ -231,12 +322,13 @@ export function mountViewer(renderer: CliRenderer): ViewerMount {
         headerParts.push(chunk(statusGlyph(label) + " " + statusLabel(label), statusColor(label) ?? RGBA.defaultForeground(), statusAttributes(label)));
       }
       if (error) headerParts.push(chunk(" · STALE: " + error));
-      header.content = truncateChunks(headerParts, available);
+      header.content = truncateChunks(headerParts, Math.max(1, terminalWidth));
+      leftHeading = model.screen === "overview" ? "STATUS" : "NODES";
       notice.content = model.notice.join("\n");
       notice.visible = model.notice.length > 0;
       table.visible = model.screen === "overview";
       chain.visible = model.screen === "detail";
-      table.content = renderOverviewTable(model.rows, available, model.selectedId);
+      table.content = renderOverviewTable(model.rows, leftWidth, model.selectedId);
       for (const step of model.steps) {
         let mounted = steps.get(step.id);
         if (!mounted) {
@@ -260,7 +352,7 @@ export function mountViewer(renderer: CliRenderer): ViewerMount {
         mounted.box.focusedBorderColor = borderColor;
         mounted.box.titleColor = borderColor;
         const titleText = " " + step.id + " ";
-        const titleWidth = Math.max(1, Math.min(titleText.length, renderer.terminalWidth - 4));
+        const titleWidth = Math.max(1, Math.min(titleText.length, leftWidth - 4));
         mounted.title.width = titleWidth;
         mounted.title.content = new StyledText([chunk(clip(titleText, titleWidth), RGBA.defaultForeground(), TextAttributes.BOLD)]);
         mounted.title.visible = selected;
@@ -269,19 +361,24 @@ export function mountViewer(renderer: CliRenderer): ViewerMount {
         mounted.preview.content = step.lines.join("\n") + (step.expandable ? "\n" + (step.expanded ? "[e collapse]" : "[e expand retained evidence]") : "");
         mounted.preview.visible = step.lines.length > 0 || step.expandable;
       }
-      botText.content = model.botLines.join("\n");
-      bot.height = Math.max(6, Math.floor(renderer.terminalHeight * 0.4));
-      footer.content = (model.screen === "overview" ? "↑↓ / j k select · Enter open · q quit" : "↑↓ / j k step · e expand · Esc back · q quit").slice(0, available);
+      stickFeedToBottom = bot.scrollTop + bot.viewport.height >= bot.scrollHeight;
+      botText.content = renderBotFeed(model.botEntries, model.botEmptyMessage);
+      footerHint = model.screen === "overview"
+        ? "Tab pane · PgUp/Dn scroll active pane · ↑↓/j k select · Enter open · q quit"
+        : "Tab pane · PgUp/Dn scroll active pane · ↑↓/j k step · e expand · Esc back · q quit";
+      updateChrome();
       const selected = model.screen === "overview" ? model.selectedId : model.selectedStepId;
-      if (selected !== selection || width !== renderer.terminalWidth) {
+      if (selected !== selection || width !== terminalWidth) {
         revealSelection = () => {
           const row = model.rows.findIndex(entry => entry[0] === selected);
-          const y = model.screen === "overview" ? (renderer.terminalWidth < 62 ? row * 4 : row + 1)
+          const tableBase = table.y - content.viewport.y + content.scrollTop;
+          const y = model.screen === "overview"
+            ? tableBase + (leftWidth < 60 ? 0 : 1) + row * (leftWidth < 60 ? 4 : 1)
             : (steps.get(selected ?? "")?.box.y ?? content.viewport.y) - content.viewport.y + content.scrollTop;
           if (y < content.scrollTop || y >= content.scrollTop + content.viewport.height) content.scrollTo(Math.max(0, y));
         };
         selection = selected;
-        width = renderer.terminalWidth;
+        width = terminalWidth;
       }
     },
   };
@@ -354,7 +451,8 @@ export async function openViewer(opts: { workflowId: string | null; source: View
   }, stop: () => renderer.stop(), destroy: () => renderer.destroy(), exit: code => process.exit(code) });
   function onSignal() { shutdown(); }
   renderer.keyInput.on("keypress", key => {
-    if (key.name === "pagedown" || key.name === "pageup") { mount.content.scrollBy(key.name === "pagedown" ? 1 : -1, "viewport"); return; }
+    if (key.name === "tab") { mount.toggleScrollTarget(); return; }
+    if (key.name === "pagedown" || key.name === "pageup") { mount.scrollByPage(key.name === "pagedown" ? 1 : -1); return; }
     const action = reduceKey(state, key, workflows, steps);
     if (action === "quit") return shutdown();
     if (action === "refresh") { refresh.invalidate(); void refresh.refresh(); }

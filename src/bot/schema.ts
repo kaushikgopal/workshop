@@ -19,6 +19,7 @@ export const chatTextV1Schema = boundedUtf8(64 * 1024, "chat text").refine(value
 export const botChatEntryV1Schema = z.strictObject({
   id: z.string().min(1).max(256),
   role: z.enum(["user", "assistant", "activity"]),
+  kind: z.enum(["input", "message", "tool_call", "tool_result", "error"]).optional(),
   text: boundedUtf8(64 * 1024, "chat entry"),
 });
 

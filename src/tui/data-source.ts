@@ -1,5 +1,8 @@
 import type { DiagramDto, NodeDescriptionDto, StatusDto } from "../views/schema.js";
-import type { BotChatViewV1 } from "../bot/schema.js";
+import type { BotChatEntryV1, BotChatViewV1 } from "../bot/schema.js";
+
+/** Keep the service entry, including its optional semantic kind, intact in the viewer. */
+export type ViewerChatEntry = BotChatEntryV1;
 
 /** The viewer consumes public service projections, never files or storage. */
 export interface ViewerSource {
@@ -12,10 +15,10 @@ export interface ViewerSnapshot {
     readonly diagram: DiagramDto;
     readonly nodes: readonly NodeDescriptionDto["node"][];
   } | null;
-  /** Shared bot messages. Absence is not a run worklog. */
-  readonly botLines?: readonly string[];
+  /** Typed shared bot entries stay separate from run worklogs and process output. */
+  readonly botEntries?: readonly ViewerChatEntry[];
+  readonly botConfigured?: boolean;
 }
-
 
 export interface ChatSource {
   view(cursor?: string, limit?: number): Promise<BotChatViewV1>;

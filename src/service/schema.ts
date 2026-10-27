@@ -50,7 +50,7 @@ export const serviceRequestV1Schema = z.discriminatedUnion("method", [
   z.strictObject({ ...mutationBase, method: z.literal("human.reply"), runId: runIdSchema,
     waitId: waitIdSchema, action: z.enum(["continue", "reject"]), answer: humanAnswerSchema }),
   z.strictObject({ ...requestBase, method: z.literal("chat.submit"), requestId: serviceRequestIdV1Schema, text: chatTextV1Schema }),
-  z.strictObject({ ...requestBase, method: z.literal("chat.view"), cursor: z.string().min(1).max(4096).optional(), limit: z.number().int().min(1).max(100).optional() }),
+  z.strictObject({ ...requestBase, method: z.literal("chat.view"), cursor: z.string().min(1).max(4096).optional(), limit: z.number().int().min(1).max(100).optional(), includeKinds: z.literal(true).optional() }),
   z.strictObject({
     ...mutationBase,
     method: z.literal("resolve"),

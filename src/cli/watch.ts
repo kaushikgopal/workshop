@@ -1,5 +1,5 @@
 import { sendServiceRequest, streamServiceLogChunks } from "../service/send-service-request.js";
-import type { ServiceRequestV1 } from "../service/schema.js";
+import type { ServiceRequestV1, ServiceResponseV1 } from "../service/schema.js";
 import type { ViewerSource } from "../tui/data-source.js";
 import { diagramDtoSchema, nodeDescriptionDtoSchema, statusDtoSchema } from "../views/schema.js";
 import { botChatViewV1Schema } from "../bot/schema.js";
@@ -31,17 +31,34 @@ export function createViewerSource(socketPath: string): ViewerSource {
     if (!response.ok) throw new Error(response.error.code + ": " + response.error.message);
     return response.result;
   };
+  let includeKindsUnsupported = false;
+  const readLegacyBotChat = async () => {
+    const response = await sendServiceRequest(socketPath, { version: 1, method: "chat.view", limit: 100 });
+    if (!response.ok) throw new Error(response.error.code + ": " + response.error.message);
+    return botChatViewV1Schema.parse(response.result);
+  };
+  const readBotChat = async () => {
+    if (includeKindsUnsupported) return readLegacyBotChat();
+    const response = await sendServiceRequest(socketPath, { version: 1, method: "chat.view", limit: 100, includeKinds: true });
+    if (!response.ok) {
+      if (isUnsupportedIncludeKindsError(response.error)) {
+        includeKindsUnsupported = true;
+        return readLegacyBotChat();
+      }
+      throw new Error(response.error.code + ": " + response.error.message);
+    }
+    return botChatViewV1Schema.parse(response.result);
+  };
   return {
     async snapshot(workflowId, expanded = []) {
       const status = statusDtoSchema.parse(await read({ version: 1, method: "status" }));
-      const bot = botChatViewV1Schema.parse(await read({ version: 1, method: "chat.view", limit: 100 }));
-      const botLines = bot.entries.map(entry => (entry.role === "user" ? "You: " : entry.role === "assistant" ? "Bot: " : "Bot activity: ") + entry.text);
-      if (botLines.length === 0) botLines.push(bot.configured ? "No bot activity yet" : "Bot not configured");
-      if (workflowId === null) return { status, detail: null, botLines: botLines.slice(-100) };
+      const bot = await readBotChat();
+      const botEntries = bot.entries;
+      if (workflowId === null) return { status, detail: null, botEntries, botConfigured: bot.configured };
       const workflow = status.workflows.find(entry => entry.workflowId === workflowId);
       if (!workflow) throw new Error("No workflow " + JSON.stringify(workflowId));
       const run = workflow.unresolvedRun ?? workflow.latestRun;
-      if (workflow.configurationError && run == null) return { status, detail: null };
+      if (workflow.configurationError && run == null) return { status, detail: null, botEntries, botConfigured: bot.configured };
       const diagram = diagramDtoSchema.parse(await read({ version: 1, method: "diagram", workflowId,
         ...(run == null ? {} : { runId: run.runId }) }));
       const nodes = await Promise.all(diagram.nodes.map(async entry => {
@@ -63,7 +80,23 @@ export function createViewerSource(socketPath: string): ViewerSource {
           nodes[index] = { ...node, failureEvidence: ids.map(id => evidence.get(id) ?? "Evidence unavailable").join("\n"), evidenceTruncated: false };
         }
       }
-      return { status, detail: { diagram, nodes }, botLines: botLines.slice(-100) };
+      return { status, detail: { diagram, nodes }, botEntries, botConfigured: bot.configured };
     },
   };
+}
+
+function isUnsupportedIncludeKindsError(error: Extract<ServiceResponseV1, { readonly ok: false }>["error"]): boolean {
+  if (error.code !== "invalid_arguments") return false;
+  const details = error.details;
+  if (typeof details !== "object" || details === null || Array.isArray(details)) return false;
+  const issues = (details as { readonly issues?: unknown }).issues;
+  if (!Array.isArray(issues)) return false;
+  return issues.some(issue => {
+    if (typeof issue !== "object" || issue === null || Array.isArray(issue)) return false;
+    const record = issue as Record<string, unknown>;
+    if (record.code !== "unrecognized_keys") return false;
+    if (Array.isArray(record.keys)) return record.keys.length === 1 && record.keys[0] === "includeKinds";
+    return record.message === 'Unrecognized key: "includeKinds"'
+      || record.message === 'Unrecognized keys: "includeKinds"';
+  });
 }

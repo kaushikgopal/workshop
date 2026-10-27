@@ -3,6 +3,9 @@ import type { Cursor, EntryRecord } from "@earendil-works/pi-durable";
 import type { Message } from "@earendil-works/pi-ai";
 import { botChatEntryV1Schema, type BotChatEntryV1, type BotPendingDecisionV1 } from "./schema.js";
 
+const TOOL_RESULT_PREVIEW_LIMIT_BYTES = 16 * 1024;
+const TOOL_RESULT_TRUNCATION_LABEL = "\n[truncated: tool result preview reached 16 KiB]";
+
 export function encodeBotChatCursor(cursor: Cursor | undefined): string | null {
   return cursor === undefined ? null : Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
 }
@@ -20,11 +23,11 @@ export function decodeBotChatCursor(value: string | undefined): Cursor | undefin
   }
 }
 
-export function buildBotChatEntries(entries: readonly EntryRecord[]): BotChatEntryV1[] {
+export function buildBotChatEntries(entries: readonly EntryRecord[], includeKinds = false): BotChatEntryV1[] {
   const result: BotChatEntryV1[] = [];
   for (const entry of [...entries].reverse()) {
     for (const [index, message] of (entry.model ?? []).entries()) {
-      const mapped = mapMessage(entry, index, message);
+      const mapped = mapMessage(entry, index, message, includeKinds);
       if (mapped !== null) result.push(botChatEntryV1Schema.parse(mapped));
     }
   }
@@ -48,25 +51,46 @@ export function pendingDecisionActions(blockKind: string): ("retry" | "accept" |
 
 export type PendingDecision = BotPendingDecisionV1;
 
-function mapMessage(entry: EntryRecord, index: number, message: Message): BotChatEntryV1 | null {
+function mapMessage(entry: EntryRecord, index: number, message: Message, includeKinds: boolean): BotChatEntryV1 | null {
   if (message.role === "user") {
     const text = readContent(message.content);
-    return text.length === 0 ? null : { id: String(entry.id) + ":" + index, role: "user", text };
+    return text.length === 0 ? null : { id: String(entry.id) + ":" + index, role: "user", ...(includeKinds ? { kind: "input" as const } : {}), text };
   }
   if (message.role === "assistant") {
     const content = message.content as unknown as readonly Record<string, unknown>[];
     const lines: string[] = [];
+    let hasToolCall = false;
     for (const block of content) {
       if (block.type === "text" && typeof block.text === "string" && block.text.length > 0) lines.push(block.text);
-      else if (block.type === "toolCall" && typeof block.name === "string") lines.push("Used " + block.name);
+      else if (block.type === "toolCall") {
+        hasToolCall = true;
+        if (typeof block.name === "string") lines.push("Used " + block.name);
+      }
     }
-    return lines.length === 0 ? null : { id: String(entry.id) + ":" + index, role: "assistant", text: lines.join("\n") };
+    return lines.length === 0 ? null : {
+      id: String(entry.id) + ":" + index, role: "assistant", ...(includeKinds ? { kind: hasToolCall ? "tool_call" as const : "message" as const } : {}), text: lines.join("\n"),
+    };
   }
   if (message.role === "toolResult") {
     const tool = "toolName" in message && typeof message.toolName === "string" ? message.toolName : "tool";
-    return { id: String(entry.id) + ":" + index, role: "activity", text: "Completed " + tool };
+    if (!includeKinds) return { id: String(entry.id) + ":" + index, role: "activity", text: "Completed " + tool };
+    const output = previewToolResult(readContent(message.content));
+    return {
+      id: String(entry.id) + ":" + index, role: "activity", kind: message.isError ? "error" : "tool_result",
+      text: tool + (output.length === 0 ? "" : "\n" + output),
+    };
   }
   return null;
+}
+
+function previewToolResult(text: string): string {
+  const bytes = Buffer.from(text, "utf8");
+  if (bytes.byteLength <= TOOL_RESULT_PREVIEW_LIMIT_BYTES) return text;
+
+  const contentLimit = TOOL_RESULT_PREVIEW_LIMIT_BYTES - Buffer.byteLength(TOOL_RESULT_TRUNCATION_LABEL, "utf8");
+  let end = Math.min(contentLimit, bytes.byteLength);
+  while (end > 0 && end < bytes.byteLength && (bytes[end]! & 0xc0) === 0x80) end--;
+  return bytes.subarray(0, end).toString("utf8") + TOOL_RESULT_TRUNCATION_LABEL;
 }
 
 function readContent(content: unknown): string {

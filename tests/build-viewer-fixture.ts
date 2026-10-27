@@ -32,5 +32,5 @@ export function buildNode(id = "first"): NodeDescriptionDto["node"] {
 
 export function buildSnapshot(nodes: readonly NodeDescriptionDto["node"][] = []): ViewerSnapshot {
   return { status: buildStatus(), detail: { diagram: { version: 2, workflowId: "alpha", definitionHash: HASH, runId: null,
-    nodes: nodes.map((node, index) => ({ nodeId: node.nodeId, position: index + 1, successorId: nodes[index + 1]?.nodeId ?? null, status: null })) }, nodes }, botLines: Array.from({ length: 100 }, (_, i) => "bot message " + i) };
+    nodes: nodes.map((node, index) => ({ nodeId: node.nodeId, position: index + 1, successorId: nodes[index + 1]?.nodeId ?? null, status: null })) }, nodes }, botConfigured: true, botEntries: Array.from({ length: 100 }, (_, i) => ({ id: "bot-" + i, role: "assistant" as const, text: "bot message " + i })) };
 }

@@ -385,7 +385,7 @@ async function openServiceRuntime(
             return { submitted: true, submissionId: String(submission.id) };
           }
           case "chat.view": {
-            return await readBotChat(activeHarness, installation, botConversation, request.cursor, request.limit ?? 50, botModel);
+            return await readBotChat(activeHarness, installation, botConversation, request.cursor, request.limit ?? 50, botModel, request.includeKinds === true);
           }
           case "status":
           case "runs":
@@ -517,6 +517,7 @@ async function readBotChat(
   encodedCursor: string | undefined,
   limit: number,
   botModel: ReturnType<typeof parseModel> | undefined,
+  includeKinds: boolean,
 ): Promise<unknown> {
   const cursor = decodeBotChatCursor(encodedCursor);
   let page: Awaited<ReturnType<Conversation["entries"]>> | undefined;
@@ -539,7 +540,7 @@ async function readBotChat(
   return botChatViewV1Schema.parse({
     configured: botModel !== undefined,
     bot: botModel === undefined ? null : { providerId: botModel.provider, modelId: botModel.modelId },
-    entries: page === undefined ? [] : buildBotChatEntries(page.items),
+    entries: page === undefined ? [] : buildBotChatEntries(page.items, includeKinds),
     nextCursor: encodeBotChatCursor(page?.next),
     pending: pending.slice(0, 100),
   });

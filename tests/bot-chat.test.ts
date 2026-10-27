@@ -4,21 +4,114 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "bun:test";
+import { z } from "zod";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createRegistry, Harness } from "@earendil-works/pi-durable";
+import type { EntryRecord } from "@earendil-works/pi-durable";
 import { createModels } from "@earendil-works/pi-ai/models";
-import { fauxAssistantMessage, fauxProvider, fauxToolCall, type FauxResponseFactory } from "@earendil-works/pi-ai/providers/faux";
+import { fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall, type FauxResponseFactory } from "@earendil-works/pi-ai/providers/faux";
+import type { Message } from "@earendil-works/pi-ai";
 import { loadCheckedWorkflow, loadInstallation } from "../src/installation/load-installation.js";
 import { openDurableStorage } from "../src/storage/durable/open-durable-storage.js";
 import { WorkshopInstallationDoc, WorkshopRunDoc } from "../src/storage/durable/define-workshop-records.js";
 import { startWorkshopService } from "../src/service/open-service-runtime.js";
 import { sendServiceRequest } from "../src/service/send-service-request.js";
 import { botChatViewV1Schema } from "../src/bot/schema.js";
+import { buildBotChatEntries } from "../src/bot/build-bot-feed.js";
 import { nodeDescriptionDtoSchema, statusDtoSchema } from "../src/views/schema.js";
 import { TALLY_BASE_URL_BY_API } from "../src/model/schema-owner-models.js";
 import { createBotExtension } from "../src/bot/create-bot-tools.js";
 import { serviceRunsPageV1Schema, serviceStartResultV1Schema } from "../src/service/schema.js";
 import { createFauxModels } from "./fixtures/create-faux-models.js";
+
+const oldBotChatEntryV1Schema = z.strictObject({
+  id: z.string(),
+  role: z.enum(["user", "assistant", "activity"]),
+  text: z.string(),
+});
+
+test("bot chat feed keeps the V1 mapping by default and labels entries only on opt-in", () => {
+  const messages: Message[] = [
+    { role: "user", content: "Terminal output: this is quoted input.", timestamp: 1 },
+    { role: "user", content: "Error: this is also human input.", timestamp: 2 },
+    fauxAssistantMessage("Terminal output: this is bot prose."),
+    fauxAssistantMessage([fauxText("I will inspect the run."), fauxToolCall("workshop_run", { workflowId: "demo" })], { stopReason: "toolUse" }),
+    {
+      role: "toolResult", toolCallId: "call-1", toolName: "workshop_run",
+      content: [{ type: "text", text: "{\"status\":\"completed\"}" }], isError: false, timestamp: 3,
+    },
+    {
+      role: "toolResult", toolCallId: "call-2", toolName: "workshop_logs",
+      content: [{ type: "text", text: "permission denied." }], isError: true, timestamp: 4,
+    },
+    {
+      role: "toolResult", toolCallId: "call-3", toolName: "workshop_logs",
+      content: [{ type: "text", text: "Error: this is successful tool output." }], isError: false, timestamp: 5,
+    },
+    { role: "toolResult", toolCallId: "call-4", toolName: "workshop_status", content: [], isError: false, timestamp: 6 },
+  ];
+  const record = {
+    id: 17 as EntryRecord["id"], conversationId: 5 as EntryRecord["conversationId"], kind: "message", model: messages,
+  };
+  const legacyFeed = buildBotChatEntries([record]);
+
+  expect(legacyFeed).toEqual([
+    { id: "17:0", role: "user", text: "Terminal output: this is quoted input." },
+    { id: "17:1", role: "user", text: "Error: this is also human input." },
+    { id: "17:2", role: "assistant", text: "Terminal output: this is bot prose." },
+    { id: "17:3", role: "assistant", text: "I will inspect the run.\nUsed workshop_run" },
+    { id: "17:4", role: "activity", text: "Completed workshop_run" },
+    { id: "17:5", role: "activity", text: "Completed workshop_logs" },
+    { id: "17:6", role: "activity", text: "Completed workshop_logs" },
+    { id: "17:7", role: "activity", text: "Completed workshop_status" },
+  ]);
+  for (const entry of legacyFeed) expect(oldBotChatEntryV1Schema.parse(entry)).toEqual(entry);
+
+  const feed = buildBotChatEntries([record], true);
+  expect(feed).toEqual([
+    { id: "17:0", role: "user", kind: "input", text: "Terminal output: this is quoted input." },
+    { id: "17:1", role: "user", kind: "input", text: "Error: this is also human input." },
+    { id: "17:2", role: "assistant", kind: "message", text: "Terminal output: this is bot prose." },
+    { id: "17:3", role: "assistant", kind: "tool_call", text: "I will inspect the run.\nUsed workshop_run" },
+    { id: "17:4", role: "activity", kind: "tool_result", text: "workshop_run\n{\"status\":\"completed\"}" },
+    { id: "17:5", role: "activity", kind: "error", text: "workshop_logs\npermission denied." },
+    { id: "17:6", role: "activity", kind: "tool_result", text: "workshop_logs\nError: this is successful tool output." },
+    { id: "17:7", role: "activity", kind: "tool_result", text: "workshop_status" },
+  ]);
+  expect(oldBotChatEntryV1Schema.safeParse(feed[0]).success).toBe(false);
+});
+
+test("bot chat feed preserves IDs, order, and the 100-entry cap in either mapping", () => {
+  const record: EntryRecord = {
+    id: 19 as EntryRecord["id"], conversationId: 5 as EntryRecord["conversationId"], kind: "message",
+    model: Array.from({ length: 120 }, (_, index): Message => ({ role: "user", content: "message-" + index, timestamp: index })),
+  };
+  const legacyFeed = buildBotChatEntries([record]);
+  const enrichedFeed = buildBotChatEntries([record], true);
+
+  expect(legacyFeed).toHaveLength(100);
+  expect(enrichedFeed).toHaveLength(100);
+  expect(legacyFeed.map(entry => entry.id)).toEqual(Array.from({ length: 100 }, (_, index) => "19:" + (index + 20)));
+  expect(enrichedFeed.map(entry => entry.id)).toEqual(legacyFeed.map(entry => entry.id));
+  expect(legacyFeed[0]).toEqual({ id: "19:20", role: "user", text: "message-20" });
+});
+
+test("bot chat feed bounds tool result previews without splitting UTF-8", () => {
+  const feed = buildBotChatEntries([{
+    id: 18 as EntryRecord["id"], conversationId: 5 as EntryRecord["conversationId"], kind: "message",
+    model: [{
+      role: "toolResult", toolCallId: "call-long", toolName: "workshop_logs",
+      content: [{ type: "text", text: "🧩".repeat(6000) }], isError: false, timestamp: 1,
+    }],
+  }], true);
+  const entry = feed[0];
+  if (entry === undefined) throw new Error("tool result feed entry is missing");
+  expect(entry.kind).toBe("tool_result");
+  expect(entry.text).toContain("[truncated: tool result preview reached 16 KiB]");
+  expect(entry.text).not.toContain("�");
+  expect(Buffer.byteLength(entry.text, "utf8")).toBeLessThanOrEqual(16 * 1024 + Buffer.byteLength("workshop_logs\n", "utf8"));
+});
+
 test("configured shared bot completes a chat round trip with a fake model", async () => {
   const directory = mkdtempSync(join(tmpdir(), "workshop-bot-chat-"));
   const workshopDirectory = join(directory, ".workshop");
@@ -43,6 +136,8 @@ test("configured shared bot completes a chat round trip with a fake model", asyn
       await new Promise(resolve => setTimeout(resolve, 20));
     }
     expect(view.configured).toBe(true);
+    expect(view.entries.every(entry => !("kind" in entry))).toBe(true);
+    for (const entry of view.entries) expect(oldBotChatEntryV1Schema.parse(entry)).toEqual(entry);
     expect(view.entries.some(entry => entry.role === "user" && entry.text === "Hello, bot.")).toBe(true);
     expect(view.entries.some(entry => entry.role === "assistant" && entry.text === "The fake bot is ready.")).toBe(true);
   } finally {
@@ -241,25 +336,43 @@ test("bot read tools include retained captures and the completed run result", as
       if (!submitted.ok) throw new Error(submitted.error.code + ": " + submitted.error.message);
       const deadline = Date.now() + 10_000;
       while (Date.now() < deadline) {
-        const response = await sendServiceRequest(socketPath, { version: 1, method: "chat.view", limit: 100 });
+        const response = await sendServiceRequest(socketPath, { version: 1, method: "chat.view", limit: 100, includeKinds: true });
         if (!response.ok) throw new Error(response.error.code + ": " + response.error.message);
         const view = botChatViewV1Schema.parse(response.result);
-        if (view.entries.filter(entry => entry.role === "assistant" && entry.text === "read complete").length >= expectedReplies) return;
+        if (view.entries.filter(entry => entry.role === "assistant" && entry.text === "read complete").length >= expectedReplies) return view;
         await new Promise(resolve => setTimeout(resolve, 20));
       }
       throw new Error("bot did not complete its read tool call");
     };
 
-    await submitAndWait("bot-read-logs", 1);
+    const logsView = await submitAndWait("bot-read-logs", 1);
+    const logsToolResult = logsView.entries.find(entry => entry.kind === "tool_result" && entry.text.startsWith("workshop_logs\n"));
+    if (logsToolResult === undefined) throw new Error("bot logs tool result is missing from the chat feed");
+    expect(logsToolResult.text).toContain("bot-known-stdout-marker");
     expect(toolOutputs[0]).toContain("bot-known-stdout-marker");
     expect(toolOutputs[0]).toContain("capture worker stdout");
     expect(toolOutputs[0]).toContain("[truncated: Workshop bot log output");
     expect(Buffer.byteLength(toolOutputs[0] ?? "", "utf8")).toBeLessThanOrEqual(16 * 1024);
     expect((toolOutputs[0] ?? "").split("\n").length).toBeLessThanOrEqual(100);
 
-    await submitAndWait("bot-read-run", 2);
+    const runView = await submitAndWait("bot-read-run", 2);
+    const runToolResult = runView.entries.find(entry => entry.kind === "tool_result" && entry.text.startsWith("workshop_run\n"));
+    if (runToolResult === undefined) throw new Error("bot run tool result is missing from the chat feed");
+    expect(runToolResult.text).toContain('"status":"completed"');
     expect(toolOutputs[1]).toContain('"status":"completed"');
     expect(toolOutputs[1]).toContain('"terminalOutput":"bot-known-stdout-marker"');
+
+    const legacyResponse = await sendServiceRequest(socketPath, { version: 1, method: "chat.view", limit: 100 });
+    if (!legacyResponse.ok) throw new Error(legacyResponse.error.code + ": " + legacyResponse.error.message);
+    const legacyView = botChatViewV1Schema.parse(legacyResponse.result);
+    expect(legacyView.entries.length).toBeLessThanOrEqual(100);
+    expect(legacyView.nextCursor).toBe(runView.nextCursor);
+    expect(legacyView.entries.map(entry => entry.id)).toEqual(runView.entries.map(entry => entry.id));
+    expect(legacyView.entries.map(entry => entry.role)).toEqual(runView.entries.map(entry => entry.role));
+    expect(legacyView.entries.every(entry => !("kind" in entry))).toBe(true);
+    for (const entry of legacyView.entries) expect(oldBotChatEntryV1Schema.parse(entry)).toEqual(entry);
+    const legacyToolResult = legacyView.entries.find(entry => entry.id === runToolResult.id);
+    expect(legacyToolResult).toEqual({ id: runToolResult.id, role: "activity", text: "Completed workshop_run" });
   } finally {
     await owner?.shutdown();
     rmSync(directory, { recursive: true, force: true });

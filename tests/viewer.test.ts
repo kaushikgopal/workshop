@@ -110,14 +110,16 @@ test("JSON and non-TTY routing stays noninteractive and snapshots show human wai
 });
 
 
-test("shared bot feed retains only the last 100 lines without substituting a worklog", () => {
-  const snapshot = { ...buildSnapshot(), botLines: Array.from({ length: 130 }, (_, i) => "message " + i) };
+test("shared bot feed retains the last 100 typed entries without substituting a worklog", () => {
+  const snapshot = { ...buildSnapshot(), botEntries: Array.from({ length: 130 }, (_, i) => ({ id: "message-" + i, role: "assistant" as const, text: "message " + i })) };
   const model = buildViewerModel({ snapshot, workflowId: null, selectedId: "alpha", selectedStepId: null, expanded: [] });
-  expect(model.botLines).toHaveLength(100);
-  expect(model.botLines[0]).toBe("message 30");
-  expect(model.botLines.at(-1)).toBe("message 129");
-  const absent = buildViewerModel({ snapshot: { ...snapshot, botLines: undefined }, workflowId: null, selectedId: "alpha", selectedStepId: null, expanded: [] });
-  expect(absent.botLines.join(" ")).toContain("Bot not configured");
+  expect(model.botEntries).toHaveLength(100);
+  expect(model.botEntries[0]?.text).toBe("message 30");
+  expect(model.botEntries.at(-1)?.text).toBe("message 129");
+  const absent = buildViewerModel({ snapshot: { ...snapshot, botEntries: undefined, botConfigured: false }, workflowId: null, selectedId: "alpha", selectedStepId: null, expanded: [] });
+  expect(absent.botEmptyMessage).toBe("Bot not configured");
+  const configuredEmpty = buildViewerModel({ snapshot: { ...snapshot, botEntries: [], botConfigured: true }, workflowId: null, selectedId: "alpha", selectedStepId: null, expanded: [] });
+  expect(configuredEmpty.botEmptyMessage).toBe("No bot activity yet");
 });
 
 test("historical status projections remain readable and latest results require matching workflow identity", () => {

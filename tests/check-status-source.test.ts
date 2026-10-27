@@ -4,9 +4,22 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createViewerSource } from "../src/cli/watch.js";
-import { parseServiceRequestLine, serviceSuccess, encodeServiceResponseFrames } from "../src/service/parse-service-protocol.js";
+import type { ViewerChatEntry } from "../src/tui/data-source.js";
+import { parseServiceRequestLine, serviceError, serviceSuccess, encodeServiceResponseFrames } from "../src/service/parse-service-protocol.js";
 import { buildNode, buildRun, buildStatus, HASH, TIME } from "./build-viewer-fixture.js";
-import type { ServiceRequestV1 } from "../src/service/schema.js";
+import type { ServiceRequestV1, ServiceResponseV1 } from "../src/service/schema.js";
+
+interface FakeProtocolResponse {
+  readonly fakeProtocolResponse: ServiceResponseV1;
+}
+
+function fakeProtocolResponse(response: ServiceResponseV1): FakeProtocolResponse {
+  return { fakeProtocolResponse: response };
+}
+
+function isFakeProtocolResponse(value: unknown): value is FakeProtocolResponse {
+  return typeof value === "object" && value !== null && "fakeProtocolResponse" in value;
+}
 
 async function fakeService(reply: (request: ServiceRequestV1) => unknown, execute: (socket: string, requests: ServiceRequestV1[]) => Promise<void>) {
   const directory = mkdtempSync(join(tmpdir(), "workshop-status-fake-"));
@@ -18,13 +31,15 @@ async function fakeService(reply: (request: ServiceRequestV1) => unknown, execut
       if (!parsed.ok) { socket.destroy(); return; }
       requests.push(parsed.request);
       const requestId = "requestId" in parsed.request ? parsed.request.requestId : null;
-      let result: unknown;
-      try { result = reply(parsed.request); }
-      catch (error) {
+      let response: ServiceResponseV1;
+      try {
+        const result = reply(parsed.request);
+        response = isFakeProtocolResponse(result) ? result.fakeProtocolResponse : serviceSuccess(requestId, result);
+      } catch (error) {
         if (parsed.request.method !== "chat.view") throw error;
-        result = { configured: false, entries: [], nextCursor: null, pending: [] };
+        response = serviceSuccess(requestId, { configured: false, entries: [], nextCursor: null, pending: [] });
       }
-      for (const frame of encodeServiceResponseFrames(serviceSuccess(requestId, result))) socket.write(frame);
+      for (const frame of encodeServiceResponseFrames(response)) socket.write(frame);
       socket.end();
     });
   });
@@ -34,11 +49,12 @@ async function fakeService(reply: (request: ServiceRequestV1) => unknown, execut
 }
 
 
-test("viewer source projects the shared bot transcript into its feed", async () => {
+test("viewer source preserves typed shared bot entries without guessing provenance", async () => {
   const status = buildStatus();
-  const entries = [
-    { id: "user-1", role: "user", text: "Check the latest run." },
-    { id: "assistant-1", role: "assistant", text: "The run is complete." },
+  const entries: ViewerChatEntry[] = [
+    { id: "user-1", role: "user", kind: "input", text: "Automated event wake: inspect the run." },
+    { id: "assistant-1", role: "assistant", kind: "message", text: "Terminal output: this is bot prose, not stdout." },
+    { id: "activity-1", role: "activity", text: "Tool execution details." },
   ];
   await fakeService(request => {
     if (request.method === "status") return status;
@@ -46,7 +62,79 @@ test("viewer source projects the shared bot transcript into its feed", async () 
     throw new Error("Unexpected request " + request.method);
   }, async (socket, requests) => {
     const snapshot = await createViewerSource(socket).snapshot(null);
-    expect(snapshot.botLines).toEqual(["You: Check the latest run.", "Bot: The run is complete."]);
+    expect(snapshot.botEntries).toEqual(entries);
+    expect(snapshot.botConfigured).toBe(true);
+    expect(requests.map(request => request.method)).toEqual(["status", "chat.view"]);
+  });
+});
+
+test("viewer retries only an explicit unsupported includeKinds field and caches the legacy path", async () => {
+  const status = buildStatus();
+  const entries: ViewerChatEntry[] = [
+    { id: "legacy-user", role: "user", text: "Error: a human quoted this text." },
+    { id: "legacy-assistant", role: "assistant", text: "Terminal output: this is bot prose." },
+    { id: "legacy-activity", role: "activity", text: "Completed workshop_logs" },
+  ];
+  await fakeService(request => {
+    if (request.method === "status") return status;
+    if (request.method === "chat.view" && request.includeKinds === true) {
+      return fakeProtocolResponse(serviceError(null, "invalid_arguments", "Request arguments do not match the method schema", {
+        issues: [{ path: [], code: "unrecognized_keys", message: 'Unrecognized key: "includeKinds"' }],
+      }));
+    }
+    if (request.method === "chat.view") return { configured: true, entries, nextCursor: "legacy-cursor", pending: [] };
+    throw new Error("Unexpected request " + request.method);
+  }, async (socket, requests) => {
+    const source = createViewerSource(socket);
+    const first = await source.snapshot(null);
+    const second = await source.snapshot(null);
+    expect(first.botEntries).toEqual(entries);
+    expect(second.botEntries).toEqual(entries);
+    expect(first.botEntries?.map(entry => entry.role)).toEqual(["user", "assistant", "activity"]);
+    expect(first.botEntries?.every(entry => !("kind" in entry))).toBe(true);
+    const chatRequests = requests.filter(request => request.method === "chat.view");
+    expect(chatRequests.map(request => request.method === "chat.view" && request.includeKinds === true)).toEqual([true, false, false]);
+    expect(chatRequests).toHaveLength(3);
+  });
+});
+
+test("viewer does not retry includeKinds after an unrelated service error", async () => {
+  await fakeService(request => {
+    if (request.method === "status") return buildStatus();
+    if (request.method === "chat.view") {
+      return fakeProtocolResponse(serviceError(null, "request_failed", "Service request failed"));
+    }
+    throw new Error("Unexpected request " + request.method);
+  }, async (socket, requests) => {
+    await expect(createViewerSource(socket).snapshot(null)).rejects.toThrow("request_failed: Service request failed");
+    expect(requests.map(request => request.method)).toEqual(["status", "chat.view"]);
+    const chatRequest = requests[1];
+    expect(chatRequest).toMatchObject({ method: "chat.view", includeKinds: true });
+  });
+});
+
+test("viewer does not retry an unrelated invalid_arguments response", async () => {
+  await fakeService(request => {
+    if (request.method === "status") return buildStatus();
+    if (request.method === "chat.view") {
+      return fakeProtocolResponse(serviceError(null, "invalid_arguments", "Request arguments do not match the method schema", {
+        issues: [{ path: [], code: "unrecognized_keys", message: 'Unrecognized key: "cursor"' }],
+      }));
+    }
+    throw new Error("Unexpected request " + request.method);
+  }, async (socket, requests) => {
+    await expect(createViewerSource(socket).snapshot(null)).rejects.toThrow("invalid_arguments:");
+    expect(requests.map(request => request.method)).toEqual(["status", "chat.view"]);
+  });
+});
+
+test("viewer propagates an invalid chat response without retrying", async () => {
+  await fakeService(request => {
+    if (request.method === "status") return buildStatus();
+    if (request.method === "chat.view") return { configured: true, entries: "invalid", nextCursor: null, pending: [] };
+    throw new Error("Unexpected request " + request.method);
+  }, async (socket, requests) => {
+    await expect(createViewerSource(socket).snapshot(null)).rejects.toThrow();
     expect(requests.map(request => request.method)).toEqual(["status", "chat.view"]);
   });
 });
