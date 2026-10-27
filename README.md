@@ -28,32 +28,33 @@ Run these commands inside the child shell. They run from the demo directory,
 the project root that contains `.workshop` — never from inside `.workshop`:
 
 ~~~fish
-mkdir -p /tmp/workshop-demo-hemingway/.workshop/workflows
-cd /tmp/workshop-demo-hemingway
-set -l model 'PROVIDER/MODEL:THINKING'
-# Replace the placeholder with a registered Pi catalog model before start.
+mkdir -p /tmp/workshop/demo/.workshop/workflows
+cd /tmp/workshop/demo
+
+cp "$workshop_repo/examples/workflows/hemingway-clock.yaml" .workshop/workflows/
+
 printf '%s\n' \
   'version: 3' \
-  'shell: /bin/bash' \
-  'max_concurrent_runs: 1' \
   'agent:' \
-  "  model: \"$model\"" \
+  '  model: "PROVIDER/MODEL:THINKING"' \
   'bot:' \
-  "  model: \"$model\"" \
+  '  model: "PROVIDER/MODEL:THINKING"' \
   > .workshop/workshop.yaml
-cp "$workshop_repo"/examples/workflows/hemingway-clock.yaml .workshop/workflows/
-workshop validate .workshop/workflows/hemingway-clock.yaml
+
 workshop start hemingway-clock --detach
-workshop watch hemingway-clock
+workshop watch
 ~~~
 
-The same model fills both roles here, but the blocks are separate roles:
+Replace both `PROVIDER/MODEL:THINKING` placeholders with a registered Pi
+catalog model before `start`. The same model fills both roles here, but the
+blocks are separate roles:
 `agent` configures workers and verifiers, `bot` the shared chat bot. Run
 `start` once. It admits the first run immediately. The `schedule` in the copied
 YAML admits up to five more runs, three minutes apart (about 15 minutes total).
 Wait until the first run finishes. Press `q` to leave the viewer.
 
-In workflow watch, use `↑`/`↓` to select nodes and `←`/`→` to browse runs.
+`watch` opens the overview. Select `hemingway-clock` and press Enter to open
+its detail screen. There, use `↑`/`↓` to select nodes and `←`/`→` to browse runs.
 The viewer starts with the newest run. A historical selection stays on that run.
 Return to the newest run to follow new admissions again. Use `j`/`k` to scroll
 the active pane and Tab to switch panes. The bot feed remains installation-wide;

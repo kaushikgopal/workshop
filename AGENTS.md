@@ -18,7 +18,7 @@ the architecture and code map.
   `workshop` function.
 - Inside the child, use plain `workshop` commands. Do not redefine the
   function, re-run `set -g workshop_repo`, or type absolute Bun paths.
-- Create the demo workspace at the fixed path `/tmp/workshop-demo-hemingway`,
+- Create the demo workspace at the fixed path `/tmp/workshop/demo`,
   and run `workshop` commands from that project root (the directory containing
   `.workshop`), never from inside `.workshop`.
 - Machine-specific model choices live in `AGENTS.local.md` (gitignored, not
