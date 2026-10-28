@@ -61,6 +61,7 @@ function withOutput(value: RunFileSnapshot, output: string): RunFileSnapshot {
 
 function writerFor(snapshots: Map<number, RunFileSnapshot>, options: { maxFileBytes?: number; now?: () => Date } = {}) {
   return createRunFileWriter({
+    executionLog: true,
     ...options,
     load: async (id) => {
       const value = snapshots.get(Number(id));
@@ -235,6 +236,7 @@ describe("workflow file projection", () => {
       const firstStarted = new Promise<void>((resolve) => { started = resolve; });
       let loads = 0;
       const writer = createRunFileWriter({
+        executionLog: true,
         load: async () => { loads += 1; if (loads === 2) { started(); await gate; return older; } return newer; },
         diagnostic: async () => {},
       });

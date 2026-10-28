@@ -125,7 +125,7 @@ flowchart TD
   WR -->|fixed decision table| D[retry / block / fail]
   D --> WR
   PE --> V[.state/captures: temporary bytes]
-  SVC --> RF[.workshop/<workflow>: results.md + execution.log]
+  SVC --> RF[.workshop/<workflow>: results.md + optional execution.log]
 ```
 
 ### One run
@@ -152,7 +152,7 @@ WorkflowRun                                define-workshop-tasks.ts
     accepted needs_input → save wait; release capacity; park the WorkflowRun
       human.reply continue → reacquire capacity; continue the same WorkflowRun
       human.reply reject → cancel this occurrence without disabling its schedule
-  retain evidence; update the newest run section in workflow results.md and execution.log
+  retain evidence; update the newest run section in results.md and the optional execution.log
 ```
 
 When the service is already running its limit of concurrent runs, a new run

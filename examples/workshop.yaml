@@ -5,6 +5,7 @@ shell: /bin/bash # Command steps and native agent tool shells use this shell.
 max_concurrent_runs: 1 # Limit concurrently executing workflow runs.
 default_timeout: 5m # Bound each step unless workflow settings override it.
 stream_cap: 256kb # Bound retained stderr for each command process.
+# execution_log: true # Write execution.log for all workflows; disabled by default.
 agent: # Native worker and verifier defaults; this is not the shared chat bot.
   model: "example/pi-model:medium" # Provider-neutral Pi model placeholder.
 bot: # Shared chat has its own model setting and no agent-model fallback.

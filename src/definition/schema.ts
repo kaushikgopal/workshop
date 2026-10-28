@@ -239,6 +239,7 @@ export const machineConfigSchema = z.strictObject({
   project_dir: z.string().optional(),
   shell: absoluteShell.optional(),
   max_concurrent_runs: positiveSafeInteger.optional(),
+  execution_log: z.boolean().optional(),
   default_timeout: timeoutValue.optional(),
   stream_cap: byteSizeValue.optional(),
   keep_files: keepFilesValue.optional(),

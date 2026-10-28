@@ -40,7 +40,7 @@ function installation(root: string) {
   const config = join(root, ".workshop");
   const workflows = join(config, "workflows");
   mkdirSync(workflows, { recursive: true });
-  writeFileSync(join(config, "workshop.yaml"), "shell: /bin/sh\nkeep_files: failed\n");
+  writeFileSync(join(config, "workshop.yaml"), "shell: /bin/sh\nkeep_files: failed\nexecution_log: true\n");
   writeFileSync(join(workflows, "projection.yaml"), [
     "version: 4",
     "defaults: { retries: 0, replay: never }",

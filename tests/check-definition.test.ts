@@ -41,6 +41,8 @@ describe("workflow and machine schemas", () => {
     })).toMatchObject({ version: 3, shell: "/bin/bash", bot: { model: "provider/bot:medium" } });
     expect(() => machineConfigSchema.parse({ orchestrator: { model: "provider/judge:medium" } })).toThrow();
     expect(machineConfigSchema.parse({})).toEqual({});
+    expect(machineConfigSchema.parse({ execution_log: true }).execution_log).toBe(true);
+    expect(() => machineConfigSchema.parse({ execution_log: "true" })).toThrow();
   });
 
   test("resolves keep_files from machine config and the failed default", () => {

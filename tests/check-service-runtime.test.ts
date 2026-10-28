@@ -197,12 +197,68 @@ describe("Durable service runtime", () => {
     }
   });
 
+  test("makes the execution log opt-in without changing retained evidence", async () => {
+    const root = mkdtempSync(join(tmpdir(), "workshop-optional-execution-log-"));
+    const config = join(root, ".workshop");
+    const workflows = join(config, "workflows");
+    const configPath = join(config, "workshop.yaml");
+    mkdirSync(workflows, { recursive: true });
+    writeFileSync(configPath, "shell: /bin/sh\n");
+    writeFileSync(join(workflows, "clock.yaml"), [
+      "version: 4", "defaults: { retries: 0, replay: never }", "steps:",
+      "  - tick: echo launch >> launches; printf fixture-output; printf fixture-error >&2", "",
+    ].join("\n"));
+    let owner: Awaited<ReturnType<typeof startWorkshopService>> | undefined;
+    try {
+      owner = await startWorkshopService(loadInstallation(root));
+      const start = async (requestId: string) => {
+        if (owner === undefined) throw new Error("service is not running");
+        const response = await sendServiceRequest(owner.metadata.socketPath, { version: 1, method: "start", workflowId: "clock", requestId });
+        if (!response.ok) throw new Error(response.error.message);
+        const { runId } = serviceStartResultV1Schema.parse(response.result);
+        await waitForCompletedRun(owner.metadata.socketPath, "clock", runId);
+        return runId;
+      };
+      const firstRun = await start("optional-log-1");
+      const directory = join(config, "clock");
+      const logPath = join(directory, "execution.log");
+      expect(readFileSync(join(directory, "results.md"), "utf8")).toContain("fixture-output");
+      expect(existsSync(logPath)).toBe(false);
+      const sections: LogsDto["sections"] = [];
+      await streamServiceLogChunks(owner.metadata.socketPath, "clock", firstRun, (section) => { sections.push(section); });
+      expect(sections.some(section => section.kind === "capture" && section.content === "fixture-error")).toBe(true);
+
+      writeFileSync(logPath, "existing log");
+      await start("optional-log-2");
+      expect(readFileSync(logPath, "utf8")).toBe("existing log");
+      await owner.shutdown();
+      owner = undefined;
+
+      writeFileSync(configPath, "shell: /bin/sh\nexecution_log: true\n");
+      owner = await startWorkshopService(loadInstallation(root));
+      expect(readFileSync(logPath, "utf8")).toContain("fixture-error");
+      expect(readFileSync(logPath, "utf8")).toContain(firstRun);
+      await owner.shutdown();
+      owner = undefined;
+
+      const enabledLog = readFileSync(logPath, "utf8");
+      writeFileSync(configPath, "shell: /bin/sh\nexecution_log: false\n");
+      owner = await startWorkshopService(loadInstallation(root));
+      await start("optional-log-3");
+      expect(readFileSync(logPath, "utf8")).toBe(enabledLog);
+      expect(readFileSync(join(root, "launches"), "utf8")).toBe("launch\nlaunch\nlaunch\n");
+    } finally {
+      if (owner !== undefined) await owner.shutdown();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   test("appends workflow sections and rebuilds them without repeating settled workers", async () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-stable-history-"));
     const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
     mkdirSync(workflows, { recursive: true });
-    writeFileSync(join(config, "workshop.yaml"), "shell: /bin/sh\n");
+    writeFileSync(join(config, "workshop.yaml"), "shell: /bin/sh\nexecution_log: true\n");
     writeFileSync(join(workflows, "clock.yaml"), [
       "version: 4", "defaults: { retries: 0, replay: never }", "steps:",
       "  - tick: echo launch >> launches; printf fixture-output", "",

@@ -52,7 +52,7 @@ export function renderResultsFile(workflowId: string, runId: string, slots: read
 }
 
 /** Derive accepted slots and labeled execution evidence from committed records. */
-export function renderRunFiles(snapshot: RunFileSnapshot) {
+export function renderRunFiles(snapshot: RunFileSnapshot, executionLog = true) {
   const { run } = snapshot;
   const slots: ResultFileSlot[] = run.nodes.map((node) => {
     const wait = run.waits?.find((value) => value.nodeId === node.nodeId);
@@ -66,6 +66,7 @@ export function renderRunFiles(snapshot: RunFileSnapshot) {
       skipped: node.status === "skipped" };
   });
   const results = renderResultsFile(run.workflowId, run.runId, slots, run.admittedAt, !["completed", "failed", "cancelled"].includes(run.status), run.admissionSequence);
+  if (!executionLog) return { results: results.text, executionLog: "", diagnostics: results.diagnostics };
   const runTag = createHash("sha256").update(run.runId, "utf8").digest("hex").slice(0, 8);
   const sections = ["# Execution: " + run.workflowId + " run " + run.runId
     + "\nRun tag: " + runTag + "\nAdmission time: " + run.admittedAt];

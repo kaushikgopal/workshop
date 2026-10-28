@@ -295,7 +295,7 @@ Final-step Continue completes even while paused. Stop cancels a waiting run.
 | `WORKSHOP_RUN_ID`, `WORKSHOP_WORKFLOW_ID` | Run and workflow identity |
 | `WORKSHOP_STEP_ID`, `WORKSHOP_ATTEMPT` | Step and attempt number; preflight uses empty step and attempt 0 |
 | `WORKSHOP_EXECUTION_ID` | Process execution identity |
-| WORKSHOP_RESULTS_PATH, WORKSHOP_LOG_PATH | The workflow's single live results.md and execution.log files in .workshop/<workflow-id>/ |
+| WORKSHOP_RESULTS_PATH, WORKSHOP_LOG_PATH | Paths to the workflow's results.md and optional execution.log in .workshop/<workflow-id>/ |
 | `WORKSHOP_CANDIDATE_STATUS`, `WORKSHOP_RETRIES_LEFT` | Command verifier candidate status and retries left (`n` or `unlimited`) |
 | `WORKSHOP_ANSWER` | Committed answer for an answered wait's immediate successor and its verifier |
 | `WORKSHOP_PROVIDER`, `WORKSHOP_MODEL_ID`, `WORKSHOP_MODEL` | Agent provider, bare model ID, and provider/model |
@@ -371,12 +371,15 @@ shell: /bin/bash
 max_concurrent_runs: 1
 default_timeout: 10m
 stream_cap: 256kb
+execution_log: false
 agent:
   model: example/pi-model:medium
 ```
 
 Machine `version` is optional; when present it must be `3`. Workflows must
 declare `version: 4`. `project_dir` resolves relative to `.workshop/`.
+Set `execution_log: true` to write execution.log for all workflows; it defaults
+to `false`. Restart the service after changing this setting.
 
 NOTE: Machine `keep_files` is accepted but ignored. Machine `orchestrator` is removed. Set `bot.model` to configure the shared bot.
 
@@ -432,17 +435,17 @@ unchanged. Action commands must enforce limits and prevent duplicates themselves
 │  └─ captures/<run-id>/            temporary process captures
 └─ <workflow-id>/                   readable projections, one per workflow
    ├─ results.md                    accepted outputs and human answers
-   ├─ execution.log                 labeled execution evidence
+   ├─ execution.log                 optional labeled execution evidence
    ├─ results-<UTC timestamp>-<admission-sequence>-<rotation-id>.md.gz  rotated results
-   └─ execution-<UTC timestamp>-<admission-sequence>-<rotation-id>.log.gz  rotated execution evidence
+   └─ execution-<UTC timestamp>-<admission-sequence>-<rotation-id>.log.gz  optional rotated execution evidence
 ~~~
 
 The private socket may live outside .state/ to meet Unix socket path limits.
 Git ignores `.state/` and the per-workflow projection directories; workflow
 definitions and machine config stay trackable.
 
-Each workflow has one live results.md and one live execution.log. Each file
-holds whole run sections in admission order. Each wrapper shows the run ID,
+Each workflow has one live results.md and, when enabled, one live execution.log.
+Each file holds whole run sections in admission order. Each wrapper shows the run ID,
 run tag, admission time, admission sequence, and mutable state. The mutable
 state is true while the run is open. It becomes false after terminal settlement. Result tags
 remain result-<step-id>-<run-tag>, answer-<step-id>-<run-tag>, and
@@ -457,20 +460,22 @@ newest rotations per file kind per workflow. Rotation names include the maximum
 admission sequence and a unique ID. A restart does not restore runs older than
 the oldest retained rotation.
 
-execution.log contains engine events, stderr, invalid stdout, preamble, trailer,
+When enabled, execution.log contains engine events, stderr, invalid stdout, preamble, trailer,
 feedback, and resolutions. Every section and process record has run and process
 labels. The database retains raw evidence. workshop logs exposes it through the
 service. Native agent executions surface as receipts: execution ID,
 conversation ID, assistant entry ID, and final-text hash. They carry no
 process identity.
-Stdout and stderr remain separate, without reconstructed interleaving.
+Stdout and stderr remain separate, without reconstructed interleaving. When disabled,
+Workshop leaves existing execution logs and rotations untouched. WORKSHOP_LOG_PATH
+still names the log path, but that file may be absent or contain older evidence.
 
 The captures/ directory holds temporary command stdout and stderr files. The service
 imports retained bytes into Durable state before cleanup, and it keeps unresolved
 captures across restart.
 
 These live files are read-only views of committed state. Deleting them lets the
-service rebuild missing sections without repeating work. Refreshes add missing
+service rebuild missing sections without repeating work when the view is enabled. Refreshes add missing
 sections, update open sections, and preserve existing finished sections. Editing a
 file changes neither accepted output nor run state. The service never deletes
 older installation directories such as `.workshop/state/`, `.workshop/state-v5/`,
@@ -554,8 +559,8 @@ Migrate workflow files to `version: 4`. Replace `max_attempts: N` with
 `orchestrator` settings and workflow `keep_files` settings. Set `bot.model` only
 when you want the shared bot. Declare `retries` and `replay` for every step
 or in `defaults`. Remove custom uses of WORKSHOP_ARCHIVE. WORKSHOP_RESULTS_PATH
-and WORKSHOP_LOG_PATH point to workflow-owned files in
-`.workshop/<workflow-id>`.
+and WORKSHOP_LOG_PATH point to workflow-owned paths in
+`.workshop/<workflow-id>`; execution.log is optional.
 
 ## Contributing
 

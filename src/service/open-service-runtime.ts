@@ -176,6 +176,7 @@ async function openServiceRuntime(
     const diagnosticKeys = new Set<string>();
     const pendingCaptureCleanup = new Set<number>();
     projectionWriter = createRunFileWriter({
+      executionLog: installation.machine.execution_log === true,
       load: async (conversationId) => {
         const index = await readInstallation(writerHarness);
         const owner = Object.entries(index.workflows).find(([, workflow]) => workflow.runs.some((run) => run.conversationId === Number(conversationId)));
@@ -227,7 +228,8 @@ async function openServiceRuntime(
     const readProjectionIdentity = (directory: string): string | null => {
       try {
         const identities: string[] = [];
-        for (const name of ["results.md", "execution.log"]) {
+        const names = installation.machine.execution_log === true ? ["results.md", "execution.log"] : ["results.md"];
+        for (const name of names) {
           const stat = lstatSync(join(directory, name));
           if (!stat.isFile()) return null;
           identities.push([stat.dev, stat.ino, stat.size, stat.mtimeMs, stat.ctimeMs].join(":"));

@@ -18,6 +18,7 @@ export function createRunFileWriter(options: {
   readonly load: (conversationId: ConversationId) => Promise<RunFileSnapshot>;
   readonly diagnostic: (conversationId: ConversationId, message: string, stepId: string | null) => Promise<void>;
   readonly settled?: (snapshot: RunFileSnapshot) => Promise<void>;
+  readonly executionLog?: boolean;
   readonly maxFileBytes?: number;
   readonly now?: () => Date;
 }) {
@@ -32,10 +33,12 @@ export function createRunFileWriter(options: {
         const next = previous.then(async (): Promise<ProjectionResult> => {
           try {
             const snapshot = await options.load(conversationId);
-            const rendered = renderRunFiles(snapshot);
+            const rendered = renderRunFiles(snapshot, options.executionLog === true);
             await prepareWorkflowDirectory(directory, snapshot.run.workflowId);
             await projectSection(join(directory, "results.md"), rendered.results, "results", snapshot, options, rotationFloors);
-            await projectSection(join(directory, "execution.log"), rendered.executionLog, "execution", snapshot, options, rotationFloors);
+            if (options.executionLog === true) {
+              await projectSection(join(directory, "execution.log"), rendered.executionLog, "execution", snapshot, options, rotationFloors);
+            }
             for (const diagnostic of rendered.diagnostics) {
               await options.diagnostic(conversationId, diagnostic.message, diagnostic.stepId);
             }
