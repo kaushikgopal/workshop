@@ -565,3 +565,7 @@ and WORKSHOP_LOG_PATH point to workflow-owned paths in
 ## Contributing
 
 See [CONTRIBUTING](CONTRIBUTING.md) for conventions, checks, and the code map.
+
+## License
+
+Workshop is licensed under the [MIT License](LICENSE).
