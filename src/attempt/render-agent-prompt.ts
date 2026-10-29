@@ -90,7 +90,6 @@ function renderWorkshopInstructions(
  * Ordinary text-mode workers omit a status line that carried no information.
  * Do not reword, reorder, or simplify these contracts or examples without
  * rerunning a real weak-model trial and comparing format-failure counts.
- * See .agents/dox/research-structured-agent-results.md, “Trial outcomes (2026-10-15)”.
  */
 function renderWorkerContract(resultMode: "text" | "tagged"): string {
   if (resultMode === "text") {

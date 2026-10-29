@@ -5,3 +5,6 @@ node_modules/
 *.log
 .DS_Store
 /AGENTS.local.md
+
+# Private agent documents
+/.agents/dox/ignored/
