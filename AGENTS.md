@@ -32,3 +32,20 @@ the architecture and code map.
 - Use `examples/workflows/hemingway-clock.yaml` as the standard live benchmark
   workflow.
 - Automated unit and integration tests keep the faux providers.
+
+## Private agent documents
+
+- Store agent-authored documents (plans, specs, reviews, research, reports)
+  in `.agents/dox/ignored/`. Git ignores that folder. This rule overrides any
+  global instruction to store them in `.agents/dox/`.
+- Never commit a path under `.agents/`. Before each commit, run
+  `git diff --cached --name-only`. Stop if a path starts with `.agents/`.
+- Do not reference private documents from tracked files, such as code
+  comments, `README.md`, or `CONTRIBUTING.md`. Put the needed reasoning in
+  the tracked file itself.
+- Do not commit credentials, tokens, absolute machine paths such as
+  `/Users/...`, or machine-specific model choices. Use fixtures,
+  placeholders, and repository-relative paths.
+- Stage named paths only. Do not use `git add -A` or `git add .`.
+- If a private file reaches a commit, stop and ask. Removal needs a history
+  rewrite and a force push.
