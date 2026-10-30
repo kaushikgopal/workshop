@@ -10,6 +10,10 @@ the architecture and code map.
 - Validate every change with `bunx tsc --noEmit` and `bun test`. The suite
   takes about a minute.
 - Keep the CONTRIBUTING code map in sync when files move.
+- With each change, check `README.md` and update it in the same commit when
+  the change affects commands, configuration, the workflow format, files on
+  disk, or the demo. Keep the README brief. Put full contracts in
+  `docs/reference.md`.
 
 ## Manual CLI examples
 
