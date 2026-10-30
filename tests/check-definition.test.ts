@@ -80,14 +80,14 @@ describe("workflow and machine schemas", () => {
     }
   });
 
-  test("checks README YAML snippets against native execution settings", () => {
-    const readme = readFileSync(join(import.meta.dir, "..", "README.md"), "utf8");
+  test("checks reference YAML snippets against native execution settings", () => {
+    const readme = readFileSync(join(import.meta.dir, "..", "docs", "reference.md"), "utf8");
     const snippets = [...readme.matchAll(/\x60{3}yaml\n([\s\S]*?)\n\x60{3}/gu)];
     expect(snippets).toHaveLength(2);
     for (const [index, snippet] of snippets.entries()) {
       const yaml = snippet[1];
-      if (yaml === undefined) throw new Error("README YAML snippet is missing");
-      const label = "README.md YAML snippet " + (index + 1);
+      if (yaml === undefined) throw new Error("Reference YAML snippet is missing");
+      const label = "docs/reference.md YAML snippet " + (index + 1);
       if (yaml.startsWith("version: 4")) {
         const checked = checkDefinitionText(yaml, label, "readme-example");
         const settings = resolveWorkflowSettings({ definition: checked.def,

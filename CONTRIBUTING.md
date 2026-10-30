@@ -322,4 +322,4 @@ Three boundaries hold. `tests/check-parity-gaps.test.ts` and
 The tests need no model credentials. `tests/check-service-restart.test.ts`
 runs the Hemingway workflow with a faux model through the real CLI and service,
 restarts the service, and checks the same Durable run. The only real-model
-check is the README's [Watch it work](README.md#watch-it-work) walkthrough.
+check is the README's [Demo: hemingway-clock](README.md#demo-hemingway-clock) walkthrough.
