@@ -25,7 +25,6 @@ Commands:
       Unknown effects require --allow-repeat for retry.
       accept requires --result-file <path> --acknowledge-effects for external_outcome_unknown.
       Supply UTF-8 text or tagged worker output in the step result mode.
-      Format 4 does not support --extra-attempt or --target judgment.
   reply <workflow> --continue|--reject --answer TEXT
       Reply to the current human wait with an explicit decision.
   chat
@@ -40,8 +39,8 @@ Commands:
       Render a checked chain with the selected run's status.
   step describe <workflow> <step> [--run <run-id>] [--json]
       Read frozen settings and execution evidence for one step.
-  watch [<workflow>]
-      Follow the selected run, or choose a workflow from the service-backed list.
+  watch [<workflow>] [--json]
+      Alias for status: follow the selected run, or choose a workflow from the service-backed list.
   service start | serve | status [--json] | stop
       Start the detached service owner (idempotent), serve it in the
       foreground, read its health and identity, or shut it down gracefully.
