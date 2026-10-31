@@ -469,11 +469,11 @@ detached startup discards service stdout and stderr.
 ### Upgrade
 
 WARNING: Run one build at a time against an installation. Overlapping old and
-new runs can repeat external effects. v5 cannot enforce draining because it
-never reads the old state.
+new runs can repeat external effects. The new build cannot enforce draining
+because it never reads the old state.
 
 Finish or stop open runs and stop the old service using the old build first.
-Then start the new build against a fresh project root. The new build keeps
+Then start the new build in the same project root. It keeps
 private state in `.workshop/.state/` and projections in
 `.workshop/<workflow-id>/`. It never opens, migrates, or falls back to older
 state directories. Existing `.workshop/state/`, `.workshop/state-v5/`,
