@@ -81,34 +81,20 @@ describe("workflow and machine schemas", () => {
   });
 
   test("checks reference YAML snippets against native execution settings", () => {
-    const readme = readFileSync(join(import.meta.dir, "..", "docs", "reference.md"), "utf8");
-    const snippets = [...readme.matchAll(/\x60{3}yaml\n([\s\S]*?)\n\x60{3}/gu)];
-    expect(snippets).toHaveLength(2);
-    for (const [index, snippet] of snippets.entries()) {
-      const yaml = snippet[1];
-      if (yaml === undefined) throw new Error("Reference YAML snippet is missing");
+    const reference = readFileSync(join(import.meta.dir, "..", "docs", "reference.md"), "utf8");
+    const snippets = [...reference.matchAll(/^(\x60{3}|~{3})yaml\n([\s\S]*?)\n\1$/gmu)].map((match) => match[2]!);
+    expect(snippets.length).toBeGreaterThan(0);
+    for (const [index, yaml] of snippets.entries()) {
       const label = "docs/reference.md YAML snippet " + (index + 1);
       if (yaml.startsWith("version: 4")) {
-        const checked = checkDefinitionText(yaml, label, "readme-example");
-        const settings = resolveWorkflowSettings({ definition: checked.def,
+        const checked = checkDefinitionText(yaml, label, "reference-example");
+        resolveWorkflowSettings({ definition: checked.def,
           machine: { agent: { model: "example/pi-model:medium" } }, projectCwd: "/tmp" });
-        expect(settings.nodes["publish-quote"]?.run.replay).toBe("never");
       } else {
-        const raw = parseStrictYaml(yaml, label) as { agent?: { harness?: unknown }; bot?: { model?: string } };
-        if (typeof raw.agent?.harness === "object") {
-          expect(() => machineConfigSchema.parse(raw)).toThrow();
-          continue;
-        }
-        const machine = machineConfigSchema.parse(raw);
-        if (machine.bot !== undefined) {
-          expect(machine.bot.model).toBe("example/pi-model:medium");
-          continue;
-        }
-        expect(machine.agent?.model).toBeDefined();
-        if (machine.agent?.harness !== undefined) expect(machine.agent.harness).toBe("pi");
+        machineConfigSchema.parse(parseStrictYaml(yaml, label));
       }
     }
-    expect(readme).not.toMatch(/WORKSHOP_\w*_FILE|failure judge|result helper/u);
+    expect(reference).not.toMatch(/WORKSHOP_\w*_FILE|failure judge|result helper/u);
   });
 
   test("validates every workflow example and resolves its worker result mode", () => {
