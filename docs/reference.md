@@ -269,15 +269,16 @@ If it cannot verify the owner, it exits 3 without signaling another process.
 
 ### Blocks and resolution
 
-The service enforces actions by block kind. The CLI acts with human authority:
+The service enforces actions by block kind. The CLI acts with human authority.
+The bot can resolve only the kinds marked yes, and only with `retry` or `fail`:
 
-| Block kind | Allowed actions |
-| --- | --- |
-| `verifier_block`, `repeated_failure`, `preflight_failed` | `retry` or `fail` |
-| `verifier_failed` | `retry` the verifier on saved evidence, or `fail` |
-| `external_outcome_unknown` | `retry --allow-repeat`, `accept --result-file … --acknowledge-effects`, or `fail` |
-| `process_death_unconfirmed` | `retry --allow-repeat` or `fail`; cleanup must still be confirmed |
-| `integrity_failed`, `runtime_incompatible` | `fail` only |
+| Block kind | Allowed actions | Bot |
+| --- | --- | --- |
+| `verifier_block`, `repeated_failure`, `preflight_failed` | `retry` or `fail` | yes |
+| `verifier_failed` | `retry` the verifier on saved evidence, or `fail` | yes |
+| `external_outcome_unknown` | `retry --allow-repeat`, `accept --result-file … --acknowledge-effects`, or `fail` | no |
+| `process_death_unconfirmed` | `retry --allow-repeat` or `fail`; cleanup must still be confirmed | no |
+| `integrity_failed`, `runtime_incompatible` | `fail` only | no |
 
 All actions require `--action` and a nonempty `--reason`. Optional `--run`
 pins the current blocked run. A block retry grants one dispatch outside the
@@ -427,7 +428,7 @@ Set `PI_CODING_AGENT_DIR` to use another Pi agent directory. Startup fails with 
 configuration error when the provider or model is unavailable. Service status and
 `chat.view` show the resolved provider ID and model ID. They never show credentials.
 The bot reads status, runs, and logs. It can start
-workflows and resolve only the block kinds that [Blocks and resolution](#blocks-and-resolution) permits for the bot. Its block resolution
+workflows and resolve only the block kinds marked for the bot in [Blocks and resolution](#blocks-and-resolution). Its block resolution
 uses the same checked service path as the CLI. The service limits the bot to one
 resolution per node in each run.
 
