@@ -1,18 +1,21 @@
 import { createInterface } from "node:readline/promises";
+import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { findInstallation } from "../installation/load-installation.js";
 import { ServiceOwnershipConflict } from "../service/acquire-service-lock.js";
 import {
   applyRecoveryInstallation,
   inspectRecoveryInstallation,
+  isRecoveryRequiredTask,
   readRecoveryReceipt,
   RecoveryRefusal,
   type RecoveryActionSelection,
   type RecoveryTerminal,
 } from "../service/recover-service-tasks.js";
-import type { WorkshopServiceOwner } from "../service/serve-workshop-service.js";
+import { launchServiceProcess } from "../service/launch-service-process.js";
 import { errorText } from "./errors.js";
 
+const CLI_PATH = fileURLToPath(new URL("./main.ts", import.meta.url));
 const USAGE = "usage: workshop service recover inspect [--json] | receipt <request-id> [--json] | apply --request-id <uuid> --diagnostic <sha256> [--abort <task-id>]... [--retry <task-id>]... [--verify-retired <task-id>]... --resume-installation --reason <text> [--supersedes <request-id>] [--json]";
 const uuid = z.string().uuid();
 const digest = z.string().regex(/^sha256:[0-9a-f]{64}$/u);
@@ -45,7 +48,16 @@ export async function cmdRecover(args: readonly string[], terminalOverride?: Rec
     } else {
       const result = await applyRecoveryInstallation(installation, command, terminalOverride ?? terminal);
       process.stdout.write(command.json ? JSON.stringify(result.receipt, null, 2) + "\n" : renderReceipt(result.receipt));
-      if (result.owner !== null) await waitForServiceOwner(result.owner);
+      if (result.owner !== null) {
+        // The recovered owner is tied to this terminal; hand off to a detached service so closing the terminal does not interrupt work.
+        await result.owner.shutdown();
+        const launched = await launchServiceProcess({
+          root: installation.root,
+          stateDirectory: installation.stateDirectory,
+          serveArguments: [CLI_PATH, "service", "serve"],
+        });
+        process.stderr.write(`service ${launched._tag === "started" ? "started" : "already running"} (pid ${launched.metadata.pid}, boot ${launched.metadata.bootId})\n`);
+      }
     }
   } catch (error) {
     if (error instanceof RecoveryRefusal) return fail(3, `${error.code}: ${error.message}`);
@@ -105,15 +117,57 @@ function parseArguments(args: readonly string[]): Command | undefined {
 }
 
 function renderManifest(manifest: Awaited<ReturnType<typeof inspectRecoveryInstallation>>): string {
-  return `recovery inspection: ${manifest.complete ? "complete" : "incomplete"}\ndigest: ${manifest.digest}\n` + JSON.stringify({
-    limitations: manifest.limitations,
-    activeRequest: manifest.activeRequest,
-    tasks: manifest.tasks,
-    processIncarnations: manifest.processIncarnations,
-    queuedSubmissions: manifest.queuedSubmissions,
-    schedules: manifest.schedules,
-  }, null, 2) + "\n";
+  const lines = [`recovery inspection: ${manifest.complete ? "complete" : "incomplete"}`, `digest: ${manifest.digest}`];
+  for (const limitation of manifest.limitations) lines.push(`limitation: ${limitation}`);
+  if (manifest.activeRequest !== null) {
+    lines.push(`active request: ${manifest.activeRequest.requestId} (global dispatch ${manifest.activeRequest.globalDispatch}); use --supersedes`);
+  }
+  const required = manifest.tasks.filter(isRecoveryRequiredTask);
+  const choices: string[] = [];
+  let blocked = false;
+  for (const task of required) {
+    const incarnation = manifest.processIncarnations.find((item) => item.taskId === task.taskId);
+    const allowed = incarnation === undefined ? task.policy.permittedActions : [incarnation.action];
+    const evidence = task.policy.abortEvidence === "host_death_proof_required" ? " (host death proof)"
+      : task.policy.abortEvidence === "operator_attestation_required" ? " (operator attests the process is absent)" : "";
+    const identity = incarnation?.process.identity ? `, pid ${incarnation.process.identity.pid}` : "";
+    lines.push(`task ${task.taskId} ${task.kind} [${describeAttribution(task.attribution)}]: ${task.state}${task.blockedReason === null ? "" : ` (${task.blockedReason})`}${identity}`);
+    if (allowed.length === 0) {
+      blocked = true;
+      lines.push(`  no permitted action: ${task.policy.abortUnavailableReason ?? task.policy.retryUnavailableReason ?? "unknown"}`);
+    } else {
+      lines.push(`  permitted: ${allowed.join(", ")}${evidence}`);
+      choices.push(`--${allowed[0]!.replace("_", "-")} ${task.taskId}`);
+    }
+  }
+  for (const incarnation of manifest.processIncarnations.filter((item) => item.action === "verify_retired")) {
+    lines.push(`task ${incarnation.taskId} ${incarnation.taskKind}: finished with unresolved process ${incarnation.process.identity === null ? "(no recorded identity)" : `pid ${incarnation.process.identity.pid}`}`);
+    lines.push("  permitted: verify_retired");
+    choices.push(`--verify-retired ${incarnation.taskId}`);
+  }
+  lines.push(`other tasks: ${manifest.tasks.length - required.length}; queued submissions: ${manifest.queuedSubmissions.length}; schedules: ${manifest.schedules.length}`);
+  if (!manifest.complete || blocked) {
+    lines.push("recovery cannot proceed until the limitations above are resolved");
+  } else if (choices.length === 0 && manifest.activeRequest === null) {
+    lines.push("no recovery is required");
+  } else {
+    const supersedes = manifest.activeRequest === null ? "" : ` --supersedes ${manifest.activeRequest.requestId}`;
+    lines.push("review, then run (choose another permitted action where listed):");
+    const parts = ["workshop service recover apply --request-id (uuidgen | string lower)", `--diagnostic ${manifest.digest}`, ...choices, "--resume-installation", supersedes.trim(), '--reason "<reason>"'];
+    lines.push("  " + parts.filter((part) => part !== "").join(" "));
+  }
+  return lines.join("\n") + "\n";
 }
+
+function describeAttribution(attribution: Awaited<ReturnType<typeof inspectRecoveryInstallation>>["tasks"][number]["attribution"]): string {
+  switch (attribution.kind) {
+    case "workflow_run": return `workflow ${attribution.workflowId} run ${attribution.runId}`;
+    case "scheduler": return `scheduler ${attribution.workflowId}`;
+    case "bot": return "shared bot";
+    default: return attribution.kind;
+  }
+}
+
 function renderReceipt(receipt: Awaited<ReturnType<typeof readRecoveryReceipt>>): string {
   const lines = [
     `recovery request ${receipt.requestId}: ${receipt.state}`,
@@ -124,28 +178,6 @@ function renderReceipt(receipt: Awaited<ReturnType<typeof readRecoveryReceipt>>)
     lines.push(`  task ${action.taskId}: ${action.action}, ${action.state}, evidence ${action.evidence === "operator_attested_absent" ? "attested absent (operator)" : action.evidence === "confirmed_dead" ? "confirmed dead (host proof)" : action.evidence ?? "none"}, dispatch ${action.dispatch}`);
   }
   return lines.join("\n") + "\n";
-}
-
-async function waitForServiceOwner(owner: WorkshopServiceOwner): Promise<void> {
-  await new Promise<void>((resolve) => {
-    let stopping = false;
-    const finish = (): void => {
-      process.off("SIGINT", onSignal);
-      process.off("SIGTERM", onSignal);
-      resolve();
-    };
-    const onSignal = (): void => {
-      if (stopping) return;
-      stopping = true;
-      void owner.shutdown().then(finish, (error) => {
-        console.error(`error: ${errorText(error)}`);
-        process.exitCode = 1;
-        finish();
-      });
-    };
-    process.on("SIGINT", onSignal);
-    process.on("SIGTERM", onSignal);
-  });
 }
 
 function fail(code: number, message: string): void {

@@ -303,7 +303,7 @@ snapshot; task inputs and secrets remain excluded.
 
 ### Durable recovery commands
 
-Recovery commands bypass the service socket and require the installation lock. They fail while another service owner holds that lock. `inspect` opens the Durable Harness paused and does not enable scheduling. It validates all retained process entries and includes unresolved terminal process incarnations. Missing, invalid, mismatched, or over-limit evidence makes the manifest incomplete. Its digest binds the task evidence and pending installation work. `receipt` reads a saved request without dispatching control calls. Inspection and receipts do not start the service.
+Recovery commands bypass the service socket and require the installation lock. They fail while another service owner holds that lock. `inspect` opens the Durable Harness paused and does not enable scheduling. Its text output lists each task that needs a decision, its permitted actions, and a suggested `apply` command; `--json` prints the full manifest. It validates all retained process entries and includes unresolved terminal process incarnations. Missing, invalid, mismatched, or over-limit evidence makes the manifest incomplete. Its digest binds the task evidence and pending installation work. `receipt` reads a saved request without dispatching control calls. Inspection and receipts do not start the service.
 
 `apply` requires terminal stdin and stderr. Use the exact digest from a complete `inspect` result. Select every required blocked task and retained process incarnation once. Choose only actions that the manifest permits. Use `--verify-retired <task-id>` for unresolved evidence tied to a terminal process task. It records death evidence and the unchanged terminal outcome. It does not call `abortTask` or change the task outcome. `--resume-installation` is required consent to resume the whole installation. Unrelated tasks, schedules, submissions, model calls, and external effects may start after recovery.
 
@@ -317,7 +317,7 @@ A zero-action replacement requires a fresh complete inspection with no required 
 
 The predecessor needs no particular global-dispatch receipt. A zero-action request records its own global resume marker and receipt before promotion. Another confirmed zero-action request can supersede it after a crash under the same rule. Supersession never repeats a task-control call.
 
-A completed request with the same payload returns its retained receipt without another control call. Reusing its request ID with a different payload fails. After dispatch, Workshop checks task settlement and fresh startup readiness. Success promotes the same runtime and keeps the service owner in the foreground until shutdown.
+A completed request with the same payload returns its retained receipt without another control call. Reusing its request ID with a different payload fails. After dispatch, Workshop checks task settlement and fresh startup readiness. Success promotes the same runtime to a ready service, prints the receipt, then shuts that owner down in order and starts a detached service. Closing the terminal afterward does not stop work. Blocked runs that recovery aborted stay blocked with `external_outcome_unknown`; resolve them with `workshop resolve`.
 
 The shared bot has no recovery tool, and the service socket exposes no recovery operation. The terminal check and digest guard against accidental noninteractive or stale use. They do not stop a hostile process running as the same account. Treat the local account, not the TTY or digest, as the security boundary.
 

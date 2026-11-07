@@ -45,7 +45,7 @@ async function startCommand(installation: Installation): Promise<void> {
     const verb = launched._tag === "started" ? "started" : "already running";
     process.stdout.write(`service ${verb} (${describeIdentity(launched.metadata)})\n`);
   } catch (error) {
-    fail(error instanceof ServiceConnectionError ? 3 : 1, errorText(error));
+    fail(error instanceof ServiceConnectionError ? 3 : 1, errorText(error) + "; run `workshop service status` for the startup diagnostic");
   }
 }
 
@@ -82,6 +82,7 @@ function renderStartupFailure(diagnostic: StartupParkDiagnosticV1): string {
   ];
   for (const limitation of diagnostic.limitations) lines.push("  limitation: " + limitation);
   for (const task of diagnostic.blockedTasks) lines.push("    " + renderParkedTask(task));
+  lines.push("  next: run `workshop service recover inspect` to review the tasks that need a decision");
   return lines.join("\n") + "\n";
 }
 

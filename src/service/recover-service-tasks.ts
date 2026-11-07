@@ -206,7 +206,7 @@ async function applyRecoveryRequest(
   for (const task of required) {
     const action = selected.get(task.taskId)!;
     const identity = await recoveryProcessSummary(harness, task.taskId);
-    terminal.write(`  ${action.action} task ${task.taskId} ${task.kind} ${JSON.stringify(task.attribution)} process ${JSON.stringify(identity)}\n`);
+    terminal.write(`  ${action.action} task ${task.taskId} ${task.kind} ${describeRecoveryAttribution(task.attribution)}; process ${JSON.stringify(identity)}\n`);
     if (task.policy.abortEvidence === "operator_attestation_required") {
       terminal.write(`  task ${task.taskId}: typed confirmation attests that the identity-free process is absent; this is not host proof.\n`);
     }
@@ -214,8 +214,10 @@ async function applyRecoveryRequest(
   for (const processIncarnation of manifest.processIncarnations.filter((item) => item.action === "verify_retired")) {
     terminal.write(`  verify_retired task ${processIncarnation.taskId} process ${JSON.stringify(processIncarnation.process)} retained entry ${processIncarnation.processEntryHash}\n`);
   }
-  terminal.write(`Unrelated pending tasks: ${JSON.stringify(manifest.tasks.filter((task) => !selected.has(task.taskId)))}\n`);
-  terminal.write(`Queued submissions: ${JSON.stringify(manifest.queuedSubmissions)}\nSchedules: ${JSON.stringify(manifest.schedules)}\n`);
+  const unrelated = manifest.tasks.filter((task) => !selected.has(task.taskId));
+  terminal.write(`Pending work released by resume: ${unrelated.length} task(s), ${manifest.queuedSubmissions.length} queued submission(s), ${manifest.schedules.filter((item) => item.state !== "exhausted").length} active schedule(s)\n`);
+  for (const task of unrelated) terminal.write(`  task ${task.taskId} ${task.kind} ${task.state} ${describeRecoveryAttribution(task.attribution)}\n`);
+  for (const schedule of manifest.schedules) terminal.write(`  schedule ${schedule.workflowId} ${schedule.state}${schedule.nextDueAt === null ? "" : ` next ${schedule.nextDueAt}`}\n`);
   terminal.write(`Type exactly: recover ${input.requestId} ${manifest.digest} resume-installation\n> `);
   const confirmationLine = `recover ${input.requestId} ${manifest.digest} resume-installation`;
   if (await terminal.readConfirmation() !== confirmationLine) {
@@ -395,7 +397,16 @@ async function replayCompletedRecoveryRequest(
 const RECOVERY_OPERATION_MS = 10_000;
 const RECOVERY_SETTLEMENT_MS = 10_000;
 
-function isRecoveryRequiredTask(task: import("./schema-recovery.js").ServiceRecoveryTaskV1): boolean {
+function describeRecoveryAttribution(attribution: import("./schema-recovery.js").ServiceRecoveryAttributionV1): string {
+  switch (attribution.kind) {
+    case "workflow_run": return `workflow ${attribution.workflowId} run ${attribution.runId}`;
+    case "scheduler": return `scheduler ${attribution.workflowId}`;
+    case "bot": return "shared bot";
+    case "unknown": return "unknown owner";
+  }
+}
+
+export function isRecoveryRequiredTask(task: import("./schema-recovery.js").ServiceRecoveryTaskV1): boolean {
   return task.state === "blocked" || (task.processEvidence !== null
     && task.state !== "completing" && task.processEvidence.checkpointPhase !== "intent");
 }
