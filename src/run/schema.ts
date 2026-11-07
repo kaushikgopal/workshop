@@ -146,7 +146,7 @@ export const operatorAcceptanceSchema = z.strictObject({
   target: z.enum(["worker", "validator"]),
   reason: boundedReason,
   resolvedAt: utcTimestampSchema,
-  processGroupsConfirmedDead: z.literal(true),
+  processGroupsConfirmedDead: z.boolean(),
   acknowledgedEffects: z.literal(true),
   sourceBlock: blockInfoSchema.refine(
     (block) => block.kind === "external_outcome_unknown" && block.nodeId !== null && block.attemptId !== null,
@@ -164,7 +164,7 @@ const operatorResolutionFields = {
   provenance: z.enum(["operator", "human", "bot"]),
   reason: boundedReason,
   resolvedAt: utcTimestampSchema,
-  processGroupsConfirmedDead: z.literal(true),
+  processGroupsConfirmedDead: z.boolean(),
   sourceBlock: blockInfoSchema,
 };
 
@@ -185,6 +185,9 @@ export const operatorResolutionSchema = z.discriminatedUnion("action", [
   if (Date.parse(resolution.resolvedAt) < Date.parse(resolution.sourceBlock.blockedAt)) {
     context.addIssue({ code: "custom", path: ["resolvedAt"], message: "resolution cannot precede its source block" });
   }
+  if (resolution.provenance === "bot" && !resolution.processGroupsConfirmedDead) {
+    context.addIssue({ code: "custom", path: ["processGroupsConfirmedDead"], message: "bot resolution requires confirmed process death" });
+  }
 });
 
 /** Attempt failures keep §11's fixed kinds; operator-forced termination is a separate run cause. */
@@ -194,11 +197,14 @@ export const operatorRunFailureSchema = z.strictObject({
   provenance: z.enum(["operator", "human", "bot"]),
   reason: boundedReason,
   failedAt: utcTimestampSchema,
-  processGroupsConfirmedDead: z.literal(true),
+  processGroupsConfirmedDead: z.boolean(),
   sourceBlock: blockInfoSchema,
 }).superRefine((failure, context) => {
   if (Date.parse(failure.failedAt) < Date.parse(failure.sourceBlock.blockedAt)) {
     context.addIssue({ code: "custom", path: ["failedAt"], message: "operator failure cannot precede its source block" });
+  }
+  if (failure.provenance === "bot" && !failure.processGroupsConfirmedDead) {
+    context.addIssue({ code: "custom", path: ["processGroupsConfirmedDead"], message: "bot resolution requires confirmed process death" });
   }
 });
 

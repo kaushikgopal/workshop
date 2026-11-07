@@ -249,12 +249,20 @@ Command processes and agent tool shells receive these values for their execution
 | `step describe <workflow> <step> [--run <run-id>] [--json]` | Frozen settings and attempt evidence |
 | `service start` | Start or reuse the detached service |
 | `service serve` | Serve in the foreground |
-| `service status [--json]` | Service health, PID, and boot ID; exit 3 if not running |
+| `service status [--json]` | Service health, PID, and boot ID; historical startup parks when unavailable; exit 3 when not ready |
 | `service stop` | Graceful, idempotent service shutdown |
+| `service recover inspect [--json]` | Inspect stopped Durable tasks and installation-wide pending work |
+| `service recover receipt <request-id> [--json]` | Read a retained recovery receipt |
+| `service recover apply --request-id <uuid> --diagnostic <sha256> [--abort <task-id>]... [--retry <task-id>]... [--verify-retired <task-id>]... --resume-installation --reason <text> [--supersedes <request-id>] [--json]` | Confirm and apply one stopped-service recovery request |
 
 `bun src/cli/main.ts help` lists commands. Except for help and validation,
 commands use the service. Public workflow commands start it when needed;
 `service status` never does.
+
+When a historical startup snapshot appears, JSON keeps `state: "not_running"` for
+compatibility. That state means the health probe is not ready. It does not prove
+the service process stopped or ownership is free. Human status reports
+`ownership: unknown`; the status command does not test process liveness.
 
 `validate` reads the exact `.yaml` or `.yml` path supplied. Relative paths resolve
 from the current directory. It checks YAML, workflow structure, and step policies.
@@ -264,8 +272,62 @@ resolved runtime settings before admission.
 Exit codes: 0 success or a saved human wait; 1 failed or cancelled run; 2 blocked
 run; 3 service unavailable; 64 usage or configuration error.
 
+Recovery command exit codes: 0 success; 3 ownership conflict or refused recovery; 64
+invalid command or missing terminal; 1 other failure. A successful `apply` keeps the
+service owner in the foreground until shutdown.
+
 `service stop` signals only a verified service owner. It waits up to 15 seconds.
 If it cannot verify the owner, it exits 3 without signaling another process.
+
+When startup blocks live Durable tasks, Workshop writes a private
+`.workshop/.state/startup-failure.json` snapshot before cleanup. `service status` includes
+it as the optional `startupFailure` JSON field when its strict schema and boot ID
+match the checked service metadata. The snapshot is historical and does not mean
+the service is ready or that recovery occurred. It lists at most 256 tasks and
+64 KiB; `truncated` marks omitted entries. `observationComplete` reports whether
+the task graph, Harness inspection, and attribution checks for listed tasks had
+recorded limitations or disagreements. It can be true when `truncated` is true
+because attribution checks cover listed tasks, not every blocked task. The human
+status reports the exact observed total and omitted count. The snapshot excludes task inputs, errors,
+commands, and secrets. It shows only allowlisted task kinds. Attribution includes scheduler, workflow/run,
+and shared-bot identities only when canonical Workshop documents and task-owned
+conversation records corroborate them. Scheduler identity requires the task ID to
+match activation.schedulerTaskId and its checked input. Workflow/run identity
+requires the root task ID and conversation ID to match one run reference, its task
+input, and the run document. Bot identity requires the stored shared conversation
+to be ownerless. Startup traces task owners and task-owned conversation owners
+through terminal records. Missing, mismatched, ambiguous, cyclic, or over-budget
+paths remain unknown. Task kind or conversation ID alone never establishes
+attribution. Only bounded workflow, run, and activation identifiers appear in the
+snapshot; task inputs and secrets remain excluded.
+
+### Durable recovery commands
+
+Recovery commands bypass the service socket and require the installation lock. They fail while another service owner holds that lock. `inspect` opens the Durable Harness paused and does not enable scheduling. It validates all retained process entries and includes unresolved terminal process incarnations. Missing, invalid, mismatched, or over-limit evidence makes the manifest incomplete. Its digest binds the task evidence and pending installation work. `receipt` reads a saved request without dispatching control calls. Inspection and receipts do not start the service.
+
+`apply` requires terminal stdin and stderr. Use the exact digest from a complete `inspect` result. Select every required blocked task and retained process incarnation once. Choose only actions that the manifest permits. Use `--verify-retired <task-id>` for unresolved evidence tied to a terminal process task. It records death evidence and the unchanged terminal outcome. It does not call `abortTask` or change the task outcome. `--resume-installation` is required consent to resume the whole installation. Unrelated tasks, schedules, submissions, model calls, and external effects may start after recovery.
+
+Before it admits a new request, `apply` prints the selected tasks, retained terminal process evidence, and pending work. It requires the exact line `recover <request-id> <digest> resume-installation`. It then rechecks the manifest. It commits and settles every required process-death proof before the first global scheduling call. The `--json` flag does not bypass the terminal check or typed confirmation.
+
+For identified processes, recovery verifies death on the host and commits the evidence before abort or global scheduling. For identity-free process launches, the exact confirmation records `operator_attested_absent`, never `confirmed_dead`. This is operator attestation, not host proof.
+
+An uncertain control call is recorded as indeterminate and is never repeated automatically. An active request blocks startup. Inspect again, then use `--supersedes <request-id>` with the active request ID to replace it.
+
+A zero-action replacement requires a fresh complete inspection with no required actions. Its request chain must link to the last request with actions. Every abort or retry in that request must have an API receipt or be indeterminate. Every process-bound abort or retirement must retain death evidence. Each recorded settlement must still match the task's terminal outcome.
+
+The predecessor needs no particular global-dispatch receipt. A zero-action request records its own global resume marker and receipt before promotion. Another confirmed zero-action request can supersede it after a crash under the same rule. Supersession never repeats a task-control call.
+
+A completed request with the same payload returns its retained receipt without another control call. Reusing its request ID with a different payload fails. After dispatch, Workshop checks task settlement and fresh startup readiness. Success promotes the same runtime and keeps the service owner in the foreground until shutdown.
+
+The shared bot has no recovery tool, and the service socket exposes no recovery operation. The terminal check and digest guard against accidental noninteractive or stale use. They do not stop a hostile process running as the same account. Treat the local account, not the TTY or digest, as the security boundary.
+
+### Paused Durable startup API
+
+The service runtime module exports `openPausedServiceRuntime` for tools that must inspect or recover Durable state before normal startup. It opens storage once and returns a paused Harness with its task inspection, task graph, blocked tasks, and inspection limitations. Opening does not resume scheduling.
+
+`PausedWorkshopServiceRuntime.completeNormalStartup()` and `completePausedServiceRuntimeStartup(pausedRuntime)` continue startup from that open Harness. They do not reopen storage. Normal startup remains stopped when inspection is blocked or uncertain, process evidence is uncertain, or an active recovery request exists. `OpenPausedServiceRuntimeOptions.isRecoveryRequestActive` accepts a synchronous or asynchronous predicate and defaults to `false`; a true result or predicate error keeps scheduling paused.
+
+`inspectPausedServiceRuntime` exposes the bounded Harness and task-graph inspection. `verifyStartupParkAttributions` checks the sorted diagnostic task prefix without resuming scheduling. Attribution is limited to 256 task IDs and bounded records; it returns `complete: false` when it cannot verify the full input. The diagnostic still reports the full blocked-task count and labels unverified attribution as unknown.
 
 ### Blocks and resolution
 
@@ -359,6 +421,7 @@ unchanged. Action commands must enforce limits and prevent duplicates themselves
 ├─ .state/                          private service state; never edit it
 │  ├─ durable.db                    service-owned database
 │  ├─ service.json  service.lock    service identity and ownership
+│  ├─ startup-failure.json          bounded startup-park diagnostic, when present
 │  └─ captures/<run-id>/            temporary process captures
 └─ <workflow-id>/                   readable projections, one per workflow
    ├─ results.md                    accepted outputs and human answers
@@ -370,6 +433,12 @@ unchanged. Action commands must enforce limits and prevent duplicates themselves
 The private socket may live outside .state/ to meet Unix socket path limits.
 Git ignores `.state/` and the per-workflow projection directories; workflow
 definitions and machine config stay trackable.
+
+WARNING: Durable 1.4.0 migrates `.state/durable.db` to SQLite schema version 2
+when the service first opens it. Durable 1.3.0 and earlier cannot open that
+database. Stop the old service and make a SQLite-consistent backup before the
+upgrade. A copy of `durable.db` alone can omit committed WAL data. Do not
+restore an old backup without checking later external effects.
 
 Each workflow has one live results.md and, when enabled, one live execution.log.
 Each file holds whole run sections in admission order. Each wrapper shows the run ID,

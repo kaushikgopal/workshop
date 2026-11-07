@@ -42,14 +42,16 @@ import { firstFixedRateDeadline } from "../run/decide-fixed-rate-schedule.js";
 import { parseDuration } from "../util/parse-units.js";
 import { admitPreparedRun } from "../storage/durable/admit-run.js";
 import { commitServiceMutation, findServiceMutationReceipt } from "../storage/durable/commit-service-mutation.js";
-import { defineWorkshopTasks, createWorkflowRunTaskInput, parseWorkflowRunTaskInput } from "../storage/durable/define-workshop-tasks.js";
+import {
+  defineWorkshopTasks,
+  createWorkflowRunTaskInput,
+  parseWorkflowRunTaskInput,
+} from "../storage/durable/define-workshop-tasks.js";
 import { buildAgentExecutionEnvironment, defineAgentExecutionTask } from "../storage/durable/define-agent-execution-task.js";
 import { createCapacityGateTaskInput } from "../storage/durable/define-capacity-gate-task.js";
 import { createScheduleWakeupTaskInput, defineScheduleWakeupTask } from "../storage/durable/define-scheduler-wakeup-task.js";
 import {
   processExecutionTaskInputSchema,
-  processExecutionTaskResultSchema,
-  recoverRetainedProcessCaptureRecords,
 } from "../storage/durable/define-process-execution-task.js";
 import { resolveWorkerArtifacts } from "../storage/durable/define-node-attempt-task.js";
 import { parseValidatorVerdictFile, parseWorkerResultFile, readResultFileBytes } from "../attempt/parse-result.js";
@@ -62,16 +64,76 @@ import { locateWorkflowDirectory } from "../run/locate-run-files.js";
 import { removeProcessCaptures } from "../storage/disk/remove-process-captures.js";
 import { readRunEvidenceSnapshot, readInstallation, readRun, projectServiceRead } from "./project-service-reads.js";
 import { ServiceRequestError, ServiceShutdownError, serveWorkshopService, type WorkshopServiceRuntime } from "./serve-workshop-service.js";
-import { serviceLogSectionPageV1Schema, serviceRunsPageV1Schema, type ServiceMetadataV1, type ServiceRequestV1 } from "./schema.js";
+import {
+  serviceLogSectionPageV1Schema,
+  serviceRunsPageV1Schema,
+  type ServiceMetadataV1,
+  type ServiceRequestV1,
+  type StartupParkDiagnosticV1,
+  type StartupParkTaskV1,
+  MAX_STARTUP_PARK_TASKS_V1,
+  STARTUP_PARK_TASK_KINDS_V1,
+  startupParkActivationIdV1Schema,
+  startupParkRunIdV1Schema,
+} from "./schema.js";
+import { createStartupParkDiagnostic, selectLowestStartupParkTasks, writeStartupParkDiagnostic } from "./write-startup-park-diagnostic.js";
 import { diagramDtoSchema } from "../views/schema.js";
 
 const TASK_VERSIONS = { workflowRun: 11, nodeAttempt: 5, agentExecution: 1, processExecution: 4, capacityGate: 1, scheduleWakeup: 1 } as const;
+const DURABLE_VERSION = "1.4.0";
 const STARTUP_RECONCILIATION_MS = 10_000;
 
-export function startWorkshopService(installation: Installation, models: Models = createWorkshopModels()) {
+export function hasRunnableTaskGraphWork(graph: TaskGraph, schedulerWakeupKind: string): boolean {
+  return Object.values(graph.tasks).some((task) => task.kind !== schedulerWakeupKind
+    && task.blocked === undefined
+    && (task.state.status === "pending" || task.state.status === "running"));
+}
+
+export type ActiveRecoveryRequestPredicate = (harness: Harness) => boolean | Promise<boolean>;
+
+export interface OpenPausedServiceRuntimeOptions {
+  readonly isRecoveryRequestActive?: ActiveRecoveryRequestPredicate;
+}
+
+export interface PausedStartupInspection {
+  readonly taskInspection: Awaited<ReturnType<Harness["inspect"]>> | undefined;
+  readonly taskGraph: TaskGraph | undefined;
+  readonly blockedTasks: readonly Pick<StartupParkTaskV1, "taskId" | "kind" | "reason">[];
+  readonly limitations: readonly StartupParkDiagnosticV1["limitations"][number][];
+}
+
+export interface PausedWorkshopServiceRuntime {
+  readonly harness: Harness;
+  readonly startupInspection: PausedStartupInspection;
+  markRecoverySchedulingStarted(): void;
+  refreshStartupInspection(): Promise<PausedStartupInspection>;
+  completeNormalStartup(): Promise<WorkshopServiceRuntime>;
+  close(): Promise<void>;
+}
+
+export function completePausedServiceRuntimeStartup(
+  pausedRuntime: PausedWorkshopServiceRuntime,
+ ): Promise<WorkshopServiceRuntime> {
+  return pausedRuntime.completeNormalStartup();
+}
+
+export function startWorkshopService(
+  installation: Installation,
+  models: Models = createWorkshopModels(),
+  options: OpenPausedServiceRuntimeOptions = {},
+) {
   return serveWorkshopService({
     stateDirectory: installation.stateDirectory,
-    openRuntime: (metadata) => openServiceRuntime(installation, metadata, models),
+    openRuntime: async (metadata) => await openServiceRuntime(installation, metadata, models, {
+      ...options,
+      isRecoveryRequestActive: async (harness) => {
+        const { WorkshopRecoveryIndexDoc } = await import("../storage/durable/define-recovery-records.js");
+        const { recoveryIndexV1Schema } = await import("../storage/durable/schema-recovery.js");
+        const index = recoveryIndexV1Schema.parse(await harness.snapshot(WorkshopRecoveryIndexDoc, BACKGROUND_CONTEXT) ?? { state: "uninitialized" });
+        return (index.state === "ready" && index.activeRequestId !== null)
+          || await (options.isRecoveryRequestActive?.(harness) ?? false);
+      },
+    }),
   });
 }
 
@@ -79,13 +141,41 @@ async function openServiceRuntime(
   installation: Installation,
   metadata: ServiceMetadataV1,
   models: Models,
-): Promise<WorkshopServiceRuntime> {
+  options: OpenPausedServiceRuntimeOptions = {},
+ ): Promise<WorkshopServiceRuntime> {
+  const pausedRuntime = await openPausedServiceRuntime(installation, metadata, models, options);
+  try {
+    return await completePausedServiceRuntimeStartup(pausedRuntime);
+  } catch (error) {
+    const causes: unknown[] = [error, ...pausedRuntime.startupInspection.blockedTasks.map((task) => new Error(task.reason))];
+    if (error instanceof Error && error.cause !== undefined) {
+      causes.push(...(error.cause instanceof AggregateError ? error.cause.errors : [error.cause]));
+    }
+    try {
+      await pausedRuntime.close();
+    } catch (cleanupError) {
+      causes.push(cleanupError);
+    }
+    throw new ServiceShutdownError("Durable startup was refused; service ownership remains held until the failed owner exits", {
+      cause: new AggregateError(causes),
+    });
+  }
+}
+
+export async function openPausedServiceRuntime(
+  installation: Installation,
+  metadata: ServiceMetadataV1,
+  models: Models = createWorkshopModels(),
+  options: OpenPausedServiceRuntimeOptions = {},
+ ): Promise<PausedWorkshopServiceRuntime> {
   const botModel = installation.machine.bot === undefined ? undefined : resolveBotModel(installation.machine.bot.model, models);
   const opened = await openDurableStorage(installation.databasePath);
   if (!opened.ok) throw new Error(`${opened.failure.message}: ${String(opened.failure.cause)}`);
   const storage = opened.storage;
   let harness: Harness | undefined;
   let tasks: ReturnType<typeof defineWorkshopTasks> | undefined;
+  let scheduleWakeupTask!: ReturnType<typeof defineScheduleWakeupTask>;
+  let botExtension!: ReturnType<typeof createBotExtension>;
   let taskGraphWatch: TaskGraphWatch | undefined;
   let idleCheckpoint = Promise.resolve();
   let idleRetryTimer: ReturnType<typeof setTimeout> | undefined;
@@ -93,6 +183,10 @@ async function openServiceRuntime(
   let shuttingDown = false;
   const openCleanupErrors: unknown[] = [];
   let opening = true;
+  const startupFailureState = { stopScheduling: true };
+  let schedulerResumed = false;
+  let recoverySchedulingStarted = false;
+  let pausedRuntimeClosed = false;
   let projectionWriter: ReturnType<typeof createRunFileWriter> | undefined;
   let projectionRefresh = Promise.resolve();
   let projectionTimer: ReturnType<typeof setTimeout> | undefined;
@@ -104,7 +198,58 @@ async function openServiceRuntime(
     if (tasks === undefined) throw new Error("Workshop tasks are unavailable");
     return tasks;
   };
-
+  let pausedStartupInspection: PausedStartupInspection | undefined;
+  let completion: Promise<WorkshopServiceRuntime> | undefined;
+  let cleanupStarted = false;
+  const cleanupFailedOpen = async (error: unknown): Promise<never> => {
+    if (cleanupStarted) throw error;
+    cleanupStarted = true;
+    opening = false;
+    shuttingDown = true;
+    tasks?.stopLaunching();
+    if (projectionTimer !== undefined) { clearTimeout(projectionTimer); projectionTimer = undefined; }
+    if (idleRetryTimer !== undefined) { clearTimeout(idleRetryTimer); idleRetryTimer = undefined; }
+    const cleanupErrors = [...openCleanupErrors];
+    if (taskGraphWatch !== undefined) {
+      try {
+        await taskGraphWatch.stop();
+        await beforeDeadline(idleCheckpoint, Date.now() + STARTUP_RECONCILIATION_MS, "partial idle WAL checkpoint");
+      } catch (cleanupError) {
+        cleanupErrors.push(cleanupError);
+      }
+      taskGraphWatch = undefined;
+    }
+    if (harness !== undefined) {
+      try {
+        if (schedulerResumed) {
+          if (startupFailureState.stopScheduling) {
+            throw new Error("refusing partial startup cleanup that could resume Durable scheduling after a blocked or incomplete inspection");
+          }
+          if (tasks !== undefined) await reconcileLiveProcessTasks(harness, tasks, Date.now() + STARTUP_RECONCILIATION_MS);
+          await assertNoUnreconciledProcessEvidence(harness, Date.now() + STARTUP_RECONCILIATION_MS);
+          await projectionRefresh;
+          await projectionWriter?.drain();
+        }
+        await beforeDeadline(harness.close(BACKGROUND_CONTEXT), Date.now() + STARTUP_RECONCILIATION_MS, "partial Harness close");
+        if (schedulerResumed) await beforeDeadline(checkpointDurableWal(installation.databasePath), Date.now() + STARTUP_RECONCILIATION_MS, "partial startup WAL checkpoint");
+        pausedRuntimeClosed = true;
+      } catch (cleanupError) {
+        cleanupErrors.push(cleanupError);
+      }
+    } else {
+      try {
+        await storage.close(BACKGROUND_CONTEXT);
+      } catch (cleanupError) {
+        cleanupErrors.push(cleanupError);
+      }
+    }
+    if (cleanupErrors.length > 0) {
+      throw new ServiceShutdownError("Durable runtime open failed and partial resources could not be safely closed", {
+        cause: new AggregateError([error, ...cleanupErrors]),
+      });
+    }
+    throw error;
+  };
   try {
     const agentExecution = defineAgentExecutionTask({ getHarness: requireHarness });
     tasks = defineWorkshopTasks(metadata.bootId, {
@@ -120,13 +265,13 @@ async function openServiceRuntime(
         throw signal.reason ?? new Error("projection wait was aborted");
       },
     });
-    const scheduleWakeupTask = defineScheduleWakeupTask({
+    scheduleWakeupTask = defineScheduleWakeupTask({
       installation,
       workflowRunTask: tasks.WorkflowRunTask,
       canAdmit: tasks.canLaunch,
       waitForAdmission: tasks.waitForAdmission,
       runtimeManifest: {
-        durableVersion: "1.0.2",
+        durableVersion: DURABLE_VERSION,
         integrationManifestHash: canonicalHash({ taskVersions: TASK_VERSIONS }),
         taskVersions: TASK_VERSIONS,
       },
@@ -138,7 +283,7 @@ async function openServiceRuntime(
     });
     registry.install(agentExecution.guard.extension);
     registry.install(CodingTools);
-    const botExtension = createBotExtension({
+    botExtension = createBotExtension({
       readStatus: async workflowId => await projectServiceRead(requireHarness(), installation, metadata, { version: 1, method: "status", ...(workflowId === undefined ? {} : { workflowId }) }),
       readRun: async (workflowId, runId) => await readBotRun(requireHarness(), installation, metadata, workflowId, runId),
       readLogs: async (workflowId, runId) => await readBotLogs(requireHarness(), installation, metadata, workflowId, runId),
@@ -155,10 +300,100 @@ async function openServiceRuntime(
         else console.error(`Durable harness reported an extension failure: ${errorText(error)}`);
       },
     }, BACKGROUND_CONTEXT);
-    await ensureInstallationReady(harness, installation);
-    await reconcileStartupProcessTasks(harness, tasks, Date.now() + STARTUP_RECONCILIATION_MS);
-    await assertNoUnreconciledProcessEvidence(harness, Date.now() + STARTUP_RECONCILIATION_MS, metadata.bootId);
-    const runtimeHarness = harness;
+    pausedStartupInspection = await inspectPausedServiceRuntime(harness, {
+      processExecutionKind: tasks.ProcessExecutionTask.definition.name,
+      deadlineMs: Date.now() + STARTUP_RECONCILIATION_MS,
+    });
+    const pausedHarness = requireHarness();
+    const startupInspection = pausedStartupInspection;
+    return {
+      harness: pausedHarness,
+      startupInspection,
+      markRecoverySchedulingStarted() {
+        recoverySchedulingStarted = true;
+      },
+      async refreshStartupInspection() {
+        if (pausedRuntimeClosed) throw new Error("paused Durable runtime is already closed");
+        const current = await inspectPausedServiceRuntime(pausedHarness, {
+          processExecutionKind: tasks!.ProcessExecutionTask.definition.name,
+          deadlineMs: Date.now() + STARTUP_RECONCILIATION_MS,
+        });
+        const refreshed = recoverySchedulingStarted ? {
+          ...current,
+          limitations: current.limitations.filter((limitation) => limitation !== "scheduler_not_paused"),
+        } : current;
+        pausedStartupInspection = refreshed;
+        return refreshed;
+      },
+      completeNormalStartup() {
+        if (completion === undefined) completion = completeNormalStartup();
+        return completion;
+      },
+      async close() {
+        if (pausedRuntimeClosed) return;
+        if (schedulerResumed) throw new Error("cannot close a paused Durable runtime after normal startup resumed scheduling");
+        cleanupStarted = true;
+        opening = false;
+        shuttingDown = true;
+        tasks?.stopLaunching();
+        if (projectionTimer !== undefined) { clearTimeout(projectionTimer); projectionTimer = undefined; }
+        if (idleRetryTimer !== undefined) { clearTimeout(idleRetryTimer); idleRetryTimer = undefined; }
+        try {
+          await beforeDeadline(pausedHarness.close(BACKGROUND_CONTEXT), Date.now() + STARTUP_RECONCILIATION_MS, "paused Harness close");
+          await beforeDeadline(checkpointDurableWal(installation.databasePath), Date.now() + STARTUP_RECONCILIATION_MS, "paused startup WAL checkpoint");
+          pausedRuntimeClosed = true;
+        } catch (error) {
+          throw new ServiceShutdownError("paused Durable runtime did not close safely", { cause: error });
+        }
+      },
+    };
+  } catch (error) {
+    return await cleanupFailedOpen(error);
+  }
+
+  async function completeNormalStartup(): Promise<WorkshopServiceRuntime> {
+    try {
+      if (harness === undefined || tasks === undefined) {
+        throw new Error("paused Durable runtime is incomplete");
+      }
+      if (pausedRuntimeClosed) throw new Error("paused Durable runtime is already closed");
+      const currentInspection = await inspectPausedServiceRuntime(harness, {
+        processExecutionKind: tasks.ProcessExecutionTask.definition.name,
+        deadlineMs: Date.now() + STARTUP_RECONCILIATION_MS,
+      });
+      const inspection = recoverySchedulingStarted ? {
+        ...currentInspection,
+        limitations: currentInspection.limitations.filter((limitation) => limitation !== "scheduler_not_paused"),
+      } : currentInspection;
+      pausedStartupInspection = inspection;
+      try {
+        await assertStartupProcessEvidence(harness, Date.now() + STARTUP_RECONCILIATION_MS, metadata.bootId);
+      } catch (error) {
+        await writePausedStartupDiagnostic(harness, installation.stateDirectory, metadata.bootId, inspection, tasks, scheduleWakeupTask.definition.name, Date.now() + STARTUP_RECONCILIATION_MS, ["process_evidence_uncertain"]);
+        throw new Error("Durable process evidence is uncertain; startup remains stopped", { cause: error });
+      }
+      if (inspection.blockedTasks.length > 0 || inspection.limitations.length > 0) {
+        await writePausedStartupDiagnostic(harness, installation.stateDirectory, metadata.bootId, inspection, tasks, scheduleWakeupTask.definition.name, Date.now() + STARTUP_RECONCILIATION_MS);
+        const cause = inspection.limitations.includes("task_graph_unavailable")
+          ? new Error("Durable startup task graph could not be inspected; startup remains stopped")
+          : undefined;
+        throw new Error("Durable startup inspection found blocked or uncertain task state; startup remains stopped",
+          cause === undefined ? undefined : { cause });
+      }
+      let recoveryRequestActive: boolean;
+      try {
+        recoveryRequestActive = await (options.isRecoveryRequestActive?.(harness) ?? false);
+      } catch {
+        await writePausedStartupDiagnostic(harness, installation.stateDirectory, metadata.bootId, inspection, tasks, scheduleWakeupTask.definition.name, Date.now() + STARTUP_RECONCILIATION_MS, ["recovery_request_unavailable"]);
+        throw new Error("active recovery request could not be checked; startup remains stopped");
+      }
+      if (recoveryRequestActive) {
+        await writePausedStartupDiagnostic(harness, installation.stateDirectory, metadata.bootId, inspection, tasks, scheduleWakeupTask.definition.name, Date.now() + STARTUP_RECONCILIATION_MS, ["recovery_request_active"]);
+        throw new Error("active recovery request exists; ordinary startup remains stopped");
+      }
+      await ensureInstallationReady(harness, installation);
+      startupFailureState.stopScheduling = false;
+      const runtimeHarness = requireHarness();
     let botConversation: Conversation | undefined;
     if (botModel !== undefined) {
       botConversation = await ensureBotConversation(runtimeHarness, botExtension, botModel.full);
@@ -279,6 +514,7 @@ async function openServiceRuntime(
       return projectionRefresh;
     };
     await refreshProjections();
+    schedulerResumed = true;
     tasks.openStartupLaunchGate();
     harness.resume();
 
@@ -312,9 +548,7 @@ async function openServiceRuntime(
       const nextGraph = JSON.stringify(graph);
       if (nextGraph !== projectionGraph) { projectionGraph = nextGraph; void refreshProjections(); kickBot(); }
       // The scheduler's durable timer is not active workflow work and must not keep an idle WAL alive.
-      const hasRunnableWork = Object.values(graph.tasks).some((task) =>
-        task.kind !== schedulerWakeupKind && task.state.status !== "waiting",
-      );
+      const hasRunnableWork = hasRunnableTaskGraphWork(graph, schedulerWakeupKind);
       if (hasRunnableWork) {
         taskGraphIdle = false;
         if (idleRetryTimer !== undefined) {
@@ -427,48 +661,9 @@ async function openServiceRuntime(
         }
       },
     };
-  } catch (error) {
-    opening = false;
-    shuttingDown = true;
-    tasks?.stopLaunching();
-    if (projectionTimer !== undefined) { clearTimeout(projectionTimer); projectionTimer = undefined; }
-    if (idleRetryTimer !== undefined) {
-      clearTimeout(idleRetryTimer);
-      idleRetryTimer = undefined;
+    } catch (error) {
+      return await cleanupFailedOpen(error);
     }
-    const cleanupErrors = [...openCleanupErrors];
-    if (taskGraphWatch !== undefined) {
-      try {
-        await taskGraphWatch.stop();
-        await beforeDeadline(idleCheckpoint, Date.now() + STARTUP_RECONCILIATION_MS, "partial idle WAL checkpoint");
-      } catch (cleanupError) {
-        cleanupErrors.push(cleanupError);
-      }
-      taskGraphWatch = undefined;
-    }
-    if (harness !== undefined) {
-      try {
-        if (tasks !== undefined) await reconcileLiveProcessTasks(harness, tasks, Date.now() + STARTUP_RECONCILIATION_MS, true);
-        await assertNoUnreconciledProcessEvidence(harness, Date.now() + STARTUP_RECONCILIATION_MS);
-        await projectionRefresh;
-        await projectionWriter?.drain();
-        await beforeDeadline(harness.close(BACKGROUND_CONTEXT), Date.now() + STARTUP_RECONCILIATION_MS, "partial Harness close");
-      } catch (cleanupError) {
-        cleanupErrors.push(cleanupError);
-      }
-    } else {
-      try {
-        await storage.close(BACKGROUND_CONTEXT);
-      } catch (cleanupError) {
-        cleanupErrors.push(cleanupError);
-      }
-    }
-    if (cleanupErrors.length > 0) {
-      throw new ServiceShutdownError("Durable runtime open failed and partial resources could not be safely closed", {
-        cause: new AggregateError([error, ...cleanupErrors]),
-      });
-    }
-    throw error;
   }
 }
 
@@ -709,7 +904,7 @@ async function startWorkflow(
     stateDirectory: installation.stateDirectory,
     resolvedSettings: checked.resolvedSettings,
     runtimeManifest: {
-      durableVersion: "1.0.2",
+      durableVersion: DURABLE_VERSION,
       integrationManifestHash: canonicalHash({ taskVersions: TASK_VERSIONS }),
       taskVersions: TASK_VERSIONS,
     },
@@ -1076,6 +1271,13 @@ export async function resolveBlockedWorkflow(
       throw new ServiceRequestError("resolution_rejected", "source block already has an operator resolution");
     }
     const checkedProcesses = await latestRunProcessEvidence(harness, selectedRun.durable.conversationId as ConversationId, selectedRun.runId);
+    for (const record of checkedProcesses) {
+      if (record.process.cleanupState !== "operator_attested_absent") continue;
+      if ((request.resolver ?? "human") !== "human"
+        || !await hasJournalBackedAttestation(harness, record, selectedRun.durable.conversationId, Date.now() + STARTUP_RECONCILIATION_MS)) {
+        throw new ServiceRequestError("process_cleanup_unconfirmed", "operator attestation requires a matching recovery journal and human resolution");
+      }
+    }
     assertRunProcessGroupsConfirmedDead(selectedRun, checkedProcesses);
     const sourceProcesses = attemptLocation === null
       ? checkedProcesses.filter((entry) => entry.process.role === "preflight")
@@ -1106,7 +1308,7 @@ export async function resolveBlockedWorkflow(
       provenance: format4 ? request.resolver ?? "human" : "operator",
       reason: request.reason,
       resolvedAt,
-      processGroupsConfirmedDead: true,
+      processGroupsConfirmedDead: checkedProcesses.every((entry) => entry.process.cleanupState !== "operator_attested_absent"),
       sourceBlock: source,
       action: request.action,
       ...(request.action === "retry" ? {
@@ -1122,7 +1324,7 @@ export async function resolveBlockedWorkflow(
         resolvedAt,
         resultFile: request.resultFile!,
         acknowledgeEffects: true,
-        processGroupsConfirmedDead: true,
+        processGroupsConfirmedDead: checkedProcesses.every((entry) => entry.process.cleanupState !== "operator_attested_absent"),
       })
       : null;
 
@@ -1195,7 +1397,7 @@ export async function resolveBlockedWorkflow(
           provenance: operatorResolution.provenance,
           reason: request.reason,
           failedAt: at,
-          processGroupsConfirmedDead: true,
+          processGroupsConfirmedDead: operatorResolution.processGroupsConfirmedDead,
           sourceBlock,
         });
         const nextNodes = currentRun.nodes.map((node) => node.status !== "blocked" ? node : {
@@ -1369,8 +1571,10 @@ function assertRunProcessGroupsConfirmedDead(run: ReadyRunForResolution, records
   }
   for (const process of records.map((entry) => entry.process)) {
     if (process.launchIntentAt === null) continue;
-    if (process.identity === null || process.cleanupState !== "confirmed_dead" || !["blocked", "exited"].includes(process.status)) {
-      throw new ServiceRequestError("process_cleanup_unconfirmed", "every launched process group must have checked confirmed-death evidence before resolution");
+    const confirmed = process.identity !== null && process.cleanupState === "confirmed_dead";
+    const attested = process.identity === null && process.cleanupState === "operator_attested_absent";
+    if ((!confirmed && !attested) || !["blocked", "exited"].includes(process.status)) {
+      throw new ServiceRequestError("process_cleanup_unconfirmed", "every launched process group requires confirmed death or a matching operator attestation before resolution");
     }
   }
 }
@@ -1430,7 +1634,7 @@ function buildOperatorAcceptance(
   node: ReadyRunForResolution["nodes"][number],
   attempt: ReadyRunForResolution["nodes"][number]["attempts"][number],
   sourceBlock: NonNullable<ReadyRunForResolution["block"]>,
-  input: { resolutionId: string; reason: string; resolvedAt: string; resultFile: string; acknowledgeEffects: true; processGroupsConfirmedDead: true },
+  input: { resolutionId: string; reason: string; resolvedAt: string; resultFile: string; acknowledgeEffects: true; processGroupsConfirmedDead: boolean },
  ): { target: "worker"; candidate: NodeResult; validator: null } | { target: "validator"; candidate: NodeResult; validator: ValidatorOutcome } {
   if (attempt.result.kind !== "settled" || attempt.result.outcome.kind !== "blocked") throw new ServiceRequestError("resolution_rejected", "accept requires an interrupted attempt with an unknown outcome");
   const sourceOutcome = attempt.result.outcome;
@@ -1454,7 +1658,7 @@ function buildOperatorAcceptance(
     const question = "question" in result ? result.question : null;
     const acceptance = operatorAcceptanceSchema.parse({
       kind: "operator_acceptance", resolutionId: input.resolutionId, provenance: "human", target, reason: input.reason,
-      resolvedAt: input.resolvedAt, processGroupsConfirmedDead: true, acknowledgedEffects: true,
+      resolvedAt: input.resolvedAt, processGroupsConfirmedDead: input.processGroupsConfirmedDead, acknowledgedEffects: true,
       sourceBlock, resultBytesHash: parsed.sourceBytesHash,
     });
     return { target, validator: null, candidate: nodeResultSchema.parse({
@@ -1622,31 +1826,404 @@ function admissionFromReference(reference: {
   };
 }
 
-async function reconcileStartupProcessTasks(
-  harness: Harness,
-  tasks: ReturnType<typeof defineWorkshopTasks>,
-  deadlineMs: number,
-): Promise<void> {
-  const inspection = await beforeDeadline(harness.inspect(BACKGROUND_CONTEXT), deadlineMs, "Durable startup task inspection");
-  const blocked = inspection.tasks.find((task) => task.state.kind === "blocked");
-  if (blocked !== undefined && blocked.state.kind === "blocked") {
-    throw new Error(`Durable task ${blocked.record.id} cannot be reconciled: ${blocked.state.reason}`);
-  }
-  const uncertainProcesses = inspection.tasks.filter((task) => {
-    if (task.record.kind !== tasks.ProcessExecutionTask.definition.name) return false;
-    const state = task.record.state;
-    if (state.status === "completing") return false;
-    const checkpoint = state.checkpoint;
-    return typeof checkpoint !== "object" || checkpoint === null
-      || !("phase" in checkpoint) || checkpoint.phase !== "intent";
-  });
-  if (uncertainProcesses.length === 0) return;
-  harness.resume();
-  await Promise.all(uncertainProcesses.map((task) =>
-    beforeDeadline(harness.waitForTask(task.record.id as TaskId, BACKGROUND_CONTEXT), deadlineMs, "process-task reconciliation"),
-  ));
+export interface PausedStartupInspectionOptions {
+  readonly processExecutionKind: string;
+  readonly deadlineMs: number;
 }
 
+export async function inspectPausedServiceRuntime(
+  harness: Harness,
+  options: PausedStartupInspectionOptions,
+): Promise<PausedStartupInspection> {
+  const limitations = new Set<StartupParkDiagnosticV1["limitations"][number]>();
+  let taskInspection: Awaited<ReturnType<Harness["inspect"]>> | undefined;
+  let taskGraph: TaskGraph | undefined;
+  try {
+    taskInspection = await beforeDeadline(harness.inspect(BACKGROUND_CONTEXT), options.deadlineMs, "Durable startup task inspection");
+    if (taskInspection.scheduling !== "paused") limitations.add("scheduler_not_paused");
+  } catch {
+    limitations.add("task_inspection_unavailable");
+  }
+  try {
+    const graphState = await beforeDeadline(harness.taskGraph(BACKGROUND_CONTEXT), options.deadlineMs, "Durable startup ownership inspection");
+    try { taskGraph = graphState.value; } finally { graphState.dispose(); }
+  } catch {
+    limitations.add("task_graph_unavailable");
+  }
+
+  const blocked = new Map<number, Pick<StartupParkTaskV1, "taskId" | "kind" | "reason">>();
+  for (const task of taskInspection?.tasks ?? []) {
+    if (task.state.kind === "blocked") {
+      const taskId = Number(task.record.id);
+      const node = taskGraph?.tasks[String(taskId)];
+      let reason: StartupParkTaskV1["reason"] = task.state.reason;
+      if (taskGraph !== undefined && node?.blocked === undefined) limitations.add("inspection_only_blocked_tasks");
+      else if (node?.blocked !== undefined && node.blocked !== reason) {
+        limitations.add("inspection_disagreement");
+        reason = "unknown";
+      }
+      blocked.set(taskId, { taskId, kind: safeStartupTaskKind(task.record.kind), reason });
+    }
+    if (task.record.kind === options.processExecutionKind && task.record.state.status !== "completing"
+      && task.record.state.status !== "terminal") {
+      const checkpoint = task.record.state.checkpoint as unknown;
+      if (typeof checkpoint !== "object" || checkpoint === null || !("phase" in checkpoint) || checkpoint.phase !== "intent") {
+        limitations.add("process_task_uncertain");
+      }
+    }
+  }
+  for (const node of Object.values(taskGraph?.tasks ?? {})) {
+    if (node.blocked === undefined) continue;
+    const taskId = Number(node.id);
+    const previous = blocked.get(taskId);
+    if (previous === undefined) {
+      limitations.add("graph_only_blocked_tasks");
+      blocked.set(taskId, { taskId, kind: safeStartupTaskKind(node.kind), reason: node.blocked });
+    } else if (previous.reason !== node.blocked) {
+      limitations.add("inspection_disagreement");
+      blocked.set(taskId, { ...previous, reason: "unknown" });
+    }
+  }
+  return {
+    taskInspection,
+    taskGraph,
+    blockedTasks: [...blocked.values()],
+    limitations: [...limitations],
+  };
+}
+
+async function writePausedStartupDiagnostic(
+  harness: Harness,
+  stateDirectory: string,
+  bootId: string,
+  inspection: PausedStartupInspection,
+  tasks: ReturnType<typeof defineWorkshopTasks>,
+  schedulerWakeupKind: string,
+  deadlineMs: number,
+  extraLimitations: readonly StartupParkDiagnosticV1["limitations"][number][] = [],
+): Promise<void> {
+  try {
+    const displayedBlocked = selectLowestStartupParkTasks(inspection.blockedTasks);
+    const limitations = new Set([...inspection.limitations, ...extraLimitations]);
+    let verifiedAttributions = new Map<number, StartupParkTaskV1["attribution"]>();
+    if (displayedBlocked.length > 0) {
+      try {
+        const verification = await verifyStartupParkAttributions(
+          harness,
+          displayedBlocked.map((task) => task.taskId),
+          schedulerWakeupKind,
+          tasks.WorkflowRunTask.definition.name,
+          deadlineMs,
+        );
+        verifiedAttributions = new Map(verification.byTaskId);
+        if (!verification.complete) limitations.add("attribution_incomplete");
+      } catch {
+        limitations.add("attribution_incomplete");
+      }
+    }
+    const diagnostic = createStartupParkDiagnostic(bootId, displayedBlocked.map((task) => ({
+      taskId: task.taskId,
+      kind: task.kind,
+      reason: task.reason,
+      attribution: verifiedAttributions.get(task.taskId) ?? { kind: "unknown" as const },
+    })), undefined, [...limitations], inspection.blockedTasks.length);
+    writeStartupParkDiagnostic(stateDirectory, diagnostic);
+  } catch {
+    console.error("could not write startup park diagnostic");
+  }
+}
+
+async function assertStartupProcessEvidence(harness: Harness, deadlineMs: number, bootId: string): Promise<void> {
+  const stored = await beforeDeadline(harness.snapshot(WorkshopInstallationDoc, BACKGROUND_CONTEXT), deadlineMs, "startup installation evidence read");
+  if (stored === undefined) return;
+  const installation = installationDocumentV1Schema.safeParse(stored);
+  if (!installation.success) throw new Error("Durable installation evidence is invalid");
+  if (installation.data.state === "ready") {
+    await assertNoUnreconciledProcessEvidence(harness, deadlineMs, bootId);
+  }
+}
+
+type StartupTaskInspection = Awaited<ReturnType<Harness["inspect"]>>["tasks"][number];
+
+function safeStartupTaskKind(kind: string): StartupParkTaskV1["kind"] {
+  return STARTUP_PARK_TASK_KINDS_V1.includes(kind as StartupParkTaskV1["kind"])
+    ? kind as StartupParkTaskV1["kind"]
+    : "unknown";
+}
+
+const MAX_STARTUP_ATTRIBUTION_TASKS = MAX_STARTUP_PARK_TASKS_V1;
+const MAX_STARTUP_ATTRIBUTION_DEPTH = 64;
+const MAX_STARTUP_ATTRIBUTION_RECORDS = 4_096;
+const MAX_STARTUP_ATTRIBUTION_VISITS = 8_192;
+const MAX_STARTUP_ATTRIBUTION_INDEX_ENTRIES = 8_192;
+
+type StartupInstallation = Extract<ReturnType<typeof installationDocumentV1Schema.parse>, { state: "ready" }>;
+type StartupStoredTask = NonNullable<Awaited<ReturnType<Tx["task"]>>>;
+type StartupStoredConversation = NonNullable<Awaited<ReturnType<Tx["conversation"]>>>;
+type StartupAttributionRoot = { readonly task: StartupStoredTask; readonly conversation: StartupStoredConversation };
+type StartupActivationReference = { readonly workflowId: string; readonly activation: StartupInstallation["workflows"][string]["activations"][number] };
+type StartupRunReference = { readonly workflowId: string; readonly reference: StartupInstallation["workflows"][string]["runs"][number] };
+type StartupAttributionTrace = { readonly complete: boolean; readonly roots: ReadonlyMap<number, StartupAttributionRoot> };
+
+/** Verify the sorted diagnostic task prefix through committed ownership without resuming scheduling. */
+export async function verifyStartupParkAttributions(
+  harness: Harness,
+  displayedTaskIds: readonly number[],
+  schedulerWakeupKind: string,
+  workflowRunKind: string,
+  deadlineMs: number,
+): Promise<{ readonly byTaskId: ReadonlyMap<number, StartupParkTaskV1["attribution"]>; readonly complete: boolean }> {
+  const byTaskId = new Map<number, StartupParkTaskV1["attribution"]>();
+  const selectedTaskIds: number[] = [];
+  const selectedTaskIdSet = new Set<number>();
+  let complete = displayedTaskIds.length <= MAX_STARTUP_ATTRIBUTION_TASKS;
+  for (const taskId of displayedTaskIds.slice(0, MAX_STARTUP_ATTRIBUTION_TASKS)) {
+    byTaskId.set(taskId, { kind: "unknown" });
+    if (!isPositiveSafeInteger(taskId) || selectedTaskIdSet.has(taskId)) {
+      complete = false;
+      continue;
+    }
+    selectedTaskIdSet.add(taskId);
+    selectedTaskIds.push(taskId);
+  }
+  if (selectedTaskIds.length === 0) return { byTaskId, complete };
+
+  let installation: StartupInstallation | undefined;
+  let bot: ReturnType<typeof botDocumentV1Schema.parse> | undefined;
+  try {
+    const value = await beforeDeadline(harness.snapshot(WorkshopInstallationDoc, BACKGROUND_CONTEXT), deadlineMs, "startup attribution installation read");
+    if (!startupInstallationWithinBound(value)) complete = false;
+    else {
+      const parsed = installationDocumentV1Schema.safeParse(value);
+      if (parsed.success && parsed.data.state === "ready") installation = parsed.data;
+      else complete = false;
+    }
+  } catch { complete = false; }
+  try {
+    const value = await beforeDeadline(harness.snapshot(WorkshopBotDoc, BACKGROUND_CONTEXT), deadlineMs, "startup attribution bot read");
+    if (value !== undefined) {
+      if (!startupBotDocumentWithinBound(value)) complete = false;
+      else {
+        const parsed = botDocumentV1Schema.safeParse(value);
+        if (parsed.success) bot = parsed.data;
+        else complete = false;
+      }
+    }
+  } catch { complete = false; }
+  if (installation === undefined) return { byTaskId, complete: false };
+
+  const activations: StartupActivationReference[] = [];
+  const runs: StartupRunReference[] = [];
+  let indexCount = 0;
+  for (const [workflowId, workflow] of Object.entries(installation.workflows)) {
+    indexCount += workflow.activations.length + workflow.runs.length;
+    if (indexCount > MAX_STARTUP_ATTRIBUTION_INDEX_ENTRIES) return { byTaskId, complete: false };
+    for (const activation of workflow.activations) activations.push({ workflowId, activation });
+    for (const reference of workflow.runs) runs.push({ workflowId, reference });
+  }
+  if (!complete) return { byTaskId, complete: false };
+
+  let traces: ReadonlyMap<number, StartupAttributionTrace>;
+  let exhausted: boolean;
+  try {
+    ({ traces, exhausted } = await beforeDeadline(harness.commit(async (tx) => {
+      const tasks = new Map<number, StartupStoredTask | undefined>();
+      const conversations = new Map<number, StartupStoredConversation | undefined>();
+      let taskReads = 0, conversationReads = 0, visits = 0, budgetExhausted = false;
+      const readTask = async (id: number): Promise<StartupStoredTask | undefined> => {
+        if (!isPositiveSafeInteger(id) || Date.now() >= deadlineMs) { budgetExhausted ||= Date.now() >= deadlineMs; return undefined; }
+        if (tasks.has(id)) return tasks.get(id);
+        if (taskReads >= MAX_STARTUP_ATTRIBUTION_RECORDS) { budgetExhausted = true; return undefined; }
+        taskReads += 1;
+        const record = await tx.task(id as TaskId);
+        tasks.set(id, record);
+        return record;
+      };
+      const readConversation = async (id: number): Promise<StartupStoredConversation | undefined> => {
+        if (!isPositiveSafeInteger(id) || Date.now() >= deadlineMs) { budgetExhausted ||= Date.now() >= deadlineMs; return undefined; }
+        if (conversations.has(id)) return conversations.get(id);
+        if (conversationReads >= MAX_STARTUP_ATTRIBUTION_RECORDS) { budgetExhausted = true; return undefined; }
+        conversationReads += 1;
+        const record = await tx.conversation(id as ConversationId);
+        conversations.set(id, record);
+        return record;
+      };
+      const traceTask = async (id: number, depth: number, path: ReadonlySet<number>): Promise<StartupAttributionTrace> => {
+        if (!isPositiveSafeInteger(id) || path.has(id)) return { complete: false, roots: new Map() };
+        if (depth > MAX_STARTUP_ATTRIBUTION_DEPTH || visits >= MAX_STARTUP_ATTRIBUTION_VISITS) {
+          budgetExhausted = true;
+          return { complete: false, roots: new Map() };
+        }
+        visits += 1;
+        const task = await readTask(id);
+        if (task === undefined) return { complete: false, roots: new Map() };
+        const conversation = await readConversation(Number(task.conversationId));
+        if (conversation === undefined || Number(conversation.id) !== Number(task.conversationId)) return { complete: false, roots: new Map() };
+        const parents: { readonly id: number; readonly conversationId: number }[] = [];
+        if (task.owner !== undefined) {
+          const ownerId = Number(task.owner);
+          if (!isPositiveSafeInteger(ownerId)) return { complete: false, roots: new Map() };
+          parents.push({ id: ownerId, conversationId: Number(task.conversationId) });
+        }
+        if (conversation.owner !== undefined) {
+          const ownerId = Number(conversation.owner.taskId), ownerConversationId = Number(conversation.owner.conversationId);
+          if (!isPositiveSafeInteger(ownerId) || !isPositiveSafeInteger(ownerConversationId) || ownerConversationId === Number(conversation.id)) return { complete: false, roots: new Map() };
+          parents.push({ id: ownerId, conversationId: ownerConversationId });
+        }
+        if (parents.length === 0) return { complete: true, roots: new Map([[id, { task, conversation }]]) };
+        const nextPath = new Set(path);
+        nextPath.add(id);
+        const roots = new Map<number, StartupAttributionRoot>();
+        let completePath = true;
+        for (const parent of parents) {
+          const parentTask = await readTask(parent.id);
+          if (parentTask === undefined || Number(parentTask.conversationId) !== parent.conversationId) { completePath = false; continue; }
+          const result = await traceTask(parent.id, depth + 1, nextPath);
+          if (!result.complete) completePath = false;
+          for (const [rootId, root] of result.roots) roots.set(rootId, root);
+        }
+        return { complete: completePath, roots };
+      };
+      const result = new Map<number, StartupAttributionTrace>();
+      for (const taskId of selectedTaskIds) result.set(taskId, await traceTask(taskId, 0, new Set()));
+      return { traces: result, exhausted: budgetExhausted };
+    }, BACKGROUND_CONTEXT), deadlineMs, "startup attribution owner traversal"));
+  } catch { return { byTaskId, complete: false }; }
+  if (exhausted) complete = false;
+
+  const rootResults = new Map<number, { readonly attribution: StartupParkTaskV1["attribution"]; readonly complete: boolean }>();
+  for (const trace of traces.values()) for (const [rootId, root] of trace.roots) {
+    if (rootResults.has(rootId)) continue;
+    const result = await verifyStartupParkRootAttribution(harness, root, bot, activations, runs, schedulerWakeupKind, workflowRunKind, deadlineMs);
+    rootResults.set(rootId, result);
+    if (!result.complete) complete = false;
+  }
+  for (const taskId of selectedTaskIds) {
+    const trace = traces.get(taskId);
+    if (trace === undefined || !trace.complete || trace.roots.size !== 1) {
+      complete = false;
+      continue;
+    }
+    const [rootId] = trace.roots.keys(), result = rootResults.get(rootId!);
+    if (result?.complete === true) byTaskId.set(taskId, result.attribution);
+  }
+  return { byTaskId, complete };
+}
+
+async function verifyStartupParkRootAttribution(
+  harness: Harness,
+  root: StartupAttributionRoot,
+  bot: ReturnType<typeof botDocumentV1Schema.parse> | undefined,
+  activations: readonly StartupActivationReference[],
+  runs: readonly StartupRunReference[],
+  schedulerWakeupKind: string,
+  workflowRunKind: string,
+  deadlineMs: number,
+): Promise<{ readonly attribution: StartupParkTaskV1["attribution"]; readonly complete: boolean }> {
+  const unknown = { attribution: { kind: "unknown" as const }, complete: false };
+  const taskId = Number(root.task.id), conversationId = Number(root.conversation.id);
+  if (!isPositiveSafeInteger(taskId) || !isPositiveSafeInteger(conversationId)
+    || root.task.owner !== undefined || root.conversation.owner !== undefined) return unknown;
+  const schedulerMatches = activations.filter(({ activation }) => activation.schedulerTaskId === taskId);
+  const workflowMatches = runs.filter(({ reference }) => reference.workflowTaskId === taskId);
+
+  if (schedulerMatches.length > 0 || root.task.kind === schedulerWakeupKind) {
+    if (schedulerMatches.length !== 1 || root.task.kind !== schedulerWakeupKind || workflowMatches.length > 0) return unknown;
+    const match = schedulerMatches[0]!;
+    let input: ReturnType<typeof createScheduleWakeupTaskInput>;
+    try { input = createScheduleWakeupTaskInput(root.task.input as Parameters<typeof createScheduleWakeupTaskInput>[0]); }
+    catch { return unknown; }
+    if (input.workflowId !== match.workflowId || input.activationId !== match.activation.activationId
+      || !startupParkActivationIdV1Schema.safeParse(match.activation.activationId).success
+      || bot?.conversationId === conversationId) return unknown;
+    return { attribution: { kind: "scheduler", workflowId: match.workflowId, activationId: match.activation.activationId }, complete: true };
+  }
+
+  if (workflowMatches.length > 0 || root.task.kind === workflowRunKind) {
+    if (workflowMatches.length !== 1 || root.task.kind !== workflowRunKind
+      || Number(workflowMatches[0]!.reference.conversationId) !== conversationId
+      || runs.filter(({ reference }) => Number(reference.conversationId) === conversationId).length !== 1
+      || bot?.conversationId === conversationId) return unknown;
+    const { workflowId, reference } = workflowMatches[0]!;
+    if (!isSafeStartupRunIdentity(workflowId, reference.runId)
+      || !startupParkActivationIdV1Schema.safeParse(reference.activationId).success
+      || !isSafeStartupOccurrenceId(reference.occurrenceId)) return unknown;
+    const identity = { workflowId, runId: reference.runId, activationId: reference.activationId, occurrenceId: reference.occurrenceId };
+    if (parseWorkflowRunTaskInput(root.task.input, identity) === undefined) return unknown;
+    let run: unknown;
+    try {
+      run = await beforeDeadline(harness.snapshot(WorkshopRunDoc, conversationId as ConversationId, BACKGROUND_CONTEXT), deadlineMs, "startup attribution run identity read");
+    } catch { return { attribution: { kind: "unknown" }, complete: false }; }
+    if (!startupRunDocumentMatches(run, identity, conversationId, taskId)) return unknown;
+    return { attribution: { kind: "workflow_run", workflowId, runId: reference.runId }, complete: true };
+  }
+
+  if (bot?.conversationId === conversationId
+    && !runs.some(({ reference }) => Number(reference.conversationId) === conversationId)) {
+    return { attribution: { kind: "bot" }, complete: true };
+  }
+  return unknown;
+}
+
+function startupRunDocumentMatches(
+  value: unknown,
+  identity: { readonly workflowId: string; readonly runId: string; readonly activationId: string; readonly occurrenceId: string },
+  conversationId: number,
+  workflowTaskId: number,
+): boolean {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const run = value as Record<string, unknown>;
+  if (run.state !== "ready" || run.workflowId !== identity.workflowId || run.runId !== identity.runId
+    || run.activationId !== identity.activationId || run.occurrenceId !== identity.occurrenceId
+    || !startupParkRunIdV1Schema.safeParse(run.runId).success
+    || !startupParkActivationIdV1Schema.safeParse(run.activationId).success
+    || !isSafeStartupOccurrenceId(run.occurrenceId)
+    || typeof run.durable !== "object" || run.durable === null || Array.isArray(run.durable)) return false;
+  const durable = run.durable as Record<string, unknown>;
+  return durable.conversationId === conversationId && durable.workflowTaskId === workflowTaskId
+    && isPositiveSafeInteger(durable.conversationId) && isPositiveSafeInteger(durable.workflowTaskId);
+}
+
+function startupInstallationWithinBound(value: unknown): boolean {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const document = value as Record<string, unknown>;
+  if (document.state !== "ready" || typeof document.workflows !== "object" || document.workflows === null || Array.isArray(document.workflows)) return false;
+  const workflows = Object.values(document.workflows as Record<string, unknown>);
+  if (workflows.length > MAX_STARTUP_ATTRIBUTION_INDEX_ENTRIES) return false;
+  let count = 0;
+  for (const value of workflows) {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) continue;
+    const workflow = value as Record<string, unknown>;
+    count += (Array.isArray(workflow.activations) ? workflow.activations.length : 0)
+      + (Array.isArray(workflow.runs) ? workflow.runs.length : 0);
+    if (count > MAX_STARTUP_ATTRIBUTION_INDEX_ENTRIES) return false;
+  }
+  return true;
+}
+
+function startupBotDocumentWithinBound(value: unknown): boolean {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const cursors = (value as Record<string, unknown>).eventCursors;
+  return typeof cursors === "object" && cursors !== null && !Array.isArray(cursors)
+    && Object.keys(cursors).length <= MAX_STARTUP_ATTRIBUTION_INDEX_ENTRIES;
+}
+
+function isSafeStartupRunIdentity(workflowId: string, runId: string): boolean {
+  if (!startupParkRunIdV1Schema.safeParse(runId).success || !runId.startsWith(workflowId + "-")) return false;
+  const suffix = runId.slice(workflowId.length + 1);
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(suffix)
+    || /^slot-[0-9a-f]{32}$/.test(suffix);
+}
+
+function isSafeStartupOccurrenceId(value: unknown): value is string {
+  return typeof value === "string" && (
+    startupParkActivationIdV1Schema.safeParse(value).success || /^schedule-[0-9a-f]{32}$/.test(value)
+  );
+}
+
+function isPositiveSafeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
 async function reconcileLiveProcessTasks(
   harness: Harness,
   tasks: ReturnType<typeof defineWorkshopTasks>,
@@ -1682,12 +2259,19 @@ async function waitForTaskTerminal(harness: Harness, taskId: TaskId, deadlineMs:
   }
 }
 
-async function assertNoUnreconciledProcessEvidence(
+export interface RetainedProcessEvidence {
+  readonly conversationId: number;
+  readonly entryId: number;
+  readonly processEntryHash: string;
+  readonly record: RunProcessEvidence;
+}
+
+export async function inspectRetainedProcessEvidence(
   harness: Harness,
   deadlineMs: number,
-  activeBootId?: string,
-): Promise<void> {
-  const installation = await beforeDeadline(readInstallation(harness), deadlineMs, "installation reconciliation read");
+): Promise<readonly RetainedProcessEvidence[]> {
+  const installation = await beforeDeadline(readInstallation(harness), deadlineMs, "installation process-evidence read");
+  const result: RetainedProcessEvidence[] = [];
   for (const workflow of Object.values(installation.workflows)) {
     for (const reference of workflow.runs) {
       const conversation = await beforeDeadline(
@@ -1695,57 +2279,252 @@ async function assertNoUnreconciledProcessEvidence(
         deadlineMs,
         "run conversation lookup",
       );
-      if (conversation === undefined) throw new Error(`run conversation for ${reference.runId} is unavailable during shutdown`);
-      const latest = new Map<string, import("../run/records.js").WorkshopProcessV1>();
+      if (conversation === undefined) throw new Error(`run conversation for ${reference.runId} is unavailable`);
+      const latest = new Map<string, RetainedProcessEvidence>();
       let cursor: import("@earendil-works/pi-durable").Cursor | undefined;
       do {
         const page = await beforeDeadline(conversation.entries({}, 256, cursor, BACKGROUND_CONTEXT), deadlineMs, "process evidence scan");
         for (const entry of page.items) {
-          if (entry.kind !== "workshop.process" || entry.data === undefined) continue;
+          if (entry.kind !== "workshop.process") continue;
+          if (entry.data === undefined) throw new Error(`process evidence entry ${String(entry.id)} has no data`);
           const parsed = workshopProcessV1Schema.safeParse(entry.data);
-          if (!parsed.success || parsed.data.runId !== reference.runId) continue;
-          const process = parsed.data.process;
-          const key = `${process.executionId}:${process.incarnationId}`;
-          if (!latest.has(key)) latest.set(key, parsed.data);
+          if (!parsed.success || parsed.data.runId !== reference.runId) {
+            throw new Error(`process evidence entry ${String(entry.id)} is invalid for run ${reference.runId}`);
+          }
+          const entryId = Number(entry.id);
+          if (!Number.isSafeInteger(entryId) || entryId <= 0) throw new Error("process evidence entry ID is invalid");
+          const record = parsed.data;
+          const item = {
+            conversationId: Number(reference.conversationId),
+            entryId,
+            processEntryHash: canonicalHash({ id: entryId, data: entry.data }),
+            record,
+          };
+          const key = `${record.taskId}:${record.process.executionId}:${record.process.incarnationId}`;
+          if (entryId > (latest.get(key)?.entryId ?? 0)) latest.set(key, item);
         }
         cursor = page.next;
       } while (cursor !== undefined);
-      for (const [identity, record] of latest) {
-        const process = record.process;
-        if (!["launching", "running", "reconciling"].includes(process.status) && process.cleanupState !== "unconfirmed") continue;
-        if (await hasReceiptBackedBlockedCapture(harness, record, deadlineMs)) continue;
-        if (activeBootId !== undefined) {
-          const task = await beforeDeadline(harness.getTask(record.taskId as TaskId, BACKGROUND_CONTEXT), deadlineMs, "process task lookup");
-          const input = processExecutionTaskInputSchema.safeParse(task?.input);
-          if (task !== undefined && task.state.status !== "terminal" && input.success && input.data.serviceBootId === activeBootId) continue;
-        }
-        throw new Error(`process group ${identity} has no confirmed-death receipt at service startup or shutdown`);
-      }
+      result.push(...latest.values());
     }
+  }
+  return result.sort((left, right) => left.conversationId - right.conversationId
+    || left.record.taskId - right.record.taskId
+    || left.record.process.executionId.localeCompare(right.record.process.executionId)
+    || left.record.process.incarnationId.localeCompare(right.record.process.incarnationId));
+}
+
+export function processEvidenceNeedsDeathVerification(process: RunProcessEvidence["process"]): boolean {
+  return process.cleanupState === "pending" || process.cleanupState === "unconfirmed"
+    || process.cleanupState === "operator_attested_absent"
+    || ["launching", "running", "reconciling"].includes(process.status);
+}
+
+export async function assertNoUnreconciledProcessEvidence(
+  harness: Harness,
+  deadlineMs: number,
+  activeBootId?: string,
+): Promise<void> {
+  const evidence = await inspectRetainedProcessEvidence(harness, deadlineMs);
+  for (const item of evidence) {
+    const { record, conversationId } = item;
+    const process = record.process;
+    if (!processEvidenceNeedsDeathVerification(process)) continue;
+    if (process.cleanupState === "operator_attested_absent"
+      && await hasJournalBackedAttestation(harness, record, conversationId, deadlineMs)) continue;
+    if (await hasJournalBackedRetiredProcessEvidence(harness, item, deadlineMs)) continue;
+    if (activeBootId !== undefined) {
+      const task = await beforeDeadline(harness.getTask(record.taskId as TaskId, BACKGROUND_CONTEXT), deadlineMs, "process task lookup");
+      const input = processExecutionTaskInputSchema.safeParse(task?.input);
+      if (task !== undefined && task.state.status !== "terminal" && input.success && input.data.serviceBootId === activeBootId) continue;
+    }
+    throw new Error(`process group ${process.executionId}:${process.incarnationId} has no confirmed-death receipt at service startup or shutdown`);
   }
 }
 
-async function hasReceiptBackedBlockedCapture(
+export async function hasJournalBackedRetiredProcessEvidence(
   harness: Harness,
-  record: import("../run/records.js").WorkshopProcessV1,
+  item: RetainedProcessEvidence,
   deadlineMs: number,
 ): Promise<boolean> {
+  const { WorkshopRecoveryIndexDoc, WorkshopRecoveryRequestDoc } = await import("../storage/durable/define-recovery-records.js");
+  const { recoveryIndexV1Schema, recoveryRequestV1Schema } = await import("../storage/durable/schema-recovery.js");
+  const index = recoveryIndexV1Schema.safeParse(await beforeDeadline(
+    harness.snapshot(WorkshopRecoveryIndexDoc, BACKGROUND_CONTEXT), deadlineMs, "retired process recovery index read",
+  ));
+  if (!index.success || index.data.state !== "ready") return false;
+  for (const [requestId, summary] of Object.entries(index.data.requests)) {
+    if (!summary.taskIds.includes(item.record.taskId)) continue;
+    const parsed = recoveryRequestV1Schema.safeParse(await beforeDeadline(
+      harness.snapshot(WorkshopRecoveryRequestDoc, requestId, BACKGROUND_CONTEXT), deadlineMs, "retired process recovery request read",
+    ));
+    if (!parsed.success || parsed.data.requestId !== requestId || parsed.data.intent === null
+      || parsed.data.intent.payloadHash !== summary.payloadHash) continue;
+    const request = parsed.data;
+    const intent = request.intent;
+    if (intent === null) continue;
+    const actionIndex = request.actions.findIndex((action) => action.action === "verify_retired"
+      && action.taskId === item.record.taskId && action.processEntryHash === item.processEntryHash);
+    const action = request.actions[actionIndex];
+    const intentAction = intent.actions[actionIndex];
+    const proof = action?.deathEvidence;
+    const task = action === undefined ? undefined : await beforeDeadline(
+      harness.getTask(action.taskId as TaskId, BACKGROUND_CONTEXT), deadlineMs, "retired process task lookup",
+    );
+    const taskInput = processExecutionTaskInputSchema.safeParse(task?.input);
+    if (task === undefined || task.state.status !== "terminal" || !taskInput.success
+      || task.kind !== "workshop.process-execution" || action === undefined || intentAction === undefined
+      || action.state !== "settled" || action.settlement === null
+      || action.settlement.outcomeHash !== canonicalHash(task.state.outcome)
+      || canonicalHash(action.settlement.taskOutcome) !== canonicalHash(task.state.outcome)
+      || action.settlement.processEvidenceHash !== canonicalHash(proof)
+      || action.taskVersion !== task.version || action.inputHash !== canonicalHash(task.input)
+      || taskInput.data.runId !== item.record.runId || taskInput.data.executionId !== item.record.process.executionId
+      || taskInput.data.incarnationId !== item.record.process.incarnationId
+      || taskInput.data.incarnationNumber !== item.record.process.incarnationNumber
+      || action.taskKind !== "workshop.process-execution"
+      || action.owner.conversationId !== item.conversationId || action.process === null
+      || action.process.executionId !== item.record.process.executionId
+      || action.process.incarnationId !== item.record.process.incarnationId
+      || canonicalHash(action.process.identity) !== canonicalHash(item.record.process.identity)
+      || action.process.launchServiceBootId !== (item.record.process.launchServiceBootId ?? taskInput.data.serviceBootId)
+      || action.processEntryHash !== item.processEntryHash
+      || proof === null || proof === undefined) continue;
+    const { occurrence: _occurrence, actionId: _actionId, state: _state, deathEvidence: _deathEvidence,
+      dispatchMarkedAt: _dispatchMarkedAt, receipt: _receipt, settlement: _settlement, refusal: _refusal, ...binding } = action;
+    if (canonicalHash(binding) !== canonicalHash(intentAction)) continue;
+    if (proof.kind === "confirmed_dead") {
+      if (proof.processEntryHash === item.processEntryHash
+        && proof.executionId === item.record.process.executionId
+        && proof.incarnationId === item.record.process.incarnationId
+        && canonicalHash(proof.identity) === canonicalHash(item.record.process.identity)
+        && proof.launchServiceBootId === action.process.launchServiceBootId
+        && proof.inputHash === action.inputHash && proof.checkpointHash === action.checkpointHash) return true;
+    } else if (proof.processEntryHash === item.processEntryHash
+      && proof.attestingRequestId === requestId
+      && proof.manifestDigest === intent.manifestDigest
+      && action.process.identity === null
+      && proof.evidenceHash === canonicalHash({
+        confirmationLine: `recover ${requestId} ${intent.manifestDigest} resume-installation`,
+        taskId: action.taskId, executionId: action.process.executionId, incarnationId: action.process.incarnationId,
+        inputHash: action.inputHash, checkpointHash: action.checkpointHash, processEntryHash: item.processEntryHash,
+      })) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export async function hasJournalBackedAttestation(
+  harness: Harness,
+  record: RunProcessEvidence,
+  conversationId: number,
+  deadlineMs: number,
+  requireSettlement = false,
+ ): Promise<boolean> {
+  const { WorkshopRecoveryIndexDoc, WorkshopRecoveryRequestDoc } = await import("../storage/durable/define-recovery-records.js");
+  const { recoveryIndexV1Schema, recoveryRequestV1Schema } = await import("../storage/durable/schema-recovery.js");
   const process = record.process;
-  if (process.status !== "blocked" || process.cleanupState !== "unconfirmed" || process.captures.length === 0) return false;
-  const task = await beforeDeadline(harness.getTask(record.taskId as TaskId, BACKGROUND_CONTEXT), deadlineMs, "blocked process task lookup");
-  const input = processExecutionTaskInputSchema.safeParse(task?.input);
-  if (task === undefined || task.state.status !== "terminal" || !input.success
-    || input.data.runId !== record.runId || input.data.executionId !== process.executionId
-    || input.data.incarnationId !== process.incarnationId || input.data.incarnationNumber !== process.incarnationNumber) return false;
-  if (task.state.outcome.status !== "completed") return false;
-  const result = processExecutionTaskResultSchema.safeParse(task.state.outcome.result);
-  if (!result.success || result.data.kind !== "blocked") return false;
-  const captures = await beforeDeadline(
-    recoverRetainedProcessCaptureRecords(input.data),
-    deadlineMs,
-    "retained process capture verification",
+  if (process.status !== "blocked" || process.identity !== null || process.exit !== null
+    || process.cleanupState !== "operator_attested_absent") return false;
+  const index = recoveryIndexV1Schema.safeParse(await beforeDeadline(
+    harness.snapshot(WorkshopRecoveryIndexDoc, BACKGROUND_CONTEXT), deadlineMs, "recovery attestation index read",
+  ));
+  if (!index.success || index.data.state !== "ready") return false;
+  for (const [requestId, summary] of Object.entries(index.data.requests)) {
+    if (!summary.taskIds.includes(record.taskId)) continue;
+    const parsed = recoveryRequestV1Schema.safeParse(await beforeDeadline(
+      harness.snapshot(WorkshopRecoveryRequestDoc, requestId, BACKGROUND_CONTEXT), deadlineMs, "recovery attestation request read",
+    ));
+    if (!parsed.success || parsed.data.requestId !== requestId || parsed.data.intent === null
+      || parsed.data.intent.payloadHash !== summary.payloadHash) continue;
+    const request = parsed.data;
+    const actionIndex = request.actions.findIndex((action) => action.taskId === record.taskId);
+    const action = request.actions[actionIndex];
+    const intentAction = request.intent!.actions[actionIndex];
+    const evidence = action?.deathEvidence;
+    const task = action === undefined ? undefined : await beforeDeadline(
+      harness.getTask(action.taskId as TaskId, BACKGROUND_CONTEXT), deadlineMs, "attested process task lookup",
+    );
+    const taskInput = processExecutionTaskInputSchema.safeParse(task?.input);
+    if (action === undefined || intentAction === undefined || action.action !== "abort"
+      || (requireSettlement && (action.state !== "settled" || action.settlement === null))
+      || action.taskKind !== "workshop.process-execution" || action.owner.conversationId !== conversationId
+      || action.process === null || action.process.identity !== null
+      || action.process.executionId !== process.executionId || action.process.incarnationId !== process.incarnationId
+      || (process.launchServiceBootId !== undefined && action.process.launchServiceBootId !== process.launchServiceBootId)
+      || task === undefined || task.state.status !== "terminal" || !taskInput.success
+      || task.kind !== "workshop.process-execution" || Number(task.conversationId) !== conversationId
+      || taskInput.data.runId !== record.runId || taskInput.data.executionId !== process.executionId
+      || taskInput.data.incarnationId !== process.incarnationId || action.inputHash !== canonicalHash(task.input)
+      || action.process.launchServiceBootId !== (process.launchServiceBootId ?? taskInput.data.serviceBootId)
+      || action.processEntryHash === undefined || evidence?.kind !== "operator_attested_absent"
+      || evidence.processEntryHash !== action.processEntryHash || evidence.attestingRequestId !== requestId
+      || evidence.manifestDigest !== request.intent!.manifestDigest
+      || evidence.evidenceHash !== canonicalHash({
+        confirmationLine: `recover ${requestId} ${request.intent!.manifestDigest} resume-installation`,
+        taskId: action.taskId, executionId: action.process.executionId, incarnationId: action.process.incarnationId,
+        inputHash: action.inputHash, checkpointHash: action.checkpointHash, processEntryHash: action.processEntryHash,
+      })
+      || (requireSettlement && (action.settlement === null
+        || action.settlement.outcomeHash !== canonicalHash(task?.state.status === "terminal" ? task.state.outcome : null)
+        || task?.state.status !== "terminal"
+        || canonicalHash(action.settlement.taskOutcome) !== canonicalHash(task.state.outcome)
+        || action.settlement.processEvidenceHash !== canonicalHash(evidence)))
+      || !await hasRetainedProcessEntryHash(
+        harness, conversationId, record.runId, action.taskId, action.process, taskInput.data.serviceBootId,
+        taskInput.data.incarnationNumber, action.processEntryHash, deadlineMs,
+      )) continue;
+    const { occurrence: _occurrence, actionId: _actionId, state: _state, deathEvidence: _deathEvidence,
+      dispatchMarkedAt: _dispatchMarkedAt, receipt: _receipt, settlement: _settlement, refusal: _refusal, ...binding } = action;
+    if (canonicalHash(binding) === canonicalHash(intentAction)) return true;
+  }
+  return false;
+}
+
+
+
+export async function hasRetainedProcessEntryHash(
+  harness: Harness,
+  conversationId: number,
+  runId: string,
+  taskId: number,
+  process: {
+    readonly executionId: string;
+    readonly incarnationId: string;
+    readonly launchServiceBootId: string | null;
+    readonly identity: { readonly pid: number; readonly pgid: number; readonly startIdentity: string; readonly serviceBootId: string } | null;
+  },
+  serviceBootId: string,
+  incarnationNumber: number,
+  expectedHash: string,
+  deadlineMs: number,
+): Promise<boolean> {
+  const conversation = await beforeDeadline(
+    harness.conversation(conversationId as ConversationId, BACKGROUND_CONTEXT), deadlineMs, "attested process conversation lookup",
   );
-  return canonicalHash(captures) === canonicalHash(process.captures);
+  if (conversation === undefined) return false;
+  let cursor: import("@earendil-works/pi-durable").Cursor | undefined;
+  do {
+    const page = await beforeDeadline(conversation.entries({}, 256, cursor, BACKGROUND_CONTEXT), deadlineMs, "attested process history scan");
+    for (const entry of page.items) {
+      if (entry.kind !== "workshop.process") continue;
+      if (entry.data === undefined) return false;
+      const parsed = workshopProcessV1Schema.safeParse(entry.data);
+      if (!parsed.success) return false;
+      if (parsed.data.taskId !== taskId || parsed.data.runId !== runId
+        || parsed.data.process.executionId !== process.executionId
+        || parsed.data.process.incarnationId !== process.incarnationId
+        || parsed.data.process.incarnationNumber !== incarnationNumber
+        || (parsed.data.process.launchServiceBootId ?? serviceBootId) !== process.launchServiceBootId
+        || canonicalHash(parsed.data.process.identity) !== canonicalHash(process.identity)) continue;
+      const entryId = Number(entry.id);
+      if (!Number.isSafeInteger(entryId) || entryId <= 0) return false;
+      if (canonicalHash({ id: entryId, data: entry.data }) === expectedHash) return true;
+    }
+    cursor = page.next;
+  } while (cursor !== undefined);
+  return false;
 }
 
 async function beforeDeadline<T>(operation: Promise<T>, deadlineMs: number, label: string): Promise<T> {

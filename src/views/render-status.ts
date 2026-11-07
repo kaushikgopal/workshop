@@ -102,6 +102,10 @@ export function renderStepPreview(node: NodeDescriptionDto["node"], expanded = f
       if (node.block) notes.push("Block: " + node.block.kind, "Allowed actions: " + blockActions(node.block.kind));
       break;
   }
+  for (const process of attempt?.processes ?? []) {
+    if (process.cleanupState === "operator_attested_absent") notes.push(`${process.role} process cleanup: attested absent`);
+    else if (process.cleanupState === "confirmed_dead") notes.push(`${process.role} process cleanup: confirmed dead`);
+  }
   const lines = evidence === "" ? [] : evidence.replace(/\n$/, "").split("\n");
   const expandable = lines.length > 40 || node.evidenceTruncated === true;
   const visible = expanded ? lines : node.status === "running" ? lines.slice(-40) : lines.slice(0, 40);

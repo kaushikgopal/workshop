@@ -405,7 +405,7 @@ export const attemptDetailDtoSchema = z.strictObject({
     if (launchedTargetProcesses.length === 0) {
       report(["operatorAcceptances", index, "sourceBlock"], "acceptance retains a launched process for its target role");
     }
-    if (launchedTargetProcesses.some((process) => process.cleanupState !== "confirmed_dead")) {
+    if (launchedTargetProcesses.some((process) => process.cleanupState !== "confirmed_dead" && process.cleanupState !== "operator_attested_absent")) {
       report(["operatorAcceptances", index, "processGroupsConfirmedDead"], "acceptance requires its target process groups to be reconciled");
     }
     if (launchedTargetProcesses.some((process) => process.status !== "blocked" || process.exit !== null)) {
@@ -562,7 +562,8 @@ export const attemptDetailDtoSchema = z.strictObject({
     const hasWorkerExecutionEvidence = hasNativeWorkerReceipt || lastWorker !== undefined;
     const workerGroupConfirmed = hasNativeWorkerReceipt
       ? workerProcesses.length === 0
-      : lastWorker !== undefined && workerProcesses.every((process) => process.cleanupState === "confirmed_dead");
+      : lastWorker !== undefined && workerProcesses.every((process) => process.cleanupState === "confirmed_dead"
+        || (process.cleanupState === "operator_attested_absent" && workerAcceptance !== undefined));
     if ((attempt.candidate === null && attempt.workerFailure === undefined)
       || !hasWorkerExecutionEvidence || !workerGroupConfirmed) {
       report(["processes"], "verifier launch requires committed worker evidence and confirmed native completion or process cleanup");
@@ -604,7 +605,8 @@ export const attemptDetailDtoSchema = z.strictObject({
   const terminalAttempt = ["succeeded", "failed", "cancelled"].includes(attempt.status);
   if (terminalAttempt && attempt.processes.some((process) => {
     const settledStatus = process.status === "prepared" || process.status === "exited" || process.status === "blocked";
-    const confirmed = process.status === "prepared" || process.cleanupState === "confirmed_dead";
+    const confirmed = process.status === "prepared" || process.cleanupState === "confirmed_dead"
+      || process.cleanupState === "operator_attested_absent";
     return !settledStatus || !confirmed;
   })) {
     report(["processes"], "terminal attempts have only prepared or reconciled process incarnations");

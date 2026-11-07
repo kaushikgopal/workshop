@@ -45,6 +45,8 @@ Commands:
       Start the detached service owner (idempotent), serve it in the
       foreground, read its health and identity, or shut it down gracefully.
       The service runs schedules.
+  service recover inspect [--json] | apply <options> | receipt <request-id> [--json]
+      Inspect or recover Durable task state with local terminal authorization.
 `;
 
 /** Route one command line; help and validate stay offline, and unknown commands fail closed. */

@@ -12,7 +12,7 @@ export const incarnationIdSchema = z.string().min(1).brand<"IncarnationId">();
 
 export const processRoleSchema = z.enum(["worker", "validator", "preflight"]);
 export const processStatusSchema = z.enum(["prepared", "launching", "running", "reconciling", "exited", "blocked"]);
-export const processCleanupStateSchema = z.enum(["not_started", "pending", "confirmed_dead", "unconfirmed"]);
+export const processCleanupStateSchema = z.enum(["not_started", "pending", "confirmed_dead", "operator_attested_absent", "unconfirmed"]);
 
 export const processIdentitySchema = z.strictObject({
   pid: positiveSafeInteger,
@@ -146,6 +146,10 @@ export const processIncarnationSchema = z.strictObject({
   if (process.cleanupState === "confirmed_dead" && process.identity === null) {
     context.addIssue({ code: "custom", path: ["cleanupState"], message: "death cannot be confirmed without process identity" });
   }
+  if (process.cleanupState === "operator_attested_absent"
+    && (process.status !== "blocked" || process.identity !== null || process.exit !== null)) {
+    context.addIssue({ code: "custom", path: ["cleanupState"], message: "operator attestation requires a blocked identity-free process without an exit receipt" });
+  }
   switch (process.status) {
     case "prepared":
       if (process.launchIntentAt !== null || process.startedAt !== null || process.finishedAt !== null
@@ -178,7 +182,7 @@ export const processIncarnationSchema = z.strictObject({
       }
       break;
     case "blocked":
-      if (process.launchIntentAt === null || (process.cleanupState !== "unconfirmed" && process.cleanupState !== "confirmed_dead")) {
+      if (process.launchIntentAt === null || !["unconfirmed", "confirmed_dead", "operator_attested_absent"].includes(process.cleanupState)) {
         context.addIssue({ code: "custom", path: ["status"], message: "blocked processes retain launch intent and reconciled cleanup state" });
       }
       break;

@@ -32,6 +32,94 @@ export const serviceHealthResponseV1Schema = z.object({
 }).strict();
 export type ServiceHealthResponseV1 = z.infer<typeof serviceHealthResponseV1Schema>;
 
+export const MAX_STARTUP_PARK_TASKS_V1 = 256;
+export const MAX_STARTUP_PARK_DIAGNOSTIC_BYTES_V1 = 64 * 1024;
+
+export const startupParkActivationIdV1Schema = z.string()
+  .regex(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+export const startupParkRunIdV1Schema = z.string().max(118)
+  .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*-(?:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}|slot-[0-9a-f]{32})$/);
+
+const startupParkAttributionV1Schema = z.discriminatedUnion("kind", [
+  z.strictObject({
+    kind: z.literal("scheduler"),
+    workflowId: workflowIdSchema,
+    activationId: startupParkActivationIdV1Schema,
+  }),
+  z.strictObject({
+    kind: z.literal("workflow_run"),
+    workflowId: workflowIdSchema,
+    runId: startupParkRunIdV1Schema,
+  }),
+  z.strictObject({ kind: z.literal("bot") }),
+  z.strictObject({ kind: z.literal("unknown") }),
+]);
+const startupParkLimitationV1Schema = z.enum([
+  "task_graph_unavailable",
+  "graph_only_blocked_tasks",
+  "inspection_only_blocked_tasks",
+  "inspection_disagreement",
+  "attribution_incomplete",
+  "task_inspection_unavailable",
+  "scheduler_not_paused",
+  "process_task_uncertain",
+  "process_evidence_uncertain",
+  "recovery_request_active",
+  "recovery_request_unavailable",
+]);
+
+export const STARTUP_PARK_TASK_KINDS_V1 = [
+  "workshop.workflow-run",
+  "workshop.node-attempt",
+  "workshop.process-execution",
+  "workshop.capacity-gate",
+  "workshop.schedule-wakeup",
+  "workshop.agent-execution",
+  "pi.generation",
+  "pi.tool",
+  "pi.compaction",
+  "unknown",
+] as const;
+
+export const startupParkTaskV1Schema = z.strictObject({
+  taskId: z.number().int().positive().safe(),
+  kind: z.enum(STARTUP_PARK_TASK_KINDS_V1),
+  reason: z.enum(["missing_task", "task_too_old", "migration_failed", "restart_limit", "unknown"]),
+  attribution: startupParkAttributionV1Schema,
+});
+export type StartupParkTaskV1 = z.infer<typeof startupParkTaskV1Schema>;
+
+export const startupParkDiagnosticV1Schema = z.strictObject({
+  version: z.literal(1),
+  state: z.literal("historical_not_ready"),
+  createdAt: z.iso.datetime(),
+  bootId: z.string().uuid(),
+  blockedTaskCount: z.number().int().nonnegative().safe(),
+  observationComplete: z.boolean(),
+  limitations: z.array(startupParkLimitationV1Schema).max(12),
+  truncated: z.boolean(),
+  blockedTasks: z.array(startupParkTaskV1Schema).max(MAX_STARTUP_PARK_TASKS_V1),
+}).superRefine((diagnostic, context) => {
+  const ids = new Set<number>();
+  diagnostic.blockedTasks.forEach((task, index) => {
+    if (ids.has(task.taskId)) {
+      context.addIssue({ code: "custom", path: ["blockedTasks", index, "taskId"], message: "blocked task IDs are unique" });
+    }
+    ids.add(task.taskId);
+  });
+  const isTruncated = diagnostic.blockedTasks.length < diagnostic.blockedTaskCount;
+  if (diagnostic.blockedTaskCount < diagnostic.blockedTasks.length || diagnostic.truncated !== isTruncated) {
+    context.addIssue({ code: "custom", path: ["truncated"], message: "truncation matches the number of listed blocked tasks" });
+  }
+  if (diagnostic.observationComplete !== (diagnostic.limitations.length === 0)) {
+    context.addIssue({ code: "custom", path: ["observationComplete"], message: "observation completeness matches the recorded inspection limitations" });
+  }
+  if (new Set(diagnostic.limitations).size !== diagnostic.limitations.length) {
+    context.addIssue({ code: "custom", path: ["limitations"], message: "inspection limitations are unique" });
+  }
+});
+export type StartupParkDiagnosticV1 = z.infer<typeof startupParkDiagnosticV1Schema>;
+
 export const serviceRequestIdV1Schema = z.string().min(1).max(128).refine(
   (value) => !/[\x00-\x1f\x7f]/.test(value),
   "requestId cannot contain control characters",

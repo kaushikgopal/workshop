@@ -1,0 +1,16 @@
+version: 4
+defaults:
+  retries: 0
+  replay: safe
+steps:
+  - prepare:
+      result: tagged
+      agent:
+        instructions: Return one successful tagged result with a short fixed output.
+  - hold-process:
+      run: |
+        sleep 1
+        printf 'effect\n' >> interrupted-effects.txt
+        printf '%s\n' "$$" > interrupted-process.pid
+        exec sleep 600
+      timeout: 1h

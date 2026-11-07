@@ -7,9 +7,10 @@ import { fauxAssistantMessage, type FauxResponseFactory } from "@earendil-works/
 import { createRegistry, Harness, type ConversationId } from "@earendil-works/pi-durable";
 import { describe, expect, test } from "bun:test";
 import { loadInstallation } from "../src/installation/load-installation.js";
+import { canonicalHash } from "../src/definition/hash-canonical-json.js";
 import { installationDocumentV1Schema } from "../src/installation/schema.js";
 import { checkBlockResolution } from "../src/run/check-block-resolution.js";
-import { workflowRunDocumentV1Schema } from "../src/run/records.js";
+import { workflowRunDocumentV1Schema, workshopProcessV1Schema } from "../src/run/records.js";
 import { blockInfoSchema, operatorResolutionSchema, type BlockInfo } from "../src/run/schema.js";
 import { resolveBlockedWorkflow } from "../src/service/open-service-runtime.js";
 import { projectServiceRead } from "../src/service/project-service-reads.js";
@@ -17,7 +18,8 @@ import { nodeDescriptionDtoSchema } from "../src/views/schema.js";
 import { serviceMetadataV1Schema } from "../src/service/schema.js";
 import { parseServiceRequestLine } from "../src/service/parse-service-protocol.js";
 import { serviceRequestV1Schema, type ServiceRequestV1 } from "../src/service/schema.js";
-import { WorkshopInstallationDoc, WorkshopRunDoc } from "../src/storage/durable/define-workshop-records.js";
+import { WorkshopInstallationDoc, WorkshopProcessEntry, WorkshopRunDoc } from "../src/storage/durable/define-workshop-records.js";
+import { admitRecoveryIntent, initializeRecoveryIndex, recordRecoveryDeathEvidence } from "../src/storage/durable/commit-recovery-intent.js";
 import { defineWorkshopTasks } from "../src/storage/durable/define-workshop-tasks.js";
 import { defineAgentExecutionTask } from "../src/storage/durable/define-agent-execution-task.js";
 import { openDurableStorage } from "../src/storage/durable/open-durable-storage.js";
@@ -132,6 +134,105 @@ async function changeBlock(fixture: Fixture, kind: BlockInfo["kind"], clearCandi
       }) })) };
   });
 }
+
+async function installAttestedWorker(fixture: Fixture, includeJournal = true) {
+  const conversation = await fixture.harness.conversation(fixture.conversationId, BACKGROUND_CONTEXT);
+  if (conversation === undefined) throw new Error("missing fixture conversation");
+  const entries = await conversation.entries({}, 256, undefined, BACKGROUND_CONTEXT);
+  const record = entries.items.filter((entry) => entry.kind === "workshop.process")
+    .map((entry) => workshopProcessV1Schema.parse(entry.data))
+    .find((entry) => entry.process.role === "worker");
+  if (record === undefined) throw new Error("missing worker process");
+  const task = await fixture.harness.getTask(record.taskId as never, BACKGROUND_CONTEXT);
+  if (task === undefined) throw new Error("missing worker process task");
+  const input = task.input as Record<string, unknown> & { serviceBootId?: string };
+  const process = { ...record.process, status: "blocked" as const, identity: null, exit: null,
+    startedAt: null, finishedAt: null, cleanupState: "operator_attested_absent" as const };
+  const processData = { ...record, process };
+  let processEntryId = 0;
+  await fixture.harness.commit(async (tx) => {
+    processEntryId = Number((await tx.appendEntry(WorkshopProcessEntry, fixture.conversationId, { data: processData })).id);
+  }, BACKGROUND_CONTEXT);
+  if (!includeJournal) return;
+  const processEntryHash = canonicalHash({ id: processEntryId, data: processData });
+  const requestId = randomUUID();
+  const manifestDigest = canonicalHash({ manifest: "reviewed" });
+  const inputHash = canonicalHash(task.input);
+  const checkpointHash = canonicalHash(null);
+  const processBinding = {
+    executionId: process.executionId, incarnationId: process.incarnationId,
+    launchServiceBootId: process.launchServiceBootId ?? input.serviceBootId ?? null, identity: null,
+  };
+  const owner = {
+    conversationId: Number(fixture.conversationId),
+    taskOwnerId: task.owner === undefined ? null : Number(task.owner),
+    conversationOwner: null,
+  };
+  expect((await initializeRecoveryIndex({ harness: fixture.harness, context: BACKGROUND_CONTEXT })).kind).toBe("initialized");
+  expect((await admitRecoveryIntent({
+    harness: fixture.harness, context: BACKGROUND_CONTEXT, requestId, manifestDigest,
+    reason: "reviewed identity-free launch", confirmedAt: new Date().toISOString(), resumeInstallation: true,
+    actions: [{
+      taskId: record.taskId, taskKind: task.kind, taskVersion: task.version, action: "abort",
+      owner: { ...owner, ownershipHash: canonicalHash({ taskId: record.taskId, ...owner }) },
+      inputHash, checkpointHash, process: processBinding, processEntryHash, replaySafety: "unknown",
+    }],
+  })).kind).toBe("admitted");
+  expect((await recordRecoveryDeathEvidence({
+    harness: fixture.harness, context: BACKGROUND_CONTEXT, requestId, taskId: record.taskId,
+    evidence: {
+      kind: "operator_attested_absent", method: "typed_terminal_confirmation",
+      attestingRequestId: requestId, attestedAt: new Date().toISOString(), manifestDigest, processEntryHash,
+      evidenceHash: canonicalHash({
+        confirmationLine: `recover ${requestId} ${manifestDigest} resume-installation`,
+        taskId: record.taskId, executionId: process.executionId, incarnationId: process.incarnationId,
+        inputHash, checkpointHash, processEntryHash,
+      }),
+    },
+  })).kind).toBe("updated");
+}
+
+for (const action of ["accept", "retry", "fail"] as const) {
+  test(`human ${action} resolves a journal-backed attested process without claiming confirmed death`, async () => {
+    await withFixture(source(), async (fixture) => {
+      await changeBlock(fixture, "external_outcome_unknown", true);
+      await installAttestedWorker(fixture);
+      await expect(fixture.resolve({ action: "fail", resolver: "bot" })).rejects.toThrow();
+      const resultFile = join(fixture.directory, "attested-result");
+      writeFileSync(resultFile, "human output");
+      const result = await fixture.resolve({ action, resolver: "human",
+        ...(action === "retry" ? { allowRepeat: true } : {}),
+        ...(action === "accept" ? { resultFile, acknowledgeEffects: true } : {}),
+      });
+      expect(result).toMatchObject({ status: action === "fail" ? "failed" : "queued" });
+      await fixture.harness.waitForIdle(BACKGROUND_CONTEXT);
+      const run = await fixture.read();
+      if (action === "accept") {
+        const outcome = run.nodes[0]?.attempts[0]?.result;
+        if (outcome?.kind !== "settled" || outcome.outcome.kind === "cancelled") throw new Error("missing accepted candidate");
+        expect(outcome.outcome.candidate).toMatchObject({ source: "operator", acceptance: { processGroupsConfirmedDead: false } });
+      } else {
+        expect(run.resolutions.at(-1)?.processGroupsConfirmedDead).toBe(false);
+        if (action === "fail") expect(run.failure).toMatchObject({ processGroupsConfirmedDead: false });
+      }
+      if (action === "fail") {
+        const metadata = serviceMetadataV1Schema.parse({ version: 1, status: "ready", pid: process.pid,
+          startIdentity: "fixture", bootId: randomUUID(), startedAt: new Date().toISOString(), socketPath: "/unused.sock" });
+        const projected = nodeDescriptionDtoSchema.parse(await projectServiceRead(fixture.harness, loadInstallation(fixture.directory), metadata,
+          { version: 1, method: "node.describe", workflowId: "blocks", nodeId: "work" }));
+        expect(projected.node.attempts[0]?.processes).toContainEqual(expect.objectContaining({ cleanupState: "operator_attested_absent" }));
+      }
+    }, [fauxAssistantMessage("malformed"), fauxAssistantMessage("malformed")]);
+  });
+}
+
+test("human resolution refuses an attestation without a journal record", async () => {
+  await withFixture(source(), async (fixture) => {
+    await changeBlock(fixture, "external_outcome_unknown", true);
+    await installAttestedWorker(fixture, false);
+    await expect(fixture.resolve({ action: "fail", resolver: "human" })).rejects.toThrow("matching recovery journal");
+  });
+});
 
 // The matrix tests the service seam, not just the pure table.
 describe("block table authority", () => {

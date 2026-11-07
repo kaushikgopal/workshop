@@ -12,6 +12,7 @@ import type {
 export const WorkshopInstallationDoc = defineDoc<InstallationDocumentV1>({
   kind: "workshop.installation",
   version: 1,
+  checkpointWhen: () => false,
   scope: "session",
   initial: () => ({ state: "uninitialized" }),
 });
@@ -20,6 +21,7 @@ export const WorkshopInstallationDoc = defineDoc<InstallationDocumentV1>({
 export const WorkshopRunDoc = defineDoc<WorkflowRunDocumentV1>({
   kind: "workshop.run",
   version: 1,
+  checkpointWhen: () => false,
   scope: "conversation",
   history: "latest",
   fork: "initial",
@@ -39,6 +41,7 @@ export const WorkshopJudgmentEntry = defineEntry<WorkshopJudgmentV1>("workshop.j
 export const WorkshopServiceReceiptsDoc = defineDoc<ServiceMutationReceiptsDocumentV1>({
   kind: "workshop.service-receipts",
   version: 1,
+  checkpointWhen: () => false,
   scope: "session",
   initial: () => ({ state: "ready", receipts: [] }),
 });
@@ -47,6 +50,7 @@ export const WorkshopServiceReceiptsDoc = defineDoc<ServiceMutationReceiptsDocum
 export const WorkshopBotDoc = defineDoc<BotDocumentV1>({
   kind: "workshop.bot",
   version: 1,
+  checkpointWhen: () => false,
   scope: "session",
   initial: () => ({ state: "ready", conversationId: null, cursorInitialized: false, eventCursors: {} }),
 });

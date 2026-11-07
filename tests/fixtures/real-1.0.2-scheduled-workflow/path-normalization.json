@@ -1,0 +1,60 @@
+{
+  "sourceCommit": "70ba39324a8c2eac2c2c15a817ffb8547e603a42",
+  "durableVersion": "1.0.2",
+  "rootPlaceholder": "/WORKSHOP_FIXTURE_ROOT",
+  "replacements": 13,
+  "records": [
+    {
+      "table": "document_revisions",
+      "key": "document_id=12, seq=2",
+      "documentKind": "workshop.run",
+      "fields": [
+        "resolvedSettings.nodes.write.run.cwd",
+        "paths.projectCwd",
+        "paths.workflowDirectory"
+      ],
+      "occurrences": 3
+    },
+    {
+      "table": "document_revisions",
+      "key": "document_id=23, seq=10",
+      "documentKind": "pi.agent",
+      "fields": [
+        "cwd"
+      ],
+      "occurrences": 1
+    },
+    {
+      "table": "document_revisions",
+      "key": "document_id=24, seq=10",
+      "documentKind": "workshop.agent-execution-environment",
+      "fields": [
+        "values.WORKSHOP_RESULTS_PATH",
+        "values.WORKSHOP_LOG_PATH"
+      ],
+      "occurrences": 2
+    },
+    {
+      "table": "tasks",
+      "key": "id=17",
+      "taskKind": "workshop.agent-execution",
+      "fields": [
+        "input.cwd",
+        "input.promptText (results and log paths)",
+        "input.env.WORKSHOP_RESULTS_PATH",
+        "input.env.WORKSHOP_LOG_PATH"
+      ],
+      "occurrences": 5
+    },
+    {
+      "table": "entries",
+      "key": "id=27",
+      "entryKind": "pi.user",
+      "fields": [
+        "model[0].content (results and log paths)"
+      ],
+      "occurrences": 2
+    }
+  ],
+  "transformation": "Replaced only the disposable capture workspace root in stored text payloads after the historical Harness closed. Task state, evidence, IDs, and checkpoints were not edited."
+}

@@ -31,6 +31,8 @@ import {
   type WorkflowRunDocumentV1,
 } from "../../run/records.js";
 import { WorkshopProcessEntry, WorkshopRunDoc } from "./define-workshop-records.js";
+import { WorkshopRecoveryIndexDoc, WorkshopRecoveryRequestDoc } from "./define-recovery-records.js";
+import { recoveryIndexV1Schema, recoveryRequestV1Schema } from "./schema-recovery.js";
 import { sha256Schema, utcTimestampSchema } from "../../util/schema.js";
 import { DEFAULT_STREAM_CAP_BYTES } from "../../util/parse-units.js";
 import { locateProcessFiles, locateWorkflowDirectory, type ProcessFiles } from "../../run/locate-run-files.js";
@@ -425,6 +427,8 @@ export function defineProcessExecutionTask(
         const checkpoint = processCheckpointSchema.parse(task.state.checkpoint);
         if (checkpoint.phase !== "monitor") throw new Error("monitor checkpoint lacks process identity");
         const process = checkpoint.process;
+        if ((process.launchServiceBootId ?? input.serviceBootId) !== serviceBootId
+          && await settleRecoveryAbort(runtime, input, process, context)) return;
         const identity = process.identity;
         if (identity === null) throw new Error("running process checkpoint has no identity");
         const run = await snapshotRun(runtime, context);
@@ -568,6 +572,8 @@ export function defineProcessExecutionTask(
         return;
       }
       const process = parsed.data.process;
+      if ((process.launchServiceBootId ?? input.serviceBootId) !== serviceBootId
+        && await settleRecoveryAbort(runtime, input, process, context)) return;
       const run = await snapshotRun(runtime, context);
       assertProcessIdentity(input, run, { requireReference: true, requireExecuting: false });
       const operatorStopRequested = run.desiredState === "stopped" && run.block === null;
@@ -671,6 +677,90 @@ export function defineProcessExecutionTask(
     openStartupLaunchGate,
     waitForAdmission,
   };
+}
+
+async function settleRecoveryAbort(
+  runtime: ProcessRuntime,
+  input: ProcessExecutionTaskInput,
+  process: z.infer<typeof processIncarnationSchema>,
+  context: Context,
+): Promise<boolean> {
+  const observedIndex = await runtime.snapshot(WorkshopRecoveryIndexDoc, context);
+  if (observedIndex == null) return false;
+  const index = recoveryIndexV1Schema.parse(observedIndex);
+  if (index.state !== "ready" || index.activeRequestId === null) return false;
+
+  let settled = false;
+  await runtime.commit(async (tx, current) => {
+    const currentIndex = recoveryIndexV1Schema.parse(await tx.doc(WorkshopRecoveryIndexDoc));
+    if (currentIndex.state !== "ready" || currentIndex.activeRequestId === null) return;
+    const requestId = currentIndex.activeRequestId;
+    const request = recoveryRequestV1Schema.parse(await tx.doc(WorkshopRecoveryRequestDoc, requestId, requestId));
+    if (request.state !== "active" || request.requestId !== requestId || request.intent === null) return;
+    const action = request.actions.find((item) => item.taskId === Number(runtime.taskId));
+    const binding = action?.process;
+    const evidence = action?.deathEvidence;
+    const checkpoint = processCheckpointSchema.safeParse(current.state.checkpoint);
+    if (action === undefined || binding === null || binding === undefined || evidence === null || evidence === undefined
+      || action.action !== "abort" || (action.state !== "dispatching" && action.state !== "applied")
+      || action.taskKind !== current.kind || action.taskVersion !== current.version
+      || action.owner.conversationId !== Number(runtime.conversationId)
+      || action.owner.taskOwnerId !== (current.owner === undefined ? null : Number(current.owner))
+      || action.inputHash !== canonicalHash(current.input) || action.checkpointHash !== canonicalHash(current.state.checkpoint)
+      || !checkpoint.success || checkpoint.data.phase === "intent"
+      || canonicalHash(checkpoint.data.process) !== canonicalHash(process) || process.exit !== null
+      || binding.executionId !== input.executionId || binding.incarnationId !== input.incarnationId
+      || process.executionId !== input.executionId || process.incarnationId !== input.incarnationId
+      || process.incarnationNumber !== input.incarnationNumber
+      || binding.launchServiceBootId !== (process.launchServiceBootId ?? input.serviceBootId)
+      || canonicalHash(binding.identity) !== canonicalHash(process.identity)) return;
+
+    if (evidence.kind === "confirmed_dead") {
+      if (process.identity === null || canonicalHash(evidence.identity) !== canonicalHash(process.identity)
+        || evidence.executionId !== process.executionId || evidence.incarnationId !== process.incarnationId
+        || evidence.launchServiceBootId !== binding.launchServiceBootId
+        || evidence.inputHash !== action.inputHash || evidence.checkpointHash !== action.checkpointHash) return;
+    } else if (process.identity !== null || evidence.attestingRequestId !== requestId
+      || evidence.manifestDigest !== request.intent.manifestDigest) return;
+
+    let cursor: import("@earendil-works/pi-durable").Cursor | undefined;
+    let matchingEntry = false;
+    let foundEntry = false;
+    do {
+      const page = await tx.scanEntries({ conversationId: runtime.conversationId }, 256, cursor);
+      for (const entry of page.items) {
+        if (entry.kind !== "workshop.process" || entry.data === undefined) continue;
+        const recorded = workshopProcessV1Schema.safeParse(entry.data);
+        if (!recorded.success || recorded.data.taskId !== Number(runtime.taskId)
+          || recorded.data.process.executionId !== process.executionId
+          || recorded.data.process.incarnationId !== process.incarnationId) continue;
+        foundEntry = true;
+        matchingEntry = recorded.data.runId === input.runId
+          && canonicalHash(recorded.data.process) === canonicalHash(process)
+          && (evidence.kind !== "confirmed_dead"
+            || evidence.processEntryHash === canonicalHash({ id: Number(entry.id), data: entry.data }));
+        break;
+      }
+      if (foundEntry) break;
+      cursor = page.next;
+    } while (cursor !== undefined);
+    if (!matchingEntry) return;
+
+    const at = timestamp(runtime.now());
+    const captures = await recoverProcessCaptureRecords(input);
+    const blocked = processIncarnationSchema.parse({
+      ...process,
+      status: "blocked",
+      exit: null,
+      cleanupState: evidence.kind,
+      captures,
+    });
+    const block = blockInfo("external_outcome_unknown", "recovery retired a prior-boot process without a known external outcome", input.runId, input.nodeId, input.attemptId, at);
+    await appendProcess(tx, runtime.conversationId, input, Number(runtime.taskId), blocked, at);
+    settled = true;
+    return { status: "terminal", outcome: { status: "completed", result: { kind: "blocked", block } } };
+  }, context);
+  return settled;
 }
 
 async function blockProcess(

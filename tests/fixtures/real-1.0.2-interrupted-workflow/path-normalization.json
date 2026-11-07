@@ -1,0 +1,141 @@
+{
+  "sourceCommit": "70ba39324a8c2eac2c2c15a817ffb8547e603a42",
+  "durableVersion": "1.0.2",
+  "rootPlaceholder": "/WORKSHOP_FIXTURE_ROOT",
+  "replacements": 29,
+  "records": [
+    {
+      "table": "document_revisions",
+      "key": "document_id=12, seq=2",
+      "column": "content",
+      "kind": null,
+      "fields": [
+        "$.resolvedSettings.nodes.mark-pending-run.run.cwd",
+        "$.paths.projectCwd",
+        "$.paths.workflowDirectory"
+      ],
+      "occurrences": 3
+    },
+    {
+      "table": "document_revisions",
+      "key": "document_id=32, seq=18",
+      "column": "content",
+      "kind": null,
+      "fields": [
+        "$.resolvedSettings.nodes.prepare.run.cwd",
+        "$.resolvedSettings.nodes.hold-process.run.cwd",
+        "$.paths.projectCwd",
+        "$.paths.workflowDirectory"
+      ],
+      "occurrences": 4
+    },
+    {
+      "table": "document_revisions",
+      "key": "document_id=43, seq=25",
+      "column": "content",
+      "kind": null,
+      "fields": [
+        "$.cwd"
+      ],
+      "occurrences": 1
+    },
+    {
+      "table": "document_revisions",
+      "key": "document_id=44, seq=25",
+      "column": "content",
+      "kind": null,
+      "fields": [
+        "$.values.WORKSHOP_RESULTS_PATH",
+        "$.values.WORKSHOP_LOG_PATH"
+      ],
+      "occurrences": 2
+    },
+    {
+      "table": "entries",
+      "key": "id=20",
+      "column": "record",
+      "kind": "workshop.process",
+      "fields": [
+        "$.data.process.captures[0].path",
+        "$.data.process.captures[1].path"
+      ],
+      "occurrences": 2
+    },
+    {
+      "table": "entries",
+      "key": "id=47",
+      "column": "record",
+      "kind": "pi.user",
+      "fields": [
+        "$.model[0].content"
+      ],
+      "occurrences": 2
+    },
+    {
+      "table": "tasks",
+      "key": "id=17",
+      "column": "record",
+      "kind": "workshop.process-execution",
+      "fields": [
+        "$.input.cwd",
+        "$.input.stdoutPath",
+        "$.input.stderrPath",
+        "$.input.env.WORKSHOP_RESULTS_PATH",
+        "$.input.env.WORKSHOP_LOG_PATH"
+      ],
+      "occurrences": 5
+    },
+    {
+      "table": "tasks",
+      "key": "id=37",
+      "column": "record",
+      "kind": "workshop.agent-execution",
+      "fields": [
+        "$.input.cwd",
+        "$.input.promptText",
+        "$.input.env.WORKSHOP_RESULTS_PATH",
+        "$.input.env.WORKSHOP_LOG_PATH"
+      ],
+      "occurrences": 5
+    },
+    {
+      "table": "tasks",
+      "key": "id=56",
+      "column": "record",
+      "kind": "workshop.process-execution",
+      "fields": [
+        "$.input.cwd",
+        "$.input.stdoutPath",
+        "$.input.stderrPath",
+        "$.input.env.WORKSHOP_RESULTS_PATH",
+        "$.input.env.WORKSHOP_LOG_PATH"
+      ],
+      "occurrences": 5
+    }
+  ],
+  "capture": {
+    "interruptedWorkflowId": "interrupted-migration",
+    "interruptedRunId": "interrupted-migration-410930d2-af7f-49c8-bca5-d7f850b2219d",
+    "pendingWorkflowId": "pending-migration",
+    "pendingRunId": "pending-migration-6d6e380d-034e-40db-8d9d-f53b08315ea8",
+    "pendingStatusBeforeInterruption": "completed",
+    "pendingWakeupTaskId": 11,
+    "pendingWakeupWaitForCapacity": true,
+    "interruptedNodeId": "hold-process",
+    "servicePid": 67006,
+    "serviceBootId": "8346c1fc-7446-4701-ba89-b6c105cb0547",
+    "workerIdentity": {
+      "pid": 67053,
+      "pgid": 67053,
+      "startIdentity": "Thu Nov  5 23:13:53 2026",
+      "serviceBootId": "8346c1fc-7446-4701-ba89-b6c105cb0547"
+    },
+    "interruptionSignal": "SIGKILL",
+    "serviceProcessExitedBySignal": "SIGKILL",
+    "workerProcessGroupKilledAfterServiceExit": true,
+    "providerRequestCount": 1,
+    "markerEffectCount": 1,
+    "pendingEffectCount": 1
+  },
+  "transformation": "Replaced only the disposable capture workspace root in stored text fields after the historical service and worker process group were killed. Task state, evidence, IDs, and checkpoints were not edited."
+}

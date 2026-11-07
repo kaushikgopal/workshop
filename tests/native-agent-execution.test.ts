@@ -19,6 +19,7 @@ const executionId = "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11";
 const DeadlineDocForTest = defineDoc<{ deadlineAt: number | null }>({
   kind: "workshop.agent-execution-deadline",
   version: 1,
+  checkpointWhen: () => false,
   scope: "conversation",
   history: "latest",
   fork: "initial",
@@ -27,6 +28,17 @@ const DeadlineDocForTest = defineDoc<{ deadlineAt: number | null }>({
 const command = "workshop-test-unsafe-effect";
 const firstToolCommand = "workshop-test-first-tool";
 const secondToolCommand = "workshop-test-second-tool";
+
+type TestSetTimer = (
+  callback: () => void,
+  delayMs: number,
+  options: { readonly background: boolean },
+) => (() => void) | undefined;
+type CapturedDeadlineTimer = {
+  readonly delayMs: number;
+  readonly cancelled: boolean;
+  fire(): void;
+};
 
 
 test("reopened unsafe bash intent blocks with no new provider request or effect", async () => {
@@ -284,6 +296,268 @@ test("expired persisted deadline before first submission returns timed_out witho
   }
 });
 
+
+test("pending model request reaches its execution deadline", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "workshop-native-agent-deadline-pending-"));
+  const database = join(directory, "durable.db");
+  const effects = join(directory, "effects.log");
+  const requests = join(directory, "requests.log");
+  let clock = Date.now();
+  const deadlineAt = clock + 10_000;
+  const timers: CapturedDeadlineTimer[] = [];
+  const providerStarted = deferred();
+  const providerAborted = deferred();
+  let requestSignal: AbortSignal | undefined;
+  let harness: HarnessType | undefined;
+  try {
+    const opened = await openHarness(
+      database,
+      new TestExecutionEnv(directory, effects, "complete"),
+      [async (_context, options) => {
+        logRequest(requests);
+        requestSignal = options?.signal;
+        providerStarted.resolve();
+        if (requestSignal === undefined) throw new Error("expected a model request abort signal");
+        if (requestSignal.aborted) providerAborted.resolve();
+        else requestSignal.addEventListener("abort", () => providerAborted.resolve(), { once: true });
+        await waitForAbort(requestSignal);
+        throw new Error("test provider request cancelled by deadline");
+      }],
+      () => clock,
+      captureDeadlineTimer(deadlineAt, () => clock, timers),
+    );
+    harness = opened.harness;
+    const taskId = await createExecution(harness, opened.task, { deadlineAt });
+    await within(providerStarted.promise, 5_000);
+    await waitForCondition(async () => timers.length > 0, 5_000, "the execution deadline timer");
+    const timer = timers[0];
+    if (timer === undefined) throw new Error("execution deadline timer was not captured");
+    expect(timer.delayMs).toBe(deadlineAt - clock);
+    expect(timer.cancelled).toBe(false);
+
+    clock = deadlineAt;
+    timer.fire();
+    const settled = await within(harness.waitForTask(taskId, BACKGROUND_CONTEXT), 5_000);
+    expect(settled.state.outcome.status).toBe("completed");
+    if (settled.state.outcome.status !== "completed") throw new Error("native task did not settle");
+    expect(settled.state.outcome.result.kind).toBe("timed_out");
+    if (settled.state.outcome.result.kind === "timed_out") expect(settled.state.outcome.result.deadlineAt).toBe(deadlineAt);
+    await within(providerAborted.promise, 5_000);
+    expect(requestSignal?.aborted).toBe(true);
+    expect(readLines(requests)).toEqual(["request"]);
+    expect(readLines(effects)).toEqual([]);
+  } finally {
+    if (harness !== undefined) await closeHarness(harness).catch(() => undefined);
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("early execution deadline timer callback re-arms without cancelling the request", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "workshop-native-agent-deadline-early-timer-"));
+  const database = join(directory, "durable.db");
+  const effects = join(directory, "effects.log");
+  const requests = join(directory, "requests.log");
+  let clock = Date.now();
+  const deadlineAt = clock + 10_000;
+  const timers: CapturedDeadlineTimer[] = [];
+  const providerStarted = deferred();
+  const providerAborted = deferred();
+  let requestSignal: AbortSignal | undefined;
+  let harness: HarnessType | undefined;
+  try {
+    const opened = await openHarness(
+      database,
+      new TestExecutionEnv(directory, effects, "complete"),
+      [async (_context, options) => {
+        logRequest(requests);
+        requestSignal = options?.signal;
+        providerStarted.resolve();
+        if (requestSignal === undefined) throw new Error("expected a model request abort signal");
+        if (requestSignal.aborted) providerAborted.resolve();
+        else requestSignal.addEventListener("abort", () => providerAborted.resolve(), { once: true });
+        await waitForAbort(requestSignal);
+        throw new Error("test provider request cancelled by deadline");
+      }],
+      () => clock,
+      captureDeadlineTimer(deadlineAt, () => clock, timers),
+    );
+    harness = opened.harness;
+    const taskId = await createExecution(harness, opened.task, { deadlineAt });
+    await within(providerStarted.promise, 5_000);
+    await waitForCondition(async () => timers.length >= 1, 5_000, "the execution deadline timer");
+    const firstTimer = timers[0];
+    if (firstTimer === undefined) throw new Error("execution deadline timer was not captured");
+
+    clock += 4_000;
+    firstTimer.fire();
+    await waitForCondition(async () => timers.length >= 2, 5_000, "the re-armed execution deadline timer");
+    const rearmedTimer = timers[1];
+    if (rearmedTimer === undefined) throw new Error("re-armed execution deadline timer was not captured");
+    expect(rearmedTimer.delayMs).toBe(deadlineAt - clock);
+    expect(rearmedTimer.cancelled).toBe(false);
+    expect(requestSignal?.aborted).toBe(false);
+    expect(readLines(requests)).toEqual(["request"]);
+    const pending = await harness.getTask<AgentExecutionTaskResult>(taskId, BACKGROUND_CONTEXT);
+    expect(pending?.state.status).toBe("running");
+
+    clock = deadlineAt;
+    rearmedTimer.fire();
+    const settled = await within(harness.waitForTask(taskId, BACKGROUND_CONTEXT), 5_000);
+    expect(settled.state.outcome.status).toBe("completed");
+    if (settled.state.outcome.status !== "completed") throw new Error("native task did not settle");
+    expect(settled.state.outcome.result.kind).toBe("timed_out");
+    if (settled.state.outcome.result.kind === "timed_out") expect(settled.state.outcome.result.deadlineAt).toBe(deadlineAt);
+    await within(providerAborted.promise, 5_000);
+    expect(requestSignal?.aborted).toBe(true);
+    expect(readLines(requests)).toEqual(["request"]);
+    expect(readLines(effects)).toEqual([]);
+  } finally {
+    if (harness !== undefined) await closeHarness(harness).catch(() => undefined);
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("reopened pending request re-arms its persisted execution deadline", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "workshop-native-agent-deadline-reopen-"));
+  const database = join(directory, "durable.db");
+  const effects = join(directory, "effects.log");
+  const requests = join(directory, "requests.log");
+  let clock = Date.now();
+  const deadlineAt = clock + 10_000;
+  const timers: CapturedDeadlineTimer[] = [];
+  const firstRequestStarted = deferred();
+  const recoveredRequestStarted = deferred();
+  let firstHarness: HarnessType | undefined;
+  let recoveredHarness: HarnessType | undefined;
+  try {
+    const first = await openHarness(
+      database,
+      new TestExecutionEnv(directory, effects, "complete"),
+      [async (_context, options) => {
+        logRequest(requests);
+        firstRequestStarted.resolve();
+        await waitForAbort(options?.signal);
+        throw new Error("test provider request cancelled by harness close");
+      }],
+      () => clock,
+      captureDeadlineTimer(deadlineAt, () => clock, timers),
+    );
+    firstHarness = first.harness;
+    const taskId = await createExecution(first.harness, first.task, { deadlineAt });
+    await within(firstRequestStarted.promise, 5_000);
+    await waitForCondition(async () => timers.length >= 1, 5_000, "the first execution deadline timer");
+    const firstTimer = timers[0];
+    if (firstTimer === undefined) throw new Error("first execution deadline timer was not captured");
+
+    await within(closeHarness(first.harness), 5_000);
+    firstHarness = undefined;
+    expect(firstTimer.cancelled).toBe(true);
+
+    const recovered = await openHarness(
+      database,
+      new TestExecutionEnv(directory, effects, "complete"),
+      [async (_context, options) => {
+        logRequest(requests);
+        recoveredRequestStarted.resolve();
+        await waitForAbort(options?.signal);
+        throw new Error("test provider request cancelled by persisted deadline");
+      }],
+      () => clock,
+      captureDeadlineTimer(deadlineAt, () => clock, timers),
+    );
+    recoveredHarness = recovered.harness;
+    recovered.harness.resume();
+    await within(recoveredRequestStarted.promise, 5_000);
+    await waitForCondition(async () => timers.length >= 2, 5_000, "the recovered execution deadline timer");
+    const recoveredTimer = timers[1];
+    if (recoveredTimer === undefined) throw new Error("recovered execution deadline timer was not captured");
+    expect(recoveredTimer.delayMs).toBe(deadlineAt - clock);
+
+    clock = deadlineAt;
+    recoveredTimer.fire();
+    const settled = await within(recovered.harness.waitForTask(taskId, BACKGROUND_CONTEXT), 5_000);
+    expect(settled.state.outcome.status).toBe("completed");
+    if (settled.state.outcome.status !== "completed") throw new Error("native task did not settle after reopen");
+    expect(settled.state.outcome.result.kind).toBe("timed_out");
+    if (settled.state.outcome.result.kind === "timed_out") expect(settled.state.outcome.result.deadlineAt).toBe(deadlineAt);
+    expect(readLines(requests)).toEqual(["request", "request"]);
+    expect(readLines(effects)).toEqual([]);
+    await within(closeHarness(recovered.harness), 5_000);
+    recoveredHarness = undefined;
+  } finally {
+    if (firstHarness !== undefined) await closeHarness(firstHarness).catch(() => undefined);
+    if (recoveredHarness !== undefined) await closeHarness(recoveredHarness).catch(() => undefined);
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("early model answer cancels its timer and stays completed past the deadline", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "workshop-native-agent-deadline-answer-"));
+  const database = join(directory, "durable.db");
+  const effects = join(directory, "effects.log");
+  const requests = join(directory, "requests.log");
+  let clock = Date.now();
+  const deadlineAt = clock + 10_000;
+  const timers: CapturedDeadlineTimer[] = [];
+  const providerStarted = deferred();
+  const releaseResponse = deferred();
+  let requestSignal: AbortSignal | undefined;
+  let abortCount = 0;
+  let harness: HarnessType | undefined;
+  try {
+    const opened = await openHarness(
+      database,
+      new TestExecutionEnv(directory, effects, "complete"),
+      [async (_context, options) => {
+        logRequest(requests);
+        requestSignal = options?.signal;
+        providerStarted.resolve();
+        if (requestSignal === undefined) throw new Error("expected a model request abort signal");
+        requestSignal.addEventListener("abort", () => { abortCount++; }, { once: true });
+        await releaseResponse.promise;
+        return fauxAssistantMessage("answered before the deadline");
+      }],
+      () => clock,
+      captureDeadlineTimer(deadlineAt, () => clock, timers),
+    );
+    harness = opened.harness;
+    const taskId = await createExecution(harness, opened.task, { deadlineAt });
+    await within(providerStarted.promise, 5_000);
+    await waitForCondition(async () => timers.length > 0, 5_000, "the execution deadline timer");
+    const timer = timers[0];
+    if (timer === undefined) throw new Error("execution deadline timer was not captured");
+    expect(timer.cancelled).toBe(false);
+    expect(clock).toBeLessThan(deadlineAt);
+
+    releaseResponse.resolve();
+    const settled = await within(harness.waitForTask(taskId, BACKGROUND_CONTEXT), 5_000);
+    expect(settled.state.outcome.status).toBe("completed");
+    if (settled.state.outcome.status !== "completed") throw new Error("native task did not settle");
+    expect(settled.state.outcome.result.kind).toBe("completed");
+    if (settled.state.outcome.result.kind === "completed") {
+      expect(settled.state.outcome.result.finalText).toBe("answered before the deadline");
+    }
+    expect(timer.cancelled).toBe(true);
+    const abortsAtSettlement = abortCount;
+
+    clock = deadlineAt;
+    timer.fire();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    const afterDeadline = await harness.getTask<AgentExecutionTaskResult>(taskId, BACKGROUND_CONTEXT);
+    expect(afterDeadline?.state.status).toBe("terminal");
+    if (afterDeadline?.state.status === "terminal") {
+      expect(afterDeadline.state.outcome.status).toBe("completed");
+      if (afterDeadline.state.outcome.status === "completed") expect(afterDeadline.state.outcome.result.kind).toBe("completed");
+    }
+    expect(abortCount).toBe(abortsAtSettlement);
+    expect(readLines(requests)).toEqual(["request"]);
+  } finally {
+    releaseResponse.resolve();
+    if (harness !== undefined) await closeHarness(harness).catch(() => undefined);
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("deadline tool block settles as timed_out after afterTools", async () => {
   const directory = mkdtempSync(join(tmpdir(), "workshop-native-agent-tool-deadline-"));
   const database = join(directory, "durable.db");
@@ -479,6 +753,7 @@ async function openHarness(
   env: NodeExecutionEnv,
   responses: Parameters<ReturnType<typeof fauxProvider>["setResponses"]>[0],
   now?: () => number,
+  setTimer?: TestSetTimer,
 ) {
   const storage = await openDurableStorage(database);
   if (!storage.ok) throw new Error(storage.failure.message);
@@ -492,7 +767,11 @@ async function openHarness(
   registry.install(CodingTools);
   registry.install(guard.extension);
   registry.install(defineExtension({ name: "workshop-agent-execution-task", tasks: [task] }));
-  harness = await Harness.open(storage.storage, { models, registry, env: () => env, ...(now === undefined ? {} : { now }) }, BACKGROUND_CONTEXT);
+  harness = await Harness.open(
+    storage.storage,
+    { models, registry, env: () => env, ...(now === undefined ? {} : { now }), ...(setTimer === undefined ? {} : { setTimer }) },
+    BACKGROUND_CONTEXT,
+  );
   return { harness, task, guard, faux };
 }
 
@@ -516,6 +795,30 @@ async function createExecution(
   const taskId = await harness.commit(tx => tx.createTask(task, input, { ownership: { kind: "conversation" }, conversationId: owner.id }), BACKGROUND_CONTEXT);
   if (options.resume !== false) harness.resume();
   return taskId;
+}
+
+function captureDeadlineTimer(
+  deadlineAt: number,
+  now: () => number,
+  timers: CapturedDeadlineTimer[],
+): TestSetTimer {
+  return (callback, delayMs, options) => {
+    if (!options.background && delayMs === deadlineAt - now()) {
+      let active = true;
+      timers.push({
+        delayMs,
+        get cancelled() { return !active; },
+        fire() {
+          if (!active) return;
+          active = false;
+          callback();
+        },
+      });
+      return () => { active = false; };
+    }
+    const timer = setTimeout(callback, delayMs);
+    return () => clearTimeout(timer);
+  };
 }
 
 function logRequest(path: string): void {
@@ -631,6 +934,50 @@ test("synthetic afterTools hook observes its durable abort mark", async () => {
     expect(faux.state.callCount).toBe(1);
   } finally {
     await harness.waitForIdle(BACKGROUND_CONTEXT);
+    await harness.close(BACKGROUND_CONTEXT);
+  }
+});
+
+test("unsafe-tool guard blocks nested calls without waiting for their parent", async () => {
+  const faux = fauxProvider({ provider: model.provider, models: [{ id: model.modelId }] });
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("parent", {}), { stopReason: "toolUse" }),
+    fauxAssistantMessage("must not be requested"),
+  ]);
+  const models = createModels();
+  models.setProvider(faux.provider);
+  let effects = 0;
+  let harness: HarnessType;
+  const { guard } = defineAgentExecutionTask({ getHarness: () => harness });
+  const tools = defineExtension({
+    name: "nested-guard-test",
+    tools: [
+      defineTool({
+        name: "parent", description: "Call the nested tool.", parameters: Type.Object({}), replay: "safe",
+        async execute(_args, api, context) {
+          await api.executeTool("child", {}, context);
+          return { output: [{ type: "text" as const, text: "ignored child error" }] };
+        },
+      }),
+      defineTool({
+        name: "child", description: "Record an effect.", parameters: Type.Object({}), replay: "unsafe",
+        async execute() { effects++; return {}; },
+      }),
+    ],
+  });
+  const registry = createRegistry();
+  registry.install(tools);
+  registry.install(guard.extension);
+  harness = await Harness.open(new MemoryStorage(), { models, registry }, BACKGROUND_CONTEXT);
+  try {
+    const conversation = await harness.createConversation({ ownership: { kind: "ownerless" }, agent: { model, extensions: [tools, guard.extension] } }, BACKGROUND_CONTEXT);
+    const submission = await conversation.submit({ type: "input", content: "Call the parent tool.", requestId: "nested-guard-test" }, BACKGROUND_CONTEXT);
+    expect((await within(submission.wait(BACKGROUND_CONTEXT), 5_000)).status).toBe("unanswered");
+    const result = await guard.waitForResult(conversation.id);
+    expect(result.state).toBe("failed");
+    expect(effects).toBe(0);
+    expect(faux.state.callCount).toBe(1);
+  } finally {
     await harness.close(BACKGROUND_CONTEXT);
   }
 });

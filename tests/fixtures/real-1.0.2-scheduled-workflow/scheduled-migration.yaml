@@ -1,0 +1,14 @@
+version: 4
+description: Captured 1.0.2 scheduled workflow for the 1.4.0 upgrade test.
+defaults:
+  retries: 0
+  replay: safe
+schedule:
+  every: 36500d
+  max_runs: 3
+steps:
+  - write:
+      result: tagged
+      agent:
+        model: fixture/legacy-worker:medium
+        instructions: Return one successful tagged result with a short fixed output.

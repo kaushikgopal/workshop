@@ -1,0 +1,7 @@
+project_dir: ..
+shell: /bin/sh
+max_concurrent_runs: 1
+keep_files: always
+agent:
+  harness: pi
+  model: "fixture/legacy-worker:medium"

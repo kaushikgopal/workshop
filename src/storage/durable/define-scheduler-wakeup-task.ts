@@ -328,6 +328,7 @@ async function waitForSchedulerChange(
   const parentContext = withAbortSignal(runtime.signal, context);
   const { context: waitContext, cancel } = withCancel(parentContext);
   let watch: DocumentWatch<JsonObject> | undefined;
+  let cancelDeadline: (() => void) | undefined;
   try {
     watch = await runtime.watchDoc(WorkshopInstallationDoc, waitContext);
     if (watch === undefined) throw new Error("scheduler installation document is unavailable for watching");
@@ -362,7 +363,12 @@ async function waitForSchedulerChange(
     if (wakeAt !== undefined) {
       const deadline = Date.parse(wakeAt);
       if (runtime.now() >= deadline) return;
-      waiters.push(runtime.sleep(deadline, waitContext).then(() => ({ kind: "deadline" as const })));
+      waiters.push(new Promise((resolve) => {
+        cancelDeadline = runtime.setTimer(
+          () => resolve({ kind: "deadline" as const }),
+          Math.max(0, deadline - runtime.now()),
+        );
+      }));
     }
     const result = await Promise.race(waiters);
     if (result.kind === "closed") {
@@ -373,6 +379,7 @@ async function waitForSchedulerChange(
       throw new Error("scheduler document watch ended: " + result.end.reason);
     }
   } finally {
+    cancelDeadline?.();
     cancel();
     if (watch !== undefined) {
       const end = await watch.stop();

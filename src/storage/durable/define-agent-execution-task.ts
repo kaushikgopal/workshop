@@ -22,6 +22,7 @@ export const AgentExecutionEnvironmentDoc = defineDoc<{
 }>({
   kind: "workshop.agent-execution-environment",
   version: 1,
+  checkpointWhen: () => false,
   scope: "conversation",
   history: "latest",
   fork: "initial",
@@ -31,6 +32,7 @@ export const AgentExecutionEnvironmentDoc = defineDoc<{
 const AgentExecutionDeadlineDoc = defineDoc<{ deadlineAt: number | null }>({
   kind: "workshop.agent-execution-deadline",
   version: 1,
+  checkpointWhen: () => false,
   scope: "conversation",
   history: "latest",
   fork: "initial",
@@ -44,6 +46,7 @@ export const AgentExecutionGuardDoc = defineDoc<{
 }>({
   kind: "workshop.agent-execution-guard-state",
   version: 1,
+  checkpointWhen: () => false,
   scope: "conversation",
   history: "latest",
   fork: "initial",
@@ -164,6 +167,7 @@ export function defineAgentExecutionTask(options: { readonly getHarness: () => H
             const task = await harness.getTask<ToolTaskResult>(api.taskId as TaskId<ToolTaskResult>, context);
             if (task?.kind !== ToolTask.definition.name) throw new Error("current tool task is unavailable");
             const toolInput = task.input as unknown as ToolTaskInput;
+            if (!("assistant" in toolInput)) throw new Error("nested tool calls are not supported by the unsafe-tool guard");
             await waitForEarlierTools(harness, api.conversationId, api.taskId, context);
             const interrupted = await readInterruptedEarlierTools(harness, api.conversationId, toolInput.assistant, call.id);
             if (interrupted.length > 0) {
@@ -296,9 +300,31 @@ export function defineAgentExecutionTask(options: { readonly getHarness: () => H
           return;
         } else {
           const answer = submission.wait(context).then(value => ({ kind: "settled" as const, value }));
-          const timeout = input.deadlineAt === null || expired ? undefined
-            : runtime.sleep(input.deadlineAt, context).then(() => ({ kind: "timeout" as const }));
-          const result = timeout === undefined ? await answer : await Promise.race([answer, timeout]);
+          let cancelTimeout: (() => void) | undefined;
+          let result: Awaited<typeof answer> | { kind: "timeout" };
+          try {
+            if (input.deadlineAt === null || expired) {
+              result = await answer;
+            } else {
+              const timeout = new Promise<{ kind: "timeout" }>((resolve) => {
+                const armTimeout = (): void => {
+                  const remainingMs = input.deadlineAt! - runtime.now();
+                  if (remainingMs <= 0) {
+                    resolve({ kind: "timeout" });
+                    return;
+                  }
+                  cancelTimeout = runtime.setTimer(() => {
+                    if (runtime.now() >= input.deadlineAt!) resolve({ kind: "timeout" });
+                    else armTimeout();
+                  }, remainingMs);
+                };
+                armTimeout();
+              });
+              result = await Promise.race([answer, timeout]);
+            }
+          } finally {
+            cancelTimeout?.();
+          }
           if (result.kind === "timeout" && !(await hasCommittedFinalAnswer(child, input.promptText))) {
             await conversation.abort(context, { background: true });
             await settle(runtime, input, checkpoint, { kind: "timed_out", deadlineAt: input.deadlineAt! }, context);
@@ -546,6 +572,7 @@ async function readInterruptedUnsafeTool(
   if (task?.kind !== ToolTask.definition.name || task.state.status !== "terminal" || task.state.outcome.status !== "failed") return undefined;
   const result = task.state.outcome.result;
   if (result === undefined) throw new Error("failed tool task has no durable result receipt");
+  if (!("entryId" in result)) throw new Error("nested tool result has no transcript receipt");
   const conversation = await harness.conversation(conversationId, BACKGROUND_CONTEXT);
   if (conversation === undefined) throw new Error("guard conversation is unavailable");
   const page = await conversation.entries({ minEntryId: result.entryId, maxEntryId: result.entryId }, 1, undefined, BACKGROUND_CONTEXT);

@@ -18,6 +18,9 @@ import { defineWorkshopTasks, createWorkflowRunTaskInput, parseWorkflowRunTaskIn
 import { WorkshopInstallationDoc } from "../src/storage/durable/define-workshop-records.js";
 import { openDurableStorage } from "../src/storage/durable/open-durable-storage.js";
 import { encodeServiceRequestLine } from "../src/service/parse-service-protocol.js";
+import { applyRecoveryInstallation, inspectRecoveryInstallation } from "../src/service/recover-service-tasks.js";
+import { probeServiceHealth } from "../src/service/probe-service-health.js";
+import type { WorkshopServiceOwner } from "../src/service/serve-workshop-service.js";
 import { sendServiceRequest } from "../src/service/send-service-request.js";
 import type { ServiceRequestV1 } from "../src/service/schema.js";
 import { serviceLogSectionPageV1Schema, serviceResolveResultV1Schema } from "../src/service/schema.js";
@@ -29,6 +32,7 @@ import { REPO_ROOT } from "./helpers.js";
 const cliPath = join(REPO_ROOT, "src/cli/main.ts");
 const fauxServePath = join(REPO_ROOT, "tests/fixtures/serve-faux-workshop.ts");
 const sentence = "The old man rowed until the sea forgot the shore.";
+const recoveryOwners = new Map<string, WorkshopServiceOwner>();
 
 describe("public service restart", () => {
   test("recovers native progress after a hard service crash without replaying committed tools", async () => {
@@ -500,7 +504,7 @@ describe("public service restart", () => {
   }, 30_000);
 
 
-  test("safe validator replay pauses, releases capacity, and waits for its persisted gate after restart", async () => {
+  test("explicit recovery blocks an uncertain validator until human retry releases capacity", async () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-safe-replay-capacity-"));
     const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
@@ -560,29 +564,50 @@ describe("public service restart", () => {
       process.kill(oldService.pid, "SIGKILL");
       await waitForPidGone(oldService.pid);
 
-      const reopened = runCli(root, ["status", "safe-replay", "--json"]);
-      expect(reopened.status).toBe(0);
-      expect(statusDtoSchema.parse(JSON.parse(reopened.stdout)).service.bootId).not.toBe(oldService.bootId);
-      const paused = await waitForRunStatus(root, "safe-replay", runId, "paused");
-      expect(paused.desiredState).toBe("paused");
-      expect(paused.waitingForCapacity).toBe(false);
+      const refused = runCli(root, ["status", "safe-replay", "--json"]);
+      expect(refused.status).toBe(3);
+      expect(readFileSync(workerLaunches, "utf8")).toBe("w");
+      expect(readFileSync(validatorLaunches, "utf8")).toBe("v");
+      expect(isProcessGroupAlive(oldPgid)).toBe(true);
+      const recovery = await recoverRefusedStartup(root);
+      expect(recovery.receipt.state).toBe("complete");
       await waitForProcessGroupGone(oldPgid);
+      const recoveredStatus = await runCliAsync(root, ["status", "safe-replay", "--json"]);
+      expect(recoveredStatus.status).toBe(0);
+      expect(statusDtoSchema.parse(JSON.parse(recoveredStatus.stdout)).service.bootId).not.toBe(oldService.bootId);
+      const blockedRun = await waitForRunStatus(root, "safe-replay", runId, "blocked");
+      expect(blockedRun.desiredState).toBe("paused");
+      expect(blockedRun.waitingForCapacity).toBe(false);
+      expect(blockedRun.block?.kind).toBe("external_outcome_unknown");
       expect(readFileSync(workerLaunches, "utf8")).toBe("w");
       expect(readFileSync(validatorLaunches, "utf8")).toBe("v");
 
-      const pausedNodeResult = runCli(root, ["step", "describe", "safe-replay", "work", "--run", runId, "--json"]);
+      const pausedNodeResult = await runCliAsync(root, ["step", "describe", "safe-replay", "work", "--run", runId, "--json"]);
       expect(pausedNodeResult.status).toBe(0);
       const pausedAttempt = nodeDescriptionDtoSchema.parse(JSON.parse(pausedNodeResult.stdout)).node.attempts[0];
       if (pausedAttempt === undefined) throw new Error("paused safe replay attempt is missing");
       expect(pausedAttempt.candidate).toEqual(originalAttempt.candidate);
       expect(pausedAttempt.processes.filter((entry) => entry.role === "validator").map((entry) => entry.cleanupState)).toEqual(["confirmed_dead"]);
 
-      const holderStart = runCli(root, ["start", "holder", "--detach"]);
+      const holderStart = await runCliAsync(root, ["start", "holder", "--detach"]);
       expect(holderStart.status).toBe(0);
       const holderRunId = runIdSchema.parse(holderStart.stdout.match(/Started run (\S+)/)?.[1]);
       await waitForFile(holderStarted);
-      const resumed = runCli(root, ["resume", "safe-replay"]);
-      expect(resumed.status).toBe(0);
+      const resumed = await runCliAsync(root, ["resume", "safe-replay"]);
+      expect(resumed.status).not.toBe(0);
+      expect(resumed.stderr).toContain("resolve the current block");
+      const missingRepeatPermission = await runCliAsync(root, [
+        "resolve", "safe-replay", "--action", "retry", "--reason", "retry after checking the validator outcome",
+      ]);
+      expect(missingRepeatPermission.status).not.toBe(0);
+      expect(missingRepeatPermission.stderr).toContain("requires --allow-repeat");
+      expect(readFileSync(validatorLaunches, "utf8")).toBe("v");
+      const retry = await runCliAsync(root, [
+        "resolve", "safe-replay", "--action", "retry", "--reason", "retry after checking the validator outcome", "--allow-repeat",
+      ]);
+      expect(retry.status).toBe(0);
+      const resumeAfterResolution = await runCliAsync(root, ["resume", "safe-replay"]);
+      expect(resumeAfterResolution.status).toBe(0);
       const waiting = await waitForRunStatus(root, "safe-replay", runId, "queued");
       expect(waiting.waitingForCapacity).toBe(true);
       expect(readFileSync(workerLaunches, "utf8")).toBe("w");
@@ -594,26 +619,34 @@ describe("public service restart", () => {
       const completed = await waitForRun(root, "safe-replay", runId);
       expect(completed.status).toBe("completed");
       expect(completed.terminalOutput).toBe("candidate-output");
-      expect(readFileSync(workerLaunches, "utf8")).toBe("w");
+      expect(readFileSync(workerLaunches, "utf8")).toBe("ww");
       expect(readFileSync(validatorLaunches, "utf8")).toBe("vv");
 
-      const finalNodeResult = runCli(root, ["step", "describe", "safe-replay", "work", "--run", runId, "--json"]);
+      const finalNodeResult = await runCliAsync(root, ["step", "describe", "safe-replay", "work", "--run", runId, "--json"]);
       expect(finalNodeResult.status).toBe(0);
       const finalNode = nodeDescriptionDtoSchema.parse(JSON.parse(finalNodeResult.stdout)).node;
-      expect(finalNode.attempts).toHaveLength(1);
-      const finalAttempt = finalNode.attempts[0];
-      if (finalAttempt === undefined) throw new Error("completed safe replay attempt is missing");
-      expect(finalAttempt.candidate).toEqual(originalAttempt.candidate);
-      const validators = finalAttempt.processes.filter((entry) => entry.role === "validator");
-      expect(validators.map((entry) => entry.incarnationNumber)).toEqual([1, 2]);
-      expect(new Set(validators.map((entry) => entry.executionId)).size).toBe(1);
-      expect(new Set(validators.map((entry) => entry.deadlineAt)).size).toBe(1);
-      expect(new Set(validators.map((entry) => entry.incarnationId)).size).toBe(2);
-      expect(validators[0]?.status).toBe("blocked");
-      expect(validators[0]?.exit).toBeNull();
-      expect(validators[0]?.cleanupState).toBe("confirmed_dead");
-      expect(validators[1]?.status).toBe("exited");
-      const historyResult = runCli(root, ["runs", "safe-replay", "--json"]);
+      expect(finalNode.attempts).toHaveLength(2);
+      const interruptedAttempt = finalNode.attempts[0];
+      const retriedAttempt = finalNode.attempts[1];
+      if (interruptedAttempt === undefined || retriedAttempt === undefined) throw new Error("both recovered attempts are required");
+      expect(interruptedAttempt.status).toBe("interrupted");
+      expect(interruptedAttempt.candidate).toEqual(originalAttempt.candidate);
+      const interruptedValidators = interruptedAttempt.processes.filter((entry) => entry.role === "validator");
+      expect(interruptedValidators).toHaveLength(1);
+      expect(interruptedValidators[0]).toMatchObject({
+        incarnationNumber: 1, status: "blocked", exit: null, cleanupState: "confirmed_dead",
+      });
+      expect(retriedAttempt.status).toBe("succeeded");
+      expect(retriedAttempt.candidate).toMatchObject({
+        sha256: originalAttempt.candidate?.sha256, byteCount: originalAttempt.candidate?.byteCount,
+        sourceBytesHash: originalAttempt.candidate?.sourceBytesHash,
+      });
+      const retriedValidators = retriedAttempt.processes.filter((entry) => entry.role === "validator");
+      expect(retriedValidators).toHaveLength(1);
+      expect(retriedValidators[0]?.status).toBe("exited");
+      expect(retriedValidators[0]?.cleanupState).toBe("confirmed_dead");
+      expect(retriedValidators[0]?.executionId).not.toBe(interruptedValidators[0]?.executionId);
+      const historyResult = await runCliAsync(root, ["runs", "safe-replay", "--json"]);
       expect(historyResult.status).toBe(0);
       expect(runsDtoSchema.parse(JSON.parse(historyResult.stdout)).runs.map((entry) => entry.runId)).toEqual([runId]);
     } finally {
@@ -630,10 +663,10 @@ describe("public service restart", () => {
     try {
       const retryStarted = join(retryRoot, "retry-started.txt");
       const retry = await startBlockedCommandRun(retryRoot, "retryable", `printf w >> '${retryMarker}'; if [ ! -f '${join(retryRoot, "attempt-")}-$WORKSHOP_RUN_ID' ]; then touch '${join(retryRoot, "attempt-")}-$WORKSHOP_RUN_ID'; sleep 60; else touch '${retryStarted}'; sleep 3; printf retry-success; fi`);
-      const resume = runCli(retryRoot, ["resume", "retryable"]);
+      const resume = await runCliAsync(retryRoot, ["resume", "retryable"]);
       expect(resume.status).not.toBe(0);
       expect(resume.stderr).toContain("resolve the current block");
-      const missingOverrides = runCli(retryRoot, ["resolve", "retryable", "--action", "retry", "--reason", "retry after checking the external effect"]);
+      const missingOverrides = await runCliAsync(retryRoot, ["resolve", "retryable", "--action", "retry", "--reason", "retry after checking the external effect"]);
       expect(missingOverrides.status).not.toBe(0);
       expect(missingOverrides.stderr).toContain("requires --allow-repeat");
       expect(missingOverrides.stdout).toContain(`Resolving run ${retry.runId}`);
@@ -653,12 +686,12 @@ describe("public service restart", () => {
       expect(retryRun.status).toBe("completed");
       expect(retryRun.terminalOutput).toBe("retry-success");
       expect(readFileSync(retryMarker, "utf8")).toBe("ww");
-      const retryNodeResult = runCli(retryRoot, ["step", "describe", "retryable", "work", "--run", retry.runId, "--json"]);
+      const retryNodeResult = await runCliAsync(retryRoot, ["step", "describe", "retryable", "work", "--run", retry.runId, "--json"]);
       expect(retryNodeResult.status).toBe(0);
       const retryNode = nodeDescriptionDtoSchema.parse(JSON.parse(retryNodeResult.stdout)).node;
       expect(retryNode.attempts.map((attempt) => attempt.number)).toEqual([1, 2]);
       expect(retryNode.attempts.map((attempt) => attempt.status)).toEqual(["interrupted", "succeeded"]);
-      const retryLogs = runCli(retryRoot, ["logs", "retryable", "--run", retry.runId, "--json"]);
+      const retryLogs = await runCliAsync(retryRoot, ["logs", "retryable", "--run", retry.runId, "--json"]);
       expect(retryLogs.status).toBe(0);
       expect(logsDtoSchema.parse(JSON.parse(retryLogs.stdout)).sections.some((section) => section.kind === "worklog" && section.content.includes("retry after checking the external effect"))).toBe(true);
     } finally {
@@ -679,7 +712,7 @@ describe("public service restart", () => {
       );
       const resultFile = join(acceptRoot, "accepted-result.json");
       writeFileSync(resultFile, "human-accepted", "utf8");
-      const cliAcceptance = runCli(acceptRoot, [
+      const cliAcceptance = await runCliAsync(acceptRoot, [
         "resolve", "acceptable", "--action", "accept", "--reason", "the recorded worker effect was checked",
         "--result-file", resultFile, "--acknowledge-effects",
       ]);
@@ -704,7 +737,7 @@ describe("public service restart", () => {
       expect(acceptedRun.terminalOutput).toBe("human-accepted");
       expect(readFileSync(acceptMarker, "utf8")).toBe("w");
       expect(readFileSync(acceptedValidatorMarker, "utf8")).toBe("v");
-      const acceptedNode = runCli(acceptRoot, ["step", "describe", "acceptable", "work", "--run", blocked.runId, "--json"]);
+      const acceptedNode = await runCliAsync(acceptRoot, ["step", "describe", "acceptable", "work", "--run", blocked.runId, "--json"]);
       expect(acceptedNode.status).toBe(0);
       const acceptedDescription = nodeDescriptionDtoSchema.parse(JSON.parse(acceptedNode.stdout));
       expect(acceptedDescription.node.successfulOutput).toBe("human-accepted");
@@ -730,18 +763,18 @@ describe("public service restart", () => {
       const duplicateResult = serviceResolveResultV1Schema.parse(duplicateResolution.result);
       expect(duplicateResult).toEqual(firstResult);
       expect(firstResult.status).toBe("failed");
-      const history = runCli(failRoot, ["runs", "fail-run", "--json"]);
+      const history = await runCliAsync(failRoot, ["runs", "fail-run", "--json"]);
       expect(history.status).toBe(0);
       const failedRun = runsDtoSchema.parse(JSON.parse(history.stdout)).runs.find((entry) => entry.runId === blocked.runId);
       expect(failedRun?.status).toBe("failed");
       expect(failedRun?.failure?.kind).toBe("operator");
       if (failedRun?.failure?.kind !== "operator") throw new Error("operator failure was not retained");
       expect(failedRun.failure.reason).toBe("the external effect cannot be safely repeated");
-      const failureLogs = runCli(failRoot, ["logs", "fail-run", "--run", blocked.runId, "--json"]);
+      const failureLogs = await runCliAsync(failRoot, ["logs", "fail-run", "--run", blocked.runId, "--json"]);
       expect(failureLogs.status).toBe(0);
       const failureSections = logsDtoSchema.parse(JSON.parse(failureLogs.stdout)).sections;
       expect(failureSections.map((section) => section.content).join("\n")).toContain("the external effect cannot be safely repeated");
-      const failureNodeResult = runCli(failRoot, ["step", "describe", "fail-run", "work", "--run", blocked.runId, "--json"]);
+      const failureNodeResult = await runCliAsync(failRoot, ["step", "describe", "fail-run", "work", "--run", blocked.runId, "--json"]);
       expect(failureNodeResult.status).toBe(0);
       expect(nodeDescriptionDtoSchema.parse(JSON.parse(failureNodeResult.stdout)).runFailure?.kind).toBe("operator");
     } finally {
@@ -1052,11 +1085,12 @@ describe("public service restart", () => {
     }
   }, 30_000);
 
-  test("retires an uncertain process group on service restart without relaunching the run", async () => {
+  test("refuses an uncertain process group until explicit recovery retires it", async () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-uncertain-process-"));
     const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
     const pidPath = join(root, "worker.pid");
+    const launches = join(root, "worker-launches.txt");
     mkdirSync(workflows, { recursive: true });
     writeFileSync(join(config, "workshop.yaml"), "shell: /bin/bash\n", "utf8");
     writeFileSync(join(workflows, "long-process.yaml"), [
@@ -1066,7 +1100,7 @@ describe("public service restart", () => {
       "  replay: never",
       "steps:",
       "  - wait:",
-      `      run: 'echo $$ > ${pidPath}; sleep 20'`,
+      `      run: 'echo launch >> ${launches}; echo $$ > ${pidPath}; sleep 20'`,
       "",
     ].join("\n"), "utf8");
 
@@ -1082,33 +1116,45 @@ describe("public service restart", () => {
       process.kill(oldService.pid, "SIGKILL");
       await waitForPidGone(oldService.pid);
 
-      const historyResult = runCli(root, ["runs", "long-process", "--json"]);
+      const refused = runCli(root, ["status", "long-process", "--json"]);
+      expect(refused.status).toBe(3);
+      expect(readFileSync(launches, "utf8")).toBe("launch\n");
+      expect(isProcessGroupAlive(workerPid)).toBe(true);
+      const recovery = await recoverRefusedStartup(root);
+      expect(recovery.receipt.state).toBe("complete");
+      await waitForProcessGroupGone(workerPid);
+      expect(Number(readFileSync(pidPath, "utf8").trim())).toBe(workerPid);
+      expect(readFileSync(launches, "utf8")).toBe("launch\n");
+
+      const serviceStatus = await runCliAsync(root, ["service", "status", "--json"]);
+      expect(serviceStatus.status).toBe(0);
+      const historyResult = await runCliAsync(root, ["runs", "long-process", "--json"]);
+      if (historyResult.status !== 0) throw new Error(historyResult.stderr || historyResult.stdout);
       expect(historyResult.status).toBe(0);
       const history = runsDtoSchema.parse(JSON.parse(historyResult.stdout));
       const interrupted = history.runs.find((run) => run.runId === runId);
       expect(interrupted).toBeDefined();
       expect(interrupted?.status).not.toBe("completed");
-      const statusResult = runCli(root, ["status", "long-process", "--json"]);
+      const statusResult = await runCliAsync(root, ["status", "long-process", "--json"]);
       expect(statusResult.status).toBe(0);
       const status = statusDtoSchema.parse(JSON.parse(statusResult.stdout));
       expect(status.service.bootId).not.toBe(oldService.bootId);
-      const logsResult = runCli(root, ["logs", "long-process", "--run", runId, "--json"]);
+      const logsResult = await runCliAsync(root, ["logs", "long-process", "--run", runId, "--json"]);
       expect(logsResult.status).toBe(0);
       expect(logsDtoSchema.parse(JSON.parse(logsResult.stdout)).runId).toBe(runId);
-      expect(Number(readFileSync(pidPath, "utf8").trim())).toBe(workerPid);
-      await waitForProcessGroupGone(workerPid);
     } finally {
       await stopService(root);
       rmSync(root, { recursive: true, force: true });
     }
   }, 30_000);
 
-  test("recovers retained log metadata without confirming process death", async () => {
+  test("preserves retained logs after refusing and explicitly recovering uncertain process evidence", async () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-retention-reopen-"));
     const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
     const state = join(root, ".workshop", ".state");
     const validatorLaunches = join(root, "validator-launches.txt");
+    const validatorPgidPath = join(root, "validator-pgid.txt");
     const successorLaunches = join(root, "successor-launches.txt");
     const capBytes = 32 * 1024 * 1024;
     const totalBytes = 34_000_000;
@@ -1134,6 +1180,7 @@ describe("public service restart", () => {
       "      verify:",
       "        run: |",
       `          printf validator >> '${validatorLaunches}'`,
+      `          echo $$ > '${validatorPgidPath}'`,
       `          head -c ${totalBytes} /dev/zero | tr '\\000' x >&2`,
       "          test -n \"$(cat)\"",
       "  - finish:",
@@ -1160,14 +1207,19 @@ describe("public service restart", () => {
 
       process.kill(oldService.pid, "SIGKILL");
       await waitForPidGone(oldService.pid);
-      await startFauxService(root, "restart-recovered", { previousBootId: oldService.bootId });
-      const restartResult = runCli(root, ["runs", "capture-recovery", "--json"], 60_000);
-      if (restartResult.status !== 0) throw new Error(restartResult.stderr || restartResult.stdout);
+      const refused = runCli(root, ["runs", "capture-recovery", "--json"], 60_000);
+      expect(refused.status).toBe(3);
+      expect(readFileSync(validatorLaunches, "utf8")).toBe("validator");
+      expect(existsSync(successorLaunches)).toBe(false);
+      const recovery = await recoverRefusedStartup(root);
+      expect(recovery.receipt.state).toBe("complete");
+      const validatorPgid = await waitForPositiveIntegerFile(validatorPgidPath);
+      await waitForProcessGroupGone(validatorPgid);
       const recoveredService = JSON.parse(readFileSync(join(state, "service.json"), "utf8")) as { status: string; bootId: string; socketPath: string };
       expect(recoveredService.status).toBe("ready");
       expect(recoveredService.bootId).not.toBe(oldService.bootId);
       const blockedRun = await waitForRunStatus(root, "capture-recovery", runId, "blocked");
-      expect(blockedRun.block?.kind).toBe("process_death_unconfirmed");
+      expect(blockedRun.block?.kind).toBe("external_outcome_unknown");
 
       let cursor: string | undefined;
       let captureSection: Extract<ReturnType<typeof serviceLogSectionPageV1Schema.parse>["section"], { kind: "capture" }> | undefined;
@@ -1212,7 +1264,7 @@ describe("public service restart", () => {
   }, 90_000);
 
 
-  test("gates a queued run until restart confirms an older process group is dead", async () => {
+  test("gates a queued run until explicit recovery verifies an older process group is dead", async () => {
     const root = mkdtempSync(join(tmpdir(), "workshop-startup-launch-gate-"));
     const config = join(root, ".workshop");
     const workflows = join(config, "workflows");
@@ -1258,23 +1310,25 @@ describe("public service restart", () => {
       await waitForPidGone(oldService.pid);
       const queuedRunId = await admitQueuedRunOffline(root, "queued-clean");
 
-      const command = spawnCli(root, ["runs", "queued-clean", "--json"]);
-      await waitForFile(termPath);
+      const refused = runCli(root, ["runs", "queued-clean", "--json"]);
+      expect(refused.status).toBe(3);
       expect(isProcessGroupAlive(oldWorkerPid)).toBe(true);
+      expect(existsSync(termPath)).toBe(false);
       expect(existsSync(queuedStartPath)).toBe(false);
-      const result = await command.completion;
-      expect(result.status).toBe(0);
+      const recovery = await recoverRefusedStartup(root);
+      expect(recovery.receipt.state).toBe("complete");
       await waitForProcessGroupGone(oldWorkerPid);
+      expect(existsSync(termPath)).toBe(true);
       await waitForFile(queuedStartPath);
 
       const queuedRun = await waitForRun(root, "queued-clean", queuedRunId);
       expect(queuedRun.status).toBe("completed");
       expect(queuedRun.runId).toBe(queuedRunId);
       expect(readFileSync(queuedStartPath, "utf8")).toBe("started\n");
-      const statusResult = runCli(root, ["status", "long-process", "--json"]);
+      const statusResult = await runCliAsync(root, ["status", "long-process", "--json"]);
       expect(statusResult.status).toBe(0);
       expect(statusDtoSchema.parse(JSON.parse(statusResult.stdout)).service.bootId).not.toBe(oldService.bootId);
-      const oldRunHistory = runCli(root, ["runs", "long-process", "--json"]);
+      const oldRunHistory = await runCliAsync(root, ["runs", "long-process", "--json"]);
       expect(runsDtoSchema.parse(JSON.parse(oldRunHistory.stdout)).runs.some((run) => run.runId === oldRunId)).toBe(true);
     } finally {
       await stopService(root);
@@ -1830,16 +1884,20 @@ describe("public service restart", () => {
       const oldService = JSON.parse(readFileSync(serviceMetadataPath, "utf8")) as { pid: number; bootId: string };
       process.kill(oldService.pid, "SIGKILL");
       await waitForPidGone(oldService.pid);
-      const reopened = runCli(root, ["status", "scheduled", "--json"]);
-      expect(reopened.status).toBe(0);
-      const reopenedDto = statusDtoSchema.parse(JSON.parse(reopened.stdout));
-      expect(reopenedDto.service.bootId).not.toBe(oldService.bootId);
+      const refused = runCli(root, ["status", "scheduled", "--json"]);
+      expect(refused.status).toBe(3);
+      expect(isProcessGroupAlive(holderPid)).toBe(true);
+      expect(readFileSync(holderLaunches, "utf8")).toBe("launch\n");
+      expect(readFileSync(scheduledLaunches, "utf8")).toBe("tick");
+      const recovery = await recoverRefusedStartup(root);
+      expect(recovery.receipt.state).toBe("complete");
       await waitForProcessGroupGone(holderPid);
+      expect(readFileSync(holderLaunches, "utf8")).toBe("launch\n");
 
       const deadline = Date.now() + 12_000;
       let history = runsDtoSchema.parse({ version: 2, workflowId: "scheduled", total: 0, truncated: false, runs: [] });
       while (Date.now() < deadline && (history.runs.length < 2 || !history.runs.every((run) => run.status === "completed"))) {
-        const result = runCli(root, ["runs", "scheduled", "--json", "--all"]);
+        const result = await runCliAsync(root, ["runs", "scheduled", "--json", "--all"]);
         if (result.status !== 0) throw new Error(result.stderr);
         history = runsDtoSchema.parse(JSON.parse(result.stdout));
         if (history.runs.length < 2 || !history.runs.every((run) => run.status === "completed")) {
@@ -1851,17 +1909,17 @@ describe("public service restart", () => {
       expect(new Set(history.runs.map((run) => run.occurrenceId)).size).toBe(2);
       expect(readFileSync(scheduledLaunches, "utf8")).toBe("ticktick");
       expect(readFileSync(holderLaunches, "utf8")).toBe("launch\n");
-      const holderHistoryResult = runCli(root, ["runs", "holder", "--json", "--all"]);
+      const holderHistoryResult = await runCliAsync(root, ["runs", "holder", "--json", "--all"]);
       expect(holderHistoryResult.status).toBe(0);
       const interruptedHolder = runsDtoSchema.parse(JSON.parse(holderHistoryResult.stdout)).runs.find((run) => run.runId === holderRunId);
       expect(interruptedHolder).toBeDefined();
       expect(interruptedHolder?.status).not.toBe("completed");
 
-      const afterRestart = runCli(root, ["status", "scheduled", "--json"]);
+      const afterRestart = await runCliAsync(root, ["status", "scheduled", "--json"]);
       expect(afterRestart.status).toBe(0);
       expect(statusDtoSchema.parse(JSON.parse(afterRestart.stdout)).workflows[0]?.activation)
         .toMatchObject({ activationId: activation.activationId, state: "exhausted", admittedCount: 2, maxRuns: 2 });
-      const noDuplicate = runCli(root, ["runs", "scheduled", "--json", "--all"]);
+      const noDuplicate = await runCliAsync(root, ["runs", "scheduled", "--json", "--all"]);
       expect(noDuplicate.status).toBe(0);
       expect(runsDtoSchema.parse(JSON.parse(noDuplicate.stdout)).runs).toHaveLength(2);
     } finally {
@@ -1988,6 +2046,38 @@ async function admitQueuedRunOffline(root: string, workflowId: string): Promise<
   }
 }
 
+async function recoverRefusedStartup(root: string) {
+  const installation = loadInstallation(root);
+  const manifest = await inspectRecoveryInstallation(installation);
+  expect(manifest.complete).toBe(true);
+  expect(manifest.scheduling).toBe("paused");
+  const required = manifest.tasks.filter((task) => task.state === "blocked"
+    || (task.processEvidence !== null && task.state !== "completing" && task.processEvidence.checkpointPhase !== "intent"));
+  expect(required.length).toBeGreaterThan(0);
+  expect(required.some((task) => task.processEvidence !== null && task.processEvidence.checkpointPhase !== "intent")).toBe(true);
+  const actions = required.map((task) => {
+    const action: "abort" | "retry" | null = task.policy.permittedActions.includes("abort") ? "abort"
+      : task.policy.permittedActions.includes("retry") ? "retry" : null;
+    if (action === null) throw new Error(`recovery task ${task.taskId} has no permitted action`);
+    return { taskId: task.taskId, action };
+  });
+  const requestId = randomUUID();
+  const result = await applyRecoveryInstallation(installation, {
+    requestId, diagnosticDigest: manifest.digest, actions, resumeInstallation: true,
+    reason: "explicitly recover uncertain prior-boot task evidence", supersedesRequestId: null,
+  }, {
+    isTerminal: () => true,
+    readConfirmation: async () => `recover ${requestId} ${manifest.digest} resume-installation`,
+    write: () => {},
+  });
+  if (result.owner === null) throw new Error("explicit recovery did not promote a service owner");
+  const health = await probeServiceHealth(installation.stateDirectory);
+  if (health.kind !== "ready") throw new Error(`recovery owner is not healthy: ${health.reason}`);
+  recoveryOwners.set(root, result.owner);
+  return result;
+}
+
+
 async function startBlockedCommandRun(
   root: string,
   workflowId: string,
@@ -2023,8 +2113,12 @@ async function startBlockedCommandRun(
   const service = JSON.parse(readFileSync(join(root, ".workshop", ".state", "service.json"), "utf8")) as { pid: number };
   process.kill(service.pid, "SIGKILL");
   await waitForPidGone(service.pid);
-  const reopened = runCli(root, ["status", workflowId, "--json"]);
-  if (reopened.status !== 0) throw new Error(reopened.stderr);
+  const refused = runCli(root, ["status", workflowId, "--json"]);
+  expect(refused.status).toBe(3);
+  expect(readFileSync(launchMarker, "utf8")).toBe("w");
+  const recovery = await recoverRefusedStartup(root);
+  expect(recovery.receipt.state).toBe("complete");
+  expect(readFileSync(launchMarker, "utf8")).toBe("w");
   await waitForRunStatus(root, workflowId, runId, "blocked");
   return { runId };
 }
@@ -2042,6 +2136,22 @@ function runCli(cwd: string, args: readonly string[], timeoutMs = 10_000) {
     stderr: [result.stderr, result.error instanceof Error ? result.error.message : ""].filter(Boolean).join("\n"),
   };
 }
+async function runCliAsync(cwd: string, args: readonly string[], timeoutMs = 10_000) {
+  const { child, completion } = spawnCli(cwd, args);
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    child.kill("SIGKILL");
+  }, timeoutMs);
+  try {
+    const result = await completion;
+    return { ...result, status: timedOut ? -1 : result.status };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+
 
 async function runCliPrefix(
   cwd: string,
@@ -2091,7 +2201,9 @@ async function waitForLaunch(path: string): Promise<void> {
 async function waitForRun(root: string, workflowId: string, runId: string) {
   const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {
-    const result = runCli(root, ["runs", workflowId, "--json"]);
+    const result = recoveryOwners.has(root)
+      ? await runCliAsync(root, ["runs", workflowId, "--json"])
+      : runCli(root, ["runs", workflowId, "--json"]);
     if (result.status !== 0) throw new Error(result.stderr);
     const projection = runsDtoSchema.parse(JSON.parse(result.stdout));
     const run = projection.runs.find((entry) => entry.runId === runId);
@@ -2104,7 +2216,9 @@ async function waitForRun(root: string, workflowId: string, runId: string) {
 async function waitForRunStatus(root: string, workflowId: string, runId: string, expectedStatus: string) {
   const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {
-    const result = runCli(root, ["runs", workflowId, "--json"]);
+    const result = recoveryOwners.has(root)
+      ? await runCliAsync(root, ["runs", workflowId, "--json"])
+      : runCli(root, ["runs", workflowId, "--json"]);
     if (result.status !== 0) throw new Error(result.stderr);
     const projection = runsDtoSchema.parse(JSON.parse(result.stdout));
     const run = projection.runs.find((entry) => entry.runId === runId);
@@ -2123,7 +2237,8 @@ async function waitForNodeStatus(
 ) {
   const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {
-    const result = runCli(root, ["step", "describe", workflowId, nodeId, "--run", runId, "--json"]);
+    const args = ["step", "describe", workflowId, nodeId, "--run", runId, "--json"];
+    const result = recoveryOwners.has(root) ? await runCliAsync(root, args) : runCli(root, args);
     if (result.status !== 0) throw new Error(result.stderr);
     const description = nodeDescriptionDtoSchema.parse(JSON.parse(result.stdout));
     if (description.node.status === expectedStatus) return description;
@@ -2296,6 +2411,12 @@ function readLaunches(path: string): number {
 }
 
 async function stopService(root: string): Promise<void> {
+  const promotedOwner = recoveryOwners.get(root);
+  if (promotedOwner !== undefined) {
+    recoveryOwners.delete(root);
+    await promotedOwner.shutdown();
+    return;
+  }
   const metadataPath = join(root, ".workshop", ".state", "service.json");
   if (!existsSync(metadataPath)) return;
   const metadata = JSON.parse(readFileSync(metadataPath, "utf8")) as { pid?: unknown };

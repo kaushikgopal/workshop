@@ -1,0 +1,11 @@
+version: 4
+description: Leaves a scheduled occurrence waiting for run capacity.
+defaults:
+  retries: 0
+  replay: never
+schedule:
+  every: 2s
+  max_runs: 2
+steps:
+  - mark-pending-run:
+      run: printf 'pending\n' >> pending-effects.txt

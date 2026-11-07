@@ -25,6 +25,7 @@ import { sendServiceRequest } from "../src/service/send-service-request.js";
 const ReceiptCounterDoc = defineDoc<{ state: "ready"; applied: number }>({
   kind: "workshop.test.service-mutation-counter",
   version: 1,
+  checkpointWhen: () => false,
   scope: "session",
   initial: () => ({ state: "ready", applied: 0 }),
 });

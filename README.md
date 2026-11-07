@@ -82,6 +82,12 @@ your Pi catalog.
 You edit only `workshop.yaml` and `workflows/`. Everything else is output.
 Deleting `results.md` is safe; the service rebuilds it.
 
+WARNING: Durable 1.4.0 migrates `.workshop/.state/durable.db` to SQLite schema
+version 2 on first open. Durable 1.3.0 and earlier cannot open the migrated
+file. Before starting the upgraded service, stop the old service and make a
+SQLite-consistent backup. A copy of `durable.db` alone can omit committed WAL
+data. Do not restore an old backup without checking later external effects.
+
 ## Commands
 
 | Command | Does |
@@ -99,6 +105,7 @@ Deleting `results.md` is safe; the service rebuilds it.
 | `resolve <workflow> --action retry\|accept\|fail --reason TEXT` | Resolve a blocked run |
 | `chat` | Talk to the shared bot |
 | `service start\|serve\|status\|stop` | Manage the background service |
+| `service recover inspect\|receipt\|apply` | Inspect stopped Durable work and apply confirmed recovery |
 
 Run `workshop help` for all flags. See [the reference](docs/reference.md)
 for the workflow format, result contracts, and configuration.
@@ -128,15 +135,19 @@ Then run `workshop reply`, or use `/continue` or `/reject` in chat.
 
 > Validate .workshop/workflows/<workflow>.yaml, then stop and start <workflow>.
 
-**The service does not start.** The detached service hides its errors.
+**The service does not start.** Ordinary startup refuses blocked tasks and uncertain prior-boot process evidence. Check `workshop service status` for a historical startup-park snapshot; it does not resume work.
 
-> Run `workshop service serve` and fix the error it prints.
+Run `workshop service recover inspect` before explicit recovery. Inspect validates retained process evidence, including terminal tasks. Choose `--verify-retired` for unresolved terminal process records. Recovery can resume unrelated installation work. Read the full [recovery contract](docs/reference.md#durable-recovery-commands) first.
+
+> For other startup errors, run `workshop service serve` and fix the error it prints.
 
 **A model is not found.** The model string does not match your Pi catalog.
 
 > Check the models in .workshop/workshop.yaml against my Pi catalog and fix them.
 
 WARNING: `retries: unlimited` can keep spending on model calls.
+
+WARNING: Durable 1.4.0 migrates `.workshop/.state/durable.db` to SQLite schema version 2 on first open. Stop the old service and make a SQLite-consistent backup before upgrading. See [the reference](docs/reference.md#what-lands-on-disk).
 
 ## Contributing
 

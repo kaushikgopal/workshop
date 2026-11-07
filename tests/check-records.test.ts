@@ -31,6 +31,7 @@ import {
   runsDtoSchema,
   statusDtoSchema,
 } from "../src/views/schema.js";
+import { renderStepPreview } from "../src/views/render-status.js";
 
 const HASH_A = `sha256:${"a".repeat(64)}`;
 const HASH_B = `sha256:${"b".repeat(64)}`;
@@ -837,6 +838,10 @@ describe("public JSON projections", () => {
       ],
     })).toThrow(/confirmed group death/);
     expect(() => attemptDetailDtoSchema.parse({
+      ...replayedAttempt, processes: [{ ...firstIncarnation, identity: null, startedAt: null, finishedAt: null,
+        cleanupState: "operator_attested_absent" }, secondIncarnation],
+    })).toThrow(/confirmed group death/);
+    expect(() => attemptDetailDtoSchema.parse({
       ...replayedAttempt, processes: [firstIncarnation, { ...secondIncarnation, launchIntentAt: STARTED_AT, startedAt: STARTED_AT }],
     })).toThrow(/follows confirmed prior completion/);
     expect(() => attemptDetailDtoSchema.parse({
@@ -866,6 +871,10 @@ describe("public JSON projections", () => {
       finishedAt: FINISHED_AT, elapsedMs: 1_000,
       failure: { ...timeoutFailure, failedAt: FINISHED_AT },
       processes: [{ ...timedOutProcess, finishedAt: FINISHED_AT }],
+    })).toThrow(/confirmed deadline timeout/);
+    expect(() => attemptDetailDtoSchema.parse({
+      ...timeoutAttempt, processes: [{ ...timedOutProcess, identity: null, startedAt: null, finishedAt: null,
+        cleanupState: "operator_attested_absent" }],
     })).toThrow(/confirmed deadline timeout/);
   });
 
@@ -946,6 +955,15 @@ describe("public JSON projections", () => {
     });
     expect(nodeDetailDtoSchema.parse(acceptedNode).attempts[0]?.operatorAcceptances[0]?.resultBytesHash)
       .toBe(HASH_B);
+    const attestedWorker = processIncarnation({
+      status: "blocked", identity: null, exit: null, startedAt: null, finishedAt: null, cleanupState: "operator_attested_absent",
+    });
+    const attestedAttempt = { ...acceptedAttempt, processes: [attestedWorker],
+      operatorAcceptances: [{ ...acceptance, processGroupsConfirmedDead: false }] };
+    const attestedNode = nodeDetailDtoSchema.parse(nodeDetail({ ...acceptedNode, attempts: [attestedAttempt] }));
+    expect(attestedNode.attempts[0]?.processes[0]?.cleanupState).toBe("operator_attested_absent");
+    expect(renderStepPreview(attestedNode).lines).toContain("worker process cleanup: attested absent");
+    expect(renderStepPreview(nodeDetailDtoSchema.parse(acceptedNode)).lines).toContain("worker process cleanup: confirmed dead");
     expect(() => nodeDetailDtoSchema.parse(nodeDetail({
       ...acceptedNode, attempts: [{
         ...acceptedAttempt, operatorAcceptances: [{ ...acceptance, resultBytesHash: HASH_A }],
@@ -990,6 +1008,11 @@ describe("public JSON projections", () => {
     };
     expect(nodeDetailDtoSchema.parse(nodeDetail({
       ...acceptedNode, resolvedSettings: validatorSettings, attempts: [acceptedWithValidator],
+    })).attempts[0]?.processes).toHaveLength(2);
+    const attestedWithValidator = { ...acceptedWithValidator, operatorAcceptances: attestedAttempt.operatorAcceptances,
+      processes: [attestedWorker, validatorProcess] };
+    expect(nodeDetailDtoSchema.parse(nodeDetail({
+      ...acceptedNode, resolvedSettings: validatorSettings, attempts: [attestedWithValidator],
     })).attempts[0]?.processes).toHaveLength(2);
     expect(() => nodeDetailDtoSchema.parse(nodeDetail({
       ...acceptedNode, resolvedSettings: validatorSettings, attempts: [acceptedAttempt],

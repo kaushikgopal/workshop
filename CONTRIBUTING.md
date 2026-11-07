@@ -161,7 +161,7 @@ waits in a CapacityGate task until a slot frees up.
 ### Built on Pi Durable
 
 [Pi Durable](https://www.npmjs.com/package/@earendil-works/pi-durable)
-(`@earendil-works/pi-durable`, pinned at 1.0.2) is a library that runs
+(`@earendil-works/pi-durable`, pinned at 1.4.0) is a library that runs
 checkpointed tasks and model conversations on top of SQLite. Workshop has no
 storage or task engine of its own; it maps its concepts onto Durable's. Command
 workers, command verifiers, and preflight are subprocesses launched by
@@ -170,14 +170,14 @@ conversations run by the `workshop.agent-execution` task.
 
 | Durable concept | How Workshop uses it |
 | --- | --- |
-| `Harness` and `Registry` | `service/open-service-runtime.ts` opens one Harness on `.state/durable.db`, registers six task definitions, reconciles leftover processes, then calls `harness.resume()`. |
+| `Harness` and `Registry` | `service/open-service-runtime.ts` opens one Harness on `.state/durable.db`, registers six task definitions, inspects task and process evidence while paused, then calls `harness.resume()` only when startup checks pass. |
 | Tasks (`defineTask`) | `WorkflowRun`, `NodeAttempt`, `ProcessExecution`, `AgentExecution`, `CapacityGate`, `ScheduleWakeup` (registered as `workshop.workflow-run` and so on). Each task is a set of named phases. A phase ends by committing its next checkpoint, waiting on children, or settling as completed or failed. |
 | Child tasks | A parent creates children with `tx.createTask` and waits for them with `allSettled`. A failed child comes back as data the parent classifies; it does not crash the parent. |
 | Conversations | Admission gives every run its own conversation. The run's tasks and records attach to it, so its history outlives the tasks. Each agent worker and verifier execution gets its own task-owned conversation. The shared bot has one ownerless conversation whose identity and committed event cursors live in a session document. |
 | Documents (`defineDoc`) | `workshop.run` holds a run's current state, scoped to its conversation. `workshop.installation` (workflows, activations) and `workshop.service-receipts` (idempotent controls) are session-scoped. |
 | Entries (`defineEntry`) | Append-only `workshop.event`, `workshop.process`, and `workshop.judgment` evidence for each run. `logs` reads the process and event entries. |
 | `runtime.commit` | The only way state changes. Document edits, new entries, new child tasks, and the task's own checkpoint land in one SQLite transaction. |
-| `runtime.sleep` | The scheduler waits for its next slot. The deadline lives in the checkpoint, so the wait survives restarts. |
+| `runtime.setTimer` | The scheduler waits for its next slot. The deadline lives in the checkpoint, so the wait survives restarts. |
 | `models` option (`pi-ai`) | The Harness registry serves the shared bot. Agent workers and verifiers run as native conversations. |
 | `snapshot`, `inspect`, `abortTask`, `close` | Status and log reads, startup compatibility checks, stop intent, and graceful shutdown. |
 
@@ -187,13 +187,15 @@ Durable leaves some work to its caller, and Workshop fills each gap:
   launch intent, then spawns the process outside the transaction, then commits
   the process identity and exit.
 - **Task ownership says nothing about OS processes.** Durable can resume a
-  task, but it cannot tell whether that task's subprocess died. At startup the
-  service finds every recorded command launch without an exit, checks the PID
-  and start time, and kills the process group. Only then may the task rerun (with
-  `replay: safe`) or block.
+  task, but it cannot tell whether that task's subprocess died. Startup inspects
+  task and process evidence while scheduling is paused. Any blocked task or
+  uncertain process evidence keeps startup stopped. Explicit recovery verifies
+  process death or records a typed operator attestation before it applies
+  selected abort or retry actions and resumes the installation.
 - **Only one process may own the storage.** Durable has no cross-process
-  locking, so the service holds a kernel lock (`acquire-service-lock.ts`) and
-  the CLI goes through the socket.
+  locking, so the service holds a kernel lock (`acquire-service-lock.ts`).
+  Ordinary CLI commands use the socket. Recovery commands bypass the socket
+  but acquire the same lock.
 - **Task definitions carry versions.** Each run freezes the versions it started
   with. After an incompatible upgrade, that run gets a `runtime_incompatible`
   block instead of running under different code.
@@ -214,19 +216,24 @@ src/
 │  ├─ dispatch-command.ts         help, validate, public command routing
 │  ├─ dispatch-public-command.ts  chat, controls, and paged inspection
 │  ├─ errors.ts                   error text at the CLI boundary
-│  ├─ service.ts                  service start | serve | status | stop
+│  ├─ service.ts                  service start | serve | status | stop | recover routing
+│  ├─ recover.ts                  terminal-confirmed Durable task recovery
 │  └─ watch.ts                    TTY routing, bot feed, and selected-run viewer reads
 ├─ service/                       one owner process per installation
 │  ├─ serve-service-process.ts    process entry and signal shutdown
 │  ├─ serve-workshop-service.ts   socket server, ownership, request dispatch
-│  ├─ open-service-runtime.ts     Harness, recovery, bot, and service controls
+│  ├─ open-service-runtime.ts     paused inspection, fail-closed startup, bot, and service controls
+│  ├─ inspect-service-recovery.ts bounded stopped-task and pending-work manifest
+│  ├─ recover-service-tasks.ts    confirmed process retirement and task controls
+│  ├─ schema-recovery.ts          recovery manifest and receipt contracts
 │  ├─ reply-human-wait.ts         checked replies and atomic wait settlement
 │  ├─ project-service-reads.ts    status, node previews, run pages, retained logs
 │  ├─ project-run-files.ts        serialized atomic readable-file projections
 │  ├─ launch-service-process.ts   reuse or spawn the service
 │  ├─ stop-service-process.ts     verified SIGTERM and bounded wait
 │  ├─ acquire-service-lock.ts     kernel lock and process identity
-│  ├─ probe-service-health.ts     metadata and live socket checks
+│  ├─ probe-service-health.ts     metadata, startup snapshots, and live socket checks
+│  ├─ write-startup-park-diagnostic.ts bounded private startup park snapshot
 │  ├─ locate-service-socket.ts    short private socket path
 │  ├─ schema.ts                   request, response, metadata contracts
 │  ├─ parse-service-protocol.ts   checked frames and fragmented responses
@@ -241,6 +248,9 @@ src/
 │  │  ├─ define-process-execution-task.ts command spawn, capture, crash replay
 │  │  ├─ define-agent-execution-task.ts native agent worker and verifier conversations
 │  │  ├─ define-workshop-records.ts installation, run, bot documents and evidence
+│  │  ├─ schema-recovery.ts          recovery intent and death-evidence contracts
+│  │  ├─ define-recovery-records.ts  recovery journal and request documents
+│  │  ├─ commit-recovery-intent.ts   checked recovery journal transitions
 │  │  ├─ commit-service-mutation.ts idempotent control receipts
 │  │  ├─ render-worklog.ts        compact or verbose committed worklog
 │  │  ├─ checkpoint-durable-wal.ts idle WAL truncation
@@ -285,6 +295,8 @@ src/
 │  └─ render-agent-prompt.ts      text and tagged worker contracts; verifier decision-line prompts
 ├─ process/
 │  ├─ launch-process.ts           supervised process group and stdin writer
+│  ├─ identify-host-boot.ts      host boot identity for death checks
+│  ├─ verify-process-death.ts     verify or retire one process group
 │  ├─ identify-process.ts         PID, group, and start identity checks
 │  ├─ kill-process-tree.ts        group retirement with confirmed death
 │  ├─ read-retained-capture.ts    exact UTF-8 or labeled base64 evidence
