@@ -22,20 +22,19 @@ brings me in only when something truly needs me.
 5. **An orchestrator I can talk to.** I can reach one agent directly, on the
    machine or over SSH from a laptop, to ask what is running, why something
    failed, or to nudge stuck work along. It also tries to fix failing steps
-   on its own, escalating to a smarter model before it asks me. I need one
+   on its own, escalating to a smarter model before it asks me. It records
+   anything significant it does and flags runs it cannot fix. I need one
    place to understand and steer everything.
-6. **Channels.** Outside inputs, such as a Linear issue, a todo, or an email
-   reply, can start or feed a workflow. Workshop sends notifications out,
-   including a daily summary, by email or message. My work and my attention
-   live outside the machine.
-7. **Convention over configuration.** Dropping a Markdown file in a folder
-   creates a workflow, with no registration or wiring. Adding a workflow
-   should take minutes.
+6. **Convention over configuration.** Dropping a folder of numbered step
+   files into `workflows/` creates a workflow, with no registration or
+   wiring. Adding a workflow should take minutes.
 
 ### Constraints
 
-- **One start path.** Schedules, the start command, and channel inputs all
-  start a run the same way.
+- **Inputs and outputs are steps.** A workflow starts on its schedule or
+  with the start command. It pulls its own inputs and sends its own
+  notifications in steps. A command step that exits with code 99 ends the
+  run early because there is nothing to do.
 - **One run at a time.** A slot that arrives while a run is open (working,
   waiting, or blocked) is skipped. After downtime, only the latest missed
   slot runs.
