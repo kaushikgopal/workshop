@@ -16,6 +16,7 @@ setup:
 
 check:
 	@node scripts/check-config.ts
+	@node scripts/check-workflows.ts
 	@npm run typecheck
 	@npm test
 

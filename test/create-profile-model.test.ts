@@ -16,6 +16,11 @@ test("profile model parses a JSON text reply from its command", async () => {
   assert.equal(result.text, "fixture reply");
 });
 
+test("profile model preserves escaped JSON text, backslashes, and braces", async () => {
+  const result = await generateText({ model: model("escaped-text"), prompt: "Say hello" });
+  assert.equal(result.text, 'Quote " and slash \\ and braces {x}');
+});
+
 test("profile model converts a JSON tool-call reply", async () => {
   const result = await generateText({
     model: model("tool"),
@@ -23,12 +28,12 @@ test("profile model converts a JSON tool-call reply", async () => {
     tools: {
       list_runs: tool({
         description: "List workflow runs.",
-        inputSchema: z.object({ limit: z.number() }),
+        inputSchema: z.object({ limit: z.number(), note: z.string() }),
       }),
     },
   });
   assert.deepEqual(result.toolCalls.map(({ toolName, input }) => ({ toolName, input })), [
-    { toolName: "list_runs", input: { limit: 3 } },
+    { toolName: "list_runs", input: { limit: 3, note: 'Quote " and slash \\ and braces {x}' } },
   ]);
 });
 

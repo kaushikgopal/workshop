@@ -2,7 +2,20 @@
 
 ## v2 development
 
-The v2 work-in-progress lives at the repository root and runs on Eve. It requires Node 24+ and npm. Run `make setup` to install dependencies and create local config files. Run `make check` to check config, types, and tests; use `make dev` for local development or `make start` to build and start Eve.
+The v2 work-in-progress lives at the repository root and runs on Eve. It
+requires Node 24+ and npm. Run `make setup` to install dependencies and create
+local config files.
+
+Before checking or launching, edit the root `workshop.yaml`. Replace model
+placeholders and remove profiles whose CLIs are not installed. Keep both
+orchestrator profile references pointed at profiles that remain declared.
+
+Run `make check` to validate config, workflow folders, types, and tests. Use
+`make dev` for local development or `make start` to build and start Eve.
+
+Each v2 workflow lives in its own folder. It has a `workflow.md` file and
+numbered `.md`, `.sh`, or `.ts` steps. A matching `.check.md`, `.check.sh`, or
+`.check.ts` file adds a check. See `examples/workflows/hemingway-clock/`.
 
 The rest of this README describes v1, which remains in the tree until v2 reaches M6.
 

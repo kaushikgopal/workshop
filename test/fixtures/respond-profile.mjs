@@ -7,7 +7,11 @@ if (mode === "fail") {
   process.stderr.write("fixture failure");
   process.exitCode = 7;
 } else if (mode === "tool") {
-  process.stdout.write(JSON.stringify({ tool_calls: [{ name: "list_runs", input: { limit: 3 } }] }));
+  const note = 'Quote " and slash \\ and braces {x}';
+  process.stdout.write(JSON.stringify({ tool_calls: [{ name: "list_runs", input: { limit: 3, note } }] }));
+} else if (mode === "escaped-text") {
+  const text = 'Quote " and slash \\ and braces {x}';
+  process.stdout.write(JSON.stringify({ text }));
 } else if (mode === "repair" && !prompt.includes("Your previous output was invalid")) {
   process.stdout.write("not JSON");
 } else if (mode === "always-invalid") {

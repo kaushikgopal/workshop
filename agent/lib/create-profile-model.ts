@@ -67,7 +67,7 @@ function parseReply(raw: string): Reply | undefined {
       const char = raw.charAt(end);
       if (quoted) {
         if (escaped) escaped = false;
-        else if (char === "\\\\") escaped = true;
+        else if (char === "\\") escaped = true;
         else if (char === '\"') quoted = false;
       } else if (char === '\"') quoted = true;
       else if (char === "{") depth++;
