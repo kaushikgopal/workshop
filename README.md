@@ -17,6 +17,17 @@ Each v2 workflow lives in its own folder. It has a `workflow.md` file and
 numbered `.md`, `.sh`, or `.ts` steps. A matching `.check.md`, `.check.sh`, or
 `.check.ts` file adds a check. See `examples/workflows/hemingway-clock/`.
 
+Each run copies its workflow to `state/snapshots/<run_id>/` and removes the
+copy when it ends. Steps share files in `data/<workflow>/`. The one-minute
+schedule starts only the latest due slot, honors `max_runs`, and records starts
+and skipped slots in `state/runs.jsonl`. Step output feeds the next command on
+stdin or an agent under `Input`; rejected checks retry with feedback, and runs
+wait for a retry, skip, accept, or fail decision when attempts run out.
+Timeouts must fit Node's timer range. Agent retries may change profiles only
+when both profiles use the same executable. A command can outlive a forced
+server kill, and a restarted run can repeat its unfinished step. Make external
+effects safe to repeat.
+
 The rest of this README describes v1, which remains in the tree until v2 reaches M6.
 
 ## What is Workshop

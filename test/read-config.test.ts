@@ -134,3 +134,21 @@ test("profile command check requires each first argument to be an executable fil
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test("resolves relative profile executables against the config directory", () => {
+  const directory = createDirectory();
+  try {
+    const bin = join(directory, "bin");
+    mkdirSync(bin);
+    const executable = join(bin, "fake-profile");
+    writeFileSync(executable, "#!/bin/sh\nexit 0\n");
+    chmodSync(executable, 0o755);
+    const file = writeConfig(directory, basicConfig("[./bin/fake-profile]"));
+    const config = readConfig(file);
+
+    assert.equal(config.agent_profiles.writer?.command[0], executable);
+    assert.deepEqual(checkProfileCommands(config, "", file), []);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});

@@ -188,6 +188,7 @@ test("checks workflow setting types and ranges", () => {
       { name: "fraction-retries", fields: 'cron: "*/5 * * * *"\nretries: 1.5', reason: /retries: Invalid input/ },
       { name: "bad-timeout", fields: 'cron: "*/5 * * * *"\ntimeout: 30d', reason: /timeout: must be a positive duration/ },
       { name: "zero-timeout", fields: 'cron: "*/5 * * * *"\ntimeout: 0s', reason: /timeout: must be a positive duration/ },
+      { name: "too-long-timeout", fields: 'cron: "*/5 * * * *"\ntimeout: 597h', reason: /timeout: must be a positive duration/ },
       { name: "unknown-profile", fields: 'cron: "*/5 * * * *"\nprofile: absent', reason: /does not exist in agent_profiles/ },
     ];
     for (const item of cases) createWorkflow(root, item.name, item.fields);

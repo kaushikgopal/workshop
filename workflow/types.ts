@@ -1,5 +1,20 @@
 export type WorkflowStepKind = "agent" | "command";
 
+export type WorkflowDecision =
+  | { action: "retry"; hint?: string; profile?: string }
+  | { action: "skip" }
+  | { action: "accept" }
+  | { action: "fail" };
+
+export type WorkflowSnapshot = {
+  workflow: Workflow;
+  runDirectory: string;
+  documents: Record<string, string>;
+  files: Record<string, string>;
+  profileCommands: Record<string, string[]>;
+  dataDirectory: string;
+};
+
 export type WorkflowCheck = {
   kind: WorkflowStepKind;
   file: string;

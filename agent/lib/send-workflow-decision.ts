@@ -1,0 +1,23 @@
+import { resumeHook } from "eve/workflow/api";
+import { resolve } from "node:path";
+import { locateBlockedStep } from "../../run/locate-blocked-step.ts";
+import { readBlockedStep } from "../../run/read-blocked-step.ts";
+import { parseWorkflowDecision } from "../../workflow/parse-workflow-decision.ts";
+import type { WorkflowDecision } from "../../workflow/types.ts";
+
+type DecisionSenderOptions = {
+  stateRoot?: string;
+  resume?: (token: string, decision: WorkflowDecision) => Promise<void>;
+};
+
+export async function sendWorkflowDecision(runId: string, decision: WorkflowDecision, options: DecisionSenderOptions = {}): Promise<void> {
+  const checkedDecision = parseWorkflowDecision(decision);
+  const stateRoot = options.stateRoot ?? resolve(process.cwd(), "state");
+  const blocked = readBlockedStep(locateBlockedStep(stateRoot, runId));
+  if (!blocked) throw new Error(`Workflow run ${runId} is not waiting on a decision`);
+  if (checkedDecision.action === "retry" && checkedDecision.profile !== undefined && !blocked.retry_profiles.includes(checkedDecision.profile)) {
+    throw new Error(`Profile "${checkedDecision.profile}" cannot retry ${blocked.step_kind} step ${blocked.step}`);
+  }
+  const resume = options.resume ?? ((token, payload) => resumeHook(token, payload));
+  await resume(blocked.token, checkedDecision);
+}

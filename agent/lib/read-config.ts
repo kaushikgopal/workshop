@@ -167,7 +167,17 @@ export function readConfig(configFile?: string): WorkshopConfig {
   const expanded = interpolateEnvironment(parsed, configuredFile);
   const result = configSchema.safeParse(expanded);
   if (!result.success) throw new ConfigReadError(describeSchemaIssues(configuredFile, result.error.issues));
-  return result.data;
+  const configDirectory = dirname(absoluteFile);
+  const agent_profiles = Object.fromEntries(
+    Object.entries(result.data.agent_profiles).map(([name, profile]) => {
+      const [executable, ...args] = profile.command;
+      const command = executable !== undefined && executable.includes("/") && !isAbsolute(executable)
+        ? [resolve(configDirectory, executable), ...args]
+        : profile.command;
+      return [name, { ...profile, command }];
+    }),
+  );
+  return { ...result.data, agent_profiles };
 }
 
 export function checkProfileCommands(
@@ -177,9 +187,10 @@ export function checkProfileCommands(
 ): ConfigIssue[] {
   const searchPath = pathValue?.split(delimiter) ?? [];
   const issues: ConfigIssue[] = [];
+  const configDirectory = dirname(resolve(configFile));
   for (const [name, profile] of Object.entries(config.agent_profiles)) {
     const executable = profile.command[0];
-    if (executable === undefined || !isExecutableOnPath(executable, searchPath)) {
+    if (executable === undefined || !isExecutableOnPath(executable, searchPath, configDirectory)) {
       issues.push({
         file: configFile,
         reason: `agent_profiles.${name}.command[0] ${JSON.stringify(executable ?? "")} must resolve to an executable file on PATH`,
@@ -189,9 +200,9 @@ export function checkProfileCommands(
   return issues;
 }
 
-function isExecutableOnPath(executable: string, searchPath: string[]): boolean {
+function isExecutableOnPath(executable: string, searchPath: string[], configDirectory: string): boolean {
   const candidates = executable.includes("/")
-    ? [resolve(executable)]
+    ? [isAbsolute(executable) ? executable : resolve(configDirectory, executable)]
     : searchPath.map((directory) => resolve(directory || process.cwd(), executable));
   return candidates.some((candidate) => {
     try {
