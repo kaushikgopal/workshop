@@ -1,5 +1,11 @@
 # Workshop
 
+## v2 development
+
+The v2 work-in-progress lives at the repository root and runs on Eve. It requires Node 24+ and npm. Run `make setup` to install dependencies and create local config files. Run `make check` to check config, types, and tests; use `make dev` for local development or `make start` to build and start Eve.
+
+The rest of this README describes v1, which remains in the tree until v2 reaches M6.
+
 ## What is Workshop
 
 Workshop runs my agent workflows round the clock, cheaply and safely, and

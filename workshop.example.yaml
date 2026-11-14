@@ -1,0 +1,15 @@
+agent_profiles:
+  pi-fast:
+    command: [pi, -p, --no-session, --model, "<provider>/<model>"]
+  claude:
+    command: [claude, -p, --model, "<model>"]
+  codex:
+    command: [codex, exec, "-"]
+  writer:
+    command: [pi, -p, --no-session, --model, "<provider>/<model>"]
+  orchestrator:
+    command: [pi, -p, --no-session, --no-tools, --no-extensions, --no-skills, --model, "<provider>/<model>"]
+    context_window: 32000
+orchestrator:
+  profile: orchestrator
+  escalation_profile: claude

@@ -1,9 +1,10 @@
 {
   "compilerOptions": {
     "target": "ESNext",
-    "module": "ESNext",
-    "moduleResolution": "bundler",
-    "types": ["bun-types"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "allowImportingTsExtensions": true,
+    "types": ["node"],
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "noImplicitOverride": true,
@@ -11,5 +12,6 @@
     "skipLibCheck": true,
     "noEmit": true
   },
-  "include": ["src", "tests"]
+  "include": ["agent/**/*.ts", "scripts/**/*.ts", "test/**/*.ts"],
+  "exclude": ["src", "tests", "spike", "node_modules"]
 }

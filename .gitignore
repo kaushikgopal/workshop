@@ -1,5 +1,13 @@
-# Workshop runtime state — never committed
-.workshop/
+# v1 runtime state remains private until v1 is removed
+/.workshop/
+
+# Eve build output and Workflow World state
+/.eve/
+/.output/
+/data/
+/state/
+/workshop.yaml
+/.env.local
 
 node_modules/
 *.log

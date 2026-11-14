@@ -1,0 +1,136 @@
+import assert from "node:assert/strict";
+import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { test } from "node:test";
+import { checkProfileCommands, ConfigReadError, readConfig, type WorkshopConfig } from "../agent/lib/read-config.ts";
+
+function createDirectory(): string {
+  return mkdtempSync(join(tmpdir(), "workshop-config-test-"));
+}
+
+function writeConfig(directory: string, source: string): string {
+  const file = join(directory, "workshop.yaml");
+  writeFileSync(file, source);
+  return file;
+}
+
+function basicConfig(command = "[node, -e, hello]"): string {
+  return `agent_profiles:\n  writer:\n    command: ${command}\norchestrator:\n  profile: writer\n  escalation_profile: writer\n`;
+}
+
+test("config loads .env.local without overwriting the environment and substitutes parsed string values", () => {
+  const directory = createDirectory();
+  const envName = "WORKSHOP_CONFIG_TEST_FROM_FILE";
+  const existingName = "WORKSHOP_CONFIG_TEST_EXISTING";
+  const quotedName = "WORKSHOP_CONFIG_TEST_QUOTED";
+  const specialName = "WORKSHOP_CONFIG_TEST_SPECIAL";
+  const configName = "WORKSHOP_CONFIG";
+  const variables = [envName, existingName, quotedName, specialName, configName];
+  const originals = new Map(variables.map((name) => [name, process.env[name]]));
+  const specialValue = `quote: \" # [] , slash \\\n\u0001\n\${"WORKSHOP_CONFIG_TEST_NESTED"}`;
+  delete process.env[envName];
+  delete process.env[quotedName];
+  process.env[existingName] = "kept-from-process";
+  process.env[specialName] = specialValue;
+  try {
+    writeFileSync(join(directory, ".env.local"), `${envName}=value-from-file\n${existingName}=ignored-file-value\n${quotedName}="value # from file"\n${specialName}=ignored-special-value\n`);
+    const file = writeConfig(directory, `agent_profiles:\n  writer:\n    command: [node, "\${${envName}}", "\${${existingName}}", "\${${quotedName}}", "\${${specialName}}"]\n    context_window: 64000\norchestrator:\n  profile: writer\n  escalation_profile: writer\n`);
+    process.env[configName] = file;
+    const config = readConfig();
+    assert.deepEqual(config.agent_profiles.writer, {
+      command: ["node", "value-from-file", "kept-from-process", "value # from file", specialValue],
+      context_window: 64000,
+    });
+    assert.equal(process.env[envName], "value-from-file");
+    assert.equal(process.env[existingName], "kept-from-process");
+    assert.equal(process.env[quotedName], "value # from file");
+    assert.equal(process.env[specialName], specialValue);
+  } finally {
+    for (const name of variables) {
+      const original = originals.get(name);
+      if (original === undefined) delete process.env[name];
+      else process.env[name] = original;
+    }
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("config errors name an unset interpolation variable", () => {
+  const directory = createDirectory();
+  const envName = "WORKSHOP_CONFIG_TEST_MISSING";
+  const configName = "WORKSHOP_CONFIG";
+  const previous = process.env[envName];
+  const previousConfig = process.env[configName];
+  delete process.env[envName];
+  try {
+    const file = writeConfig(directory, `agent_profiles:\n  writer:\n    command: [node, "\${${envName}}"]\norchestrator:\n  profile: writer\n  escalation_profile: writer\n`);
+    process.env[configName] = file;
+    assert.throws(() => readConfig(), (error: unknown) => {
+      assert.ok(error instanceof ConfigReadError);
+      assert.match(error.message, new RegExp(envName));
+      return true;
+    });
+  } finally {
+    if (previous === undefined) delete process.env[envName];
+    else process.env[envName] = previous;
+    if (previousConfig === undefined) delete process.env[configName];
+    else process.env[configName] = previousConfig;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("config validates command arrays, profile names, references, and context windows", () => {
+  const directory = createDirectory();
+  try {
+    const invalidConfigs = [
+      { source: basicConfig("[]"), message: /at least one argument/ },
+      { source: basicConfig("[\"\"]"), message: /must not be empty/ },
+      { source: basicConfig().replace("writer:", "Writer:"), message: /lowercase letters, digits, and hyphens/ },
+      { source: basicConfig().replace("profile: writer", "profile: missing"), message: /does not exist in agent_profiles/ },
+      { source: basicConfig().replace("profile: writer", "profile: constructor"), message: /does not exist in agent_profiles/ },
+      { source: basicConfig().replace("escalation_profile: writer", "escalation_profile: missing"), message: /does not exist in agent_profiles/ },
+      { source: basicConfig().replace("command:", "unknown: true\n    command:"), message: /Unrecognized key/ },
+      { source: basicConfig().replace("command:", "context_window: 0\n    command:"), message: /context_window: Too small/ },
+      { source: basicConfig().replace("command:", "context_window: 1.5\n    command:"), message: /context_window: Invalid input/ },
+    ];
+    for (const [index, item] of invalidConfigs.entries()) {
+      const file = writeConfig(directory, item.source);
+      assert.throws(() => readConfig(file), item.message, `invalid config ${index}`);
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("profile command check requires each first argument to be an executable file", () => {
+  const directory = createDirectory();
+  try {
+    const bin = join(directory, "bin");
+    mkdirSync(bin);
+    const executable = join(bin, "fake-profile");
+    writeFileSync(executable, "#!/bin/sh\nexit 0\n");
+    chmodSync(executable, 0o755);
+    const pathDirectory = join(bin, "directory-command");
+    mkdirSync(pathDirectory);
+    const explicitDirectory = join(directory, "explicit-directory");
+    mkdirSync(explicitDirectory);
+    const config: WorkshopConfig = {
+      agent_profiles: {
+        found: { command: ["fake-profile"] },
+        missing: { command: ["not-installed"] },
+        pathDirectory: { command: ["directory-command"] },
+        explicitDirectory: { command: [explicitDirectory] },
+      },
+      orchestrator: { profile: "found", escalation_profile: "found" },
+    };
+    const issues = checkProfileCommands(config, bin);
+    assert.equal(issues.length, 3);
+    assert.ok(issues.some(({ reason }) => reason.includes('agent_profiles.missing.command[0] "not-installed"')));
+    assert.ok(issues.some(({ reason }) => reason.includes('agent_profiles.pathDirectory.command[0] "directory-command"')));
+    assert.ok(issues.some(({ reason }) => reason.includes(`agent_profiles.explicitDirectory.command[0] "${explicitDirectory}"`)));
+    assert.ok(issues.every(({ reason }) => reason.includes("must resolve to an executable file on PATH")));
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
