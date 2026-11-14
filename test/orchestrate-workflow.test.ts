@@ -76,6 +76,7 @@ async function executeFakeOrchestrator(request: ProcessExecutionRequest, root: s
     workflow: "test-loop",
     runId: "wrun_orchestrator_test",
     dataDirectory: root,
+    stateDirectory: root,
     cwd: root,
   });
 }

@@ -12,6 +12,7 @@ orchestrator profile references pointed at profiles that remain declared.
 
 Run `make check` to validate config, workflow folders, types, and tests.
 By default, `make dev` serves on `127.0.0.1:2000` and `make start` serves on `127.0.0.1:3000`. The start service accepts loopback clients only. `make chat` prefers the start service and falls back to the dev server.
+Install or remove the macOS launch agent with `make service-install` and `make service-uninstall`; create a private copy with `make copy to=<dir>`. See `examples/workflows/daily-summary/` for a daily activity summary workflow.
 
 Each v2 workflow lives in its own folder. It has a `workflow.md` file and
 numbered `.md`, `.sh`, or `.ts` steps. A matching `.check.md`, `.check.sh`, or

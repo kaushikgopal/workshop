@@ -5,6 +5,7 @@ type ExecuteWorkflowProcessInput = ProcessExecutionRequest & {
   workflow: string;
   runId: string;
   dataDirectory: string;
+  stateDirectory: string;
   cwd: string;
 };
 
@@ -39,6 +40,8 @@ export async function executeWorkflowProcess(input: ExecuteWorkflowProcessInput)
         WORKSHOP_RUN_ID: input.runId,
         WORKSHOP_STEP: input.step,
         WORKSHOP_DATA_DIR: input.dataDirectory,
+        // State indexes belong to the service, outside a workflow's working folder.
+        WORKSHOP_STATE_DIR: input.stateDirectory,
         WORKSHOP_FEEDBACK: input.feedback,
       },
       detached: process.platform !== "win32",

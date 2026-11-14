@@ -78,6 +78,7 @@ export function createWorkflowSnapshot(input: CreateWorkflowSnapshotInput): Work
       contents: workflowContents(workflow, directory),
       profileCommands: input.profileCommands,
       dataDirectory: input.dataDirectory,
+      stateDirectory: input.stateRoot,
     };
   } catch (error) {
     rmSync(temporaryDirectory, { recursive: true, force: true });

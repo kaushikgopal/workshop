@@ -361,6 +361,7 @@ test("fake profile commands receive stdin and Workshop environment without a she
     workflow: "clock",
     runId: "wrun_process_1",
     dataDirectory: "/data/clock",
+    stateDirectory: "/service/state",
     cwd: process.cwd(),
   });
   assert.equal(result.exitCode, 0);
@@ -370,6 +371,7 @@ test("fake profile commands receive stdin and Workshop environment without a she
     runId: "wrun_process_1",
     step: "20-write",
     dataDirectory: "/data/clock",
+    stateDirectory: "/service/state",
     feedback: "try again",
   });
 });
@@ -387,6 +389,7 @@ test("process timeout terminates a fake profile command", async () => {
     workflow: "clock",
     runId: "wrun_timeout_1",
     dataDirectory: "/data/clock",
+    stateDirectory: "/service/state",
     cwd: process.cwd(),
   });
   assert.equal(result.timedOut, true);

@@ -32,6 +32,7 @@ export type WorkflowSnapshot = {
   contents: Record<string, string>;
   profileCommands: Record<string, string[]>;
   dataDirectory: string;
+  stateDirectory: string;
 };
 
 export type WorkflowCheck = {

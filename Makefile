@@ -1,7 +1,8 @@
 PORT ?= 3000
 DEV_PORT ?= 2000
+LABEL ?= dev.workshop.service
 
-.PHONY: setup check dev start chat
+.PHONY: setup check dev start chat service-install service-uninstall copy
 
 setup:
 	@if ! command -v node >/dev/null 2>&1 || ! node -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 24 ? 0 : 1)'; then \
@@ -34,3 +35,15 @@ chat:
 	if ! nc -z 127.0.0.1 "$$port" >/dev/null 2>&1; then port="$(DEV_PORT)"; fi; \
 	if ! nc -z 127.0.0.1 "$$port" >/dev/null 2>&1; then echo "No Workshop service is listening; run make start (or make dev)." >&2; exit 1; fi; \
 	npx eve remote connect --url "http://127.0.0.1:$$port"
+
+service-install:
+	@test -f workshop.yaml || { echo "workshop.yaml is required; run make setup and edit the config first." >&2; exit 1; }
+	@$(MAKE) check
+	@npx eve build
+	@node scripts/install-launch-agent.ts "$(LABEL)" "$(CURDIR)" "$$(command -v npx)" "$(PORT)"
+
+service-uninstall:
+	@node scripts/uninstall-launch-agent.ts "$(LABEL)"
+
+copy:
+	@node scripts/copy-workshop.ts "$(to)"

@@ -99,6 +99,7 @@ export async function executeWorkflow(input: WorkflowStartInput) {
           workflow: input.workflowName,
           runId: workflowRunId,
           dataDirectory: preparedSnapshot.dataDirectory,
+          stateDirectory: preparedSnapshot.stateDirectory,
           cwd: preparedSnapshot.dataDirectory,
         }),
         waitBeforeRetry: (duration) => sleep(duration),

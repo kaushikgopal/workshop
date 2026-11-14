@@ -23,6 +23,7 @@ if (mode === "echo") {
     runId: process.env.WORKSHOP_RUN_ID,
     step: process.env.WORKSHOP_STEP,
     dataDirectory: process.env.WORKSHOP_DATA_DIR,
+    stateDirectory: process.env.WORKSHOP_STATE_DIR,
     feedback: process.env.WORKSHOP_FEEDBACK,
   }));
 }
