@@ -1,5 +1,54 @@
 # Workshop
 
+## What is Workshop
+
+Workshop runs my agent workflows round the clock, cheaply and safely, and
+brings me in only when something truly needs me.
+
+### Requirements
+
+1. **Always on.** Workflows run on a schedule, day and night, without me
+   starting them. Repeatable work should happen whether or not I am at a
+   keyboard.
+2. **A model per step.** Each agent step picks its own model, from a cheap
+   local one to a frontier one. I pay for quality only on the steps that need
+   it.
+3. **Workflows of commands and agents.** A workflow is a fixed sequence of
+   steps, and each step is a shell command or a headless agent. Fixed
+   structure keeps a run predictable, and agents add judgment only where a
+   step needs it.
+4. **Durable.** A run survives crashes, restarts, and reboots, and resumes
+   where it stopped. Unattended work must not lose progress.
+5. **An orchestrator I can talk to.** I can reach one agent directly, on the
+   machine or over SSH from a laptop, to ask what is running, why something
+   failed, or to nudge stuck work along. It also tries to fix failing steps
+   on its own, escalating to a smarter model before it asks me. I need one
+   place to understand and steer everything.
+6. **Channels.** Outside inputs, such as a Linear issue, a todo, or an email
+   reply, can start or feed a workflow. Workshop sends notifications out,
+   including a daily summary, by email or message. My work and my attention
+   live outside the machine.
+7. **Convention over configuration.** Dropping a Markdown file in a folder
+   creates a workflow, with no registration or wiring. Adding a workflow
+   should take minutes.
+
+### Constraints
+
+- **One start path.** Schedules, the start command, and channel inputs all
+  start a run the same way.
+- **One run at a time.** A slot that arrives while a run is open (working,
+  waiting, or blocked) is skipped. After downtime, only the latest missed
+  slot runs.
+- **Optional checks per step.** A step can name a command or a judge agent
+  to check its output. A rejected result retries the step with the reason as
+  feedback. The orchestrator steps in only when retries run out.
+- **Shared working folder.** Steps pass data through files, not through a
+  data contract between steps.
+- **Steps are safe to repeat.** A step interrupted by a crash runs again from
+  its start.
+- **One Workshop per machine.** Each machine has its own workflows, so
+  personal and work loops stay apart.
+
 Workshop is a small TypeScript runtime built on
 [pi-durable](https://www.npmjs.com/package/@earendil-works/pi-durable). It runs
 what people call software factories and what I call
