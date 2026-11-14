@@ -3,9 +3,11 @@ import { resolve } from "node:path";
 import { defineWorkflowTool } from "eve/tools";
 import { createHook, FatalError, getWorkflowMetadata } from "eve/workflow";
 import { z } from "zod";
+import { decideWorkflowAdmission } from "../../run/admit-workflow-run.ts";
 import { appendRunIndex } from "../../run/append-run-index.ts";
 import { buildDecisionToken } from "../../run/build-decision-token.ts";
 import { locateBlockedStep } from "../../run/locate-blocked-step.ts";
+import { readRunIndex } from "../../run/read-run-index.ts";
 import { removeBlockedStep } from "../../run/remove-blocked-step.ts";
 import { writeBlockedStep } from "../../run/write-blocked-step.ts";
 import { createWorkflowSnapshot } from "../../workflow/create-workflow-snapshot.ts";
@@ -15,7 +17,10 @@ import type { WorkflowDecision, WorkflowSnapshot } from "../../workflow/types.ts
 import { executeWorkflowProcess } from "../lib/execute-workflow-process.ts";
 import { checkProfileCommands, readConfig } from "../lib/read-config.ts";
 
-type WorkflowStartInput = { workflowName: string; scheduledSlot?: string | null };
+type WorkflowStartInput = { workflowName: string; scheduledSlot?: string | null; maxRuns?: number };
+type PreparedWorkflowResult =
+  | { kind: "prepared"; snapshot: WorkflowSnapshot }
+  | { kind: "skipped"; reason: string };
 type BlockedDecisionInput = {
   workflow: string;
   runId: string;
@@ -42,25 +47,34 @@ export async function executeWorkflow(input: WorkflowStartInput) {
     const conflict = await lock.getConflict();
     if (conflict) {
       await recordLockSkip({ workflow: input.workflowName, slot: input.scheduledSlot ?? null, runId: workflowRunId, conflictRunId: conflict.runId });
-      return { status: "skipped" as const, workflowRunId, conflictRunId: conflict.runId };
+      return { status: "skipped" as const, workflowRunId, reason: `workflow lock held by ${conflict.runId}` };
     }
 
     let snapshot: WorkflowSnapshot | undefined;
     try {
-      const prepared = await prepareWorkflow({ workflowName: input.workflowName, runId: workflowRunId, slot: input.scheduledSlot ?? null });
-      snapshot = prepared;
+      const prepared = await prepareWorkflow({
+        workflowName: input.workflowName,
+        runId: workflowRunId,
+        slot: input.scheduledSlot ?? null,
+        ...(input.maxRuns === undefined ? {} : { maxRuns: input.maxRuns }),
+      });
+      if (prepared.kind === "skipped") {
+        return { status: "skipped" as const, workflowRunId, reason: prepared.reason };
+      }
+      const preparedSnapshot = prepared.snapshot;
+      snapshot = preparedSnapshot;
       const result = await interpretWorkflow({
-        workflow: prepared.workflow,
-        documents: prepared.documents,
-        files: prepared.files,
+        workflow: preparedSnapshot.workflow,
+        documents: preparedSnapshot.documents,
+        files: preparedSnapshot.files,
         workflowRunId,
-        profileCommands: prepared.profileCommands,
+        profileCommands: preparedSnapshot.profileCommands,
         executeProcess: (request) => executeWorkflowProcess({
           ...request,
           workflow: input.workflowName,
           runId: workflowRunId,
-          dataDirectory: prepared.dataDirectory,
-          cwd: prepared.dataDirectory,
+          dataDirectory: preparedSnapshot.dataDirectory,
+          cwd: preparedSnapshot.dataDirectory,
         }),
         waitForDecision: (blocked) => waitForWorkflowDecision(blocked),
       });
@@ -83,11 +97,29 @@ export default defineWorkflowTool({
   execute: executeWorkflow,
 });
 
-async function prepareWorkflow(input: { workflowName: string; runId: string; slot: string | null }): Promise<WorkflowSnapshot> {
+async function prepareWorkflow(input: { workflowName: string; runId: string; slot: string | null; maxRuns?: number }): Promise<PreparedWorkflowResult> {
   "use step";
 
   const stateRoot = resolve(process.cwd(), "state");
-  appendRunIndex(resolve(stateRoot, "runs.jsonl"), {
+  const indexFile = resolve(stateRoot, "runs.jsonl");
+  const admission = decideWorkflowAdmission({
+    entries: readRunIndex(indexFile),
+    workflow: input.workflowName,
+    runId: input.runId,
+    slot: input.slot,
+    ...(input.maxRuns === undefined ? {} : { maxRuns: input.maxRuns }),
+  });
+  if (admission.kind === "skip") {
+    appendRunIndex(indexFile, {
+      workflow: input.workflowName,
+      slot: input.slot,
+      run_id: input.runId,
+      outcome: "skipped",
+      reason: admission.reason,
+    });
+    return { kind: "skipped", reason: admission.reason };
+  }
+  appendRunIndex(indexFile, {
     workflow: input.workflowName,
     slot: input.slot,
     run_id: input.runId,
@@ -114,7 +146,7 @@ async function prepareWorkflow(input: { workflowName: string; runId: string; slo
       profileCommands,
     });
     mkdirSync(dataDirectory, { recursive: true });
-    return snapshot;
+    return { kind: "prepared", snapshot };
   } catch (error) {
     rmSync(resolve(stateRoot, "snapshots", input.runId), { recursive: true, force: true });
     throw new FatalError(error instanceof Error ? error.message : String(error));

@@ -63,11 +63,15 @@ export default defineSchedule({
       }
 
       try {
-        const handle = await start(executeWorkflow, [{ workflowName: workflow.name, scheduledSlot: decision.slot }]);
+        const handle = await start(executeWorkflow, [{
+          workflowName: workflow.name,
+          scheduledSlot: decision.slot,
+          ...(workflow.max_runs === undefined ? {} : { maxRuns: workflow.max_runs }),
+        }]);
         // The tick must return while the run works so later slots can observe and skip its lock.
         void handle.returnValue.then(
           (result) => {
-            if (result.status === "skipped") console.info(`[workshop] workflow ${workflow.name} slot ${decision.slot} skipped (${result.conflictRunId})`);
+            if (result.status === "skipped") console.info(`[workshop] workflow ${workflow.name} slot ${decision.slot} skipped (${result.reason})`);
           },
           (error) => console.error(`[workshop] workflow run ${handle.runId} failed: ${error instanceof Error ? error.message : String(error)}`),
         );
