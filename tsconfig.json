@@ -13,5 +13,5 @@
     "noEmit": true
   },
   "include": ["agent/**/*.ts", "scripts/**/*.ts", "test/**/*.ts"],
-  "exclude": ["src", "tests", "spike", "node_modules"]
+  "exclude": ["spike", "node_modules"]
 }

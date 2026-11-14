@@ -10,328 +10,121 @@ A reader should know what a file does from its path alone, before opening it.
 
 ### Folders are nouns, files are verbs
 
-- **Folders** name the domain things the code is about: `definition/`, `run/`,
-  `attempt/`, `storage/`. Pick the nouns your data model already uses (table
-  names, directory names, words in the UI) so one word means one thing
-  everywhere.
-- **Files** lead with a verb that says what the file does to that thing:
-  `run/create-run.ts`, `attempt/judge-output.ts`, `storage/disk/lock-run.ts`.
-  A noun alone (`packet.ts`, `utils.ts`, `helpers.ts`) says what a file is
-  about, not what it does, and invites unrelated code to pile in.
-- **Exception: pure shape.** A file that only declares types, a schema, or an
-  interface keeps a noun name: `schema.ts`, `types.ts`, `data-source.ts`.
-  So does an entrypoint (`main.ts`) and a file named after the command it
-  implements (`cli/watch.ts`).
+- **Folders** name the domain things the code is about: `agent/`, `workflow/`, `run/`, and `schedule/`. Use the same nouns as the data model and user-facing terms.
+- **Files** lead with a verb that says what they do: `workflow/load-workflows.ts`, `workflow/interpret-workflow.ts`, `run/read-run-index.ts`. A noun alone (`types.ts`) says what a file is about, not what it does.
+- **Exception: pure shape.** A file that only declares types or a schema keeps a noun name, such as `workflow/types.ts` or `run/types.ts`. So does an entrypoint (`agent/agent.ts`) and a command tool (`agent/tools/list_runs.ts`).
 
 ### Use one verb per kind of work
 
-Each verb below has one meaning. Reuse it for that meaning, and never borrow it
-for another.
+Give each verb one meaning and reuse it for that meaning:
 
 | Verb | Means | Example |
 | --- | --- | --- |
-| `parse` | turn text into structure | `parse-yaml.ts`, `parse-units.ts` |
-| `check` | apply a fixed rule; pass or throw, no judgment | `check-chain.ts`, `check-packet.ts` |
-| `judge` | ask an agent or command whether output is good enough | `judge-output.ts` |
-| `resolve` | combine layered settings into one value | `resolve-node-settings.ts` |
-| `load` | read a file and return checked data | `load-definition.ts` |
-| `build` | assemble data for another program to consume | `build-status-json.ts` |
-| `render` | produce text for a person or an agent to read | `render-agent-prompt.ts` |
-| `locate` | compute a path without touching disk | `locate-run-files.ts` |
-| `create` | add a new record | `create-run.ts` |
-| `execute` | carry out one unit of work to its end | `execute-attempt.ts` |
-| `recover` | repair state left behind by a crash | `recover-after-crash.ts` |
+| `parse` | turn text into structure | `workflow/parse-workflow-decision.ts` |
+| `check` | apply fixed rules and report errors | `scripts/check-workflows.ts` |
+| `load` | read a file and return checked data | `workflow/load-workflows.ts` |
+| `build` | assemble input for another program | `workflow/build-orchestrator-brief.ts` |
+| `create` | make a new snapshot | `workflow/create-workflow-snapshot.ts` |
+| `execute` | carry out a unit of work | `agent/lib/execute-workflow-process.ts` |
+| `locate` | find a state file | `run/locate-blocked-step.ts` |
+| `record` | append an action record | `run/record-action-log.ts` |
+| `read` | read stored records | `run/read-run-index.ts` |
 
-Other plain verbs (`launch`, `merge`, `verify`, `format`) are fine when no verb
-above already covers the job. Before adding a verb, check that it does not
-overlap one in the table; if it will recur, add it to the table.
+Other plain verbs (`start`, `send`, `cancel`, `pause`, `resume`) are fine when no verb above already covers the job. Before adding a verb, check that it does not overlap one in the table; if it will recur, add it to the table.
 
 ### Rules that prevent collisions
 
-- **Never use "run" as a verb.** In a workflow runner, "run" is the most
-  important noun. A function named `runChain` or a file named `run-paths.ts`
-  forces the reader to guess which meaning you meant. Use `execute`, `advance`,
-  `launch`, or a more specific verb.
-- **Never use "validate" for two things.** The user-facing step `verify` is
-  called a validator in code. Code that applies fixed rules says `check`, and
-  code that invokes a validator says `judge`.
-- **Steps are nodes in code.** Authors write `steps:`; the frozen definition,
-  records, and tasks call them nodes (`NodeAttempt`, `nodeId`).
-- **Name the logic, not the area.** `run-paths.ts` leaves open whether the
-  file builds, checks, or cleans paths. `locate-run-files.ts` does not.
-- **Match exported symbols to the file's verb.** `judge-output.ts` exports
-  `judgeOutput`; `locate-run-files.ts` exports `locateWorklog`.
-- **Split a file when its name needs "and".** `open-and-migrate.ts` is the
-  ceiling: two steps that always happen together. Three verbs means three files.
+- **Never use "run" as a verb.** In a workflow runner, `run` names one execution. A function named `runWorkflow` or a file named `run-paths.ts` forces the reader to guess which meaning you meant. Use `execute`, `advance`, `start`, or a more specific verb.
+- **Use `parse` and `check` for different jobs.** Parsing turns input into structure. Checking applies fixed rules and reports errors.
+- **Use the project's domain words.** Authors and code both call these items steps (`WorkflowStep`), not nodes.
+- **Name the logic, not the area.** `run/read-run-index.ts` says what it reads; a broad name like `run/state.ts` does not.
+- **Match exported symbols to the file's verb.** `workflow/load-workflows.ts` exports `loadWorkflows`; `run/locate-blocked-step.ts` exports `locateBlockedStep`.
+- **Split a file when its name needs "and".** `read-and-remove.ts` is the ceiling: two steps that always happen together. Three verbs means three files.
 
 ## Code
 
-- **Optimize for deletion.** Keep behavior local. Prefer a small duplicated
-  helper over a shared abstraction that couples two features.
-- **Point dependencies one way.** Entry points depend on domain folders, and
-  domain folders depend on storage and utilities. Never the reverse. When a
-  rule matters, write a test that reads the import graph and fails on a
-  violation.
-- **Comment the why.** Explain non-obvious reasons and constraints. Do not
-  narrate what the next line does.
-- **Test behavior that could regress.** Test what the code promises: its
-  outputs, state transitions, and error cases. Do not test how it is built.
+- **Optimize for deletion.** Keep behavior local. Prefer a small duplicated helper over a shared abstraction that couples two features.
+- **Point dependencies one way.** Entry points depend on domain folders, and domain folders depend on storage and utilities. Never the reverse. When a rule matters, write a test that reads the import graph and fails on a violation.
+- **Comment the why.** Explain non-obvious reasons and constraints. Do not narrate what the next line does.
+- **Test behavior that could regress.** Test what the code promises: its outputs, state transitions, and error cases. Do not test how it is built.
 
 ## Changes
 
-- Keep each change small and about one thing. A rename and a behavior change
-  belong in separate commits.
-- Write commit subjects that say what changed and why; put the reasoning a
-  reviewer needs in the body.
+- Keep each change small and about one thing. A rename and a behavior change belong in separate commits.
+- Write commit subjects that say what changed and why; put the reasoning a reviewer needs in the body.
 - Run the typecheck and tests before asking for review.
 
 ## This project
 
-- Domain nouns: **workflow** (the YAML definition), **run** (one occurrence of
-  a workflow), **attempt** (one try at one node). These match the stored
-  records and workflow-owned projection files.
-- The `service` owns runs. A step-local verifier checks results and can request
-  a retry or block. Fixed rules decide failure and retry transitions.
-- Checks before review:
+- A **workflow** is a folder of settings and ordered steps. A **run** is one execution of that workflow. A **step** is a command or an agent operation.
+- Eve owns durable workflow execution. Workshop loads workflow folders, interprets steps, starts scheduled work, and exposes the orchestrator tools.
+- `make check` validates local config and workflow folders, typechecks the project, and runs its tests.
+- Before review, run:
 
-  ```bash
-  bunx tsc --noEmit
-  bun test
+  ```fish
+  npx tsc --noEmit
+  npm test
+  make check
+  npx eve build
   ```
 
-- [Code map](#code-map) describes the folders and their boundaries; update it
-  when you add or move a file.
+- [Code map](#code-map) describes the folders and their boundaries; update it when you add or move a file.
 
 ## How the code works
 
-Workshop is a local service with a thin CLI. The CLI sends every command over a
-private Unix socket. The service owns a Pi Durable Harness: a task runner that
-commits each step's progress to SQLite before taking the next one. Every run is
-a small tree of Durable tasks, so after a crash the service resumes from the
-last commit instead of guessing.
+Workshop is a Node.js and TypeScript application built on Eve. `make dev` starts Eve's development server; `make start` builds the app and starts its local service. Eve owns the schedule, chat session, and durable workflow execution.
+
+The configured orchestrator profile powers chat through an Eve model adapter. Eve exposes Workshop's tools for listing workflows and runs, reading runs, starting or cancelling work, deciding blocked steps, pausing or resuming workflows, and reading actions. A one-minute UTC schedule checks each workflow and starts its latest due slot.
+
+A workflow start records admission, copies the source folder into a run snapshot, and interprets its numbered steps in order. Command steps run with `sh` or `node`; agent steps and Markdown checks run through a configured profile command. Accepted output becomes the next step's stdin or is appended to the next agent prompt under `Input`. Checks and retries apply before the automatic orchestrator rounds. A run waits on an Eve hook when chat must decide what happens next.
+
+Steps share the persistent `data/<workflow>/` folder. Workshop keeps a run index, action log, pause list, and blocked-step records under `state/`; Eve owns the durable execution state. Commands and agent profiles run with the user's permissions. They are not sandboxed, and an interrupted external action can repeat.
 
 ```mermaid
 flowchart TD
-  CLI[workshop CLI] -->|Unix socket| SVC[service]
-  SVC --> H[Durable Harness + SQLite]
-  H --> SCH[ScheduleWakeup task]
-  SCH -->|admits| WR[WorkflowRun task]
-  SVC -->|start| WR
-  WR --> NA[NodeAttempt task]
-  NA -->|command| PE[ProcessExecution task]
-  PE --> P[command process]
-  NA -->|agent| AE[AgentExecution task]
-  AE --> C[durable conversation]
-  WR -->|fixed decision table| D[retry / block / fail]
-  D --> WR
-  PE --> V[.state/captures: temporary bytes]
-  SVC --> RF[.workshop/<workflow>: results.md + optional execution.log]
+  MAKE[make dev or make start] --> EVE[Eve app]
+  EVE --> AGENT[agent/agent.ts and Workshop tools]
+  EVE --> SCHEDULE[one-minute UTC schedule]
+  SCHEDULE --> START[agent/tools/start_workflow.ts]
+  AGENT --> START
+  START --> SNAPSHOT[workflow snapshot]
+  SNAPSHOT --> INTERPRETER[workflow/interpret-workflow.ts]
+  INTERPRETER --> PROCESS[sh, node, or profile command]
+  PROCESS --> DATA[data/<workflow>/]
+  INTERPRETER -->|exhausted retries| ROUNDS[automatic orchestrator rounds]
+  ROUNDS -->|needs a decision| HOOK[Eve decision hook]
+  HOOK --> AGENT
+  START --> INDEX[state/runs.jsonl]
+  AGENT --> ACTIONS[state/actions.jsonl]
 ```
-
-### One run
-
-The task tree for one run, in `src/storage/durable/`:
-
-```text
-WorkflowRun                                define-workshop-tasks.ts
-  preflight → ProcessExecution
-  for each step (node) in the frozen chain:
-    NodeAttempt                            define-node-attempt-task.ts
-      build process stdin                  attempt/build-process-stdin.ts
-      command worker    → ProcessExecution   define-process-execution-task.ts
-      agent worker      → AgentExecution     define-agent-execution-task.ts
-      parse result by frozen result mode
-      command validator → ProcessExecution
-      agent validator   → AgentExecution
-    if the attempt failed:
-      fixed decision table                 define-workshop-tasks.ts
-        retry → new NodeAttempt (needs replay: safe and retries left)
-        identical consecutive failures → repeated_failure block
-        exhausted retry → terminal failure
-    accepted success_and_complete → finish; mark successors skipped
-    accepted needs_input → save wait; release capacity; park the WorkflowRun
-      human.reply continue → reacquire capacity; continue the same WorkflowRun
-      human.reply reject → cancel this occurrence without disabling its schedule
-  retain evidence; update the newest run section in results.md and the optional execution.log
-```
-
-When the service is already running its limit of concurrent runs, a new run
-waits in a CapacityGate task until a slot frees up.
-
-### Built on Pi Durable
-
-[Pi Durable](https://www.npmjs.com/package/@earendil-works/pi-durable)
-(`@earendil-works/pi-durable`, pinned at 1.4.0) is a library that runs
-checkpointed tasks and model conversations on top of SQLite. Workshop has no
-storage or task engine of its own; it maps its concepts onto Durable's. Command
-workers, command verifiers, and preflight are subprocesses launched by
-`src/process/launch-process.ts`. Agent workers and agent verifiers are Durable
-conversations run by the `workshop.agent-execution` task.
-
-| Durable concept | How Workshop uses it |
-| --- | --- |
-| `Harness` and `Registry` | `service/open-service-runtime.ts` opens one Harness on `.state/durable.db`, registers six task definitions, inspects task and process evidence while paused, then calls `harness.resume()` only when startup checks pass. |
-| Tasks (`defineTask`) | `WorkflowRun`, `NodeAttempt`, `ProcessExecution`, `AgentExecution`, `CapacityGate`, `ScheduleWakeup` (registered as `workshop.workflow-run` and so on). Each task is a set of named phases. A phase ends by committing its next checkpoint, waiting on children, or settling as completed or failed. |
-| Child tasks | A parent creates children with `tx.createTask` and waits for them with `allSettled`. A failed child comes back as data the parent classifies; it does not crash the parent. |
-| Conversations | Admission gives every run its own conversation. The run's tasks and records attach to it, so its history outlives the tasks. Each agent worker and verifier execution gets its own task-owned conversation. The shared bot has one ownerless conversation whose identity and committed event cursors live in a session document. |
-| Documents (`defineDoc`) | `workshop.run` holds a run's current state, scoped to its conversation. `workshop.installation` (workflows, activations) and `workshop.service-receipts` (idempotent controls) are session-scoped. |
-| Entries (`defineEntry`) | Append-only `workshop.event`, `workshop.process`, and `workshop.judgment` evidence for each run. `logs` reads the process and event entries. |
-| `runtime.commit` | The only way state changes. Document edits, new entries, new child tasks, and the task's own checkpoint land in one SQLite transaction. |
-| `runtime.setTimer` | The scheduler waits for its next slot. The deadline lives in the checkpoint, so the wait survives restarts. |
-| `models` option (`pi-ai`) | The Harness registry serves the shared bot. Agent workers and verifiers run as native conversations. |
-| `snapshot`, `inspect`, `abortTask`, `close` | Status and log reads, startup compatibility checks, stop intent, and graceful shutdown. |
-
-Durable leaves some work to its caller, and Workshop fills each gap:
-
-- **No side effects inside a commit.** `ProcessExecution` first commits a
-  launch intent, then spawns the process outside the transaction, then commits
-  the process identity and exit.
-- **Task ownership says nothing about OS processes.** Durable can resume a
-  task, but it cannot tell whether that task's subprocess died. Startup inspects
-  task and process evidence while scheduling is paused. Any blocked task or
-  uncertain process evidence keeps startup stopped. Explicit recovery verifies
-  process death or records a typed operator attestation before it applies
-  selected abort or retry actions and resumes the installation.
-- **Only one process may own the storage.** Durable has no cross-process
-  locking, so the service holds a kernel lock (`acquire-service-lock.ts`).
-  Ordinary CLI commands use the socket. Recovery commands bypass the socket
-  but acquire the same lock.
-- **Task definitions carry versions.** Each run freezes the versions it started
-  with. After an incompatible upgrade, that run gets a `runtime_incompatible`
-  block instead of running under different code.
 
 ### Code map
 
 Folders and filenames follow [Naming files](#naming-files).
 
 ```text
-src/
-├─ bot/                           shared bot tools, event cursor, and chat projection
-│  ├─ schema.ts                   bot state, chat entries, and pending-decision contracts
-│  ├─ create-bot-tools.ts         restricted status, log, start, and resolve tools
-│  ├─ scan-bot-events.ts          committed event delivery and restart-safe cursors
-│  └─ build-bot-feed.ts           chat transcript and viewer feed lines
-├─ cli/                           argv, offline validation, socket clients
-│  ├─ main.ts                     entry point
-│  ├─ dispatch-command.ts         help, validate, public command routing
-│  ├─ dispatch-public-command.ts  chat, controls, and paged inspection
-│  ├─ errors.ts                   error text at the CLI boundary
-│  ├─ service.ts                  service start | serve | status | stop | recover routing
-│  ├─ recover.ts                  terminal-confirmed Durable task recovery
-│  └─ watch.ts                    TTY routing, bot feed, and selected-run viewer reads
-├─ service/                       one owner process per installation
-│  ├─ serve-service-process.ts    process entry and signal shutdown
-│  ├─ serve-workshop-service.ts   socket server, ownership, request dispatch
-│  ├─ open-service-runtime.ts     paused inspection, fail-closed startup, bot, and service controls
-│  ├─ inspect-service-recovery.ts bounded stopped-task and pending-work manifest
-│  ├─ recover-service-tasks.ts    confirmed process retirement and task controls
-│  ├─ schema-recovery.ts          recovery manifest and receipt contracts
-│  ├─ reply-human-wait.ts         checked replies and atomic wait settlement
-│  ├─ project-service-reads.ts    status, node previews, run pages, retained logs
-│  ├─ project-run-files.ts        serialized atomic readable-file projections
-│  ├─ launch-service-process.ts   reuse or spawn the service
-│  ├─ stop-service-process.ts     verified SIGTERM and bounded wait
-│  ├─ acquire-service-lock.ts     kernel lock and process identity
-│  ├─ probe-service-health.ts     metadata, startup snapshots, and live socket checks
-│  ├─ write-startup-park-diagnostic.ts bounded private startup park snapshot
-│  ├─ locate-service-socket.ts    short private socket path
-│  ├─ schema.ts                   request, response, metadata contracts
-│  ├─ parse-service-protocol.ts   checked frames and fragmented responses
-│  └─ send-service-request.ts     socket client and paged log reads
-├─ storage/
-│  ├─ durable/                    checkpointed tasks and records
-│  │  ├─ define-scheduler-wakeup-task.ts fixed-rate admission on persisted deadlines
-│  │  ├─ admit-run.ts             atomic idempotent admission
-│  │  ├─ define-capacity-gate-task.ts waits for a freed run slot on document watches
-│  │  ├─ define-workshop-tasks.ts WorkflowRun and fixed outcome decisions
-│  │  ├─ define-node-attempt-task.ts worker, result parsing, verifier
-│  │  ├─ define-process-execution-task.ts command spawn, capture, crash replay
-│  │  ├─ define-agent-execution-task.ts native agent worker and verifier conversations
-│  │  ├─ define-workshop-records.ts installation, run, bot documents and evidence
-│  │  ├─ schema-recovery.ts          recovery intent and death-evidence contracts
-│  │  ├─ define-recovery-records.ts  recovery journal and request documents
-│  │  ├─ commit-recovery-intent.ts   checked recovery journal transitions
-│  │  ├─ commit-service-mutation.ts idempotent control receipts
-│  │  ├─ render-worklog.ts        compact or verbose committed worklog
-│  │  ├─ checkpoint-durable-wal.ts idle WAL truncation
-│  │  └─ open-durable-storage.ts SQLite with FULL synchronization
-│  └─ disk/
-│     ├─ cap-streams.ts           bounded stream capture and retention metadata
-│     └─ remove-process-captures.ts checked capture removal
-├─ definition/                    strict YAML and resolved frozen settings
-│  ├─ parse-yaml.ts               reject duplicate keys and anchors
-│  ├─ check-definition.ts         format 4 authoring and migration checks
-│  ├─ check-chain.ts              linear chain invariants
-│  ├─ resolve-agent-settings.ts   worker and verifier model resolution
-│  ├─ resolve-workflow-settings.ts frozen execution settings; text worker default
-│  ├─ resolve-retry-limit.ts      format 4 and historical retry counts
-│  ├─ parse-model.ts              provider/model/thinking strings
-│  ├─ hash-canonical-json.ts      stable definition hashes
-│  ├─ schema.ts                   authored, machine, historical definitions
-│  ├─ schema-resolved.ts          current and historical frozen settings
-├─ model/                          owner Pi provider catalog and request-time auth
-│  ├─ create-workshop-models.ts    built-in plus checked owner Tally providers
-│  ├─ load-owner-models.ts         private catalog file read
-│  ├─ parse-owner-models.ts        checked public provider and model metadata
-│  ├─ resolve-owner-provider-auth.ts request-time credential lookup
-│  └─ schema-owner-models.ts       owner provider catalog and credential shapes
-├─ installation/
-│  ├─ load-installation.ts        find .workshop and load checked workflows
-│  └─ schema.ts                   installation index, activations, receipts
-├─ run/
-│  ├─ check-block-resolution.ts   action and resolver authority table
-│  ├─ decide-fixed-rate-schedule.ts due slots and catch-up decisions
-│  ├─ locate-run-files.ts         readable paths and capture identity
-│  ├─ prepare-admission.ts        frozen admission input and initial run
-│  ├─ render-run-files.ts         results.md and execution.log text
-│  ├─ records.ts                  persisted run and evidence contracts
-│  └─ schema.ts                   lifecycle, outcomes, blocks, waits
-├─ attempt/
-│  ├─ parse-result.ts             historical JSON result contracts
-│  ├─ parse-tagged-result.ts      text and tagged worker stdout results
-│  ├─ parse-verifier-result.ts    strict verifier decision-line stdout
-│  ├─ build-process-stdin.ts      committed role input bytes and hashes
-│  ├─ build-failure-feedback.ts   bounded feedback and raw evidence hashes
-│  └─ render-agent-prompt.ts      text and tagged worker contracts; verifier decision-line prompts
-├─ process/
-│  ├─ launch-process.ts           supervised process group and stdin writer
-│  ├─ identify-host-boot.ts      host boot identity for death checks
-│  ├─ verify-process-death.ts     verify or retire one process group
-│  ├─ identify-process.ts         PID, group, and start identity checks
-│  ├─ kill-process-tree.ts        group retirement with confirmed death
-│  ├─ read-retained-capture.ts    exact UTF-8 or labeled base64 evidence
-│  └─ schema.ts                   process, capture, stdin evidence contracts
-├─ views/
-│  ├─ schema.ts                   versioned public JSON projections
-│  ├─ format-for-terminal.ts      local times and lifecycle glyphs
-│  └─ render-status.ts            three-column snapshots and state previews
-├─ tui/                           lazily loaded OpenTUI clients
-│  ├─ data-source.ts              service-backed snapshot contract
-│  ├─ build-panes.ts              overview and frozen-chain screen models
-│  ├─ mount-viewer.ts             scroll, navigation, serial refresh
-│  └─ mount-chat.ts               shared conversation and pending decisions
-└─ util/
-   ├─ parse-units.ts              duration and byte-size parsing
-   └─ schema.ts                   shared primitive contracts
+agent/                         Eve application and Workshop chat integration
+├─ agent.ts                    configured profile as Eve's chat model
+├─ instructions.md             orchestrator rules and first-message routine
+├─ channels/eve.ts             local-request authentication
+├─ lib/                        config, profile model, child process, hook decisions
+├─ schedules/                  one-minute workflow scheduler
+└─ tools/                      chat tools for runs, decisions, pause, and actions
+workflow/                      workflow parsing, snapshots, interpretation, and retries
+run/                           run index, blocked-step records, and action log
+schedule/                      latest due cron-slot selection
+scripts/                       config/workflow checks, private copy, launch-agent setup
+service/                       launch-agent plist template
+test/                          v2 tests and fake profile fixtures
+examples/workflows/             hemingway-clock and daily-summary folders
+workflows/                      private workflows; upstream keeps .gitkeep only
+workshop.example.yaml           config template
+workshop.yaml                   local config, ignored upstream
+Makefile                        setup, checks, service, and copy commands
 ```
 
-Repository-root entrypoints sit outside this map. The `Makefile` exposes
-`make cli`, which always runs the frozen-lockfile install check in the checkout
-and then opens a fish child shell through `launch-workshop-cli.sh`, with a
-temporary `workshop` function that calls `bun src/cli/main.ts`.
-`tests/check-cli-launcher.test.ts` covers the launcher.
+`agent/` contains Eve entry points. The workflow parser and interpreter stay in `workflow/` and do not depend on chat tools. `run/` and `schedule/` hold file-backed records and slot rules. `test/` uses fake profile commands so the suite does not need model credentials.
 
-Three boundaries hold. `tests/check-parity-gaps.test.ts` and
-`tests/tui-boundary.test.ts` enforce the import rules:
+### Tests and validation
 
-- Only the service touches Durable storage. The CLI is a socket client.
-- `views/schema.ts` is the contract for outside readers. The viewer reads
-  those projections, never SQLite or run directories.
-- Only `tui/` imports a UI library, and the CLI loads it lazily.
-
-### Tests and specs
-
-The tests need no model credentials. `tests/check-service-restart.test.ts`
-runs the Hemingway workflow with a faux model through the real CLI and service,
-restarts the service, and checks the same Durable run. The only real-model
-check is the README's [Demo: hemingway-clock](README.md#demo-hemingway-clock) walkthrough.
+`npm test` runs the Node test suite in `test/`. `make check` validates config and workflows, then runs the typecheck and tests. `npx eve build` checks the Eve app bundle.
