@@ -103,6 +103,17 @@ test("config validates command arrays, profile names, references, and context wi
   }
 });
 
+test("profile commands preserve empty arguments for CLI flags", () => {
+  const directory = createDirectory();
+  try {
+    const file = writeConfig(directory, basicConfig('[node, "", -e, hello]'));
+    assert.deepEqual(readConfig(file).agent_profiles.writer?.command, ["node", "", "-e", "hello"]);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+
 test("profile command check requires each first argument to be an executable file", () => {
   const directory = createDirectory();
   try {

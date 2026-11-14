@@ -6,8 +6,9 @@ import { lastSlotForWorkflow, readRunIndex, startedCountForWorkflow } from "../.
 import type { RunIndexEntry } from "../../run/types.ts";
 import { decideWorkflowSlot } from "../../schedule/decide-workflow-slot.ts";
 import { loadWorkflows } from "../../workflow/load-workflows.ts";
+import { readPausedWorkflows } from "../../workflow/read-paused-workflows.ts";
 import { checkProfileCommands, readConfig, type WorkshopConfig } from "../lib/read-config.ts";
-import { executeWorkflow } from "../tools/define-workflow-tool.ts";
+import { executeWorkflow } from "../tools/start_workflow.ts";
 
 export default defineSchedule({
   cron: "* * * * *",
@@ -29,7 +30,15 @@ export default defineSchedule({
     const loaded = loadWorkflows(resolve(process.cwd(), "workflows"), new Set(Object.keys(config.agent_profiles)));
     for (const issue of loaded.errors) console.error(`[workshop] workflow skipped (${issue.file}): ${issue.reason}`);
 
-    const indexFile = resolve(process.cwd(), "state", "runs.jsonl");
+    const stateRoot = resolve(process.cwd(), "state");
+    let paused: Set<string>;
+    try {
+      paused = readPausedWorkflows(resolve(stateRoot, "paused.json"));
+    } catch (error) {
+      console.error(`[workshop] schedule skipped: could not read pause state: ${error instanceof Error ? error.message : String(error)}`);
+      return;
+    }
+    const indexFile = resolve(stateRoot, "runs.jsonl");
     let entries: RunIndexEntry[];
     try {
       entries = readRunIndex(indexFile);
@@ -40,7 +49,7 @@ export default defineSchedule({
 
     const now = new Date();
     for (const workflow of loaded.workflows) {
-      if (workflow.enabled === false) continue;
+      if (workflow.enabled === false || paused.has(workflow.name)) continue;
       const decision = decideWorkflowSlot({
         cron: workflow.cron,
         now,

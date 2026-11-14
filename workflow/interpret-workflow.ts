@@ -1,7 +1,18 @@
-import type { Workflow, WorkflowDecision, WorkflowStep } from "./types.ts";
-import { parseWorkflowDecision } from "./parse-workflow-decision.ts";
+import { advanceOrchestratorRound, type OrchestratorRound } from "./advance-orchestrator-round.ts";
+import { applyWorkflowDecision } from "./apply-workflow-decision.ts";
+import { buildOrchestratorBrief } from "./build-orchestrator-brief.ts";
+import { computeRetryProfiles } from "./compute-retry-profiles.ts";
+import { failedOrchestratorDecision, parseOrchestratorDecision } from "./parse-orchestrator-decision.ts";
+import type {
+  AttemptHistoryEntry,
+  OrchestratorDecision,
+  Workflow,
+  WorkflowDecision,
+  WorkflowStep,
+  WorkflowStepResult,
+} from "./types.ts";
 
-export type ProcessExecutionKind = "command" | "agent" | "command-check" | "agent-check";
+export type ProcessExecutionKind = "command" | "agent" | "command-check" | "agent-check" | "orchestrator";
 
 export type ProcessExecutionRequest = {
   kind: ProcessExecutionKind;
@@ -22,13 +33,29 @@ export type ProcessExecutionResult = {
   error?: string;
 };
 
+export type AutomaticDecisionLog = {
+  workflow: string;
+  runId: string;
+  step: string;
+  round: OrchestratorRound;
+  decision: OrchestratorDecision;
+  note: string;
+};
+
 export type WorkflowInterpreterInput = {
   workflow: Workflow;
   documents: Record<string, string>;
   files: Record<string, string>;
+  contents?: Record<string, string>;
   workflowRunId: string;
   profileCommands: Record<string, string[]>;
+  orchestrator?: {
+    profile: string;
+    escalationProfile: string;
+    recordDecision(input: AutomaticDecisionLog): Promise<void>;
+  };
   executeProcess(request: ProcessExecutionRequest): Promise<ProcessExecutionResult>;
+  waitBeforeRetry?(duration: string): Promise<void>;
   waitForDecision(input: {
     workflow: string;
     runId: string;
@@ -36,6 +63,8 @@ export type WorkflowInterpreterInput = {
     stepKind: WorkflowStep["kind"];
     retryProfiles: string[];
     lastError: string;
+    lastOutput: string;
+    attemptHistory: AttemptHistoryEntry[];
     decisionNumber: number;
   }): Promise<WorkflowDecision>;
 };
@@ -44,6 +73,7 @@ export type WorkflowInterpretation = {
   status: "completed" | "nothing-to-do";
   output: string;
   completedSteps: number;
+  steps: WorkflowStepResult[];
 };
 
 type AttemptResult =
@@ -81,6 +111,15 @@ function processFailure(label: string, result: ProcessExecutionResult, timeoutMs
   const status = result.exitCode === null ? `signal ${result.signal ?? "unknown"}` : `exit code ${result.exitCode}`;
   const details = [result.stderr.trim(), result.stdout.trim()].filter(Boolean).join("\n");
   return `${label} failed with ${status}${details ? `: ${details}` : ""}`;
+}
+
+function attemptRecord(step: WorkflowStep, profile: string | undefined, attempt: number, result: AttemptResult): AttemptHistoryEntry {
+  return {
+    attempt,
+    ...(step.kind === "agent" && profile !== undefined ? { profile } : {}),
+    output: result.output,
+    ...(result.kind === "failed" ? { error: result.reason } : {}),
+  };
 }
 
 export function parseMarkdownVerdict(output: string): { accepted: boolean; reason: string } {
@@ -183,75 +222,212 @@ function retryLimit(step: WorkflowStep, workflow: Workflow): number {
   return step.retries ?? step.check?.retries ?? workflow.retries ?? 0;
 }
 
+function orchestratorDecision(input: WorkflowInterpreterInput, step: WorkflowStep, stepIdValue: string, round: OrchestratorRound, result: Extract<AttemptResult, { kind: "failed" }>, attempts: AttemptHistoryEntry[]): Promise<OrchestratorDecision> {
+  const profileName = round === 1 ? input.orchestrator?.profile : input.orchestrator?.escalationProfile;
+  const command = profileName === undefined ? undefined : input.profileCommands[profileName];
+  if (!command) return Promise.resolve(failedOrchestratorDecision(`profile "${profileName ?? ""}" is not configured`));
+
+  const allowedRetryProfiles = computeRetryProfiles(step, input.profileCommands);
+  const brief = buildOrchestratorBrief({
+    round,
+    workflow: input.workflow,
+    step,
+    stepId: stepIdValue,
+    stepContent: input.contents?.[step.file] ?? input.documents[step.file] ?? "",
+    lastOutput: result.output,
+    lastError: result.reason,
+    attemptHistory: attempts,
+    allowedRetryProfiles,
+  });
+  const timeoutMs = timeoutMilliseconds(step.timeout ?? input.workflow.timeout);
+  return input.executeProcess({
+    kind: "orchestrator",
+    command,
+    input: brief.prompt,
+    step: `${stepIdValue}.orchestrator-round-${round}`,
+    feedback: "",
+    timeoutMs,
+    attempt: 1,
+  }).then((execution) => {
+    if (execution.exitCode !== 0 || execution.timedOut || execution.error !== undefined) {
+      return failedOrchestratorDecision(processFailure(`orchestrator round ${round}`, execution, timeoutMs));
+    }
+    return parseOrchestratorDecision(execution.stdout, brief);
+  });
+}
+
+function workflowDecision(decision: OrchestratorDecision): WorkflowDecision {
+  if (decision.action === "give_up") throw new Error("give_up decisions cannot be applied to a workflow step");
+  if (decision.action === "retry") {
+    return {
+      action: "retry",
+      ...(decision.hint === undefined ? {} : { hint: decision.hint }),
+      ...(decision.profile === undefined ? {} : { profile: decision.profile }),
+      ...(decision.after === undefined ? {} : { after: decision.after }),
+    };
+  }
+  return { action: decision.action };
+}
+
 export async function interpretWorkflow(input: WorkflowInterpreterInput): Promise<WorkflowInterpretation> {
   let pipeInput = "";
   let completedSteps = 0;
+  const steps: WorkflowStepResult[] = [];
   for (const step of input.workflow.steps) {
     const id = stepId(step);
     const retries = retryLimit(step, input.workflow);
-    let batchAttempt = 0;
+    let localRetriesLeft = retries;
     let totalAttempts = 0;
     let decisionNumber = 0;
+    let automaticRound: 0 | 1 | 2 | 3 = input.orchestrator ? 1 : 3;
     let feedback = "";
     let selectedProfile = step.profile;
+    const attemptHistory: AttemptHistoryEntry[] = [];
+    let pendingResult: AttemptResult | undefined;
+    let pendingResultRecorded = false;
 
     while (true) {
-      totalAttempts += 1;
-      const result = await executeAttempt(input, step, selectedProfile, pipeInput, feedback, totalAttempts);
-      if (result.kind === "nothing-to-do") return { status: "nothing-to-do", output: result.output, completedSteps };
+      let result: AttemptResult;
+      let resultRecorded = false;
+      if (pendingResult !== undefined) {
+        result = pendingResult;
+        resultRecorded = pendingResultRecorded;
+        pendingResult = undefined;
+        pendingResultRecorded = false;
+      } else {
+        totalAttempts += 1;
+        result = await executeAttempt(input, step, selectedProfile, pipeInput, feedback, totalAttempts);
+      }
+      if (result.kind === "nothing-to-do") {
+        attemptHistory.push(attemptRecord(step, selectedProfile, totalAttempts, result));
+        steps.push({ step: id, status: "nothing-to-do", output: result.output, attempts: attemptHistory });
+        return { status: "nothing-to-do", output: result.output, completedSteps, steps };
+      }
       if (result.kind === "accepted") {
+        attemptHistory.push(attemptRecord(step, selectedProfile, totalAttempts, result));
         pipeInput = result.output;
         completedSteps += 1;
+        steps.push({ step: id, status: "completed", output: result.output, attempts: attemptHistory });
         break;
       }
 
-      if (batchAttempt < retries) {
-        batchAttempt += 1;
+      if (!resultRecorded) attemptHistory.push(attemptRecord(step, selectedProfile, totalAttempts, result));
+      if (localRetriesLeft > 0) {
+        localRetriesLeft -= 1;
         feedback = result.reason;
         continue;
       }
 
+      if (automaticRound === 1 || automaticRound === 2) {
+        const round: OrchestratorRound = automaticRound;
+        const decision = await orchestratorDecision(input, step, id, round, result, attemptHistory);
+        await input.orchestrator?.recordDecision({
+          workflow: input.workflow.name,
+          runId: input.workflowRunId,
+          step: id,
+          round,
+          decision,
+          note: decision.note,
+        });
+        const transition = advanceOrchestratorRound(round, decision);
+        if (transition.kind === "escalate" || transition.kind === "wait-for-user") {
+          automaticRound = round === 1 ? 2 : 3;
+          pendingResult = result;
+          pendingResultRecorded = true;
+          continue;
+        }
+
+        const applied = applyWorkflowDecision({
+          decision: workflowDecision(decision),
+          step,
+          currentProfile: selectedProfile,
+          profileCommands: input.profileCommands,
+          lastError: result.reason,
+        });
+        if (applied.action === "retry") {
+          if (applied.after !== undefined) {
+            if (!input.waitBeforeRetry) throw new Error("A retry delay was requested but no durable wait is configured");
+            await input.waitBeforeRetry(applied.after);
+          }
+          selectedProfile = applied.profile;
+          feedback = applied.feedback;
+          totalAttempts += 1;
+          const retried = await executeAttempt(input, step, selectedProfile, pipeInput, feedback, totalAttempts);
+          if (retried.kind === "nothing-to-do") {
+            attemptHistory.push(attemptRecord(step, selectedProfile, totalAttempts, retried));
+            steps.push({ step: id, status: "nothing-to-do", output: retried.output, attempts: attemptHistory });
+            return { status: "nothing-to-do", output: retried.output, completedSteps, steps };
+          }
+          if (retried.kind === "accepted") {
+            attemptHistory.push(attemptRecord(step, selectedProfile, totalAttempts, retried));
+            pipeInput = retried.output;
+            completedSteps += 1;
+            steps.push({ step: id, status: "completed", output: retried.output, attempts: attemptHistory });
+            break;
+          }
+          automaticRound = round === 1 ? 2 : 3;
+          // Reuse the durable attempt result; do not execute the failed step again.
+          pendingResult = retried;
+          pendingResultRecorded = false;
+          continue;
+        }
+
+        if (applied.action === "skip") {
+          completedSteps += 1;
+          steps.push({ step: id, status: "skipped", output: "", attempts: attemptHistory });
+          break;
+        }
+        if (applied.action === "accept") {
+          pipeInput = result.output;
+          completedSteps += 1;
+          steps.push({ step: id, status: "completed", output: result.output, attempts: attemptHistory });
+          break;
+        }
+        throw new Error(`${id} failed after ${totalAttempts} attempts: ${result.reason}`);
+      }
+
       decisionNumber += 1;
-      const decision = parseWorkflowDecision(await input.waitForDecision({
+      const decision = await input.waitForDecision({
         workflow: input.workflow.name,
         runId: input.workflowRunId,
         step: id,
         stepKind: step.kind,
-        retryProfiles: step.kind === "agent"
-          ? Object.entries(input.profileCommands)
-              .filter(([, command]) => command[0] === input.profileCommands[step.profile ?? ""]?.[0])
-              .map(([name]) => name)
-          : [],
+        retryProfiles: computeRetryProfiles(step, input.profileCommands),
         lastError: result.reason,
+        lastOutput: result.output,
+        attemptHistory,
         decisionNumber,
-      }));
-      if (decision.action === "retry") {
-        if (decision.profile !== undefined) {
-          if (step.kind !== "agent") throw new Error(`${id} cannot retry with a profile because it is a command step`);
-          const retryCommand = input.profileCommands[decision.profile];
-          if (!retryCommand) throw new Error(`Unknown retry profile "${decision.profile}" for ${id}`);
-          const originalExecutable = input.profileCommands[step.profile ?? ""]?.[0];
-          if (retryCommand[0] !== originalExecutable) {
-            throw new Error(`Retry profile "${decision.profile}" must use the same executable as ${step.profile}`);
-          }
-          selectedProfile = decision.profile;
+      });
+      const applied = applyWorkflowDecision({
+        decision,
+        step,
+        currentProfile: selectedProfile,
+        profileCommands: input.profileCommands,
+        lastError: result.reason,
+      });
+      if (applied.action === "retry") {
+        if (applied.after !== undefined) {
+          if (!input.waitBeforeRetry) throw new Error("A retry delay was requested but no durable wait is configured");
+          await input.waitBeforeRetry(applied.after);
         }
-        feedback = [result.reason, decision.hint ? `Hint: ${decision.hint}` : ""].filter(Boolean).join("\n\n");
-        batchAttempt = 0;
+        selectedProfile = applied.profile;
+        feedback = applied.feedback;
+        localRetriesLeft = retries;
         continue;
       }
-      if (decision.action === "skip") {
-        // A skipped step has no stdout, so leave the previous pipe input unchanged.
+      if (applied.action === "skip") {
         completedSteps += 1;
+        steps.push({ step: id, status: "skipped", output: "", attempts: attemptHistory });
         break;
       }
-      if (decision.action === "accept") {
+      if (applied.action === "accept") {
         pipeInput = result.output;
         completedSteps += 1;
+        steps.push({ step: id, status: "completed", output: result.output, attempts: attemptHistory });
         break;
       }
       throw new Error(`${id} failed after ${totalAttempts} attempts: ${result.reason}`);
     }
   }
-  return { status: "completed", output: pipeInput, completedSteps };
+  return { status: "completed", output: pipeInput, completedSteps, steps };
 }

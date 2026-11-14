@@ -1,16 +1,35 @@
 export type WorkflowStepKind = "agent" | "command";
 
 export type WorkflowDecision =
-  | { action: "retry"; hint?: string; profile?: string }
+  | { action: "retry"; hint?: string; profile?: string; after?: string }
   | { action: "skip" }
   | { action: "accept" }
   | { action: "fail" };
+
+export type OrchestratorDecision =
+  | { action: "retry"; hint?: string; profile?: string; after?: string; note: string }
+  | { action: "skip" | "accept" | "fail" | "give_up"; note: string };
+
+export type AttemptHistoryEntry = {
+  attempt: number;
+  profile?: string;
+  output: string;
+  error?: string;
+};
+
+export type WorkflowStepResult = {
+  step: string;
+  status: "completed" | "skipped" | "nothing-to-do";
+  output: string;
+  attempts: AttemptHistoryEntry[];
+};
 
 export type WorkflowSnapshot = {
   workflow: Workflow;
   runDirectory: string;
   documents: Record<string, string>;
   files: Record<string, string>;
+  contents: Record<string, string>;
   profileCommands: Record<string, string[]>;
   dataDirectory: string;
 };

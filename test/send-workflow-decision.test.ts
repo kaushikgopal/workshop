@@ -9,6 +9,7 @@ import { buildDecisionToken } from "../run/build-decision-token.ts";
 import { locateBlockedStep } from "../run/locate-blocked-step.ts";
 import { removeBlockedStep } from "../run/remove-blocked-step.ts";
 import { writeBlockedStep } from "../run/write-blocked-step.ts";
+import { readActionLog } from "../run/read-action-log.ts";
 
 function withState(action: (stateRoot: string) => Promise<void>): Promise<void> {
   const root = mkdtempSync(join(tmpdir(), "workshop-decision-test-"));
@@ -62,6 +63,12 @@ test("sendWorkflowDecision resumes the blocked run with a checked payload", asyn
       token,
       decision: { action: "retry", hint: "Try a shorter sentence.", profile: "writer-fast" },
     });
+    const action = readActionLog(join(stateRoot, "actions.jsonl"))[0];
+    assert.equal(action?.source, "chat");
+    assert.equal(action?.run_id, runId);
+    assert.equal(action?.step, "10-write");
+    assert.deepEqual(action?.decision, { action: "retry", hint: "Try a shorter sentence.", profile: "writer-fast" });
+
     removeBlockedStep(locateBlockedStep(stateRoot, runId));
     await assert.rejects(sendWorkflowDecision(runId, { action: "skip" }, {
       stateRoot,

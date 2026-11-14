@@ -10,8 +10,8 @@ Before checking or launching, edit the root `workshop.yaml`. Replace model
 placeholders and remove profiles whose CLIs are not installed. Keep both
 orchestrator profile references pointed at profiles that remain declared.
 
-Run `make check` to validate config, workflow folders, types, and tests. Use
-`make dev` for local development or `make start` to build and start Eve.
+Run `make check` to validate config, workflow folders, types, and tests.
+By default, `make dev` serves on `127.0.0.1:2000` and `make start` serves on `127.0.0.1:3000`. The start service accepts loopback clients only. `make chat` prefers the start service and falls back to the dev server.
 
 Each v2 workflow lives in its own folder. It has a `workflow.md` file and
 numbered `.md`, `.sh`, or `.ts` steps. A matching `.check.md`, `.check.sh`, or
@@ -21,8 +21,11 @@ Each run copies its workflow to `state/snapshots/<run_id>/` and removes the
 copy when it ends. Steps share files in `data/<workflow>/`. The one-minute
 schedule starts only the latest due slot, honors `max_runs`, and records starts
 and skipped slots in `state/runs.jsonl`. Step output feeds the next command on
-stdin or an agent under `Input`; rejected checks retry with feedback, and runs
-wait for a retry, skip, accept, or fail decision when attempts run out.
+stdin or an agent under `Input`; rejected checks retry with feedback. When a
+step exhausts its retries, two orchestrator rounds decide what to do before
+the run waits for chat. `state/actions.jsonl` records decisions and chat
+actions. Pausing a workflow skips schedule ticks and refuses manual starts.
+The orchestrator can act on runs but never edits workflow files.
 Timeouts must fit Node's timer range. Agent retries may change profiles only
 when both profiles use the same executable. A command can outlive a forced
 server kill, and a restarted run can repeat its unfinished step. Make external

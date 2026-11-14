@@ -9,6 +9,13 @@ const blockedStepSchema = z.object({
   step_kind: z.enum(["agent", "command"]),
   retry_profiles: z.array(z.string().regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/)),
   last_error: z.string(),
+  last_output: z.string().optional(),
+  attempt_history: z.array(z.object({
+    attempt: z.number().int().positive(),
+    profile: z.string().optional(),
+    output: z.string(),
+    error: z.string().optional(),
+  }).strict()).optional(),
   token: z.string().min(1),
   at: z.string().datetime({ offset: true }),
 }).strict();

@@ -38,6 +38,15 @@ function workflowFiles(workflow: Workflow, directory: string): Record<string, st
   return files;
 }
 
+function workflowContents(workflow: Workflow, directory: string): Record<string, string> {
+  const contents: Record<string, string> = {};
+  for (const step of workflow.steps) {
+    contents[step.file] = readFileSync(join(directory, step.file), "utf8");
+    if (step.check) contents[step.check.file] = readFileSync(join(directory, step.check.file), "utf8");
+  }
+  return contents;
+}
+
 export function createWorkflowSnapshot(input: CreateWorkflowSnapshotInput): WorkflowSnapshot {
   if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(input.workflowName)) throw new Error(`Invalid workflow name: ${input.workflowName}`);
   if (!/^[A-Za-z0-9_-]+$/.test(input.runId)) throw new Error(`Invalid workflow run ID: ${input.runId}`);
@@ -66,6 +75,7 @@ export function createWorkflowSnapshot(input: CreateWorkflowSnapshotInput): Work
       runDirectory,
       documents: workflowDocuments(workflow, directory),
       files: workflowFiles(workflow, directory),
+      contents: workflowContents(workflow, directory),
       profileCommands: input.profileCommands,
       dataDirectory: input.dataDirectory,
     };

@@ -20,4 +20,5 @@ export default defineAgent({
   model: createProfileModel(profile.command),
   modelContextWindowTokens: profile.context_window ?? 32_000,
   defaultTools: false,
+  tool: false,
 });

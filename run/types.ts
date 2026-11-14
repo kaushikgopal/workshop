@@ -1,3 +1,4 @@
+import type { AttemptHistoryEntry } from "../workflow/types.ts";
 export type RunIndexEntry = {
   workflow: string;
   slot: string | null;
@@ -14,6 +15,8 @@ export type BlockedWorkflowStep = {
   step_kind: "agent" | "command";
   retry_profiles: string[];
   last_error: string;
+  last_output?: string;
+  attempt_history?: AttemptHistoryEntry[];
   token: string;
   at: string;
 };

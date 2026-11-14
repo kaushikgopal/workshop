@@ -1,25 +1,28 @@
 import { mkdirSync, rmSync } from "node:fs";
 import { resolve } from "node:path";
 import { defineWorkflowTool } from "eve/tools";
-import { createHook, FatalError, getWorkflowMetadata } from "eve/workflow";
+import { createHook, FatalError, getWorkflowMetadata, sleep } from "eve/workflow";
+import { start } from "eve/workflow/api";
 import { z } from "zod";
+import { recordActionLog } from "../../run/record-action-log.ts";
 import { decideWorkflowAdmission } from "../../run/admit-workflow-run.ts";
 import { appendRunIndex } from "../../run/append-run-index.ts";
 import { buildDecisionToken } from "../../run/build-decision-token.ts";
 import { locateBlockedStep } from "../../run/locate-blocked-step.ts";
+import { readPausedWorkflows } from "../../workflow/read-paused-workflows.ts";
 import { readRunIndex } from "../../run/read-run-index.ts";
 import { removeBlockedStep } from "../../run/remove-blocked-step.ts";
 import { writeBlockedStep } from "../../run/write-blocked-step.ts";
 import { createWorkflowSnapshot } from "../../workflow/create-workflow-snapshot.ts";
-import { interpretWorkflow } from "../../workflow/interpret-workflow.ts";
+import { interpretWorkflow, type AutomaticDecisionLog } from "../../workflow/interpret-workflow.ts";
 import { parseWorkflowDecision } from "../../workflow/parse-workflow-decision.ts";
-import type { WorkflowDecision, WorkflowSnapshot } from "../../workflow/types.ts";
+import type { AttemptHistoryEntry, WorkflowDecision, WorkflowSnapshot } from "../../workflow/types.ts";
 import { executeWorkflowProcess } from "../lib/execute-workflow-process.ts";
 import { checkProfileCommands, readConfig } from "../lib/read-config.ts";
 
 type WorkflowStartInput = { workflowName: string; scheduledSlot?: string | null; maxRuns?: number };
 type PreparedWorkflowResult =
-  | { kind: "prepared"; snapshot: WorkflowSnapshot }
+  | { kind: "prepared"; snapshot: WorkflowSnapshot; orchestrator: { profile: string; escalationProfile: string } }
   | { kind: "skipped"; reason: string };
 type BlockedDecisionInput = {
   workflow: string;
@@ -28,10 +31,26 @@ type BlockedDecisionInput = {
   stepKind: "agent" | "command";
   retryProfiles: string[];
   lastError: string;
+  lastOutput: string;
+  attemptHistory: AttemptHistoryEntry[];
   decisionNumber: number;
 };
 
 const workflowNameSchema = z.string().regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/);
+
+export async function startWorkflowForChat(
+  workflowName: string,
+  ports: {
+    isPaused(name: string): boolean;
+    start(name: string): Promise<string>;
+    recordStart?(name: string, runId: string): Promise<void> | void;
+  },
+): Promise<{ status: "started"; workflow: string; runId: string }> {
+  if (ports.isPaused(workflowName)) throw new Error(`Workflow "${workflowName}" is paused; resume it before starting manually.`);
+  const runId = await ports.start(workflowName);
+  await ports.recordStart?.(workflowName, runId);
+  return { status: "started", workflow: workflowName, runId };
+}
 
 export async function executeWorkflow(input: WorkflowStartInput) {
   "use workflow";
@@ -56,6 +75,7 @@ export async function executeWorkflow(input: WorkflowStartInput) {
         workflowName: input.workflowName,
         runId: workflowRunId,
         slot: input.scheduledSlot ?? null,
+        manual: input.scheduledSlot === undefined || input.scheduledSlot === null,
         ...(input.maxRuns === undefined ? {} : { maxRuns: input.maxRuns }),
       });
       if (prepared.kind === "skipped") {
@@ -67,8 +87,13 @@ export async function executeWorkflow(input: WorkflowStartInput) {
         workflow: preparedSnapshot.workflow,
         documents: preparedSnapshot.documents,
         files: preparedSnapshot.files,
+        contents: preparedSnapshot.contents,
         workflowRunId,
         profileCommands: preparedSnapshot.profileCommands,
+        orchestrator: {
+          ...prepared.orchestrator,
+          recordDecision: recordAutomaticDecision,
+        },
         executeProcess: (request) => executeWorkflowProcess({
           ...request,
           workflow: input.workflowName,
@@ -76,6 +101,7 @@ export async function executeWorkflow(input: WorkflowStartInput) {
           dataDirectory: preparedSnapshot.dataDirectory,
           cwd: preparedSnapshot.dataDirectory,
         }),
+        waitBeforeRetry: (duration) => sleep(duration),
         waitForDecision: (blocked) => waitForWorkflowDecision(blocked),
       });
       return { ...result, workflowRunId };
@@ -92,16 +118,54 @@ export async function executeWorkflow(input: WorkflowStartInput) {
 }
 
 export default defineWorkflowTool({
-  description: "Start a named workflow. Each run uses a snapshot of its numbered steps and resumes safely after a restart.",
+  description: "Start a named workflow and return its run id. Use list_runs and read_run to inspect progress.",
   inputSchema: z.object({ workflowName: workflowNameSchema }),
-  execute: executeWorkflow,
+  async task({ workflowName }) {
+    "use workflow";
+    if (!workflowNameSchema.safeParse(workflowName).success) throw new FatalError(`Invalid workflow name: ${workflowName}`);
+    return await startManualWorkflow(workflowName);
+  },
 });
 
-async function prepareWorkflow(input: { workflowName: string; runId: string; slot: string | null; maxRuns?: number }): Promise<PreparedWorkflowResult> {
+async function startManualWorkflow(workflowName: string): Promise<{ status: "started"; workflow: string; runId: string }> {
+  "use step";
+  const stateRoot = resolve(process.cwd(), "state");
+  return startWorkflowForChat(workflowName, {
+    isPaused: (name) => readPausedWorkflows(resolve(stateRoot, "paused.json")).has(name),
+    start: async (name) => (await start(executeWorkflow, [{ workflowName: name }])).runId,
+    recordStart: recordManualStart,
+  });
+}
+
+async function recordManualStart(workflow: string, runId: string): Promise<void> {
+  "use step";
+  recordActionLog(resolve(process.cwd(), "state", "actions.jsonl"), {
+    workflow,
+    run_id: runId,
+    step: null,
+    source: "chat",
+    decision: { action: "start" },
+    note: "Workflow run started from chat.",
+  });
+}
+
+async function prepareWorkflow(input: { workflowName: string; runId: string; slot: string | null; manual: boolean; maxRuns?: number }): Promise<PreparedWorkflowResult> {
   "use step";
 
   const stateRoot = resolve(process.cwd(), "state");
   const indexFile = resolve(stateRoot, "runs.jsonl");
+  if (readPausedWorkflows(resolve(stateRoot, "paused.json")).has(input.workflowName)) {
+    const reason = `workflow ${input.workflowName} is paused`;
+    if (input.manual) throw new FatalError(`Workflow "${input.workflowName}" is paused; resume it before starting manually.`);
+    appendRunIndex(indexFile, {
+      workflow: input.workflowName,
+      slot: input.slot,
+      run_id: input.runId,
+      outcome: "skipped",
+      reason,
+    });
+    return { kind: "skipped", reason };
+  }
   const admission = decideWorkflowAdmission({
     entries: readRunIndex(indexFile),
     workflow: input.workflowName,
@@ -146,7 +210,14 @@ async function prepareWorkflow(input: { workflowName: string; runId: string; slo
       profileCommands,
     });
     mkdirSync(dataDirectory, { recursive: true });
-    return { kind: "prepared", snapshot };
+    return {
+      kind: "prepared",
+      snapshot,
+      orchestrator: {
+        profile: config.orchestrator.profile,
+        escalationProfile: config.orchestrator.escalation_profile,
+      },
+    };
   } catch (error) {
     rmSync(resolve(stateRoot, "snapshots", input.runId), { recursive: true, force: true });
     throw new FatalError(error instanceof Error ? error.message : String(error));
@@ -164,6 +235,18 @@ async function recordLockSkip(input: { workflow: string; slot: string | null; ru
   });
 }
 
+async function recordAutomaticDecision(input: AutomaticDecisionLog): Promise<void> {
+  "use step";
+  recordActionLog(resolve(process.cwd(), "state", "actions.jsonl"), {
+    workflow: input.workflow,
+    run_id: input.runId,
+    step: input.step,
+    source: input.round === 1 ? "round-1" : "round-2",
+    decision: input.decision,
+    note: input.note,
+  });
+}
+
 async function persistBlockedStep(input: BlockedDecisionInput & { token: string }): Promise<void> {
   "use step";
   const file = locateBlockedStep(resolve(process.cwd(), "state"), input.runId);
@@ -174,7 +257,9 @@ async function persistBlockedStep(input: BlockedDecisionInput & { token: string 
     step_kind: input.stepKind,
     retry_profiles: input.retryProfiles,
     last_error: input.lastError,
-    token: input.token
+    last_output: input.lastOutput,
+    attempt_history: input.attemptHistory,
+    token: input.token,
   });
 }
 

@@ -1,4 +1,7 @@
-.PHONY: setup check dev start
+PORT ?= 3000
+DEV_PORT ?= 2000
+
+.PHONY: setup check dev start chat
 
 setup:
 	@if ! command -v node >/dev/null 2>&1 || ! node -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 24 ? 0 : 1)'; then \
@@ -21,7 +24,13 @@ check:
 	@npm test
 
 dev:
-	@npm run dev
+	@npm run dev -- --host 127.0.0.1 --port $(DEV_PORT)
 
 start:
-	@npm run build && npm run start
+	@npx eve build && WORKSHOP_LOCAL_EVE_AUTH=1 npx eve start --host 127.0.0.1 --port $(PORT)
+
+chat:
+	@port="$(PORT)"; \
+	if ! nc -z 127.0.0.1 "$$port" >/dev/null 2>&1; then port="$(DEV_PORT)"; fi; \
+	if ! nc -z 127.0.0.1 "$$port" >/dev/null 2>&1; then echo "No Workshop service is listening; run make start (or make dev)." >&2; exit 1; fi; \
+	npx eve remote connect --url "http://127.0.0.1:$$port"

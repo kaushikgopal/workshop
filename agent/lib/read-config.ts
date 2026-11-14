@@ -31,7 +31,7 @@ export class ConfigReadError extends Error {
 const profileName = z.string().regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/, "must use lowercase letters, digits, and hyphens");
 
 const agentProfileSchema = z.object({
-  command: z.array(z.string().refine((part) => part.trim().length > 0, "must not be empty")).min(1, "must contain at least one argument"),
+  command: z.array(z.string()).min(1, "must contain at least one argument").refine((command) => Boolean(command[0]?.trim()), "must not be empty"),
   context_window: z.number().int().positive().optional(),
 }).strict();
 

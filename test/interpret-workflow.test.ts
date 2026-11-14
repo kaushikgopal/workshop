@@ -207,6 +207,13 @@ test("exhausted attempts stay blocked and expose the step and last error", async
     stepKind: "agent",
     retryProfiles: ["writer", "fast"],
     lastError: "10-write profile failed with exit code 7: profile crashed\nlast output",
+    lastOutput: "last output",
+    attemptHistory: [{
+      attempt: 1,
+      profile: "writer",
+      output: "last output",
+      error: "10-write profile failed with exit code 7: profile crashed\nlast output",
+    }],
     decisionNumber: 1,
   });
   releaseDecision?.({ action: "skip" });
