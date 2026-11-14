@@ -263,22 +263,22 @@ test("rejects orphaned, mismatched, and duplicate checks and validates Markdown 
   });
 });
 
-test("ignores v1 YAML examples only when requested and loads good workflows beside broken ones", () => {
+test("ignores top-level YAML examples only when requested and loads good workflows beside broken ones", () => {
   withRoot((root) => {
     const exampleRoot = join(root, "examples");
     mkdirSync(exampleRoot);
-    writeFileSync(join(exampleRoot, "hemingway-clock.yaml"), "v1 format");
+    writeFileSync(join(exampleRoot, "top-level.yaml"), "not a folder workflow");
     const result = loadWorkflows(exampleRoot, profiles, { ignoreTopLevelYaml: true });
     assert.deepEqual(result, { workflows: [], errors: [] });
 
     const workflowsRoot = join(root, "workflows");
     mkdirSync(workflowsRoot);
-    writeFileSync(join(workflowsRoot, "v1.yaml"), "v1 format");
+    writeFileSync(join(workflowsRoot, "invalid.yaml"), "not a folder workflow");
     createWorkflow(workflowsRoot, "good", 'cron: "*/5 * * * *"');
     createWorkflow(workflowsRoot, "broken", "cron: invalid");
     const workflows = loadWorkflows(workflowsRoot, profiles);
     assert.deepEqual(workflows.workflows.map(({ name }) => name), ["good"]);
     assert.match(errorReasons(workflows, "broken/workflow.md").join(" "), /valid cron expression/);
-    assert.match(errorReasons(workflows, "v1.yaml").join(" "), /unknown file/);
+    assert.match(errorReasons(workflows, "invalid.yaml").join(" "), /unknown file/);
   });
 });
