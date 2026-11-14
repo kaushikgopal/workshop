@@ -33,14 +33,14 @@ function copy(): void {
   const destination = resolve(requestedPath);
   if (destinationExists(destination)) throw new Error(`Destination already exists: ${destination}`);
 
-  const originResult = spawnSync("git", ["remote", "get-url", "origin"], { cwd: source, encoding: "utf8" });
-  if (originResult.error) throw originResult.error;
-  const origin = originResult.status === 0 ? originResult.stdout.trim() : source;
+  const remotes = gitOutput(["remote"], source).split(/\r?\n/).filter(Boolean);
+  const origin = remotes.includes("origin") ? gitOutput(["remote", "get-url", "origin"], source) : source;
   executeCommand("git", ["clone", origin, destination]);
 
   const branch = gitOutput(["branch", "--show-current"], source) || "workshop-copy";
   executeCommand("git", ["fetch", "--no-tags", source, branch], destination);
   executeCommand("git", ["checkout", "-B", branch, "FETCH_HEAD"], destination);
+
   executeCommand("git", ["remote", "rename", "origin", "upstream"], destination);
 
   const ignoreFile = resolve(destination, ".gitignore");
