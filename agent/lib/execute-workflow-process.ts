@@ -1,4 +1,6 @@
 import { spawn } from "node:child_process";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import type { ProcessExecutionRequest, ProcessExecutionResult } from "../../workflow/interpret-workflow.ts";
 
 type ExecuteWorkflowProcessInput = ProcessExecutionRequest & {
@@ -30,45 +32,48 @@ function terminate(child: ReturnType<typeof spawn>, signal: NodeJS.Signals): voi
 }
 
 const terminationGraceMs = 250;
-const activeProcessGroups = new Map<string, Set<number>>();
-
-function registerProcessGroup(runId: string, pid: number): () => void {
-  const groups = activeProcessGroups.get(runId) ?? new Set<number>();
-  groups.add(pid);
-  activeProcessGroups.set(runId, groups);
-  return () => {
-    groups.delete(pid);
-    if (groups.size === 0) activeProcessGroups.delete(runId);
-  };
-}
-
-export async function cancelWorkflowProcesses(runId: string): Promise<void> {
-  const groups = [...(activeProcessGroups.get(runId) ?? [])];
-  if (groups.length === 0) return;
-  let firstError: unknown;
-  for (const pid of groups) {
-    try {
-      terminateGroup(pid, "SIGTERM");
-    } catch (error) {
-      firstError ??= error;
-    }
-  }
-  await new Promise((resolve) => setTimeout(resolve, terminationGraceMs));
-  for (const pid of groups) {
-    try {
-      terminateGroup(pid, "SIGKILL");
-    } catch (error) {
-      firstError ??= error;
-    }
-  }
-  if (firstError !== undefined) throw firstError;
-}
 
 export async function executeWorkflowProcess(input: ExecuteWorkflowProcessInput): Promise<ProcessExecutionResult> {
   "use step";
 
   const [executable, ...args] = input.command;
   if (!executable) return { exitCode: null, stdout: "", stderr: "", timedOut: false, error: "process command is empty" };
+
+  type ProcessRecord = { run_id: string; process_group_ids: number[] };
+  if (!/^[A-Za-z0-9_-]+$/.test(input.runId)) throw new Error(`Invalid workflow run ID: ${input.runId}`);
+  const processRecordPath = join(input.stateDirectory, "processes", `${input.runId}.json`);
+  const readProcessGroupIds = (): number[] => {
+    let text: string;
+    try {
+      text = readFileSync(processRecordPath, "utf8");
+    } catch (error) {
+      if (errorCode(error) === "ENOENT") return [];
+      throw error;
+    }
+    const value: unknown = JSON.parse(text);
+    if (typeof value !== "object" || value === null || !("run_id" in value) || value.run_id !== input.runId || !("process_group_ids" in value) || !Array.isArray(value.process_group_ids)) {
+      throw new Error(`Invalid process record for workflow run ${input.runId}`);
+    }
+    const processGroupIds: number[] = [];
+    for (const pid of value.process_group_ids) {
+      if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid <= 0) throw new Error(`Invalid process group ID for workflow run ${input.runId}`);
+      processGroupIds.push(pid);
+    }
+    return processGroupIds;
+  };
+  const writeProcessGroupIds = (processGroupIds: number[]): void => {
+    if (processGroupIds.length === 0) {
+      rmSync(processRecordPath, { force: true });
+      return;
+    }
+    mkdirSync(join(input.stateDirectory, "processes"), { recursive: true });
+    const record: ProcessRecord = { run_id: input.runId, process_group_ids: processGroupIds };
+    writeFileSync(processRecordPath, `${JSON.stringify(record)}\n`);
+  };
+  const registerProcessGroup = (pid: number): (() => void) => {
+    writeProcessGroupIds([...readProcessGroupIds(), pid]);
+    return () => writeProcessGroupIds(readProcessGroupIds().filter((processGroupId) => processGroupId !== pid));
+  };
 
   let child: ReturnType<typeof spawn>;
   try {
@@ -94,7 +99,20 @@ export async function executeWorkflowProcess(input: ExecuteWorkflowProcessInput)
   const stdin = child.stdin;
   const stdoutStream = child.stdout;
   const stderrStream = child.stderr;
-  const unregister = child.pid === undefined ? () => {} : registerProcessGroup(input.runId, child.pid);
+  let unregister = () => {};
+  let trackingError: string | undefined;
+  if (child.pid !== undefined) {
+    try {
+      unregister = registerProcessGroup(child.pid);
+    } catch (error) {
+      trackingError = error instanceof Error ? error.message : String(error);
+      try {
+        terminateGroup(child.pid, "SIGKILL");
+      } catch (killError) {
+        trackingError += `; could not stop untracked process: ${killError instanceof Error ? killError.message : String(killError)}`;
+      }
+    }
+  }
   if (!stdin || !stdoutStream || !stderrStream) {
     terminate(child, "SIGKILL");
     unregister();
@@ -105,7 +123,7 @@ export async function executeWorkflowProcess(input: ExecuteWorkflowProcessInput)
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
     let timedOut = false;
-    let processError: string | undefined;
+    let processError: string | undefined = trackingError;
     let timeoutTimer: NodeJS.Timeout | undefined;
     let terminationStarted = false;
     let terminationComplete = false;
@@ -115,7 +133,11 @@ export async function executeWorkflowProcess(input: ExecuteWorkflowProcessInput)
     const finish = () => {
       if (!processClosed || (terminationStarted && !terminationComplete) || !closeResult) return;
       if (timeoutTimer) clearTimeout(timeoutTimer);
-      unregister();
+      try {
+        unregister();
+      } catch (error) {
+        processError ??= error instanceof Error ? error.message : String(error);
+      }
       resolve({
         ...closeResult,
         stdout: Buffer.concat(stdout).toString("utf8"),

@@ -4,7 +4,8 @@ import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
-import { cancelWorkflowProcesses, executeWorkflowProcess } from "../agent/lib/execute-workflow-process.ts";
+import { cancelWorkflowProcesses } from "../agent/lib/cancel-workflow-process.ts";
+import { executeWorkflowProcess } from "../agent/lib/execute-workflow-process.ts";
 import { createWorkflowSnapshot } from "../workflow/create-workflow-snapshot.ts";
 import { interpretWorkflow, parseMarkdownVerdict, type ProcessExecutionRequest, type ProcessExecutionResult, type WorkflowInterpreterInput } from "../workflow/interpret-workflow.ts";
 import type { Workflow, WorkflowDecision, WorkflowStep } from "../workflow/types.ts";
@@ -351,29 +352,31 @@ test("timeouts become workflow failures with the configured limit", async () => 
 });
 
 test("fake profile commands receive stdin and Workshop environment without a shell", async () => {
-  const result = await executeWorkflowProcess({
-    kind: "agent",
-    command: [process.execPath, fixture, "environment"],
-    input: "prompt from stdin",
-    step: "20-write",
-    feedback: "try again",
-    attempt: 2,
-    timeoutMs: 2_000,
-    workflow: "clock",
-    runId: "wrun_process_1",
-    dataDirectory: "/data/clock",
-    stateDirectory: "/service/state",
-    cwd: process.cwd(),
-  });
-  assert.equal(result.exitCode, 0);
-  assert.deepEqual(JSON.parse(result.stdout), {
-    input: "prompt from stdin",
-    workflow: "clock",
-    runId: "wrun_process_1",
-    step: "20-write",
-    dataDirectory: "/data/clock",
-    stateDirectory: "/service/state",
-    feedback: "try again",
+  await withRoot(async (root) => {
+    const result = await executeWorkflowProcess({
+      kind: "agent",
+      command: [process.execPath, fixture, "environment"],
+      input: "prompt from stdin",
+      step: "20-write",
+      feedback: "try again",
+      attempt: 2,
+      timeoutMs: 2_000,
+      workflow: "clock",
+      runId: "wrun_process_1",
+      dataDirectory: "/data/clock",
+      stateDirectory: root,
+      cwd: process.cwd(),
+    });
+    assert.equal(result.exitCode, 0);
+    assert.deepEqual(JSON.parse(result.stdout), {
+      input: "prompt from stdin",
+      workflow: "clock",
+      runId: "wrun_process_1",
+      step: "20-write",
+      dataDirectory: "/data/clock",
+      stateDirectory: root,
+      feedback: "try again",
+    });
   });
 });
 
@@ -433,11 +436,15 @@ test("step timeout kills the process tree", { skip: process.platform === "win32"
 test("run cancellation kills the active process tree", { skip: process.platform === "win32" }, async () => {
   await withRoot(async (root) => {
     const pidFile = join(root, "grandchild.pid");
+    const processRecord = join(root, "processes", "wrun_grandchild_1.json");
     const pending = grandchildProcessInput(root, pidFile);
     const pid = await waitForProcessId(pidFile);
-    await cancelWorkflowProcesses("wrun_grandchild_1");
+    assert.equal(existsSync(processRecord), true);
+    await cancelWorkflowProcesses("wrun_grandchild_1", root);
     const result = await pending;
     assert.equal(result.timedOut, false);
+    assert.equal(result.signal, "SIGTERM");
     await assertProcessStopped(pid);
+    assert.equal(existsSync(processRecord), false);
   });
 });

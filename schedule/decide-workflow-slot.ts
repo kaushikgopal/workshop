@@ -18,9 +18,11 @@ export function decideWorkflowSlot(input: {
   lastSlot?: string;
   startedCount: number;
   maxRuns?: number;
+  paused?: boolean;
 }): WorkflowSlotDecision {
   const slot = latestCronSlot(input.cron, input.now);
   if (input.lastSlot !== undefined && slot <= input.lastSlot) return { kind: "already-indexed", slot };
+  if (input.paused) return { kind: "skip", slot, reason: "paused" };
   if (input.maxRuns !== undefined && input.startedCount >= input.maxRuns) {
     return { kind: "skip", slot, reason: "max_runs reached" };
   }

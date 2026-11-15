@@ -36,13 +36,16 @@ brings me in only when something truly needs me.
   notifications in steps. A command step that exits with code 99 ends the
   run early because there is nothing to do.
 - **One run at a time.** A slot that arrives while a run is open (working,
-  waiting, or blocked) is skipped. After downtime, only the latest missed
-  slot runs.
+  waiting, or blocked) is skipped. Slots the scheduler sees while a workflow
+  is paused are skipped for good; resuming never replays them. After downtime,
+  only the latest missed slot runs.
 - **Optional checks per step.** A step can name a command or a judge agent
   to check its output. A rejected result retries the step with the reason as
   feedback. The orchestrator steps in only when retries run out.
 - **Shared working folder.** Steps pass data through files, not through a
   data contract between steps.
+- **Cancellation stops active processes.** Cancelling a run stops its active
+  command or profile process group.
 - **Steps are safe to repeat.** A step interrupted by a crash runs again from
   its start.
 - **One Workshop per machine.** Each machine has its own workflows, so

@@ -51,6 +51,38 @@ test("skips and indexes a slot when max_runs has been reached", () => {
   });
 });
 
+test("indexes a paused slot as skipped so resume starts only a later slot", () => {
+  withRoot((root) => {
+    const indexFile = join(root, "state", "runs.jsonl");
+    const pausedSlot = decideWorkflowSlot({
+      cron: "* * * * *",
+      now: new Date("2026-11-14T12:27:40.000Z"),
+      startedCount: 0,
+      paused: true,
+    });
+    assert.deepEqual(pausedSlot, { kind: "skip", slot: "2026-11-14T12:27:00.000Z", reason: "paused" });
+    if (pausedSlot.kind !== "skip") assert.fail("paused slot must be skipped");
+    appendRunIndex(indexFile, {
+      workflow: "clock",
+      slot: pausedSlot.slot,
+      run_id: null,
+      outcome: "skipped",
+      reason: pausedSlot.reason,
+      at: "2026-11-14T12:27:40.000Z",
+    });
+
+    const resumed = decideWorkflowSlot({
+      cron: "* * * * *",
+      now: new Date("2026-11-14T12:29:40.000Z"),
+      lastSlot: lastSlotForWorkflow(readRunIndex(indexFile), "clock"),
+      startedCount: 0,
+    });
+    assert.deepEqual(resumed, { kind: "start", slot: "2026-11-14T12:29:00.000Z" });
+    assert.equal(lastSlotForWorkflow(readRunIndex(indexFile), "clock"), pausedSlot.slot);
+  });
+});
+
+
 test("a lock-conflict slot is indexed as skipped and is not retried for that slot", () => {
   withRoot((root) => {
     const indexFile = join(root, "state", "runs.jsonl");

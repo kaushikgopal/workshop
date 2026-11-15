@@ -82,7 +82,7 @@ Every child process inherits the service environment and receives these variable
 
 Command processes receive workflow input through stdin. Agent processes receive the step prompt, then optional `## Input` and `## Feedback` sections. A check receives the worker's output as its input; its result does not replace the worker's output.
 
-A command step that exits with code `99` ends the run successfully with status `nothing-to-do`; its check does not run. Exit `99` from an agent or a check does not have this meaning. Each command or profile process starts in its own process group. A step timeout or run cancellation sends the group `SIGTERM`, then `SIGKILL` after 250 ms if it remains; this also stops descendants. A parent-service crash can leave a child process running, and an unfinished step can repeat when Eve resumes it. Make external effects safe to repeat; Workshop does not provide exactly-once effects.
+A command step that exits with code `99` ends the run successfully with status `nothing-to-do`; its check does not run. Exit `99` from an agent or a check does not have this meaning. Each command or profile process starts in its own process group. Workshop records each active process group under `state/processes/<run_id>.json` and removes its entry when the process exits. A step timeout or run cancellation sends the group `SIGTERM`, then `SIGKILL` after 250 ms if it remains; this also stops descendants. A parent-service crash can leave a child process running, and an unfinished step can repeat when Eve resumes it. Make external effects safe to repeat; Workshop does not provide exactly-once effects.
 
 ## Checks, attempts, and feedback
 
@@ -116,19 +116,19 @@ On its first message in a chat session, the agent lists runs, reads blocked runs
 | `read_run` | Read a run's status, available outputs, errors, or blocked-step history. |
 | `start_workflow` | Start a workflow manually. |
 | `decide_blocked_run` | Retry, skip, accept, or fail a blocked step. |
-| `cancel_run` | Request cancellation through Eve. |
+| `cancel_run` | Request cancellation through Eve and stop the active process group. |
 | `pause_workflow` / `resume_workflow` | Pause or resume future workflow starts. |
 | `list_actions` | Read recent automatic and chat actions. |
 
-Run output is not written to a separate log file. `read_run` reads Eve's completed return value or the saved blocked-step record; it is not a live process log. Cancelling asks Eve to cancel a workflow. Workshop sends `SIGTERM` to the active step's process group, then `SIGKILL` after 250 ms if it remains.
+Run output is not written to a separate log file. `read_run` reads Eve's completed return value or the saved blocked-step record; it is not a live process log. Cancelling first asks Eve to cancel the run, then Workshop sends `SIGTERM` to its recorded active process groups and `SIGKILL` after 250 ms if they remain. Interrupted steps end with the cancelled run instead of retrying.
 
 ## Scheduling and admission
 
-One Eve schedule ticks every minute in UTC. On each tick, Workshop loads config and valid workflows, then considers each enabled, unpaused workflow. It finds the latest cron slot at or before the current time. If that slot is newer than the last indexed slot and `max_runs` is not reached, Workshop starts the workflow. After downtime it considers only the latest due slot, not every missed slot. A new workflow is eligible at the first tick.
+One Eve schedule ticks every minute in UTC. On each tick, Workshop loads config and valid workflows, then considers each enabled workflow. It finds the latest cron slot at or before the current time. A paused workflow's new slot is indexed as skipped with reason `paused`; resuming never replays it. For an unpaused workflow, if the slot is newer than the last indexed slot and `max_runs` is not reached, Workshop starts the workflow. After downtime it considers only the latest due slot, not every missed slot. A new workflow is eligible at the first tick.
 
 A hook lock is named for each workflow. It skips another occurrence of that same workflow while a run is active, waiting, sleeping before retry, or blocked. The skipped slot is recorded, not queued. Different workflows can run at the same time. The README's “one run at a time” wording is broader than the implementation: the current lock is per workflow, not global.
 
-`max_runs` counts unique run IDs indexed as `started`, not successful completions. It limits scheduled starts only: manual starts ignore `max_runs`, count toward the limit for later scheduled starts, and refuse workflows with `enabled: false`. Pausing a workflow prevents both manual and scheduled starts; it does not stop an active run. Resuming allows later ticks to start it again, but does not start it immediately. A scheduled run is indexed as started before config and snapshot preparation finishes, so failed preparation can count against `max_runs`.
+`max_runs` counts unique run IDs indexed as `started`, not successful completions. It limits scheduled starts only: manual starts ignore `max_runs`, count toward the limit for later scheduled starts, and refuse workflows with `enabled: false`. Pausing a workflow prevents manual starts and skips each newly observed scheduled slot; it does not stop an active run. Resuming allows later ticks to start new slots. It does not replay skipped slots or start a run immediately. A scheduled run is indexed as started before config and snapshot preparation finishes, so failed preparation can count against `max_runs`.
 
 ## Files on disk
 
@@ -145,6 +145,7 @@ state/
 ├─ actions.jsonl                 orchestrator and chat action history
 ├─ paused.json                   JSON list of paused workflow names
 ├─ blocked/<run_id>.json         current blocked-step decision details
+├─ processes/<run_id>.json       active process group IDs for cancellation
 ├─ snapshots/<run_id>/<workflow>/ workflow copy used by a run
 └─ service.log                   launch-agent stdout and stderr
 .eve/                            Eve-managed local workflow state

@@ -49,12 +49,13 @@ export default defineSchedule({
 
     const now = new Date();
     for (const workflow of loaded.workflows) {
-      if (workflow.enabled === false || paused.has(workflow.name)) continue;
+      if (workflow.enabled === false) continue;
       const decision = decideWorkflowSlot({
         cron: workflow.cron,
         now,
         lastSlot: lastSlotForWorkflow(entries, workflow.name),
         startedCount: startedCountForWorkflow(entries, workflow.name),
+        paused: paused.has(workflow.name),
         ...(workflow.max_runs === undefined ? {} : { maxRuns: workflow.max_runs }),
       });
       if (decision.kind === "already-indexed") continue;

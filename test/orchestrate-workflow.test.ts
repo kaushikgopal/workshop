@@ -424,10 +424,11 @@ test("cancel tool cancels active runs and stops their processes", async () => {
   const cancelled: string[] = [];
   const stopped: string[] = [];
   const actions: string[] = [];
+  const events: string[] = [];
   const active = await cancelWorkflowRun("wrun_active", entries, {
     getStatus: async () => "running",
-    cancel: async (id) => { cancelled.push(id); },
-    stopProcesses: async (id) => { stopped.push(id); },
+    cancel: async (id) => { events.push("cancel"); cancelled.push(id); },
+    stopProcesses: async (id) => { events.push("stop"); stopped.push(id); },
     recordAction: ({ workflow, runId }) => { actions.push(`${workflow}:${runId}`); },
   });
   const completed = await cancelWorkflowRun("wrun_done", entries, {
@@ -440,5 +441,6 @@ test("cancel tool cancels active runs and stops their processes", async () => {
   assert.deepEqual(completed, { run_id: "wrun_done", workflow: "clock", status: "completed", cancelled: false });
   assert.deepEqual(cancelled, ["wrun_active"]);
   assert.deepEqual(stopped, ["wrun_active"]);
+  assert.deepEqual(events, ["cancel", "stop"]);
   assert.deepEqual(actions, ["clock:wrun_active"]);
 });
