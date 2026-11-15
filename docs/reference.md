@@ -51,7 +51,7 @@ workflows/<name>/
 | `retries` | Optional nonnegative safe integer for extra step attempts. |
 | `timeout` | Optional positive duration in `s`, `m`, or `h`, within Node's timer limit. |
 
-The body of `workflow.md` describes the workflow for people and the orchestrator. The current validator permits an empty body and a workflow with no steps.
+`workflow.md` needs a non-empty description body. Every workflow needs at least one step.
 
 Step files are named `N-name.md`, `N-name.sh`, or `N-name.ts`. Markdown files are agent steps; shell and TypeScript files are command steps. `N` is a safe integer. Leading zeros and gaps are allowed, but numbers must be unique. Steps execute in numeric order.
 
@@ -82,7 +82,7 @@ Every child process inherits the service environment and receives these variable
 
 Command processes receive workflow input through stdin. Agent processes receive the step prompt, then optional `## Input` and `## Feedback` sections. A check receives the worker's output as its input; its result does not replace the worker's output.
 
-A command step that exits with code `99` ends the run successfully with status `nothing-to-do`; its check does not run. Exit `99` from an agent or a check does not have this meaning. A command that exceeds its timeout is sent `SIGTERM`, then `SIGKILL` one second later. A parent-service crash can leave a child process running, and an unfinished step can repeat when Eve resumes it. Make external effects safe to repeat; Workshop does not provide exactly-once effects.
+A command step that exits with code `99` ends the run successfully with status `nothing-to-do`; its check does not run. Exit `99` from an agent or a check does not have this meaning. Each command or profile process starts in its own process group. A step timeout or run cancellation sends the group `SIGTERM`, then `SIGKILL` after 250 ms if it remains; this also stops descendants. A parent-service crash can leave a child process running, and an unfinished step can repeat when Eve resumes it. Make external effects safe to repeat; Workshop does not provide exactly-once effects.
 
 ## Checks, attempts, and feedback
 
@@ -101,7 +101,7 @@ After local retries run out, Workshop asks the configured orchestrator to decide
 - `accept` its last output, when that output is non-empty;
 - `fail` or `give_up`.
 
-A retry runs the step once. If it fails, the next round gets a chance. A `fail` or `give_up` in round one escalates to round two. In round two, either action leaves the run waiting for chat; it does not fail the run automatically. Invalid JSON, an invalid choice, or an orchestrator process failure counts as `give_up`. An automatic retry can switch an agent step to another profile only when both profile commands have the exact same first argument. Command steps cannot switch profiles.
+A retry runs the step once. If it fails, the next round gets a chance. An automatic `fail` ends the run immediately in either round. `give_up` escalates from round one and waits for chat after round two. Invalid JSON, an invalid choice, or an orchestrator process failure counts as `give_up`. An automatic retry can switch an agent step to another profile only when both profile commands have the exact same first argument. Command steps cannot switch profiles.
 
 A run waiting on chat keeps its per-workflow lock. Its decision record is written to `state/blocked/<run_id>.json`, and Eve holds a durable hook for the answer. Chat can choose `retry`, `skip`, `accept`, or `fail`. A chat retry can include a hint, a profile allowed for that step, and a delay. It resets the local retry budget. `skip` keeps the last successful pipe input for the next step. `accept` uses the failed attempt's last output. `fail` ends the run. The orchestrator can also cancel a run, pause or resume a workflow, and start a workflow.
 
@@ -120,7 +120,7 @@ On its first message in a chat session, the agent lists runs, reads blocked runs
 | `pause_workflow` / `resume_workflow` | Pause or resume future workflow starts. |
 | `list_actions` | Read recent automatic and chat actions. |
 
-Run output is not written to a separate log file. `read_run` reads Eve's completed return value or the saved blocked-step record; it is not a live process log. Cancelling asks Eve to cancel a workflow, but Workshop does not promise that an external child process stops immediately.
+Run output is not written to a separate log file. `read_run` reads Eve's completed return value or the saved blocked-step record; it is not a live process log. Cancelling asks Eve to cancel a workflow. Workshop sends `SIGTERM` to the active step's process group, then `SIGKILL` after 250 ms if it remains.
 
 ## Scheduling and admission
 
@@ -128,7 +128,7 @@ One Eve schedule ticks every minute in UTC. On each tick, Workshop loads config 
 
 A hook lock is named for each workflow. It skips another occurrence of that same workflow while a run is active, waiting, sleeping before retry, or blocked. The skipped slot is recorded, not queued. Different workflows can run at the same time. The README's “one run at a time” wording is broader than the implementation: the current lock is per workflow, not global.
 
-`max_runs` counts unique run IDs indexed as `started`, not successful completions. A manual start bypasses `max_runs` and `enabled: false`, but it counts toward the limit for later scheduled starts. Pausing a workflow prevents both manual and scheduled starts; it does not stop an active run. Resuming allows later ticks to start it again, but does not start it immediately. A scheduled run is indexed as started before config and snapshot preparation finishes, so failed preparation can count against `max_runs`.
+`max_runs` counts unique run IDs indexed as `started`, not successful completions. It limits scheduled starts only: manual starts ignore `max_runs`, count toward the limit for later scheduled starts, and refuse workflows with `enabled: false`. Pausing a workflow prevents both manual and scheduled starts; it does not stop an active run. Resuming allows later ticks to start it again, but does not start it immediately. A scheduled run is indexed as started before config and snapshot preparation finishes, so failed preparation can count against `max_runs`.
 
 ## Files on disk
 

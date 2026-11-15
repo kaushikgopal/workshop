@@ -2,7 +2,7 @@
 
 ## What is Workshop
 
-Workshop runs my agent workflows round the clock, cheaply and safely, and
+Workshop runs my [agent workflows](https://kau.sh/blog/responsible-loop-engineering) round the clock, cheaply and safely, and
 brings me in only when something truly needs me.
 
 ### Requirements
