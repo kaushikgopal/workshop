@@ -1,4 +1,5 @@
-import { readFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { readFileSync, writeFileSync } from "node:fs";
 
 const input = readFileSync(0, "utf8");
 const mode = process.argv[2];
@@ -16,6 +17,17 @@ if (mode === "echo") {
   process.exitCode = 7;
 } else if (mode === "sleep") {
   await new Promise((resolve) => setTimeout(resolve, 30_000));
+} else if (mode === "spawn-grandchild") {
+  const pidFile = process.argv[3];
+  if (!pidFile) throw new Error("grandchild PID file is required");
+  const grandchild = spawn(process.execPath, [
+    "--input-type=module",
+    "-e",
+    "process.on('SIGTERM', () => {}); setInterval(() => {}, 1_000)",
+  ], { stdio: "ignore" });
+  if (grandchild.pid === undefined) throw new Error("grandchild did not start");
+  writeFileSync(pidFile, String(grandchild.pid));
+  await new Promise(() => {});
 } else if (mode === "environment") {
   process.stdout.write(JSON.stringify({
     input,

@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
-import { executeWorkflowProcess } from "../agent/lib/execute-workflow-process.ts";
+import { cancelWorkflowProcesses, executeWorkflowProcess } from "../agent/lib/execute-workflow-process.ts";
 import { createWorkflowSnapshot } from "../workflow/create-workflow-snapshot.ts";
 import { interpretWorkflow, parseMarkdownVerdict, type ProcessExecutionRequest, type ProcessExecutionResult, type WorkflowInterpreterInput } from "../workflow/interpret-workflow.ts";
 import type { Workflow, WorkflowDecision, WorkflowStep } from "../workflow/types.ts";
@@ -376,22 +377,67 @@ test("fake profile commands receive stdin and Workshop environment without a she
   });
 });
 
-test("process timeout terminates a fake profile command", async () => {
-  const started = Date.now();
-  const result = await executeWorkflowProcess({
+async function waitForProcessId(file: string): Promise<number> {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    if (existsSync(file)) {
+      const pid = Number(readFileSync(file, "utf8"));
+      assert.ok(Number.isSafeInteger(pid) && pid > 0, "fixture must write a valid grandchild PID");
+      return pid;
+    }
+    await new Promise((resolveWait) => setTimeout(resolveWait, 20));
+  }
+  assert.fail("fixture did not start its grandchild");
+}
+
+async function assertProcessStopped(pid: number): Promise<void> {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    const result = spawnSync("ps", ["-o", "stat=", "-p", String(pid)], { encoding: "utf8" });
+    assert.ifError(result.error);
+    const state = result.stdout.trim();
+    if (result.status !== 0 || state.length === 0 || state.startsWith("Z")) return;
+    await new Promise((resolveWait) => setTimeout(resolveWait, 20));
+  }
+  assert.fail(`grandchild ${pid} is still running`);
+}
+
+function grandchildProcessInput(root: string, pidFile: string, timeoutMs?: number) {
+  return executeWorkflowProcess({
     kind: "agent",
-    command: [process.execPath, fixture, "sleep"],
+    command: [process.execPath, fixture, "spawn-grandchild", pidFile],
     input: "",
-    step: "10-sleep",
+    step: "10-grandchild",
     feedback: "",
     attempt: 1,
-    timeoutMs: 30,
+    ...(timeoutMs === undefined ? {} : { timeoutMs }),
     workflow: "clock",
-    runId: "wrun_timeout_1",
-    dataDirectory: "/data/clock",
-    stateDirectory: "/service/state",
-    cwd: process.cwd(),
+    runId: "wrun_grandchild_1",
+    dataDirectory: root,
+    stateDirectory: root,
+    cwd: root,
   });
-  assert.equal(result.timedOut, true);
-  assert.ok(Date.now() - started < 5_000);
+}
+
+test("step timeout kills the process tree", { skip: process.platform === "win32" }, async () => {
+  await withRoot(async (root) => {
+    const pidFile = join(root, "grandchild.pid");
+    const pending = grandchildProcessInput(root, pidFile, 500);
+    const pid = await waitForProcessId(pidFile);
+    const result = await pending;
+    assert.equal(result.timedOut, true);
+    await assertProcessStopped(pid);
+  });
+});
+
+test("run cancellation kills the active process tree", { skip: process.platform === "win32" }, async () => {
+  await withRoot(async (root) => {
+    const pidFile = join(root, "grandchild.pid");
+    const pending = grandchildProcessInput(root, pidFile);
+    const pid = await waitForProcessId(pidFile);
+    await cancelWorkflowProcesses("wrun_grandchild_1");
+    const result = await pending;
+    assert.equal(result.timedOut, false);
+    await assertProcessStopped(pid);
+  });
 });

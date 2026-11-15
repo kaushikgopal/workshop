@@ -143,21 +143,23 @@ test("builds a failure brief with workflow, step, output, error, history, and al
   assert.match(brief.prompt, /check a file/);
   assert.match(brief.prompt, /partial/);
   assert.match(brief.prompt, /exit 7/);
+  assert.match(brief.prompt, /Fail ends the workflow immediately/);
   assert.match(brief.prompt, /Allowed actions: retry, skip, accept, fail, give_up/);
   assert.match(brief.prompt, /Allowed retry profiles: none/);
 });
 
-test("advances round decisions to retry, escalate, apply, or wait", () => {
+test("advances round decisions to retry, apply, fail, escalate, or wait", () => {
   const giveUp = { action: "give_up", note: "uncertain" } as const;
   const retry = { action: "retry", note: "try" } as const;
   const skip = { action: "skip", note: "safe" } as const;
+  const fail = { action: "fail", note: "cannot fix" } as const;
   assert.deepEqual(advanceOrchestratorRound(1, retry), { kind: "retry" });
   assert.deepEqual(advanceOrchestratorRound(1, retry, "retry-succeeded"), { kind: "apply" });
   assert.deepEqual(advanceOrchestratorRound(1, retry, "retry-failed"), { kind: "escalate", nextRound: 2 });
   assert.deepEqual(advanceOrchestratorRound(1, giveUp), { kind: "escalate", nextRound: 2 });
   assert.deepEqual(advanceOrchestratorRound(2, giveUp), { kind: "wait-for-user" });
-  assert.deepEqual(advanceOrchestratorRound(1, { action: "fail", note: "cannot fix" }), { kind: "escalate", nextRound: 2 });
-  assert.deepEqual(advanceOrchestratorRound(2, { action: "fail", note: "cannot fix" }), { kind: "wait-for-user" });
+  assert.deepEqual(advanceOrchestratorRound(1, fail), { kind: "fail" });
+  assert.deepEqual(advanceOrchestratorRound(2, fail), { kind: "fail" });
   assert.deepEqual(advanceOrchestratorRound(2, retry, "retry-failed"), { kind: "wait-for-user" });
   assert.deepEqual(advanceOrchestratorRound(2, skip), { kind: "apply" });
 });
@@ -238,26 +240,25 @@ test("two automatic give_up decisions leave the run waiting for the user", async
     assert.equal((await pending).steps[0]?.status, "skipped");
   });
 });
-test("two automatic fail decisions also leave the run waiting for the user", async () => {
+test("automatic fail decisions end the run and are written to the action log", async () => {
   await withRoot(async (root) => {
-    let release: ((decision: { action: "skip" }) => void) | undefined;
-    let signalBlocked: (() => void) | undefined;
-    const blocked = new Promise<void>((resolveBlocked) => { signalBlocked = resolveBlocked; });
-    const userDecision = new Promise<{ action: "skip" }>((resolveDecision) => { release = resolveDecision; });
-    const decisions: { round: number; action: string }[] = [];
+    const actionFile = join(root, "state", "actions.jsonl");
     const input = orchestratedInput(async (request) => {
       if (request.kind === "orchestrator") return executeFakeOrchestrator(request, root);
       return failed("partial", "step still fails");
-    }, async ({ round, decision }) => { decisions.push({ round, action: decision.action }); }, { first: "fail", escalation: "fail" }, async () => {
-      signalBlocked?.();
-      return userDecision;
-    });
-    const pending = interpretWorkflow(input);
+    }, async ({ workflow, runId, step, round, decision, note }) => {
+      recordActionLog(actionFile, {
+        workflow,
+        run_id: runId,
+        step,
+        source: round === 1 ? "round-1" : "round-2",
+        decision,
+        note,
+      });
+    }, { first: "fail", escalation: "skip" });
 
-    await blocked;
-    assert.deepEqual(decisions, [{ round: 1, action: "fail" }, { round: 2, action: "fail" }]);
-    release?.({ action: "skip" });
-    assert.equal((await pending).steps[0]?.status, "skipped");
+    await assert.rejects(interpretWorkflow(input), /10-check failed after 1 attempts: 10-check failed with exit code 7: step still fails/);
+    assert.deepEqual(readActionLog(actionFile).map(({ source, decision }) => [source, decision.action]), [["round-1", "fail"]]);
   });
 });
 
@@ -328,16 +329,23 @@ test("pause and resume update the state file and record chat actions", async () 
   });
 });
 
-test("manual starts refuse paused workflows and log a successful start through the supplied port", async () => {
+test("manual starts refuse paused or disabled workflows and log successful starts", async () => {
   let starts = 0;
   const startsLogged: string[] = [];
   await assert.rejects(startWorkflowForChat("clock", {
     isPaused: () => true,
+    isEnabled: () => true,
     start: async () => { starts += 1; return "wrun_never"; },
   }), /paused; resume it before starting manually/);
+  await assert.rejects(startWorkflowForChat("clock", {
+    isPaused: () => false,
+    isEnabled: () => false,
+    start: async () => { starts += 1; return "wrun_never"; },
+  }), /disabled; enable it before starting manually/);
   assert.equal(starts, 0);
   const started = await startWorkflowForChat("clock", {
     isPaused: () => false,
+    isEnabled: () => true,
     start: async () => "wrun_started",
     recordStart: (name, runId) => { startsLogged.push(`${name}:${runId}`); },
   });
@@ -411,22 +419,26 @@ test("chat decision tool applies a checked user action through its injected send
   assert.deepEqual(result, { run_id: "wrun_1", decision: { action: "skip" } });
 });
 
-test("cancel tool cancels an active run and leaves completed runs unchanged", async () => {
+test("cancel tool cancels active runs and stops their processes", async () => {
   const entries = [runEntry("wrun_active"), runEntry("wrun_done")];
   const cancelled: string[] = [];
+  const stopped: string[] = [];
   const actions: string[] = [];
   const active = await cancelWorkflowRun("wrun_active", entries, {
     getStatus: async () => "running",
     cancel: async (id) => { cancelled.push(id); },
+    stopProcesses: async (id) => { stopped.push(id); },
     recordAction: ({ workflow, runId }) => { actions.push(`${workflow}:${runId}`); },
   });
   const completed = await cancelWorkflowRun("wrun_done", entries, {
     getStatus: async () => "completed",
     cancel: async () => { assert.fail("terminal run must not be cancelled"); },
+    stopProcesses: async () => { assert.fail("terminal run processes must not be stopped"); },
     recordAction: () => { assert.fail("terminal run must not be logged as cancelled"); },
   });
   assert.deepEqual(active, { run_id: "wrun_active", workflow: "clock", status: "cancellation-requested", cancelled: true });
   assert.deepEqual(completed, { run_id: "wrun_done", workflow: "clock", status: "completed", cancelled: false });
   assert.deepEqual(cancelled, ["wrun_active"]);
+  assert.deepEqual(stopped, ["wrun_active"]);
   assert.deepEqual(actions, ["clock:wrun_active"]);
 });

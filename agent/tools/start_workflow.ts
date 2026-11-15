@@ -15,6 +15,7 @@ import { removeBlockedStep } from "../../run/remove-blocked-step.ts";
 import { writeBlockedStep } from "../../run/write-blocked-step.ts";
 import { createWorkflowSnapshot } from "../../workflow/create-workflow-snapshot.ts";
 import { interpretWorkflow, type AutomaticDecisionLog } from "../../workflow/interpret-workflow.ts";
+import { loadWorkflows } from "../../workflow/load-workflows.ts";
 import { parseWorkflowDecision } from "../../workflow/parse-workflow-decision.ts";
 import type { AttemptHistoryEntry, WorkflowDecision, WorkflowSnapshot } from "../../workflow/types.ts";
 import { executeWorkflowProcess } from "../lib/execute-workflow-process.ts";
@@ -42,11 +43,13 @@ export async function startWorkflowForChat(
   workflowName: string,
   ports: {
     isPaused(name: string): boolean;
+    isEnabled(name: string): boolean;
     start(name: string): Promise<string>;
     recordStart?(name: string, runId: string): Promise<void> | void;
   },
 ): Promise<{ status: "started"; workflow: string; runId: string }> {
   if (ports.isPaused(workflowName)) throw new Error(`Workflow "${workflowName}" is paused; resume it before starting manually.`);
+  if (!ports.isEnabled(workflowName)) throw new Error(`Workflow "${workflowName}" is disabled; enable it before starting manually.`);
   const runId = await ports.start(workflowName);
   await ports.recordStart?.(workflowName, runId);
   return { status: "started", workflow: workflowName, runId };
@@ -133,6 +136,11 @@ async function startManualWorkflow(workflowName: string): Promise<{ status: "sta
   const stateRoot = resolve(process.cwd(), "state");
   return startWorkflowForChat(workflowName, {
     isPaused: (name) => readPausedWorkflows(resolve(stateRoot, "paused.json")).has(name),
+    isEnabled: (name) => {
+      const config = readConfig();
+      const workflows = loadWorkflows(resolve(process.cwd(), "workflows"), new Set(Object.keys(config.agent_profiles)));
+      return workflows.workflows.find((workflow) => workflow.name === name)?.enabled !== false;
+    },
     start: async (name) => (await start(executeWorkflow, [{ workflowName: name }])).runId,
     recordStart: recordManualStart,
   });

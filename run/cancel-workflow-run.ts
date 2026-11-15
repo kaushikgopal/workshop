@@ -6,6 +6,7 @@ export async function cancelWorkflowRun(
   ports: {
     getStatus(runId: string): Promise<string>;
     cancel(runId: string): Promise<void>;
+    stopProcesses(runId: string): Promise<void>;
     recordAction(input: { workflow: string; runId: string }): Promise<void> | void;
   },
 ): Promise<{ run_id: string; workflow: string; status: string; cancelled: boolean }> {
@@ -15,7 +16,7 @@ export async function cancelWorkflowRun(
   if (status !== "pending" && status !== "running") {
     return { run_id: runId, workflow: entry.workflow, status, cancelled: false };
   }
-  await ports.cancel(runId);
+  await Promise.all([ports.cancel(runId), ports.stopProcesses(runId)]);
   await ports.recordAction({ workflow: entry.workflow, runId });
   return { run_id: runId, workflow: entry.workflow, status: "cancellation-requested", cancelled: true };
 }

@@ -41,7 +41,7 @@ export function buildOrchestratorBrief(input: OrchestratorBriefInput): Orchestra
     "Return exactly one strict JSON object and no Markdown. The object must have a string note. Valid shapes:",
     '{"action":"retry","hint":"optional","profile":"optional allowed profile","after":"optional duration such as 30s","note":"why"}',
     '{"action":"skip|accept|fail|give_up","note":"why"}',
-    "Use give_up when you cannot justify another safe action. Fail ends this round: round 1 escalates, and round 2 waits for chat. Accept is allowed only when last_output is non-empty.",
+    "Use give_up when you cannot justify another safe action. Fail ends the workflow immediately. Accept is allowed only when last_output is non-empty.",
     `Allowed actions: ${allowedActions.join(", ")}.`,
     `Allowed retry profiles: ${input.allowedRetryProfiles.length ? input.allowedRetryProfiles.join(", ") : "none (command steps cannot change profile)"}. Omit profile to keep the current profile.`,
     "",

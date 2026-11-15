@@ -109,6 +109,18 @@ test("accepts numbering gaps and leading zeroes, and sorts steps numerically", (
   });
 });
 
+test("rejects workflows with no steps or an empty description", () => {
+  withRoot((root) => {
+    createWorkflow(root, "no-steps", undefined, "A workflow description.");
+    const emptyDescription = createWorkflow(root, "empty-description", undefined, "");
+    writeStep(emptyDescription, "10-step.sh");
+    const result = loadWorkflows(root, profiles);
+    assert.equal(result.workflows.length, 0);
+    assert.match(errorReasons(result, "no-steps/workflow.md").join(" "), /at least one step/);
+    assert.match(errorReasons(result, "empty-description/workflow.md").join(" "), /description body must not be empty/);
+  });
+});
+
 test("rejects duplicate numeric steps even when their leading zeroes differ", () => {
   withRoot((root) => {
     const directory = createWorkflow(root);
@@ -274,7 +286,8 @@ test("ignores top-level YAML examples only when requested and loads good workflo
     const workflowsRoot = join(root, "workflows");
     mkdirSync(workflowsRoot);
     writeFileSync(join(workflowsRoot, "invalid.yaml"), "not a folder workflow");
-    createWorkflow(workflowsRoot, "good", 'cron: "*/5 * * * *"');
+    const good = createWorkflow(workflowsRoot, "good", 'cron: "*/5 * * * *"');
+    writeStep(good, "10-step.sh");
     createWorkflow(workflowsRoot, "broken", "cron: invalid");
     const workflows = loadWorkflows(workflowsRoot, profiles);
     assert.deepEqual(workflows.workflows.map(({ name }) => name), ["good"]);

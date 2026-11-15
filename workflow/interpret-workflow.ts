@@ -330,6 +330,9 @@ export async function interpretWorkflow(input: WorkflowInterpreterInput): Promis
           note: decision.note,
         });
         const transition = advanceOrchestratorRound(round, decision);
+        if (transition.kind === "fail") {
+          throw new Error(`${id} failed after ${totalAttempts} attempts: ${result.reason}`);
+        }
         if (transition.kind === "escalate" || transition.kind === "wait-for-user") {
           automaticRound = round === 1 ? 2 : 3;
           pendingResult = result;

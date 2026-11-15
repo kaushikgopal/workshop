@@ -250,6 +250,9 @@ function readWorkflow(
     const metadataFile = join(directory, "workflow.md");
     markdown = readMarkdown(join(folder, "workflow.md"), metadataFile, errors);
     if (markdown) metadata = parseWorkflowMetadata(markdown, metadataFile, errors);
+  if (markdown && markdown.body.length === 0) {
+    issue(errors, join(directory, "workflow.md"), "workflow description body must not be empty");
+  }
   }
   if (metadata?.profile !== undefined && !availableProfiles.has(metadata.profile)) {
     issue(errors, join(directory, "workflow.md"), `profile "${metadata.profile}" does not exist in agent_profiles`);
@@ -277,6 +280,7 @@ function readWorkflow(
     stepFiles.push(readStepFile(root, directory, entry.name, stepName.number, stepName.name, stepName.extension, metadata?.profile, availableProfiles, errors));
   }
 
+  if (stepFiles.length === 0) issue(errors, join(directory, "workflow.md"), "workflow must contain at least one step");
   stepFiles.sort((left, right) => left.number - right.number || left.file.localeCompare(right.file));
   const stepsByNumber = new Map<number, StepFile>();
   for (const step of stepFiles) {

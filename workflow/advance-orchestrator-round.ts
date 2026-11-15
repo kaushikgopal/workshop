@@ -5,6 +5,7 @@ export type OrchestratorRoundOutcome = "not-retried" | "retry-failed" | "retry-s
 export type OrchestratorRoundAction =
   | { kind: "retry" }
   | { kind: "apply" }
+  | { kind: "fail" }
   | { kind: "escalate"; nextRound: 2 }
   | { kind: "wait-for-user" };
 
@@ -13,7 +14,8 @@ export function advanceOrchestratorRound(
   decision: OrchestratorDecision,
   outcome: OrchestratorRoundOutcome = "not-retried",
 ): OrchestratorRoundAction {
-  if (decision.action === "give_up" || decision.action === "fail") {
+  if (decision.action === "fail") return { kind: "fail" };
+  if (decision.action === "give_up") {
     return round === 1 ? { kind: "escalate", nextRound: 2 } : { kind: "wait-for-user" };
   }
   if (decision.action !== "retry") return { kind: "apply" };

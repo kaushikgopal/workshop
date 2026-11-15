@@ -4,6 +4,7 @@ import { getRun } from "eve/workflow/api";
 import { recordActionLog } from "../../run/record-action-log.ts";
 import { cancelWorkflowRun } from "../../run/cancel-workflow-run.ts";
 import { readRunIndex } from "../../run/read-run-index.ts";
+import { cancelWorkflowProcesses } from "../lib/execute-workflow-process.ts";
 import { z } from "zod";
 
 export async function cancelRun(runId: string) {
@@ -12,6 +13,7 @@ export async function cancelRun(runId: string) {
   return cancelWorkflowRun(runId, entries, {
     getStatus: async (id) => await getRun(id).status,
     cancel: async (id) => await getRun(id).cancel(),
+    stopProcesses: cancelWorkflowProcesses,
     recordAction: ({ workflow, runId: cancelledRunId }) => {
       recordActionLog(resolve(stateRoot, "actions.jsonl"), {
         workflow,
