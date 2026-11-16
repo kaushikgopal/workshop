@@ -11,7 +11,9 @@ A reader should know what a file does from its path alone, before opening it.
 ### Folders are nouns, files are verbs
 
 - **Folders** name the domain things the code is about: `config/`, `workflow/`, `run/`, `schedule/`, and `service/`. Use the same nouns as the data model and user-facing terms.
-- **Files** lead with a verb that says what they do: `workflow/load-workflows.ts`, `workflow/interpret-workflow.ts`, `service/serve-service-socket.ts`. A noun alone (`types.ts`) says what a file is about, not what it does.
+- **Files** lead with a verb that says what they do: `workflow/load-workflows.ts`,
+  `workflow/interpret-workflow.ts`, `service/serve-service-socket.ts`. A noun
+  alone, such as `workflow/types.ts`, says what a file is about, not what it does.
 - **Exception: pure shape.** A file that only declares types or a schema keeps a noun name, such as `workflow/types.ts` or `service/types.ts`.
 
 ### Use one verb per kind of work
@@ -22,12 +24,11 @@ Give each verb one meaning and reuse it for that meaning:
 | --- | --- | --- |
 | `parse` | turn text into structure | `workflow/parse-workflow-decision.ts` |
 | `check` | apply fixed rules and report errors | `scripts/check-workflows.ts` |
-| `load` | read a file and return checked data | `workflow/load-workflows.ts` |
+| `load` | read a file and return checked data | `workflow/load-workflows.ts`, `workflow/load-workflow-step.ts` |
 | `build` | assemble input for another program | `workflow/build-orchestrator-brief.ts` |
 | `create` | assemble an in-process component | `service/create-workshop-service.ts` |
 | `define` | register a durable task | `workflow/define-workflow-task.ts` |
 | `execute` | carry out a unit of work | `run/execute-workflow-process.ts` |
-| `load` | read a file and return checked data | `workflow/load-workflow-step.ts` |
 | `open` | initialize a durable harness | `service/open-workshop-harness.ts` |
 | `serve` | expose the local JSON API | `service/serve-service-socket.ts` |
 
@@ -35,12 +36,20 @@ Other plain verbs (`start`, `send`, `cancel`, `pause`, `resume`) are fine when n
 
 ### Rules that prevent collisions
 
-- **Never use "run" as a verb.** In a workflow runner, `run` names one execution. A function named `runWorkflow` or a file named `run-paths.ts` forces the reader to guess which meaning you meant. Use `execute`, `advance`, `start`, or a more specific verb.
-- **Use `parse` and `check` for different jobs.** Parsing turns input into structure. Checking applies fixed rules and reports errors.
-- **Use the project's domain words.** Authors and code both call these items steps (`WorkflowStep`), not nodes.
-- **Name the logic, not the area.** `run/read-run-index.ts` says what it reads; a broad name like `run/state.ts` does not.
-- **Match exported symbols to the file's verb.** `workflow/load-workflows.ts` exports `loadWorkflows`; `run/locate-blocked-step.ts` exports `locateBlockedStep`.
-- **Split a file when its name needs "and".** `read-and-remove.ts` is the ceiling: two steps that always happen together. Three verbs means three files.
+- **Never use "run" as a verb.** In this project, a `run` is one workflow
+  execution. Use `execute`, `advance`, `start`, or a more specific verb
+  instead.
+- **Use `parse` and `check` for different jobs.** Parsing turns input into
+  structure. Checking applies fixed rules and reports errors.
+- **Use the project's domain words.** Authors and code both call these items
+  steps (`WorkflowStep`), not nodes.
+- **Name the logic, not the area.** Use a specific, verb-first name that
+  describes the file's main action.
+- **Match exported symbols to the file's verb.**
+  `workflow/load-workflows.ts` exports `loadWorkflows`;
+  `run/start-workflow.ts` exports `startWorkflow`.
+- **Split a file when its name needs "and".** Combine two steps only when they
+  always happen together. Give independent steps their own files.
 
 ## Code
 
@@ -72,15 +81,34 @@ Other plain verbs (`start`, `send`, `cancel`, `pause`, `resume`) are fine when n
 
 ## How the code works
 
-## How the code works
+Workshop is a Node.js and TypeScript service built on pi-durable. `make start`
+runs `service/start-service.ts`; `make dev` runs it in Node watch mode. Startup
+validates config and workflows, claims the SQLite owner row, opens the durable
+harness, and listens on a private Unix socket. It resolves the root and consult
+models through Pi's registry and auth store. The harness keeps the root
+orchestrator conversation and durable workflow tasks in SQLite. A durable tick
+task checks schedules once a minute.
 
-Workshop is a Node.js and TypeScript service built on pi-durable. `make start` runs `service/start-service.ts`; `make dev` watches source files and restarts the service. Startup validates config and workflows, claims the SQLite owner row before task recovery, resolves orchestrator models through Pi's registry and auth store, opens the harness, and listens on a private Unix socket. The harness keeps one root conversation in SQLite for client chat and automatic failure rounds. A durable tick task checks schedules once a minute.
+A workflow admission creates a `WorkflowTask` with its validated settings and
+ordered steps. The task reads each step and check file when that step starts,
+then creates a `StepAttemptTask` to do the work. Checkpoints keep the pipe
+input, step results, attempts, retry state, and blocked decisions. Run-reference
+documents map public run IDs to durable task IDs. The session document keeps
+recent admissions, actions, and decision receipts, plus scheduling counters.
+A hard service crash can replay an unfinished command, and its original child
+process may still be running. Make external effects safe to repeat.
 
-`WorkflowTask` stores the validated workflow settings and ordered step list. It reads each step and check file when that step starts, then creates a `StepAttemptTask` for the work. The task checkpoint stores pipe input, results, attempts, retry state, and blocked decisions. Run-reference documents map public run IDs to durable task IDs. A bounded session document keeps recent admission, action, and decision-receipt history plus per-workflow schedule counters. A hard service crash can replay an unfinished command; external effects must be safe to repeat. Workshop does not write run snapshots or separate run-state files.
+After local retries fail, the workflow task submits one keyed failure round to
+the root conversation. The root can decide through Workshop tools or call
+`consult`, a read-only child conversation using the escalation model. If the
+round takes no safe action, Workshop records `give_up` and leaves the run
+blocked. `make chat` attaches to the same persistent root over the socket and
+streams text and tool progress. Submissions queue behind an active turn.
 
-After local retries fail, the workflow task saves the evidence and submits one keyed failure round to the root conversation. The root can decide through Workshop tools or call `consult`, a read-only child conversation using the escalation model. If it takes no safe action, Workshop records `give_up` and leaves the run blocked. `make chat` attaches to the persistent root over the private socket and streams text and tool progress; submissions queue behind an active turn.
-
-The daily-summary example reads recent runs and actions through this service API. Steps still share `data/<workflow>/`, which is separate from the SQLite record. Commands and profile processes run with the service account's permissions. They are not sandboxed.
+The daily-summary example reads recent runs and actions through the service
+API. Workflow steps share `data/<workflow>/`, separate from SQLite state.
+Commands and profile processes use the service account's permissions; they
+are not sandboxed.
 
 ```mermaid
 flowchart TD
@@ -109,23 +137,76 @@ flowchart TD
 Folders and filenames follow [Naming files](#naming-files).
 
 ```text
-agent/instructions.md            root orchestrator instructions
-config/                          config loading and validation
-run/                             durable workflow admission, state, process execution
-schedule/                        cron-slot selection and durable schedule ticks
-service/                         Pi model runtime, root extension, harness, socket API, service entrypoint
-workflow/                        parsing, step loading, decisions, durable task definitions
-scripts/                         checks, activity reader, chat client, copy, launch-agent setup
-test/                            unit, service, socket, and SQLite resume tests
-examples/workflows/              hemingway-clock and daily-summary folders
-workflows/                       private workflows; upstream keeps .gitkeep only
-workshop.example.yaml            config template
-workshop.yaml                    local config, ignored upstream
-Makefile                         setup, checks, service, chat, and copy commands
+agent/instructions.md                     root orchestrator instructions
+config/                                   config loading and validation
+  read-workshop-config.ts                 YAML, environment, and profile validation
+service/                                  durable service and local API
+  acquire-store-lock.ts                   single-owner SQLite lock
+  create-orchestrator-runtime.ts           Pi model registry and auth
+  create-workshop-extension.ts             root tools, status, and consult
+  create-workshop-service.ts               service request handling
+  launch-service.plist.template            macOS service launch settings
+  open-workshop-harness.ts                 durable task and conversation registry
+  request-service.ts                       local API client
+  serve-service-socket.ts                  private JSON socket
+  start-service.ts                         entrypoint and lifecycle
+  types.ts                                 service request and response shapes
+workflow/                                 workflow loading and durable execution
+  apply-workflow-decision.ts               blocked-run decision rules
+  build-orchestrator-brief.ts              failure-round prompt
+  compute-retry-profiles.ts                allowed retry profiles
+  define-step-attempt-task.ts              durable step-attempt task
+  define-workflow-task.ts                  durable workflow task
+  interpret-workflow.ts                    command, agent, and check behavior
+  list-workflow-status.ts                  workflow status for orchestrator tools
+  load-workflow-step.ts                    step and check files at step start
+  load-workflows.ts                        folder validation and workflow loading
+  parse-workflow-decision.ts               decision validation
+  types.ts                                 workflow and step shapes
+run/                                      admission, state, and process execution
+  execute-workflow-process.ts              command and profile process groups
+  start-workflow.ts                        workflow admission and task creation
+  workshop-state.ts                        bounded history, pause state, counters
+schedule/                                 cron-slot selection and durable ticks
+  decide-workflow-slot.ts                  slot and `max_runs` decisions
+  tick-workflows.ts                        one-minute durable schedule tick
+scripts/                                  checks and user-facing commands
+  check-config.ts                          local config and profile checks
+  check-workflows.ts                       workflow and example checks
+  chat-workshop.ts                         socket chat client
+  copy-workshop.ts                         private copy setup
+  install-launch-agent.ts                  macOS LaunchAgent installer
+  read-workshop-activity.ts                activity reader for daily-summary
+  uninstall-launch-agent.ts                macOS LaunchAgent remover
+test/                                     unit and integration tests
+  chat-workshop.test.ts                    interactive and single-reply chat
+  check-workflows.test.ts                  workflow validation
+  crash-resume.test.ts                     SQLite task recovery
+  interpret-workflow.test.ts               command, agent, and check behavior
+  load-workflows.test.ts                   workflow folder loading
+  orchestrate-workflow.test.ts             step attempts and decisions
+  read-config.test.ts                      config and profile checks
+  service-socket.test.ts                   socket behavior
+  service.test.ts                          service operations and chat
+examples/workflows/                       hemingway-clock and daily-summary
+workflows/                                private workflows; upstream keeps .gitkeep only
+workshop.example.yaml                     public config template
+Makefile                                 setup, validation, service, chat, and copy targets
 ```
 
-`workflow/` does not depend on the service API. `run/` and `schedule/` use the durable store through the service harness. Tests use fake commands and do not need model credentials.
+`workflow/` does not depend on the service API. The service composes config,
+workflow, run, and schedule behavior around the durable harness. Tests use
+fake commands and do not need model credentials.
 
 ### Tests and validation
 
-`npm test` runs the Node test suite in `test/`. It includes an SQLite crash-resume test that verifies the same parent and child task IDs resume. `make check` validates config and workflows, then runs the typecheck and tests.
+`npm test` runs the Node test suite in `test/`, including an SQLite crash-resume
+test that verifies the same parent and child task IDs resume. `make check`
+validates config, profile executables, private workflows, and examples, then
+runs the typecheck and tests. Before review, run:
+
+```fish
+npx tsc --noEmit
+npm test
+make check
+```

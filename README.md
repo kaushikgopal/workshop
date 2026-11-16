@@ -83,7 +83,10 @@ workflows/hemingway-clock/
 
 `workflow.md` holds schedule settings and defaults. A numbered `.md` file is an agent step; `.sh` and `.ts` files are command steps. A matching `.check.md`, `.check.sh`, or `.check.ts` checks a step's output.
 
-Workshop stores durable state in `state/workshop.sqlite`. It does not copy run snapshots. It loads each step and check file when that step starts. Steps share `data/<workflow>/`. See [the reference](docs/reference.md) for validation and execution rules.
+Workshop stores runs and orchestrator state in `state/workshop.sqlite`. It
+reads each step and check file when that step starts. Steps share
+`data/<workflow>/`. See [the reference](docs/reference.md) for validation and
+execution rules.
 
 ## Agent profiles
 

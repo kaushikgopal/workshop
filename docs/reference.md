@@ -27,24 +27,35 @@ Workshop reads `.env.local` from the config file's directory. Existing process e
 
 ## Orchestrator conversation
 
-Workshop keeps one root conversation in `state/workshop.sqlite`. It uses `orchestrator.model` and the Pi registry/auth store. Automatic failure rounds and chat submissions use the same conversation.
+Workshop keeps one root conversation in `state/workshop.sqlite`. It uses
+`orchestrator.model` and Pi's registry and auth store. After local retries fail,
+each failed workflow step gets one keyed failure round in this conversation;
+chat messages use the same root.
 
-The system prompt includes `agent/instructions.md` and a live Workshop status section. Status lists blocked runs, broken workflows, paused workflows, and recent actions. The root has in-process tools to list workflows and runs, read a run, start or cancel a run, decide a blocked run, pause or resume a workflow, and list actions.
+The system prompt includes `agent/instructions.md` and a live Workshop status
+section. Status lists blocked runs, broken workflows, paused workflows, and
+recent actions. The root has in-process tools to list workflows and runs, read a
+run, start or cancel a run, decide a blocked run, pause or resume a workflow,
+and list actions.
 
-The `consult` tool creates a read-only child conversation with `orchestrator.escalation_model`. It can inspect workflows, runs, and recent actions, but it has no tools that mutate Workshop state. The failure round can use `consult` for independent advice before it calls `decide_blocked_run`.
+The `consult` tool creates a read-only child conversation with
+`orchestrator.escalation_model`. It can inspect workflows, runs, and recent
+actions, but it has no tools that mutate Workshop state. A failure round can
+call `consult` for advice before deciding what to do.
 
 ## Workflow folders and validation
 
-Put each workflow in its own folder under `workflows/`. The folder name and each step name use lowercase letters, digits, and hyphens.
+Each workflow goes in its own folder under `workflows/`. Folder and step names
+use lowercase letters, digits, and hyphens. The shipped
+`examples/workflows/hemingway-clock/` folder shows a valid layout:
 
 ```text
-workflows/<name>/
+examples/workflows/hemingway-clock/
 ├─ workflow.md
-├─ 10-fetch.sh
-├─ 20-draft.md
-├─ 20-draft.check.md
-├─ 25-tidy.ts
-└─ 30-save.sh
+├─ 10-get-timestamp.sh
+├─ 20-write-line.md
+├─ 20-write-line.check.md
+└─ 30-save-line.sh
 ```
 
 `workflow.md` is required. Its YAML frontmatter accepts only these keys:
@@ -68,7 +79,10 @@ Unknown files, subfolders, malformed frontmatter, unknown keys, invalid profile 
 
 ## Step execution
 
-A workflow start stores its validated settings and ordered step list in the durable task. Workshop does not copy a run snapshot. It reads each step file and its check when that step starts, including when a retry starts. An edit to a later step can therefore affect an active run; an edit to the current step does not change an attempt that has already started.
+A workflow start stores its validated settings and ordered step list in the
+durable task. It reads each step file and its check when that step starts,
+including when a retry starts. An edit to a later step can affect an active run;
+an edit to the current step does not change an attempt that has already started.
 
 Steps execute in order. The first step receives empty input. A command step runs as `sh <file>` for `.sh` or `node <file>` for `.ts`, with its working directory set to `data/<workflow>/`. An agent step runs the selected profile command with its prompt on stdin. Workshop does not invoke a shell to start profile commands.
 
@@ -123,9 +137,16 @@ Cancelling a run aborts its durable workflow task and owned step-attempt task. T
 
 ## Durable state and files
 
-Run Workshop from the project root. `state/workshop.sqlite` is the only record of run admission, task checkpoints and outcomes, step results, blocked details, decisions, pause state, and the persistent root and consult conversations. Each run has a durable reference from its run ID to its task ID, so the service can inspect older runs without scanning every task.
+Run Workshop from the project root. `state/workshop.sqlite` is the durable
+record for workflow admissions, task checkpoints and outcomes, step results,
+blocked details, decisions, pause state, and the root and consult conversations.
+Each run ID maps to a durable task ID so the service can inspect older runs.
 
-The session document keeps the most recent 1,000 admission records, actions, and mutation receipts. Separate per-workflow counters preserve `max_runs` and the latest scheduled slot after older records roll off. Run tasks and their references remain in SQLite. There are no run snapshots, JSONL indexes, paused-workflow files, blocked-step files, or process registry files.
+The session-scoped Workshop state document keeps the latest 1,000 admission
+records, actions, and mutation receipts. Per-workflow counters preserve
+`max_runs` and the latest scheduled slot after older admission records roll off.
+
+Project inputs and runtime files are:
 
 ```text
 workshop.yaml                    local config; ignored upstream
@@ -133,13 +154,40 @@ workshop.yaml                    local config; ignored upstream
 workflows/<name>/                user workflow folders
 examples/workflows/<name>/       shipped examples; not auto-started
 data/<workflow>/                persistent shared working files for steps
-state/
-├─ workshop.sqlite               durable tasks and Workshop state documents
-├─ service.sock                  private local JSON API socket
-└─ service.log                   launch-agent stdout and stderr
+state/workshop.sqlite            durable task store and Workshop state documents
+state/service.sock               private local JSON API socket
+state/service.log               LaunchAgent stdout and stderr
 ```
 
-`data/<workflow>/` belongs to workflow steps, not to Workshop's run-state record. It remains in place between runs. Runtime state, data, and logs are ignored by Git. The service removes its socket when it shuts down.
+`data/<workflow>/` belongs to workflow steps, not to Workshop's durable state.
+It remains in place between runs. Runtime state, data, and logs are ignored by
+Git. Workshop removes the socket when the service shuts down.
+
+## Upgrading with open runs
+
+pi-durable stores a version with each task's input and checkpoint. The current
+task definitions are:
+
+| Task kind | Version | Migration |
+| --- | ---: | --- |
+| `workshop.workflow` | 3 | None |
+| `workshop.step-attempt` | 1 | None |
+| `workshop.schedule-tick` | 1 | None |
+
+A task at the same version resumes from its saved checkpoint. The current task
+definitions have no migration functions. An open `workshop.workflow` task
+stored below version 3 cannot resume under the current version 3 definition.
+When a newer definition replaces an older version without a migration,
+pi-durable blocks the task and reports `migration_failed`. If the installed
+definition is older than the stored task, it reports `task_too_old`; if the
+task kind is no longer registered, it reports `missing_task`. Add migrations
+for supported older versions before changing a task's version. A compatible
+code change can keep the existing version only if it can still read the saved
+input and checkpoint.
+
+The `workshop.state` document is version 2 and migrates version 1. The
+`workshop.workflow-decision` and `workshop.run-reference` documents are version
+1. Keep document migrations in step with their stored shapes.
 
 ## Local service API
 
@@ -186,7 +234,7 @@ The daily-summary activity step uses this API to read recent runs and actions. `
 | `make dev` | Starts the service in Node watch mode. It stays in the foreground; stop it with Ctrl-C. |
 | `make start` | Starts the service in the foreground; stop it with Ctrl-C. |
 | `make chat` | Attaches to the persistent orchestrator conversation; use `make chat print="message"` for one reply. |
-| `make service-install` | Runs checks, then installs a macOS per-user LaunchAgent for the Node service. |
-| `make service-uninstall` | Removes the macOS LaunchAgent. It leaves workflow data and runtime state in place. |
+| `make service-install` | Runs checks, then installs a per-user macOS LaunchAgent that starts `node service/start-service.ts` from the project root. The agent writes stdout and stderr to `state/service.log`. |
+| `make service-uninstall` | Removes the macOS LaunchAgent and plist. It leaves runtime state and workflow data in place. |
 
-The LaunchAgent writes stdout and stderr to `state/service.log`. Foreground `make start` and `make dev` output goes to the terminal instead.
+The foreground `make start` and `make dev` commands write output to the terminal.
