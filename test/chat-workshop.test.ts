@@ -221,3 +221,102 @@ test("--print gives one make-start hint when the service socket is missing", { t
     rmSync(projectRoot, { recursive: true, force: true });
   }
 });
+
+
+function executePipedChat(cwd: string, message: string): Promise<{ code: number | null; stdout: string; stderr: string }> {
+  const child = spawn(process.execPath, [chatScript], { cwd, stdio: ["pipe", "pipe", "pipe"] });
+  let output = "";
+  let errors = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk: string) => { output += chunk; });
+  child.stderr.on("data", (chunk: string) => { errors += chunk; });
+  child.stdin.end(`${message}\n`);
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => child.kill("SIGKILL"), 5_000);
+    child.once("error", (error) => { clearTimeout(timeout); reject(error); });
+    child.once("exit", (code) => { clearTimeout(timeout); resolve({ code, stdout: output, stderr: errors }); });
+  });
+}
+
+test("interactive chat keeps piped input and EOF received before attachment", { timeout: 12_000 }, async () => {
+  const projectRoot = createProject();
+  mkdirSync(join(projectRoot, "state"), { recursive: true });
+  let socketServer: Awaited<ReturnType<typeof serveServiceSocket>> | undefined;
+  try {
+    socketServer = await serveServiceSocket(join(projectRoot, "state", "service.sock"), async (value, send) => {
+      const request = parseServiceRequest(value);
+      if (request.type === "watch_chat") {
+        await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+        send({ request_id: request.request_id, ok: true, type: "chat.attached", conversation_id: "test-root", busy: false });
+        return { close: async () => {} };
+      } else if (request.type === "submit_chat") {
+        send({ request_id: request.request_id, ok: true, answer: "Piped input reached the attached service." });
+      }
+    });
+    const result = await executePipedChat(projectRoot, "Answer before EOF");
+    assert.equal(result.code, 0, result.stderr);
+    assert.match(result.stdout, /Piped input reached the attached service\./);
+    assert.equal(result.stderr, "");
+  } finally {
+    if (socketServer) await socketServer.close();
+    rmSync(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("interactive chat ignores unknown and duplicate responses", { timeout: 20_000 }, async () => {
+  const projectRoot = createProject();
+  mkdirSync(join(projectRoot, "state"), { recursive: true });
+  let socketServer: Awaited<ReturnType<typeof serveServiceSocket>> | undefined;
+  try {
+    socketServer = await serveServiceSocket(join(projectRoot, "state", "service.sock"), async (value, send) => {
+      const request = parseServiceRequest(value);
+      if (request.type === "watch_chat") {
+        send({ request_id: request.request_id, ok: true, type: "chat.attached", conversation_id: "test-root", busy: false });
+        return { close: async () => {} };
+      } else if (request.type === "submit_chat") {
+        send({ request_id: "chat-unknown", ok: true, answer: "Unrelated answer." });
+        send({ request_id: "chat-unknown", ok: true, answer: "Unrelated answer." });
+        send({ request_id: request.request_id, ok: true, answer: "The matching answer." });
+        send({ request_id: request.request_id, ok: true, answer: "The matching answer." });
+      }
+    });
+    const result = await executeInteractiveChat(projectRoot, "Ask one question");
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(result.stdout.match(/Unrelated answer\./g)?.length ?? 0, 0);
+    assert.equal(result.stdout.match(/The matching answer\./g)?.length ?? 0, 1);
+    assert.equal(result.stderr, "");
+  } finally {
+    if (socketServer) await socketServer.close();
+    rmSync(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("print and interactive clients treat replacement deltas as new text", { timeout: 30_000 }, async () => {
+  const projectRoot = createProject();
+  mkdirSync(join(projectRoot, "state"), { recursive: true });
+  let socketServer: Awaited<ReturnType<typeof serveServiceSocket>> | undefined;
+  try {
+    socketServer = await serveServiceSocket(join(projectRoot, "state", "service.sock"), async (value, send) => {
+      const request = parseServiceRequest(value);
+      if (request.type === "watch_chat") {
+        send({ request_id: request.request_id, ok: true, type: "chat.attached", conversation_id: "test-root", busy: false });
+        return { close: async () => {} };
+      } else if (request.type === "submit_chat") {
+        send({ request_id: request.request_id, ok: true, type: "assistant.delta", chat_request_id: request.request_id, text: "Old partial" });
+        send({ request_id: request.request_id, ok: true, type: "assistant.delta", chat_request_id: request.request_id, text: "Replacement", replace: true });
+        send({ request_id: request.request_id, ok: true, type: "assistant.final", chat_request_id: request.request_id, answer: "Replacement" });
+        send({ request_id: request.request_id, ok: true, answer: "Replacement" });
+      }
+    });
+    const printed = await executeChat(["--print", "Replace this"], projectRoot);
+    assert.equal(printed.code, 0, printed.stderr);
+    assert.doesNotMatch(printed.stdout, /Old partialReplacement/);
+    const interactive = await executeInteractiveChat(projectRoot, "Replace this too");
+    assert.equal(interactive.code, 0, interactive.stderr);
+    assert.doesNotMatch(interactive.stdout, /Old partialReplacement/);
+  } finally {
+    if (socketServer) await socketServer.close();
+    rmSync(projectRoot, { recursive: true, force: true });
+  }
+});

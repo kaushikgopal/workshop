@@ -7,6 +7,13 @@ import { stderr, stdin, stdout } from "node:process";
 const socketPath = join(process.cwd(), "state", "service.sock");
 type Event = Record<string, unknown>;
 type EventHandler = (event: Event) => void;
+type PendingChat = { streamedText: string; hasText: boolean; lineEnded: boolean };
+type ChatClientState =
+  | { phase: "connecting"; queuedMessages: string[]; inputEnded: boolean }
+  | { phase: "attaching"; watchId: string; queuedMessages: string[]; inputEnded: boolean }
+  | { phase: "attached"; watchId: string; queuedMessages: string[]; pendingById: Map<string, PendingChat>; inputEnded: boolean; promptVisible: boolean }
+  | { phase: "closing"; watchId?: string; pendingById: ReadonlyMap<string, PendingChat> }
+  | { phase: "closed" };
 
 function isRecord(value: unknown): value is Event {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -16,7 +23,7 @@ function requestId(): string {
   return randomUUID();
 }
 
-async function connectChat(onEvent: EventHandler, onError: (error: Error) => void): Promise<Socket> {
+async function connectChat(watchId: string, onEvent: EventHandler, onError: (error: Error) => void): Promise<Socket> {
   const socket = connect(socketPath);
   socket.setEncoding("utf8");
   await new Promise<void>((resolve, reject) => {
@@ -48,12 +55,17 @@ async function connectChat(onEvent: EventHandler, onError: (error: Error) => voi
       try {
         const parsed: unknown = JSON.parse(line);
         if (!isRecord(parsed)) throw new Error("Workshop returned an invalid chat event");
-        if (!attached && parsed.ok === false) throw new Error(String(parsed.error ?? "Chat attachment failed"));
         if (parsed.type === "chat.attached") {
+          if (attached || parsed.request_id !== watchId) {
+            newline = buffer.indexOf("\n");
+            continue;
+          }
           attached = true;
           resolveAttached();
+        } else if (!attached && parsed.ok === false) {
+          throw new Error(String(parsed.error ?? "Chat attachment failed"));
         }
-        onEvent(parsed);
+        if (attached && parsed.type !== "chat.attached") onEvent(parsed);
       } catch (error) {
         const failure = error instanceof Error ? error : new Error(String(error));
         if (!attached) rejectAttached(failure);
@@ -72,7 +84,7 @@ async function connectChat(onEvent: EventHandler, onError: (error: Error) => voi
     if (!attached) rejectAttached(new Error("Workshop closed the chat connection before attaching"));
     else onError(new Error("Workshop chat connection closed"));
   });
-  socket.write(`${JSON.stringify({ request_id: requestId(), type: "watch_chat" })}\n`);
+  socket.write(`${JSON.stringify({ request_id: watchId, type: "watch_chat" })}\n`);
   await ready;
   return socket;
 }
@@ -95,37 +107,72 @@ function outputTool(event: Event, output: NodeJS.WriteStream): void {
   }
 }
 
+function appendDelta(pending: PendingChat, text: string, replace: boolean, output: NodeJS.WriteStream): void {
+  if (replace) {
+    if (pending.streamedText.length > 0) output.write("\n");
+    output.write(text);
+    pending.streamedText = text;
+    pending.hasText = text.length > 0;
+    pending.lineEnded = false;
+    return;
+  }
+  output.write(text);
+  pending.streamedText += text;
+  pending.hasText ||= text.length > 0;
+  pending.lineEnded = false;
+}
+
+function printAnswer(pending: PendingChat, answer: string, output: NodeJS.WriteStream): void {
+  if (answer.startsWith(pending.streamedText)) {
+    output.write(answer.slice(pending.streamedText.length));
+  } else {
+    if (pending.streamedText.length > 0) output.write("\n");
+    output.write(answer);
+  }
+  pending.streamedText = answer;
+  pending.hasText ||= answer.length > 0;
+  pending.lineEnded = false;
+}
+
 async function printMessage(message: string): Promise<void> {
   const id = requestId();
-  let streamed = "";
+  const watchId = requestId();
+  const pending: PendingChat = { streamedText: "", hasText: false, lineEnded: false };
   let resolveReply = () => {};
   let rejectReply = (_error: Error) => {};
+  let settled = false;
   const reply = new Promise<void>((resolve, reject) => {
     resolveReply = resolve;
     rejectReply = reject;
   });
   let socket: Socket | undefined;
   try {
-    socket = await connectChat((event) => {
+    socket = await connectChat(watchId, (event) => {
+      if (settled) return;
       if (event.type === "assistant.delta" && event.chat_request_id === id && typeof event.text === "string") {
-        streamed += event.text;
-        stdout.write(event.text);
+        appendDelta(pending, event.text, event.replace === true, stdout);
       } else if (event.type === "assistant.final" && event.chat_request_id === id && typeof event.answer === "string") {
-        if (event.answer.startsWith(streamed)) stdout.write(event.answer.slice(streamed.length));
-        else stdout.write(`\n${event.answer}`);
-        streamed = event.answer;
+        printAnswer(pending, event.answer, stdout);
       } else if ((event.type === "tool.call" || event.type === "tool.result") && event.chat_request_id === id) {
         outputTool(event, stderr);
       }
-      if (event.request_id !== id) return;
+      if (event.request_id !== id || (event.ok !== false && typeof event.answer !== "string")) return;
+      settled = true;
       if (event.ok === false) {
         rejectReply(new Error(String(event.error ?? "Chat request failed")));
-      } else if (typeof event.answer === "string") {
-        if (streamed.length === 0 && event.answer.length > 0) stdout.write(event.answer);
-        if (event.answer.length > 0 || streamed.length > 0) stdout.write("\n");
-        resolveReply();
+        return;
       }
-    }, (error) => rejectReply(error));
+      const answer = event.answer;
+      if (typeof answer !== "string") return;
+      if (answer.startsWith(pending.streamedText)) stdout.write(answer.slice(pending.streamedText.length));
+      else if (pending.streamedText.length === 0) stdout.write(answer);
+      else stdout.write(`\n${answer}`);
+      pending.streamedText = answer;
+      if (answer.length > 0 || pending.hasText) stdout.write("\n");
+      resolveReply();
+    }, (error) => {
+      if (!settled) rejectReply(error);
+    });
     socket.write(`${JSON.stringify({ request_id: id, type: "submit_chat", content: message })}\n`);
     await reply;
   } finally {
@@ -134,100 +181,136 @@ async function printMessage(message: string): Promise<void> {
 }
 
 async function startChat(): Promise<void> {
-  let pending = 0;
-  let responseHasText = false;
-  let promptVisible = false;
-  let readerClosed = false;
-  const pendingText = new Map<string, string>();
-  let closeReader: (() => void) | undefined;
+  const watchId = requestId();
+  let state: ChatClientState = { phase: "connecting", queuedMessages: [], inputEnded: false };
   let socket: Socket | undefined;
+  let interrupted = false;
   const reader = createInterface({ input: stdin, output: stdout, terminal: stdin.isTTY && stdout.isTTY });
+
   const prompt = () => {
-    if (pending === 0 && !readerClosed) {
+    if (state.phase === "attached" && state.pendingById.size === 0 && state.queuedMessages.length === 0 && !state.inputEnded) {
       reader.setPrompt("workshop> ");
       reader.prompt();
-      promptVisible = true;
-      responseHasText = false;
+      state.promptVisible = true;
     }
   };
-  try {
-    socket = await connectChat((event) => {
-      if (event.type === "assistant.delta" && typeof event.chat_request_id === "string" && pendingText.has(event.chat_request_id) && typeof event.text === "string") {
-        if (promptVisible) {
-          stdout.write("\n");
-          promptVisible = false;
-        }
-        stdout.write(event.text);
-        pendingText.set(event.chat_request_id, (pendingText.get(event.chat_request_id) ?? "") + event.text);
-        responseHasText = true;
-      } else if ((event.type === "tool.call" || event.type === "tool.result") && typeof event.chat_request_id === "string" && pendingText.has(event.chat_request_id)) {
-        if (promptVisible) {
-          stdout.write("\n");
-          promptVisible = false;
-        }
-        outputTool(event, stdout);
-      } else if (event.type === "assistant.final" && typeof event.chat_request_id === "string" && typeof event.answer === "string") {
-        const streamed = pendingText.get(event.chat_request_id);
-        if (streamed !== undefined) {
-          if (promptVisible) {
-            stdout.write("\n");
-            promptVisible = false;
-          }
-          if (event.answer.startsWith(streamed)) stdout.write(event.answer.slice(streamed.length));
-          else if (streamed.length === 0) stdout.write(event.answer);
-          else stdout.write(`\n${event.answer}`);
-          pendingText.set(event.chat_request_id, event.answer);
-          responseHasText = true;
-          if (pending === 0) {
-            if (event.answer.length > 0) stdout.write("\n");
-            prompt();
-          }
-        }
-      } else if (event.type === "run.end" && typeof event.chat_request_id === "string" && pendingText.has(event.chat_request_id) && pending === 0) {
-        if (responseHasText) stdout.write("\n");
-        prompt();
-      }
-
-      if (typeof event.request_id !== "string" || !event.request_id.startsWith("chat-")) return;
-      if (event.ok === false) {
-        stderr.write(`Chat failed: ${String(event.error ?? "unknown error")}\n`);
-        pending = Math.max(0, pending - 1);
-        pendingText.delete(event.request_id);
-        prompt();
-      } else if (typeof event.answer === "string") {
-        const streamed = pendingText.get(event.request_id) ?? "";
-        if (event.answer.startsWith(streamed)) stdout.write(event.answer.slice(streamed.length));
-        else if (streamed.length === 0) stdout.write(event.answer);
-        else stdout.write(`\n${event.answer}`);
-        if (event.answer.length > 0 || streamed.length > 0) stdout.write("\n");
-        pendingText.delete(event.request_id);
-        responseHasText = false;
-        pending = Math.max(0, pending - 1);
-        prompt();
-      }
-    }, (error) => {
-      if (!readerClosed) stderr.write(`${error.message}\n`);
-      closeReader?.();
-    });
-    reader.on("line", (line) => {
-      promptVisible = false;
+  const closeSocket = () => {
+    if (state.phase === "closing" || state.phase === "closed") return;
+    const pendingById = state.phase === "attached" ? state.pendingById : new Map<string, PendingChat>();
+    state = { phase: "closing", watchId, pendingById };
+    socket?.destroy();
+    state = { phase: "closed" };
+  };
+  const finishIfDrained = () => {
+    if (state.phase === "attached" && state.inputEnded && state.queuedMessages.length === 0 && state.pendingById.size === 0) closeSocket();
+  };
+  const hidePrompt = () => {
+    if (state.phase === "attached" && state.promptVisible) {
+      stdout.write("\n");
+      state.promptVisible = false;
+    }
+  };
+  const queueMessage = (line: string) => {
+    if (state.phase === "connecting" || state.phase === "attaching") {
+      state.queuedMessages.push(line);
+      return;
+    }
+    if (state.phase === "attached" && !state.inputEnded) {
+      state.promptVisible = false;
+      state.queuedMessages.push(line);
+      flushQueuedMessages();
+    }
+  };
+  const flushQueuedMessages = () => {
+    if (state.phase !== "attached") return;
+    while (state.queuedMessages.length > 0) {
+      const line = state.queuedMessages.shift() ?? "";
       const content = line.trim();
-      if (content.length === 0) {
-        prompt();
-        return;
-      }
-      pending += 1;
+      if (content.length === 0) continue;
       const id = `chat-${requestId()}`;
-      pendingText.set(id, "");
+      state.pendingById.set(id, { streamedText: "", hasText: false, lineEnded: false });
       socket?.write(`${JSON.stringify({ request_id: id, type: "submit_chat", content })}\n`);
-    });
-    reader.on("SIGINT", () => reader.close());
-    reader.once("close", () => {
-      readerClosed = true;
-      socket?.destroy();
-    });
-    closeReader = () => reader.close();
+    }
     prompt();
+    finishIfDrained();
+  };
+  const handleEvent = (event: Event) => {
+    if (state.phase !== "attached") return;
+    const chatId = typeof event.chat_request_id === "string" ? event.chat_request_id : undefined;
+    const pending = chatId === undefined ? undefined : state.pendingById.get(chatId);
+    if (event.type === "assistant.delta" && pending && typeof event.text === "string") {
+      hidePrompt();
+      appendDelta(pending, event.text, event.replace === true, stdout);
+    } else if ((event.type === "tool.call" || event.type === "tool.result") && pending) {
+      hidePrompt();
+      outputTool(event, stdout);
+    } else if (event.type === "assistant.final" && pending && typeof event.answer === "string") {
+      hidePrompt();
+      printAnswer(pending, event.answer, stdout);
+    } else if (event.type === "run.end" && pending) {
+      if (pending.hasText && !pending.lineEnded) stdout.write("\n");
+      pending.lineEnded = true;
+    }
+
+    const id = typeof event.request_id === "string" ? event.request_id : undefined;
+    if (id === undefined) return;
+    const response = state.pendingById.get(id);
+    if (!response) return;
+    if (event.ok === false) {
+      stderr.write(`Chat failed: ${String(event.error ?? "unknown error")}\n`);
+      state.pendingById.delete(id);
+      prompt();
+      finishIfDrained();
+      return;
+    }
+    if (typeof event.answer !== "string") return;
+    if (event.answer.startsWith(response.streamedText)) stdout.write(event.answer.slice(response.streamedText.length));
+    else if (response.streamedText.length === 0) stdout.write(event.answer);
+    else stdout.write(`\n${event.answer}`);
+    response.streamedText = event.answer;
+    if ((event.answer.length > 0 || response.hasText) && !response.lineEnded) stdout.write("\n");
+    state.pendingById.delete(id);
+    prompt();
+    finishIfDrained();
+  };
+
+  reader.on("line", (line) => queueMessage(line));
+  reader.on("SIGINT", () => {
+    interrupted = true;
+    reader.close();
+  });
+  reader.once("close", () => {
+    if (interrupted) {
+      closeSocket();
+      return;
+    }
+    if (state.phase === "connecting" || state.phase === "attaching") state.inputEnded = true;
+    else if (state.phase === "attached") state.inputEnded = true;
+    if (state.phase === "attached") flushQueuedMessages();
+  });
+
+  state = { phase: "attaching", watchId, queuedMessages: state.queuedMessages, inputEnded: state.inputEnded };
+  try {
+    socket = await connectChat(watchId, handleEvent, (error) => {
+      if (state.phase === "closing" || state.phase === "closed") return;
+      stderr.write(`${error.message}\n`);
+      process.exitCode = 1;
+      reader.close();
+      closeSocket();
+    });
+    if (state.phase !== "attaching") {
+      socket.destroy();
+      return;
+    }
+    state = {
+      phase: "attached",
+      watchId,
+      queuedMessages: state.queuedMessages,
+      pendingById: new Map(),
+      inputEnded: state.inputEnded,
+      promptVisible: false,
+    };
+    flushQueuedMessages();
   } catch (error) {
     reader.close();
     if (isMissingSocket(error)) {
@@ -235,7 +318,7 @@ async function startChat(): Promise<void> {
     } else {
       stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
     }
-    socket?.destroy();
+    closeSocket();
     process.exitCode = 1;
   }
 }
