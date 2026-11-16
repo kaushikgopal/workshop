@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { createRegistry, defineDoc, Harness, MemoryStorage, type TaskRecord } from "@earendil-works/pi-durable";
 import type { JsonValue } from "@earendil-works/chord/json";
 import { test } from "node:test";
@@ -475,19 +476,19 @@ test("submit_chat reuses the configured root conversation through the service", 
     (context) => {
       const prompt = transcriptText(context.messages);
       assert.match(prompt, /## Workshop status/);
+      assert.match(prompt, /### Active runs/);
       assert.match(prompt, /### Blocked runs/);
       assert.match(prompt, /### Broken workflows/);
       assert.match(prompt, /### Paused workflows/);
       assert.match(prompt, /### Recent actions/);
-      return fauxAssistantMessage(fauxToolCall("list_workflows", {}), { stopReason: "toolUse" });
+      return fauxAssistantMessage("First answer.");
     },
     fauxAssistantMessage(fauxToolCall("consult", { question: "Review the loaded workflow." }), { stopReason: "toolUse" }),
     fauxAssistantMessage("Independent advice: the workflow is ready."),
     (context) => {
       assert.match(transcriptText(context.messages), /Independent advice: the workflow is ready/);
-      return fauxAssistantMessage("First answer.");
+      return fauxAssistantMessage("Second answer.");
     },
-    fauxAssistantMessage("Second answer."),
   ]);
   const configuredModel = {
     model: { provider: model.provider, modelId: model.id },
@@ -508,9 +509,9 @@ test("submit_chat reuses the configured root conversation through the service", 
     });
     service = createWorkshopService({ projectRoot: project.root, harness });
     harness.resume();
-    const first = await service.handleRequest({ request_id: "chat-1", type: "submit_chat", content: "Hello." });
-    const replay = await service.handleRequest({ request_id: "chat-1", type: "submit_chat", content: "Hello." });
-    const second = await service.handleRequest({ request_id: "chat-2", type: "submit_chat", content: "Continue." });
+    const first = await service.handleRequest({ request_id: "chat-1", type: "submit_chat", content: "What is running?" });
+    const replay = await service.handleRequest({ request_id: "chat-1", type: "submit_chat", content: "What is running?" });
+    const second = await service.handleRequest({ request_id: "chat-2", type: "submit_chat", content: "Ask for independent advice about the workflow." });
     const rootConversation = await harness.root(BACKGROUND_CONTEXT);
     const chatSubmissions = await storage.scanSubmissions({ conversationId: rootConversation.id }, 100, undefined, BACKGROUND_CONTEXT);
     assert.equal(first.ok, true, JSON.stringify({ first, chatSubmissions: chatSubmissions.items }));
@@ -520,9 +521,93 @@ test("submit_chat reuses the configured root conversation through the service", 
     assert.equal(second.answer, "Second answer.");
     assert.equal(first.conversation_id, second.conversation_id);
     assert.ok(chatSubmissions.items.some((submission) => submission.requestId === "chat:chat-1"));
-    assert.equal(faux.state.callCount, 5);
+    assert.equal(faux.state.callCount, 4);
   } finally {
     if (harness) await harness.close(BACKGROUND_CONTEXT);
+    rmSync(project.root, { recursive: true, force: true });
+  }
+});
+
+test("submit_chat keeps the root transcript after reopening SQLite storage", { timeout: 30_000 }, async () => {
+  const project = createProject("printf 'unused'\n");
+  const stateDirectory = join(project.root, "state");
+  mkdirSync(stateDirectory, { recursive: true });
+  const databasePath = join(stateDirectory, "workshop.sqlite");
+  let firstHarness: Awaited<ReturnType<typeof openWorkshopHarness>> | undefined;
+  let secondHarness: Awaited<ReturnType<typeof openWorkshopHarness>> | undefined;
+  let secondPrompt = "";
+
+  const firstFaux = fauxProvider();
+  const firstModels = createModels();
+  firstModels.setProvider(firstFaux.provider);
+  const firstModel = firstFaux.getModel();
+  assert.ok(firstModel);
+  firstFaux.setResponses([fauxAssistantMessage("Nothing is running.")]);
+  const firstConfiguredModel = {
+    model: { provider: firstModel.provider, modelId: firstModel.id },
+    thinkingLevel: "medium" as const,
+  };
+
+  try {
+    let firstService: ReturnType<typeof createWorkshopService> | undefined;
+    firstHarness = await openWorkshopHarness(await openNodeSqliteStorage(databasePath), undefined, {
+      projectRoot: project.root,
+      models: firstModels,
+      model: firstConfiguredModel,
+      escalationModel: firstConfiguredModel,
+      request: async (request) => {
+        if (!firstService) throw new Error("Workshop service is not ready");
+        return await firstService.handleRequest(request);
+      },
+    });
+    firstService = createWorkshopService({ projectRoot: project.root, harness: firstHarness });
+    firstHarness.resume();
+    const first = await firstService.handleRequest({ request_id: "before-restart", type: "submit_chat", content: "What is running?" });
+    assert.equal(first.ok, true);
+    assert.equal(first.answer, "Nothing is running.");
+    const firstConversationId = first.conversation_id;
+    assert.notEqual(firstConversationId, undefined);
+    await firstHarness.close(BACKGROUND_CONTEXT);
+    firstHarness = undefined;
+
+    const secondFaux = fauxProvider();
+    const secondModels = createModels();
+    secondModels.setProvider(secondFaux.provider);
+    const secondModel = secondFaux.getModel();
+    assert.ok(secondModel);
+    assert.equal(secondModel.provider, firstModel.provider);
+    assert.equal(secondModel.id, firstModel.id);
+    secondFaux.setResponses([(context) => {
+      secondPrompt = transcriptText(context.messages);
+      return fauxAssistantMessage("You asked what is running.");
+    }]);
+    const secondConfiguredModel = {
+      model: { provider: secondModel.provider, modelId: secondModel.id },
+      thinkingLevel: "medium" as const,
+    };
+    let secondService: ReturnType<typeof createWorkshopService> | undefined;
+    secondHarness = await openWorkshopHarness(await openNodeSqliteStorage(databasePath), undefined, {
+      projectRoot: project.root,
+      models: secondModels,
+      model: secondConfiguredModel,
+      escalationModel: secondConfiguredModel,
+      request: async (request) => {
+        if (!secondService) throw new Error("Workshop service is not ready");
+        return await secondService.handleRequest(request);
+      },
+    });
+    secondService = createWorkshopService({ projectRoot: project.root, harness: secondHarness });
+    secondHarness.resume();
+    const secondRoot = await secondHarness.root(BACKGROUND_CONTEXT);
+    assert.equal(secondRoot.id, firstConversationId);
+    const second = await secondService.handleRequest({ request_id: "after-restart", type: "submit_chat", content: "What did I ask?" });
+    assert.equal(second.ok, true);
+    assert.equal(second.answer, "You asked what is running.");
+    assert.match(secondPrompt, /What is running\?/);
+    assert.match(secondPrompt, /Nothing is running\./);
+  } finally {
+    if (secondHarness) await secondHarness.close(BACKGROUND_CONTEXT);
+    if (firstHarness) await firstHarness.close(BACKGROUND_CONTEXT);
     rmSync(project.root, { recursive: true, force: true });
   }
 });

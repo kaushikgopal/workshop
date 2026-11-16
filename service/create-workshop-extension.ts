@@ -34,6 +34,9 @@ function formatList(value: unknown, format: (entry: Record<string, unknown>) => 
 
 function renderStatus(workflows: ServiceResponse, runs: ServiceResponse, actions: ServiceResponse): string {
   if (!workflows.ok || !runs.ok || !actions.ok) throw new Error("Workshop status could not be read");
+  const active = formatList(runs.runs, (item) => ["pending", "running", "waiting", "sleeping"].includes(String(item.status))
+    ? `- ${String(item.workflow)} / ${String(item.run_id)} — ${String(item.status)}`
+    : "").filter(Boolean);
   const blocked = formatList(runs.runs, (item) => item.status === "blocked"
     ? `- ${String(item.workflow)} / ${String(item.run_id)} — step ${String(item.blocked_step ?? "unknown")}: ${String(item.last_error ?? "no error recorded")}`
     : "").filter(Boolean);
@@ -47,6 +50,9 @@ function renderStatus(workflows: ServiceResponse, runs: ServiceResponse, actions
   );
   return [
     "## Workshop status",
+    "",
+    "### Active runs",
+    ...(active.length ? active : ["- None"]),
     "",
     "### Blocked runs",
     ...(blocked.length ? blocked : ["- None"]),
