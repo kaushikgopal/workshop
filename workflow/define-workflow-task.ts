@@ -1,14 +1,23 @@
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { defineDoc, defineTask, type TaskId, type TaskRuntime } from "@earendil-works/pi-durable";
-import { applyWorkflowDecision } from "./apply-workflow-decision.ts";
+import { defineDoc, defineTask, type TaskOutcome, type TaskRuntime } from "@earendil-works/pi-durable";
+import {
+  advanceWorkflowState,
+  decodeWorkflowTaskCheckpoint,
+  WorkflowCheckpointIntegrityError,
+  type WorkflowExecutionState,
+  type WorkflowStateContext,
+  type WorkflowTaskCheckpoint,
+  type WorkflowTaskResult,
+} from "./advance-workflow-state.ts";
 import { buildOrchestratorBrief } from "./build-orchestrator-brief.ts";
-import { computeRetryProfiles } from "./compute-retry-profiles.ts";
 import { StepAttemptTask } from "./define-step-attempt-task.ts";
 import { loadWorkflowStep } from "./load-workflow-step.ts";
-import type { WorkflowAttemptRequest, WorkflowAttemptResult, WorkflowDecisionRequest, WorkflowInterpretation } from "./interpret-workflow.ts";
-import type { AttemptHistoryEntry, OrchestratorDecision, Workflow, WorkflowDecision, WorkflowStep, WorkflowStepResult } from "./types.ts";
+import type { WorkflowAttemptRequest, WorkflowAttemptResult, WorkflowDecisionRequest } from "./interpret-workflow.ts";
+import type { OrchestratorDecision, Workflow, WorkflowDecision, WorkflowStep } from "./types.ts";
 import { appendRecent, workshopStateDocument } from "./define-workshop-state.ts";
+
+export type { WorkflowTaskCheckpoint, WorkflowTaskResult } from "./advance-workflow-state.ts";
 
 export const WORKFLOW_TASK_NAME = "workshop.workflow";
 
@@ -24,28 +33,6 @@ export type WorkflowTaskInput = {
   profileCommands: Record<string, string[]>;
 };
 
-type ActiveAttempt = {
-  taskId: TaskId<WorkflowAttemptResult>;
-  request: WorkflowAttemptRequest;
-};
-type CheckpointPosition = {
-  stepIndex: number;
-  pipeInput: string;
-  results: WorkflowStepResult[];
-  attemptHistory: AttemptHistoryEntry[];
-  localRetriesLeft: number;
-  profile?: string;
-  feedback: string;
-  decisionNumber: number;
-  automaticRoundUsed: boolean;
-  waitUntil?: number;
-};
-type StepCheckpoint = CheckpointPosition & { phase: "step" };
-type AttemptCheckpoint = CheckpointPosition & { phase: "attempt"; activeAttempt: ActiveAttempt };
-type BlockedCheckpoint = CheckpointPosition & { phase: "blocked"; failure: WorkflowDecisionRequest; roundStatus?: "pending" | "settled" };
-type DecisionCheckpoint = CheckpointPosition & { phase: "decision"; failure: WorkflowDecisionRequest; decision: WorkflowDecision; decisionSource?: "chat" | "round" };
-export type WorkflowTaskCheckpoint = StepCheckpoint | AttemptCheckpoint | BlockedCheckpoint | DecisionCheckpoint;
-export type WorkflowTaskResult = WorkflowInterpretation;
 type WorkflowTaskRuntime = TaskRuntime<WorkflowTaskInput, WorkflowTaskCheckpoint, WorkflowTaskResult, object>;
 
 type DecisionDocument = {
@@ -60,197 +47,97 @@ export const workflowDecisionDocument = defineDoc<DecisionDocument>({
   checkpointWhen: () => true,
 });
 
-function stepId(step: WorkflowStep): string {
-  return `${step.number}-${step.name}`;
-}
-
 function retryLimit(step: WorkflowStep, workflow: Workflow): number {
   return step.retries ?? step.check?.retries ?? workflow.retries ?? 0;
 }
 
-function durationMilliseconds(value: string): number {
-  const match = /^([1-9][0-9]*)(s|m|h)$/.exec(value);
-  if (!match) throw new Error(`Invalid retry delay: ${value}`);
-  const amount = Number(match[1]);
-  const factor = match[2] === "s" ? 1_000 : match[2] === "m" ? 60_000 : 3_600_000;
-  const milliseconds = amount * factor;
-  if (!Number.isSafeInteger(milliseconds) || milliseconds > 2_147_483_647) throw new Error(`Retry delay is too large: ${value}`);
-  return milliseconds;
-}
-
-function attemptRecord(request: WorkflowAttemptRequest, result: WorkflowAttemptResult): AttemptHistoryEntry {
+function stateContext(input: WorkflowTaskInput): WorkflowStateContext {
   return {
-    attempt: request.attempt,
-    ...(request.step.kind === "agent" && request.profile !== undefined ? { profile: request.profile } : {}),
-    output: result.output,
-    ...(result.kind === "failed" ? { error: result.reason } : {}),
-  };
-}
-
-function resultForDecision(failure: WorkflowDecisionRequest, action: "accept" | "skip"): WorkflowStepResult {
-  return action === "accept"
-    ? { step: failure.step, status: "completed", output: failure.lastOutput, attempts: failure.attemptHistory }
-    : { step: failure.step, status: "skipped", output: "", attempts: failure.attemptHistory };
-}
-
-function checkpointForNextStep(input: WorkflowTaskInput, position: CheckpointPosition, stepResult: WorkflowStepResult, pipeInput: string): StepCheckpoint {
-  const stepIndex = position.stepIndex + 1;
-  const nextStep = input.workflow.steps[stepIndex];
-  return {
-    phase: "step",
-    stepIndex,
-    pipeInput,
-    results: [...position.results, stepResult],
-    attemptHistory: [],
-    localRetriesLeft: nextStep === undefined ? 0 : retryLimit(nextStep, input.workflow),
-    ...(nextStep?.profile === undefined ? {} : { profile: nextStep.profile }),
-    feedback: "",
-    decisionNumber: position.decisionNumber,
-    automaticRoundUsed: false,
-  };
-}
-
-async function commitStepResult(
-  input: WorkflowTaskInput,
-  position: CheckpointPosition,
-  stepResult: WorkflowStepResult,
-  pipeInput: string,
-  runtime: WorkflowTaskRuntime,
-  context: typeof BACKGROUND_CONTEXT,
-): Promise<void> {
-  const next = checkpointForNextStep(input, position, stepResult, pipeInput);
-  if (next.stepIndex >= input.workflow.steps.length) {
-    const result: WorkflowTaskResult = {
-      status: "completed",
-      output: pipeInput,
-      completedSteps: next.results.filter((item) => item.status !== "nothing-to-do").length,
-      steps: next.results,
-    };
-    await runtime.commit(() => ({ status: "terminal", outcome: { status: "completed", result } }), context);
-    return;
-  }
-  await runtime.commit(() => ({ status: "running", checkpoint: next }), context);
-}
-
-async function finishNothingToDo(
-  input: WorkflowTaskInput,
-  checkpoint: CheckpointPosition,
-  step: WorkflowStep,
-  result: WorkflowAttemptResult,
-  runtime: WorkflowTaskRuntime,
-  context: typeof BACKGROUND_CONTEXT,
-): Promise<void> {
-  const steps = [...checkpoint.results, {
-    step: stepId(step),
-    status: "nothing-to-do" as const,
-    output: result.output,
-    attempts: checkpoint.attemptHistory,
-  }];
-  const completedSteps = steps.filter((item) => item.status !== "nothing-to-do").length;
-  const workflowResult: WorkflowTaskResult = {
-    status: "nothing-to-do",
-    output: result.output,
-    completedSteps,
-    steps,
-  };
-  void input;
-  await runtime.commit(() => ({ status: "terminal", outcome: { status: "completed", result: workflowResult } }), context);
-}
-
-async function finishFailed(
-  step: WorkflowStep,
-  failure: WorkflowDecisionRequest,
-  runtime: WorkflowTaskRuntime,
-  context: typeof BACKGROUND_CONTEXT,
-): Promise<void> {
-  const error = { message: `${stepId(step)} failed: ${failure.lastError}` };
-  await runtime.commit(() => ({ status: "terminal", outcome: { status: "failed", error } }), context);
-}
-
-
-function failureFor(input: WorkflowTaskInput, checkpoint: CheckpointPosition, step: WorkflowStep, lastError: string, lastOutput: string): WorkflowDecisionRequest {
-  return {
-    workflow: input.workflowName,
+    workflow: input.workflow,
+    workflowName: input.workflowName,
     runId: input.runId,
-    step: stepId(step),
-    stepKind: step.kind,
-    retryProfiles: computeRetryProfiles(step, input.profileCommands),
-    lastError,
-    lastOutput,
-    attemptHistory: checkpoint.attemptHistory,
-    decisionNumber: checkpoint.decisionNumber + 1,
-  };
-}
-
-async function blockRun(
-  checkpoint: CheckpointPosition,
-  failure: WorkflowDecisionRequest,
-  runtime: WorkflowTaskRuntime,
-  context: typeof BACKGROUND_CONTEXT,
-  roundStatus: "pending" | "settled",
-): Promise<void> {
-  const blocked: BlockedCheckpoint = {
-    phase: "blocked",
-    stepIndex: checkpoint.stepIndex,
-    pipeInput: checkpoint.pipeInput,
-    results: checkpoint.results,
-    attemptHistory: failure.attemptHistory,
-    localRetriesLeft: checkpoint.localRetriesLeft,
-    ...(checkpoint.profile === undefined ? {} : { profile: checkpoint.profile }),
-    feedback: checkpoint.feedback,
-    decisionNumber: failure.decisionNumber,
-    automaticRoundUsed: true,
-    failure,
-    roundStatus,
-  };
-  await runtime.commit(() => ({ status: "running", checkpoint: blocked }), context);
-}
-
-async function applyDecision(
-  input: WorkflowTaskInput,
-  checkpoint: DecisionCheckpoint,
-  runtime: WorkflowTaskRuntime,
-  context: typeof BACKGROUND_CONTEXT,
-): Promise<void> {
-  const step = input.workflow.steps[checkpoint.stepIndex];
-  if (!step) throw new Error(`Workflow step ${checkpoint.failure.step} is missing from the workflow`);
-  const applied = applyWorkflowDecision({
-    decision: checkpoint.decision,
-    step,
-    currentProfile: checkpoint.profile ?? checkpoint.attemptHistory.at(-1)?.profile ?? step.profile,
     profileCommands: input.profileCommands,
-    lastError: checkpoint.failure.lastError,
-  });
-  if (applied.action === "fail") {
-    await finishFailed(step, checkpoint.failure, runtime, context);
-    return;
-  }
-  if (applied.action === "retry") {
-    const nextCheckpoint: StepCheckpoint = {
-      phase: "step",
-      stepIndex: checkpoint.stepIndex,
-      pipeInput: checkpoint.pipeInput,
-      results: checkpoint.results,
-      attemptHistory: checkpoint.failure.attemptHistory,
-      localRetriesLeft: retryLimit(step, input.workflow),
-      ...(applied.profile === undefined ? {} : { profile: applied.profile }),
-      feedback: applied.feedback,
-      decisionNumber: checkpoint.decisionNumber,
-      automaticRoundUsed: checkpoint.automaticRoundUsed || checkpoint.decisionSource === "round",
-    };
-    if (applied.after !== undefined) {
-      const waitUntil = runtime.now() + durationMilliseconds(applied.after);
-      await runtime.sleepUntil(waitUntil, { ...nextCheckpoint, waitUntil }, context);
-    } else {
-      await runtime.commit(() => ({ status: "running", checkpoint: nextCheckpoint }), context);
-    }
-    return;
-  }
-  const stepResult = resultForDecision(checkpoint.failure, applied.action);
-  const nextPipe = applied.action === "accept" ? checkpoint.failure.lastOutput : checkpoint.pipeInput;
-  await commitStepResult(input, checkpoint, stepResult, nextPipe, runtime, context);
+  };
 }
 
+function decodeCheckpoint(value: unknown, input: WorkflowTaskInput): WorkflowTaskCheckpoint {
+  return decodeWorkflowTaskCheckpoint(value, stateContext(input));
+}
+
+function checkpointForStep(value: unknown, input: WorkflowTaskInput): Extract<WorkflowTaskCheckpoint, { phase: "step" }> {
+  const checkpoint = decodeCheckpoint(value, input);
+  if (checkpoint.phase !== "step") throw new WorkflowCheckpointIntegrityError("checkpoint.phase", `step handler received ${checkpoint.phase}`);
+  return checkpoint;
+}
+
+function checkpointForAttempt(value: unknown, input: WorkflowTaskInput): Extract<WorkflowTaskCheckpoint, { phase: "attempt" }> {
+  const checkpoint = decodeCheckpoint(value, input);
+  if (checkpoint.phase !== "attempt") throw new WorkflowCheckpointIntegrityError("checkpoint.phase", `attempt handler received ${checkpoint.phase}`);
+  return checkpoint;
+}
+
+function checkpointForBlocked(value: unknown, input: WorkflowTaskInput): Extract<WorkflowTaskCheckpoint, { phase: "blocked" }> {
+  const checkpoint = decodeCheckpoint(value, input);
+  if (checkpoint.phase !== "blocked") throw new WorkflowCheckpointIntegrityError("checkpoint.phase", `blocked handler received ${checkpoint.phase}`);
+  return checkpoint;
+}
+
+function checkpointForDecision(value: unknown, input: WorkflowTaskInput): Extract<WorkflowTaskCheckpoint, { phase: "decision" }> {
+  const checkpoint = decodeCheckpoint(value, input);
+  if (checkpoint.phase !== "decision") throw new WorkflowCheckpointIntegrityError("checkpoint.phase", `decision handler received ${checkpoint.phase}`);
+  return checkpoint;
+}
+
+function requireAccepted(transition: ReturnType<typeof advanceWorkflowState>): WorkflowExecutionState {
+  if (transition.kind === "rejected") throw new Error(`Workflow transition rejected (${transition.code}): ${transition.message}`);
+  return transition.state;
+}
+
+async function commitExecutionState(
+  state: WorkflowExecutionState,
+  runtime: WorkflowTaskRuntime,
+  context: typeof BACKGROUND_CONTEXT,
+): Promise<void> {
+  if (state.phase === "finished") {
+    await runtime.commit(() => ({ status: "terminal", outcome: state.outcome }), context);
+  } else {
+    await runtime.commit(() => ({ status: "running", checkpoint: state }), context);
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function decodeAttemptResult(value: unknown): WorkflowAttemptResult {
+  if (!isRecord(value)) throw new Error("Step attempt result integrity error: result must be an object");
+  const result = value;
+  switch (result.kind) {
+    case "accepted":
+    case "nothing-to-do":
+      if (typeof result.output !== "string") throw new Error(`Step attempt result integrity error: ${result.kind}.output must be a string`);
+      return { kind: result.kind, output: result.output };
+    case "failed":
+      if (typeof result.output !== "string" || typeof result.reason !== "string") throw new Error("Step attempt result integrity error: failed result needs string output and reason");
+      return { kind: "failed", output: result.output, reason: result.reason };
+    default:
+      throw new Error("Step attempt result integrity error: kind is unknown");
+  }
+}
+
+export function decodeStepAttemptOutcome(outcome: TaskOutcome<WorkflowAttemptResult>): WorkflowAttemptResult {
+  switch (outcome.status) {
+    case "completed":
+      return decodeAttemptResult(outcome.result);
+    case "aborted":
+      return { kind: "failed", output: "", reason: outcome.reason ?? "Step attempt was aborted" };
+    case "failed":
+    case "faulted":
+      return { kind: "failed", output: "", reason: outcome.error.message };
+    case "orphaned":
+      return { kind: "failed", output: "", reason: outcome.reason };
+  }
+}
 
 function roundFailureNote(settled: { status: string; reason?: string }): string {
   return settled.status === "unanswered"
@@ -260,12 +147,12 @@ function roundFailureNote(settled: { status: string; reason?: string }): string 
 
 async function submitFailureRound(
   input: WorkflowTaskInput,
-  checkpoint: BlockedCheckpoint,
+  checkpoint: Extract<WorkflowTaskCheckpoint, { phase: "blocked" }>,
   runtime: WorkflowTaskRuntime,
   context: typeof BACKGROUND_CONTEXT,
 ): Promise<void> {
   const step = input.workflow.steps[checkpoint.stepIndex];
-  if (!step) throw new Error(`Workflow step ${checkpoint.failure.step} is missing from the workflow`);
+  if (!step) throw new WorkflowCheckpointIntegrityError("checkpoint.stepIndex", "does not identify a workflow step");
   const loaded = loadWorkflowStep(join(input.projectRoot, "workflows"), input.workflow, step);
   const brief = buildOrchestratorBrief({
     workflow: input.workflow,
@@ -305,13 +192,15 @@ async function submitFailureRound(
         note,
       });
     }
-    return { status: "running", checkpoint: { ...checkpoint, roundStatus: "settled" } };
+    const next = requireAccepted(advanceWorkflowState(checkpoint, { kind: "round-settled" }, stateContext(input)));
+    if (next.phase !== "blocked") throw new Error("Settling a failure round unexpectedly left the blocked phase");
+    return { status: "running", checkpoint: next };
   }, context);
 }
 
 async function waitForDecision(
   input: WorkflowTaskInput,
-  checkpoint: BlockedCheckpoint,
+  checkpoint: Extract<WorkflowTaskCheckpoint, { phase: "blocked" }>,
   runtime: WorkflowTaskRuntime,
   context: typeof BACKGROUND_CONTEXT,
 ): Promise<void> {
@@ -356,43 +245,23 @@ async function waitForDecision(
         throw new Error("Cannot accept a blocked step with empty output");
       }
       document.choice = null;
-      const decisionCheckpoint: DecisionCheckpoint = {
-        phase: "decision",
-        stepIndex: checkpoint.stepIndex,
-        pipeInput: checkpoint.pipeInput,
-        results: checkpoint.results,
-        attemptHistory: checkpoint.attemptHistory,
-        localRetriesLeft: checkpoint.localRetriesLeft,
-        ...(checkpoint.profile === undefined ? {} : { profile: checkpoint.profile }),
-        feedback: checkpoint.feedback,
-        decisionNumber: checkpoint.decisionNumber,
-        automaticRoundUsed: checkpoint.automaticRoundUsed,
-        failure: checkpoint.failure,
+      const next = requireAccepted(advanceWorkflowState(checkpoint, {
+        kind: "decision-recorded",
+        decisionNumber: acceptedDecisionNumber,
         decision: accepted.decision,
-        decisionSource: accepted.source ?? "chat",
-      };
-      return { status: "running", checkpoint: decisionCheckpoint };
+        source: accepted.source ?? "chat",
+      }, stateContext(input)));
+      if (next.phase !== "decision") throw new Error("Recording a decision unexpectedly left the decision phase");
+      return { status: "running", checkpoint: next };
     }, context);
   } finally {
     await watch.stop();
   }
 }
 
-async function blockAfterFailure(
-  input: WorkflowTaskInput,
-  checkpoint: AttemptCheckpoint,
-  step: WorkflowStep,
-  result: Extract<WorkflowAttemptResult, { kind: "failed" }>,
-  runtime: WorkflowTaskRuntime,
-  context: typeof BACKGROUND_CONTEXT,
-): Promise<void> {
-  const failure = failureFor(input, checkpoint, step, result.reason, result.output);
-  await blockRun(checkpoint, failure, runtime, context, checkpoint.automaticRoundUsed ? "settled" : "pending");
-}
-
 async function startStepAttempt(
   input: WorkflowTaskInput,
-  checkpoint: StepCheckpoint,
+  checkpoint: Extract<WorkflowTaskCheckpoint, { phase: "step" }>,
   runtime: WorkflowTaskRuntime,
   context: typeof BACKGROUND_CONTEXT,
 ): Promise<void> {
@@ -401,16 +270,7 @@ async function startStepAttempt(
     return;
   }
   const step = input.workflow.steps[checkpoint.stepIndex];
-  if (!step) {
-    const result: WorkflowTaskResult = {
-      status: "completed",
-      output: checkpoint.pipeInput,
-      completedSteps: checkpoint.results.filter((item) => item.status !== "nothing-to-do").length,
-      steps: checkpoint.results,
-    };
-    await runtime.commit(() => ({ status: "terminal", outcome: { status: "completed", result } }), context);
-    return;
-  }
+  if (!step) throw new WorkflowCheckpointIntegrityError("checkpoint.stepIndex", "does not identify a workflow step");
   const loaded = loadWorkflowStep(join(input.projectRoot, "workflows"), input.workflow, step);
   const request: WorkflowAttemptRequest = {
     step,
@@ -435,64 +295,49 @@ async function startStepAttempt(
     const taskId = await tx.createTask(StepAttemptTask, attemptInput, {
       ownership: { kind: "task", taskId: runtime.taskId },
     });
-    const nextCheckpoint: AttemptCheckpoint = {
-      ...checkpoint,
-      phase: "attempt",
+    const next = requireAccepted(advanceWorkflowState(checkpoint, {
+      kind: "attempt-started",
       activeAttempt: { taskId, request },
-    };
-    return { status: "running", checkpoint: nextCheckpoint };
+    }, stateContext(input)));
+    if (next.phase !== "attempt") throw new Error("Starting an attempt unexpectedly left the attempt phase");
+    return { status: "running", checkpoint: next };
   }, context);
 }
 
 async function receiveStepAttempt(
   input: WorkflowTaskInput,
-  checkpoint: AttemptCheckpoint,
+  checkpoint: Extract<WorkflowTaskCheckpoint, { phase: "attempt" }>,
   runtime: WorkflowTaskRuntime,
   context: typeof BACKGROUND_CONTEXT,
 ): Promise<void> {
   const settled = await runtime.waitForTask(checkpoint.activeAttempt.taskId, context);
-  const outcome = settled.state.outcome;
-  const attemptResult: WorkflowAttemptResult = outcome.status === "completed"
-    ? outcome.result
-    : {
-      kind: "failed",
-      output: "",
-      reason: outcome.status === "aborted"
-        ? outcome.reason ?? "Step attempt was aborted"
-        : outcome.status === "failed"
-          ? outcome.error?.message ?? "Step attempt failed"
-          : "Step attempt ended without a result",
-    };
-  const history = [...checkpoint.attemptHistory, attemptRecord(checkpoint.activeAttempt.request, attemptResult)];
-  const position: AttemptCheckpoint = { ...checkpoint, attemptHistory: history };
-  const step = checkpoint.activeAttempt.request.step;
+  const attemptResult = decodeStepAttemptOutcome(settled.state.outcome);
+  const transition = advanceWorkflowState(checkpoint, {
+    kind: "attempt-settled",
+    attempt: checkpoint.activeAttempt.request.attempt,
+    result: attemptResult,
+  }, stateContext(input));
+  const next = requireAccepted(transition);
+  await commitExecutionState(next, runtime, context);
+}
 
-  if (attemptResult.kind === "nothing-to-do") {
-    await finishNothingToDo(input, position, step, attemptResult, runtime, context);
+async function applyDecision(
+  input: WorkflowTaskInput,
+  checkpoint: Extract<WorkflowTaskCheckpoint, { phase: "decision" }>,
+  runtime: WorkflowTaskRuntime,
+  context: typeof BACKGROUND_CONTEXT,
+): Promise<void> {
+  const now = runtime.now();
+  const next = requireAccepted(advanceWorkflowState(checkpoint, {
+    kind: "decision-applied",
+    decisionNumber: checkpoint.decisionNumber,
+    now,
+  }, stateContext(input)));
+  if (next.phase === "step" && next.waitUntil !== undefined) {
+    await runtime.sleepUntil(next.waitUntil, next, context);
     return;
   }
-  if (attemptResult.kind === "accepted") {
-    const stepResult: WorkflowStepResult = { step: stepId(step), status: "completed", output: attemptResult.output, attempts: history };
-    await commitStepResult(input, position, stepResult, attemptResult.output, runtime, context);
-    return;
-  }
-  if (checkpoint.localRetriesLeft > 0) {
-    const nextCheckpoint: StepCheckpoint = {
-      phase: "step",
-      stepIndex: checkpoint.stepIndex,
-      pipeInput: checkpoint.pipeInput,
-      results: checkpoint.results,
-      attemptHistory: history,
-      localRetriesLeft: checkpoint.localRetriesLeft - 1,
-      ...(checkpoint.activeAttempt.request.profile === undefined ? {} : { profile: checkpoint.activeAttempt.request.profile }),
-      feedback: attemptResult.reason,
-      decisionNumber: checkpoint.decisionNumber,
-      automaticRoundUsed: checkpoint.automaticRoundUsed,
-    };
-    await runtime.commit(() => ({ status: "running", checkpoint: nextCheckpoint }), context);
-    return;
-  }
-  await blockAfterFailure(input, position, step, attemptResult, runtime, context);
+  await commitExecutionState(next, runtime, context);
 }
 
 export const WorkflowTask = defineTask<WorkflowTaskInput, WorkflowTaskCheckpoint, WorkflowTaskResult, object>({
@@ -514,10 +359,10 @@ export const WorkflowTask = defineTask<WorkflowTaskInput, WorkflowTaskCheckpoint
     };
   },
   phases: {
-    step: async (task, runtime, context) => startStepAttempt(task.input, task.state.checkpoint, runtime, context),
-    attempt: async (task, runtime, context) => receiveStepAttempt(task.input, task.state.checkpoint, runtime, context),
-    blocked: async (task, runtime, context) => waitForDecision(task.input, task.state.checkpoint, runtime, context),
-    decision: async (task, runtime, context) => applyDecision(task.input, task.state.checkpoint, runtime, context),
+    step: async (task, runtime, context) => startStepAttempt(task.input, checkpointForStep(task.state.checkpoint, task.input), runtime, context),
+    attempt: async (task, runtime, context) => receiveStepAttempt(task.input, checkpointForAttempt(task.state.checkpoint, task.input), runtime, context),
+    blocked: async (task, runtime, context) => waitForDecision(task.input, checkpointForBlocked(task.state.checkpoint, task.input), runtime, context),
+    decision: async (task, runtime, context) => applyDecision(task.input, checkpointForDecision(task.state.checkpoint, task.input), runtime, context),
   },
   abort: async (_task, runtime, context) => {
     await runtime.commit(() => ({ status: "terminal", outcome: { status: "aborted", reason: "cancelled" } }), context);

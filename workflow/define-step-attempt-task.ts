@@ -1,5 +1,5 @@
 import { defineTask, type TaskRuntime } from "@earendil-works/pi-durable";
-import { executeWorkflowAttempt, type ProcessExecutionRequest, type ProcessExecutionResult, type WorkflowAttemptRequest, type WorkflowAttemptResult, type WorkflowInterpreterInput } from "./interpret-workflow.ts";
+import { executeWorkflowAttempt, type ProcessExecutionRequest, type ProcessExecutionResult, type WorkflowAttemptEnvironment, type WorkflowAttemptRequest, type WorkflowAttemptResult } from "./interpret-workflow.ts";
 import type { Workflow, WorkflowStep } from "./types.ts";
 
 
@@ -44,11 +44,10 @@ async function executeAttemptTask(
   runtime: StepAttemptRuntime,
   executeProcess: StepAttemptProcessExecutor,
 ): Promise<WorkflowAttemptResult> {
-  const interpreter: WorkflowInterpreterInput = {
+  const attemptEnvironment: WorkflowAttemptEnvironment = {
     workflow: input.workflow,
     documents: input.documents,
     files: input.files,
-    workflowRunId: input.runId,
     profileCommands: input.profileCommands,
     signal: runtime.signal,
     executeProcess: (request) => executeProcess({
@@ -61,9 +60,8 @@ async function executeAttemptTask(
       cwd: input.dataDirectory,
       signal: runtime.signal,
     }),
-    waitForDecision: async () => { throw new Error("A step-attempt task cannot wait for a workflow decision"); },
   };
-  return await executeWorkflowAttempt(interpreter, { ...input.request, step: input.step });
+  return await executeWorkflowAttempt(attemptEnvironment, { ...input.request, step: input.step });
 }
 
 export function createStepAttemptTask(executeProcess: StepAttemptProcessExecutor) {

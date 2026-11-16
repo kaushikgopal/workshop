@@ -5,8 +5,8 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
 import { executeWorkflowProcess } from "../run/execute-workflow-process.ts";
-import { executeWorkflowAttempt, interpretWorkflow, parseMarkdownVerdict, type ProcessExecutionRequest, type ProcessExecutionResult, type WorkflowInterpreterInput, type WorkflowInterpreterResume } from "../workflow/interpret-workflow.ts";
-import type { Workflow, WorkflowDecision, WorkflowStep } from "../workflow/types.ts";
+import { executeWorkflowAttempt, parseMarkdownVerdict, type ProcessExecutionRequest, type ProcessExecutionResult, type WorkflowAttemptEnvironment } from "../workflow/interpret-workflow.ts";
+import type { Workflow, WorkflowStep } from "../workflow/types.ts";
 
 const fixture = resolve("test/fixtures/profile-command.mjs");
 
@@ -20,22 +20,25 @@ function makeWorkflow(steps: WorkflowStep[], extra: Partial<Workflow> = {}): Wor
     ...extra,
   };
 }
+function firstStep(workflow: Workflow): WorkflowStep {
+  const step = workflow.steps[0];
+  if (!step) throw new Error("Test workflow needs a first step");
+  return step;
+}
+
 
 function makeInput(
   workflow: Workflow,
-  executeProcess: WorkflowInterpreterInput["executeProcess"],
-  waitForDecision: WorkflowInterpreterInput["waitForDecision"] = async () => ({ action: "fail" }),
-  extra: Partial<WorkflowInterpreterInput> = {},
- ): WorkflowInterpreterInput {
+  executeProcess: WorkflowAttemptEnvironment["executeProcess"],
+  extra: Partial<WorkflowAttemptEnvironment> = {},
+): WorkflowAttemptEnvironment {
   const files = workflow.steps.flatMap((step) => [step.file, ...(step.check ? [step.check.file] : [])]);
   return {
     workflow,
     documents: {},
     files: Object.fromEntries(files.map((file) => [file, join("/workflows/clock", file)] as const)),
-    workflowRunId: "wrun_test_1",
     profileCommands: { writer: ["fake-writer"], judge: ["fake-judge"], fast: ["fake-writer", "--fast"] },
     executeProcess,
-    waitForDecision,
     ...extra,
   };
 }
@@ -49,7 +52,7 @@ function failed(stdout = "", stderr = "failure"): ProcessExecutionResult {
 }
 
 async function withRoot(action: (root: string) => void | Promise<void>): Promise<void> {
-  const root = mkdtempSync(join(tmpdir(), "workshop-interpreter-test-"));
+  const root = mkdtempSync(join(tmpdir(), "workshop-attempt-test-"));
   try {
     await action(root);
   } finally {
@@ -57,321 +60,147 @@ async function withRoot(action: (root: string) => void | Promise<void>): Promise
   }
 }
 
-test("pipes stdout between command and agent steps without changing it", async () => {
+test("command attempts preserve stdout and use the source-file command", async () => {
   const calls: ProcessExecutionRequest[] = [];
-  const executeProcess = async (request: ProcessExecutionRequest) => {
+  const workflow = makeWorkflow([{ kind: "command", file: "10-first.sh", number: 10, name: "first", timeout: "3s" }]);
+  const result = await executeWorkflowAttempt(makeInput(workflow, async (request) => {
     calls.push(request);
-    if (request.kind === "command" && request.step === "30-last") return successful("done\n");
-    if (request.kind === "command") return successful("command output\n");
-    if (request.kind === "agent") return successful("agent output\n");
-    return successful("done\n");
-  };
-  const workflow = makeWorkflow([
-    { kind: "command", file: "10-first.sh", number: 10, name: "first" },
-    { kind: "agent", file: "20-write.md", number: 20, name: "write", profile: "writer" },
-    { kind: "command", file: "30-last.ts", number: 30, name: "last" },
-  ], { timeout: "3s" });
-  const result = await interpretWorkflow(makeInput(workflow, executeProcess, undefined, {
-    documents: { "20-write.md": "Write one line." },
-  }));
+    return successful("command output\n");
+  }), { step: firstStep(workflow), pipeInput: "prior\n", feedback: "retry hint", attempt: 2 });
 
-  assert.equal(result.status, "completed");
-  assert.equal(result.output, "done\n");
-  assert.equal(result.completedSteps, 3);
-  assert.deepEqual(calls.map(({ input, timeoutMs }) => [input, timeoutMs]), [
-    ["", 3_000],
-    ["Write one line.\n\n## Input\n\ncommand output\n", 3_000],
-    ["agent output\n", 3_000],
-  ]);
-  assert.deepEqual(calls.map(({ command }) => command.map((part) => part.split("/").at(-1))), [
-    ["sh", "10-first.sh"],
-    ["fake-writer"],
-    ["node", "30-last.ts"],
+  assert.deepEqual(result, { kind: "accepted", output: "command output\n" });
+  assert.deepEqual(calls.map(({ kind, command, input, timeoutMs, attempt }) => [kind, command, input, timeoutMs, attempt]), [
+    ["command", ["sh", "/workflows/clock/10-first.sh"], "prior\n", 3_000, 2],
   ]);
 });
 
-test("exit 99 ends the workflow successfully before later steps", async () => {
+test("agent attempts receive the prompt, untrimmed input, feedback, and selected profile", async () => {
   const calls: ProcessExecutionRequest[] = [];
-  const result = await interpretWorkflow(makeInput(makeWorkflow([
-    { kind: "command", file: "10-nothing.sh", number: 10, name: "nothing" },
-    { kind: "command", file: "20-later.sh", number: 20, name: "later" },
-  ]), async (request) => {
+  const workflow = makeWorkflow([{ kind: "agent", file: "10-write.md", number: 10, name: "write", profile: "writer" }]);
+  const result = await executeWorkflowAttempt(makeInput(workflow, async (request) => {
     calls.push(request);
-    return { exitCode: 99, stdout: "", stderr: "", timedOut: false };
-  }));
+    return successful("agent output\n");
+  }, { documents: { "10-write.md": "Write one line." } }), {
+    step: firstStep(workflow), profile: "fast", pipeInput: "upstream\n", feedback: "Use the hint.", attempt: 1,
+  });
 
-  assert.equal(result.status, "nothing-to-do");
-  assert.equal(result.completedSteps, 0);
-  assert.equal(calls.length, 1);
+  assert.deepEqual(result, { kind: "accepted", output: "agent output\n" });
+  assert.deepEqual(calls.map(({ kind, command, input, feedback, profile }) => [kind, command, input, feedback, profile]), [[
+    "agent", ["fake-writer", "--fast"], "Write one line.\n\n## Input\n\nupstream\n\n\n## Feedback\n\nUse the hint.", "Use the hint.", "fast",
+  ]]);
 });
 
-test("check rejection retries with its reason and accepts the next candidate", async () => {
-  const calls: ProcessExecutionRequest[] = [];
-  let candidates = 0;
-  let verdicts = 0;
-  const workflow = makeWorkflow([{
-    kind: "agent",
-    file: "10-write.md",
-    number: 10,
-    name: "write",
-    profile: "writer",
-    retries: 1,
-    check: { kind: "agent", file: "10-write.check.md", profile: "judge" },
-  }]);
-  const result = await interpretWorkflow(makeInput(workflow, async (request) => {
-    calls.push(request);
-    if (request.kind === "agent") {
-      candidates += 1;
-      return successful(candidates === 1 ? "first candidate\n" : "second candidate\n");
-    }
-    if (request.kind === "agent-check") {
-      verdicts += 1;
-      return successful(verdicts === 1 ? "REJECT - repeats a previous sentence\n" : "ACCEPT - original\n");
-    }
-    return successful("");
-  }, undefined, {
-    documents: {
-      "10-write.md": "Write one sentence.",
-      "10-write.check.md": "Judge the sentence.",
-    },
-  }));
+test("only a clean command exit 99 means nothing-to-do", async () => {
+  const workflow = makeWorkflow([{ kind: "command", file: "10-step.sh", number: 10, name: "step" }]);
+  const nothing = await executeWorkflowAttempt(makeInput(workflow, async () => ({ exitCode: 99, stdout: "", stderr: "", timedOut: false })), {
+    step: firstStep(workflow), pipeInput: "", feedback: "", attempt: 1,
+  });
+  assert.deepEqual(nothing, { kind: "nothing-to-do", output: "" });
 
-  assert.equal(result.status, "completed");
-  assert.equal(result.output, "second candidate\n");
-  assert.equal(calls.length, 4);
-  assert.match(calls[2]?.input ?? "", /## Feedback\n\nrepeats a previous sentence/);
-  assert.equal(calls[3]?.input, "Judge the sentence.\n\n## Input\n\nsecond candidate\n");
+  const errored = await executeWorkflowAttempt(makeInput(workflow, async () => ({
+    exitCode: 99, stdout: "partial", stderr: "", timedOut: false, error: "pipe failed",
+  })), { step: firstStep(workflow), pipeInput: "", feedback: "", attempt: 1 });
+  assert.equal(errored.kind, "failed");
+  if (errored.kind === "failed") assert.match(errored.reason, /pipe failed/);
 });
 
-test("command checks accept on exit zero and feed a rejection back into the retry", async () => {
+test("command checks accept exit zero and keep the worker output", async () => {
   const calls: ProcessExecutionRequest[] = [];
   const workflow = makeWorkflow([{
-    kind: "command",
-    file: "10-checkable.sh",
-    number: 10,
-    name: "checkable",
-    retries: 1,
+    kind: "command", file: "10-checkable.sh", number: 10, name: "checkable",
     check: { kind: "command", file: "10-checkable.check.sh" },
   }]);
-  const result = await interpretWorkflow(makeInput(workflow, async (request) => {
+  const result = await executeWorkflowAttempt(makeInput(workflow, async (request) => {
     calls.push(request);
-    if (request.kind === "command-check" && request.attempt === 1) {
-      return { exitCode: 2, stdout: "wrong output", stderr: "expected a line", timedOut: false };
-    }
-    if (request.kind === "command-check") return successful("");
-    return successful(`candidate ${request.attempt}`);
-  }));
-  assert.equal(result.output, "candidate 2");
-  assert.deepEqual(calls.map(({ kind, input }) => [kind, input]), [
-    ["command", ""],
-    ["command-check", "candidate 1"],
-    ["command", ""],
-    ["command-check", "candidate 2"],
-  ]);
-  assert.deepEqual(calls.map(({ command }) => command.map((part) => part.split("/").at(-1))), [
-    ["sh", "10-checkable.sh"],
-    ["sh", "10-checkable.check.sh"],
-    ["sh", "10-checkable.sh"],
-    ["sh", "10-checkable.check.sh"],
-  ]);
-  assert.equal(calls[2]?.feedback, "wrong output\nexpected a line");
+    return request.kind === "command-check" ? successful("checker output does not replace the worker") : successful("candidate\n");
+  }), { step: firstStep(workflow), pipeInput: "input", feedback: "", attempt: 1 });
+
+  assert.deepEqual(result, { kind: "accepted", output: "candidate\n" });
+  assert.deepEqual(calls.map(({ kind, input }) => [kind, input]), [["command", "input"], ["command-check", "candidate\n"]]);
 });
-test("Markdown checks use only their first line", () => {
+
+test("a failed command check rejects the attempt with its output and reason", async () => {
+  const workflow = makeWorkflow([{
+    kind: "command", file: "10-checkable.sh", number: 10, name: "checkable",
+    check: { kind: "command", file: "10-checkable.check.sh" },
+  }]);
+  const result = await executeWorkflowAttempt(makeInput(workflow, async (request) => request.kind === "command-check"
+    ? failed("wrong output", "expected a line")
+    : successful("candidate")), { step: firstStep(workflow), pipeInput: "", feedback: "", attempt: 1 });
+
+  assert.deepEqual(result, { kind: "failed", output: "candidate", reason: "wrong output\nexpected a line" });
+});
+
+test("Markdown checks use only their first line and failed check processes cannot accept", async () => {
   assert.deepEqual(parseMarkdownVerdict("ACCEPT - original\nREJECT"), { accepted: true, reason: "original" });
   assert.deepEqual(parseMarkdownVerdict("explanation\nACCEPT"), {
     accepted: false,
-    reason: `check must start with ACCEPT or REJECT; received "explanation"`,
+    reason: "check must start with ACCEPT or REJECT; received \"explanation\"",
   });
-});
-
-test("exhausted attempts stay blocked and expose the step and last error", async () => {
-  let releaseDecision: ((decision: WorkflowDecision) => void) | undefined;
-  let signalBlocked: (() => void) | undefined;
-  const blocked = new Promise<void>((resolveBlocked) => { signalBlocked = resolveBlocked; });
-  const decision = new Promise<WorkflowDecision>((resolveDecision) => { releaseDecision = resolveDecision; });
-  let settled = false;
-  let blockedInput: Parameters<WorkflowInterpreterInput["waitForDecision"]>[0] | undefined;
+  const calls: ProcessExecutionRequest[] = [];
   const workflow = makeWorkflow([{
-    kind: "agent", file: "10-write.md", number: 10, name: "write", profile: "writer", retries: 0,
+    kind: "agent", file: "10-write.md", number: 10, name: "write", profile: "writer",
+    check: { kind: "agent", file: "10-write.check.md", profile: "judge" },
   }]);
-  const pending = interpretWorkflow(makeInput(workflow, async () => failed("last output", "profile crashed"), async (input) => {
-    blockedInput = input;
-    signalBlocked?.();
-    return decision;
-  }, { documents: { "10-write.md": "Write." } })).then((value) => {
-    settled = true;
-    return value;
+  const result = await executeWorkflowAttempt(makeInput(workflow, async (request) => {
+    calls.push(request);
+    return request.kind === "agent"
+      ? successful("draft")
+      : { exitCode: 7, stdout: "ACCEPT", stderr: "judge crashed", timedOut: false };
+  }, { documents: { "10-write.md": "Write.", "10-write.check.md": "Judge." } }), {
+    step: firstStep(workflow), profile: "writer", pipeInput: "", feedback: "", attempt: 1,
   });
 
-  await blocked;
-  assert.equal(settled, false);
-  assert.deepEqual(blockedInput, {
-    workflow: "clock",
-    runId: "wrun_test_1",
-    step: "10-write",
-    stepKind: "agent",
-    retryProfiles: ["writer", "fast"],
-    lastError: "10-write profile failed with exit code 7: profile crashed\nlast output",
-    lastOutput: "last output",
-    attemptHistory: [{
-      attempt: 1,
-      profile: "writer",
-      output: "last output",
-      error: "10-write profile failed with exit code 7: profile crashed\nlast output",
-    }],
-    decisionNumber: 1,
-  });
-  releaseDecision?.({ action: "skip" });
-  assert.equal((await pending).status, "completed");
+  assert.deepEqual(calls.map(({ kind }) => kind), ["agent", "agent-check"]);
+  assert.deepEqual(result, { kind: "failed", output: "draft", reason: "10-write.check failed with exit code 7: judge crashed\nACCEPT" });
 });
 
-test("retry, skip, accept, and fail decisions have distinct effects", async (t) => {
-  await t.test("retry applies the hint and selected agent profile", async () => {
-    const calls: ProcessExecutionRequest[] = [];
-    const result = await interpretWorkflow(makeInput(makeWorkflow([
-      { kind: "agent", file: "10-write.md", number: 10, name: "write", profile: "writer", retries: 0 },
-    ]), async (request) => {
-      calls.push(request);
-      return request.attempt === 1 ? failed("bad output") : successful("fixed output");
-    }, async () => ({ action: "retry", hint: "Use a different image.", profile: "fast" }), {
-      documents: { "10-write.md": "Write." },
-    }));
-
-    assert.equal(result.output, "fixed output");
-    assert.deepEqual(calls.map(({ command }) => command), [["fake-writer"], ["fake-writer", "--fast"]]);
-    assert.match(calls[1]?.input ?? "", /Hint: Use a different image\./);
-  });
-
-  await t.test("retry profiles cannot switch executables", async () => {
-    const workflow = makeWorkflow([
-      { kind: "agent", file: "10-write.md", number: 10, name: "write", profile: "writer", retries: 0 },
-    ]);
-    await assert.rejects(interpretWorkflow(makeInput(workflow, async () => failed("bad output"), async () => ({
-      action: "retry", profile: "other",
-    }), {
-      documents: { "10-write.md": "Write." },
-      profileCommands: { writer: ["fake-writer"], other: ["other-writer"] },
-    })), /same executable/);
-  });
-
-  await t.test("skip preserves the previous pipe input", async () => {
-    const inputs: string[] = [];
-    const result = await interpretWorkflow(makeInput(makeWorkflow([
-      { kind: "command", file: "10-first.sh", number: 10, name: "first" },
-      { kind: "command", file: "20-skip.sh", number: 20, name: "skip" },
-      { kind: "command", file: "30-last.sh", number: 30, name: "last" },
-    ]), async (request) => {
-      inputs.push(request.input);
-      return request.step === "20-skip" ? failed("not accepted") : successful(request.step === "10-first" ? "upstream" : "downstream");
-    }, async () => ({ action: "skip" })));
-
-    assert.deepEqual(inputs, ["", "upstream", "upstream"]);
-    assert.equal(result.output, "downstream");
-  });
-
-  await t.test("accept passes the last failed output to the next step", async () => {
-    const inputs: string[] = [];
-    const result = await interpretWorkflow(makeInput(makeWorkflow([
-      { kind: "command", file: "10-accept.sh", number: 10, name: "accept" },
-      { kind: "command", file: "20-last.sh", number: 20, name: "last" },
-    ]), async (request) => {
-      inputs.push(request.input);
-      return request.step === "10-accept" ? failed("last output") : successful("finished");
-    }, async () => ({ action: "accept" })));
-
-    assert.deepEqual(inputs, ["", "last output"]);
-    assert.equal(result.output, "finished");
-  });
-
-  await t.test("fail ends the workflow with the last failure", async () => {
-    await assert.rejects(
-      interpretWorkflow(makeInput(makeWorkflow([
-        { kind: "command", file: "10-fail.sh", number: 10, name: "fail" },
-      ]), async () => failed("", "command broke"), async () => ({ action: "fail" }))),
-      /10-fail failed after 1 attempts: 10-fail failed with exit code 7: command broke/,
-    );
-  });
-});
-
-
-test("timeouts become workflow failures with the configured limit", async () => {
+test("attempt timeouts and invalid saved workflow timeouts keep their limits", async () => {
   const requests: ProcessExecutionRequest[] = [];
-  const workflow = makeWorkflow([
-    { kind: "command", file: "10-slow.sh", number: 10, name: "slow" },
-  ], { timeout: "2s", retries: 0 });
-  await assert.rejects(interpretWorkflow(makeInput(workflow, async (request) => {
+  const workflow = makeWorkflow([{ kind: "command", file: "10-slow.sh", number: 10, name: "slow" }], { timeout: "2s" });
+  const result = await executeWorkflowAttempt(makeInput(workflow, async (request) => {
     requests.push(request);
     return { exitCode: null, stdout: "partial", stderr: "", timedOut: true, signal: "SIGTERM" };
-  }, async () => ({ action: "fail" }))), /10-slow timed out after 2000ms/);
-  assert.equal(requests[0]?.timeoutMs, 2_000);
-});
+  }), { step: firstStep(workflow), pipeInput: "", feedback: "", attempt: 1 });
+  assert.deepEqual(requests.map(({ timeoutMs }) => timeoutMs), [2_000]);
+  assert.equal(result.kind, "failed");
+  if (result.kind === "failed") assert.match(result.reason, /10-slow timed out after 2000ms/);
 
-test("rejects a persisted workflow timeout beyond the Node timer limit", async () => {
-  const workflow = makeWorkflow([
-    { kind: "command", file: "10-slow.sh", number: 10, name: "slow" },
-  ], { timeout: "999999h" });
-  await assert.rejects(
-    interpretWorkflow(makeInput(workflow, async () => successful("unused"))),
-    /Workflow timeout is too large for Node timers: 999999h/,
-  );
+  const invalid = makeWorkflow([{ kind: "command", file: "10-slow.sh", number: 10, name: "slow" }], { timeout: "999999h" });
+  await assert.rejects(executeWorkflowAttempt(makeInput(invalid, async () => successful("unused")), {
+    step: firstStep(invalid), pipeInput: "", feedback: "", attempt: 1,
+  }), /Workflow timeout is too large for Node timers: 999999h/);
 });
 
 test("fake profile commands receive stdin and Workshop environment without a shell", async () => {
   await withRoot(async (root) => {
     const result = await executeWorkflowProcess({
-      kind: "agent",
-      command: [process.execPath, fixture, "environment"],
-      input: "prompt from stdin",
-      step: "20-write",
-      feedback: "try again",
-      attempt: 2,
-      timeoutMs: 2_000,
-      workflow: "clock",
-      runId: "wrun_process_1",
-      projectRoot: root,
-      dataDirectory: "/data/clock",
-      stateDirectory: root,
-      cwd: process.cwd(),
+      kind: "agent", command: [process.execPath, fixture, "environment"], input: "prompt from stdin", step: "20-write",
+      feedback: "try again", attempt: 2, timeoutMs: 2_000, workflow: "clock", runId: "wrun_process_1",
+      projectRoot: root, dataDirectory: "/data/clock", stateDirectory: root, cwd: process.cwd(),
     });
     assert.equal(result.exitCode, 0);
     assert.deepEqual(JSON.parse(result.stdout), {
-      input: "prompt from stdin",
-      workflow: "clock",
-      runId: "wrun_process_1",
-      step: "20-write",
-      dataDirectory: "/data/clock",
-      stateDirectory: root,
-      feedback: "try again",
+      input: "prompt from stdin", workflow: "clock", runId: "wrun_process_1", step: "20-write",
+      dataDirectory: "/data/clock", stateDirectory: root, feedback: "try again",
     });
   });
 });
 
-test("command steps execute their file path with stdin semantics", async () => {
+test("command processes execute their source path with stdin semantics", async () => {
   await withRoot(async (root) => {
     const file = join(root, "10-step with spaces.sh");
-    const content = `IFS= read -r line\nprintf '%s:%s' "$line" "$0"\n`;
-    writeFileSync(file, content);
+    writeFileSync(file, `IFS= read -r line\nprintf '%s:%s' "$line" "$0"\n`);
     const result = await executeWorkflowProcess({
-      kind: "command",
-      command: ["sh", file],
-      input: "pipe content\n",
-      step: "10-step",
-      feedback: "",
-      attempt: 1,
-      workflow: "clock",
-      runId: "wrun_file_path",
-      projectRoot: root,
-      dataDirectory: root,
-      stateDirectory: root,
-      cwd: root,
+      kind: "command", command: ["sh", file], input: "pipe content\n", step: "10-step", feedback: "", attempt: 1,
+      workflow: "clock", runId: "wrun_file_path", projectRoot: root, dataDirectory: root, stateDirectory: root, cwd: root,
     });
-
     assert.equal(result.exitCode, 0);
     assert.equal(result.stdout, `pipe content:${file}`);
   });
 });
 
-test("typed TypeScript command steps and checks run through Node", async () => {
+test("typed TypeScript commands and checks execute through Node", async () => {
   await withRoot(async (root) => {
     const stepFile = join(root, "10-typed.ts");
     const checkFile = join(root, "10-typed.check.ts");
@@ -382,38 +211,25 @@ test("typed TypeScript command steps and checks run through Node", async () => {
       "",
     ].join("\n"));
     writeFileSync(checkFile, [
-      "let input = \"\";",
+      'let input = "";',
       "for await (const chunk of process.stdin) input += chunk.toString();",
       "const checked: string = input;",
       'if (checked !== "typed output") throw new Error(`Unexpected input: ${checked}`);',
       "",
     ].join("\n"));
     const workflow = makeWorkflow([{
-      kind: "command",
-      file: "10-typed.ts",
-      number: 10,
-      name: "typed",
+      kind: "command", file: "10-typed.ts", number: 10, name: "typed",
       check: { kind: "command", file: "10-typed.check.ts" },
     }]);
-    const input = makeInput(workflow, (request) => executeWorkflowProcess({
-      ...request,
-      workflow: "clock",
-      runId: "typed-run",
-      projectRoot: root,
-      dataDirectory: root,
-      stateDirectory: root,
-      cwd: root,
-    }), undefined, {
-      files: { "10-typed.ts": stepFile, "10-typed.check.ts": checkFile },
+    const result = await executeWorkflowAttempt(makeInput(workflow, (request) => executeWorkflowProcess({
+      ...request, workflow: "clock", runId: "typed-run", projectRoot: root,
+      dataDirectory: root, stateDirectory: root, cwd: root,
+    }), { files: { "10-typed.ts": stepFile, "10-typed.check.ts": checkFile } }), {
+      step: firstStep(workflow), pipeInput: "", feedback: "", attempt: 1,
     });
-
-    const result = await interpretWorkflow(input);
-    assert.equal(result.status, "completed");
-    assert.equal(result.output, "typed output");
+    assert.deepEqual(result, { kind: "accepted", output: "typed output" });
   });
 });
-
-
 
 async function waitForProcessId(file: string): Promise<number> {
   const deadline = Date.now() + 5_000;
@@ -441,19 +257,9 @@ async function assertProcessStopped(pid: number): Promise<void> {
 
 function grandchildProcessInput(root: string, pidFile: string, timeoutMs?: number, signal?: AbortSignal) {
   return executeWorkflowProcess({
-    kind: "agent",
-    command: [process.execPath, fixture, "spawn-grandchild", pidFile],
-    input: "",
-    step: "10-grandchild",
-    feedback: "",
-    attempt: 1,
-    ...(timeoutMs === undefined ? {} : { timeoutMs }),
-    workflow: "clock",
-    runId: "wrun_grandchild_1",
-    projectRoot: root,
-    dataDirectory: root,
-    stateDirectory: root,
-    cwd: root,
+    kind: "agent", command: [process.execPath, fixture, "spawn-grandchild", pidFile], input: "", step: "10-grandchild",
+    feedback: "", attempt: 1, ...(timeoutMs === undefined ? {} : { timeoutMs }), workflow: "clock",
+    runId: "wrun_grandchild_1", projectRoot: root, dataDirectory: root, stateDirectory: root, cwd: root,
     ...(signal === undefined ? {} : { signal }),
   });
 }
@@ -483,109 +289,16 @@ test("aborting the step task signal kills the active process tree", { skip: proc
   });
 });
 
-test("a requested retry delay returns a resume checkpoint before rerunning the step", async () => {
-  let attempts = 0;
-  let retryResume: WorkflowInterpreterResume | undefined;
-  const workflow = makeWorkflow([{ kind: "command", file: "10-run.sh", number: 10, name: "run", retries: 0 }]);
-  const input = makeInput(workflow, async () => {
-    attempts += 1;
-    return failed("partial", "first attempt failed");
-  }, async () => ({ action: "retry", after: "30s", hint: "Wait before retrying." }));
-  input.waitBeforeRetry = async (duration, resume) => {
-    assert.equal(duration, "30s");
-    retryResume = resume;
-    return true;
-  };
-
-  const waiting = await interpretWorkflow(input);
-  assert.equal(waiting.status, "waiting");
-  assert.equal(attempts, 1);
-  assert.ok(retryResume);
-  assert.equal(retryResume.localRetriesLeft, 0);
-  assert.equal(retryResume.attemptHistory.length, 1);
-  assert.match(retryResume.feedback, /Wait before retrying/);
-
-  const resumed = await interpretWorkflow({
-    ...input,
-    resume: retryResume,
-    waitBeforeRetry: undefined,
-    executeProcess: async (request) => {
-      assert.equal(request.kind, "command");
-      assert.equal(request.attempt, 2);
-      return successful("completed after wait");
-    },
-  });
-  assert.equal(resumed.status, "completed");
-  assert.equal(resumed.output, "completed after wait");
-});
-
-test("a failed Markdown checker cannot accept its output", async () => {
-  const calls: ProcessExecutionRequest[] = [];
-  let decisionError: string | undefined;
-  const workflow = makeWorkflow([{
-    kind: "agent",
-    file: "10-write.md",
-    number: 10,
-    name: "write",
-    profile: "writer",
-    check: { kind: "agent", file: "10-write.check.md", profile: "judge" },
-  }]);
-  const result = await interpretWorkflow(makeInput(workflow, async (request) => {
-    calls.push(request);
-    return request.kind === "agent"
-      ? successful("draft")
-      : { exitCode: 7, stdout: "ACCEPT", stderr: "judge crashed", timedOut: false };
-  }, async ({ lastError }) => {
-    decisionError = lastError;
-    return { action: "skip" };
-  }, {
-    documents: {
-      "10-write.md": "Write a sentence.",
-      "10-write.check.md": "Judge the sentence.",
-    },
-  }));
-
-  assert.deepEqual(calls.map(({ kind }) => kind), ["agent", "agent-check"]);
-  assert.equal(decisionError, "10-write.check failed with exit code 7: judge crashed\nACCEPT");
-  assert.deepEqual(result, {
-    status: "completed",
-    output: "",
-    completedSteps: 1,
-    steps: [{
-      step: "10-write",
-      status: "skipped",
-      output: "",
-      attempts: [{
-        attempt: 1,
-        profile: "writer",
-        output: "draft",
-        error: "10-write.check failed with exit code 7: judge crashed\nACCEPT",
-      }],
-    }],
-  });
-});
-
 test("a pre-aborted attempt does not spawn its process", async () => {
   await withRoot(async (root) => {
     const marker = join(root, "spawned");
     const controller = new AbortController();
     controller.abort();
     const result = await executeWorkflowProcess({
-      kind: "command",
-      command: [process.execPath, "-e", `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'spawned')`],
-      input: "",
-      step: "10-pre-aborted",
-      feedback: "",
-      attempt: 1,
-      workflow: "clock",
-      runId: "pre-aborted",
-      projectRoot: root,
-      dataDirectory: root,
-      stateDirectory: root,
-      cwd: root,
-      signal: controller.signal,
+      kind: "command", command: [process.execPath, "-e", `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'spawned')`],
+      input: "", step: "10-pre-aborted", feedback: "", attempt: 1, workflow: "clock", runId: "pre-aborted",
+      projectRoot: root, dataDirectory: root, stateDirectory: root, cwd: root, signal: controller.signal,
     });
-
     assert.equal(existsSync(marker), false);
     assert.equal(result.timedOut, false);
     assert.match(result.error ?? "", /cancelled before it started/);
@@ -599,18 +312,9 @@ test("abort remains the first stop cause when timeout fires during termination",
     const pending = executeWorkflowProcess({
       kind: "command",
       command: [process.execPath, "-e", `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ready'); process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)`],
-      input: "",
-      step: "10-abort-before-timeout",
-      feedback: "",
-      attempt: 1,
-      timeoutMs: 1_000,
-      workflow: "clock",
-      runId: "abort-before-timeout",
-      projectRoot: root,
-      dataDirectory: root,
-      stateDirectory: root,
-      cwd: root,
-      signal: controller.signal,
+      input: "", step: "10-abort-before-timeout", feedback: "", attempt: 1, timeoutMs: 1_000,
+      workflow: "clock", runId: "abort-before-timeout", projectRoot: root, dataDirectory: root,
+      stateDirectory: root, cwd: root, signal: controller.signal,
     });
     const abortTimer = setTimeout(() => controller.abort(), 850);
     const deadline = Date.now() + 2_000;
@@ -618,7 +322,6 @@ test("abort remains the first stop cause when timeout fires during termination",
     assert.ok(existsSync(marker), "the process started");
     const result = await pending;
     clearTimeout(abortTimer);
-
     assert.equal(result.timedOut, false);
     assert.equal(result.signal, "SIGKILL");
   });
@@ -628,43 +331,17 @@ test("a worker that succeeds after cancellation does not start its checker", asy
   const controller = new AbortController();
   const calls: string[] = [];
   const workflow = makeWorkflow([{
-    kind: "agent",
-    file: "10-write.md",
-    number: 10,
-    name: "write",
-    profile: "writer",
+    kind: "agent", file: "10-write.md", number: 10, name: "write", profile: "writer",
     check: { kind: "command", file: "10-write.check.sh" },
   }]);
   const input = makeInput(workflow, async (request) => {
     calls.push(request.kind);
     controller.abort();
     return successful("candidate");
-  }, undefined, {
-    documents: { "10-write.md": "Write." },
-    signal: controller.signal,
-  });
+  }, { documents: { "10-write.md": "Write." }, signal: controller.signal });
 
   await assert.rejects(executeWorkflowAttempt(input, {
-    step: workflow.steps[0]!,
-    profile: "writer",
-    pipeInput: "",
-    feedback: "",
-    attempt: 1,
+    step: firstStep(workflow), profile: "writer", pipeInput: "", feedback: "", attempt: 1,
   }), /cancelled before its check could start/);
   assert.deepEqual(calls, ["agent"]);
-});
-
-test("exit 99 with a process error is a failed attempt, not nothing-to-do", async () => {
-  const workflow = makeWorkflow([{ kind: "command", file: "10-step.sh", number: 10, name: "step" }]);
-  const result = await executeWorkflowAttempt(makeInput(workflow, async () => ({
-    exitCode: 99, stdout: "partial", stderr: "", timedOut: false, error: "pipe failed",
-  })), {
-    step: workflow.steps[0]!,
-    pipeInput: "",
-    feedback: "",
-    attempt: 1,
-  });
-
-  assert.equal(result.kind, "failed");
-  if (result.kind === "failed") assert.match(result.reason, /pipe failed/);
 });

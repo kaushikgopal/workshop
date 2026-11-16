@@ -1,6 +1,4 @@
-import { applyWorkflowDecision } from "./apply-workflow-decision.ts";
-import { computeRetryProfiles } from "./compute-retry-profiles.ts";
-import type { AttemptHistoryEntry, Workflow, WorkflowDecision, WorkflowStep, WorkflowStepResult } from "./types.ts";
+import type { AttemptHistoryEntry, Workflow, WorkflowStep } from "./types.ts";
 
 export type ProcessExecutionKind = "command" | "agent" | "command-check" | "agent-check";
 
@@ -14,6 +12,7 @@ export type ProcessExecutionRequest = {
   attempt: number;
   profile?: string;
 };
+
 export type ProcessExecutionResult = {
   exitCode: number | null;
   stdout: string;
@@ -21,16 +20,6 @@ export type ProcessExecutionResult = {
   timedOut: boolean;
   signal?: string | null;
   error?: string;
-};
-
-
-export type WorkflowInterpreterResume = {
-  profile?: string;
-  feedback: string;
-  attemptHistory: AttemptHistoryEntry[];
-  decisionNumber: number;
-  localRetriesLeft?: number;
-  waitUntil?: number;
 };
 
 export type WorkflowDecisionRequest = {
@@ -58,29 +47,14 @@ export type WorkflowAttemptResult =
   | { kind: "failed"; output: string; reason: string }
   | { kind: "nothing-to-do"; output: string };
 
-export type WorkflowInterpreterInput = {
+export type WorkflowAttemptEnvironment = {
   workflow: Workflow;
   documents: Record<string, string>;
   files: Record<string, string>;
-  workflowRunId: string;
   profileCommands: Record<string, string[]>;
-  initialInput?: string;
-  resume?: WorkflowInterpreterResume;
   executeProcess(request: ProcessExecutionRequest): Promise<ProcessExecutionResult>;
-  executeAttempt?(request: WorkflowAttemptRequest): Promise<WorkflowAttemptResult>;
-  waitBeforeRetry?(duration: string, resume: WorkflowInterpreterResume): Promise<boolean>;
-  waitForDecision(input: WorkflowDecisionRequest): Promise<WorkflowDecision>;
   signal?: AbortSignal;
 };
-
-export type WorkflowInterpretation = {
-  status: "completed" | "nothing-to-do" | "waiting";
-  output: string;
-  completedSteps: number;
-  steps: WorkflowStepResult[];
-};
-
-type AttemptResult = WorkflowAttemptResult;
 
 function timeoutMilliseconds(value: string | undefined): number | undefined {
   if (value === undefined) return undefined;
@@ -115,15 +89,6 @@ function processFailure(label: string, result: ProcessExecutionResult, timeoutMs
   return `${label} failed with ${status}${details ? `: ${details}` : ""}`;
 }
 
-function attemptRecord(step: WorkflowStep, profile: string | undefined, attempt: number, result: AttemptResult): AttemptHistoryEntry {
-  return {
-    attempt,
-    ...(step.kind === "agent" && profile !== undefined ? { profile } : {}),
-    output: result.output,
-    ...(result.kind === "failed" ? { error: result.reason } : {}),
-  };
-}
-
 export function parseMarkdownVerdict(output: string): { accepted: boolean; reason: string } {
   const firstLine = output.split(/\r?\n/, 1)[0]?.trim() ?? "";
   const match = /^(ACCEPT|REJECT)(?=$|\s|:|-)(?:\s*[:-]?\s*(.*))?$/i.exec(firstLine);
@@ -136,7 +101,11 @@ export function parseMarkdownVerdict(output: string): { accepted: boolean; reaso
   };
 }
 
-async function executeAttempt(input: WorkflowInterpreterInput, step: WorkflowStep, profile: string | undefined, pipeInput: string, feedback: string, attempt: number): Promise<AttemptResult> {
+async function executeAttempt(
+  input: WorkflowAttemptEnvironment,
+  request: WorkflowAttemptRequest,
+): Promise<WorkflowAttemptResult> {
+  const { step, profile, pipeInput, feedback, attempt } = request;
   const id = stepId(step);
   const stepTimeout = timeoutMilliseconds(step.timeout ?? input.workflow.timeout);
   let output: string;
@@ -170,6 +139,7 @@ async function executeAttempt(input: WorkflowInterpreterInput, step: WorkflowSte
       feedback,
       timeoutMs: stepTimeout,
       attempt,
+      ...(profile === undefined ? {} : { profile }),
     });
     output = result.stdout;
     if (result.exitCode !== 0 || result.timedOut || result.error !== undefined) {
@@ -215,6 +185,7 @@ async function executeAttempt(input: WorkflowInterpreterInput, step: WorkflowSte
     feedback: "",
     timeoutMs: checkTimeout,
     attempt,
+    profile: checkProfile,
   });
   if (result.exitCode !== 0 || result.timedOut || result.error !== undefined) {
     return { kind: "failed", output, reason: processFailure(checkId, result, checkTimeout) };
@@ -223,103 +194,9 @@ async function executeAttempt(input: WorkflowInterpreterInput, step: WorkflowSte
   return verdict.accepted ? { kind: "accepted", output } : { kind: "failed", output, reason: verdict.reason };
 }
 
-export async function executeWorkflowAttempt(input: WorkflowInterpreterInput, request: WorkflowAttemptRequest): Promise<WorkflowAttemptResult> {
-  return await executeAttempt(input, request.step, request.profile, request.pipeInput, request.feedback, request.attempt);
-}
-
-function retryLimit(step: WorkflowStep, workflow: Workflow): number {
-  return step.retries ?? step.check?.retries ?? workflow.retries ?? 0;
-}
-
-
-export async function interpretWorkflow(input: WorkflowInterpreterInput): Promise<WorkflowInterpretation> {
-  let pipeInput = input.initialInput ?? "";
-  let completedSteps = 0;
-  const steps: WorkflowStepResult[] = [];
-  for (const [stepIndex, step] of input.workflow.steps.entries()) {
-    const resume = stepIndex === 0 ? input.resume : undefined;
-    const id = stepId(step);
-    const retries = retryLimit(step, input.workflow);
-    let localRetriesLeft = resume?.localRetriesLeft ?? retries;
-    let totalAttempts = resume?.attemptHistory.reduce((latest, entry) => Math.max(latest, entry.attempt), 0) ?? 0;
-    let decisionNumber = resume?.decisionNumber ?? 0;
-    let feedback = resume?.feedback ?? "";
-    let selectedProfile = resume?.profile ?? step.profile;
-    const attemptHistory: AttemptHistoryEntry[] = [...(resume?.attemptHistory ?? [])];
-
-    while (true) {
-      totalAttempts += 1;
-      const request: WorkflowAttemptRequest = { step, ...(selectedProfile === undefined ? {} : { profile: selectedProfile }), pipeInput, feedback, attempt: totalAttempts };
-      const result = input.executeAttempt ? await input.executeAttempt(request) : await executeWorkflowAttempt(input, request);
-      if (result.kind === "nothing-to-do") {
-        attemptHistory.push(attemptRecord(step, selectedProfile, totalAttempts, result));
-        steps.push({ step: id, status: "nothing-to-do", output: result.output, attempts: attemptHistory });
-        return { status: "nothing-to-do", output: result.output, completedSteps, steps };
-      }
-      if (result.kind === "accepted") {
-        attemptHistory.push(attemptRecord(step, selectedProfile, totalAttempts, result));
-        pipeInput = result.output;
-        completedSteps += 1;
-        steps.push({ step: id, status: "completed", output: result.output, attempts: attemptHistory });
-        break;
-      }
-
-      attemptHistory.push(attemptRecord(step, selectedProfile, totalAttempts, result));
-      if (localRetriesLeft > 0) {
-        localRetriesLeft -= 1;
-        feedback = result.reason;
-        continue;
-      }
-
-      decisionNumber += 1;
-      const decision = await input.waitForDecision({
-        workflow: input.workflow.name,
-        runId: input.workflowRunId,
-        step: id,
-        stepKind: step.kind,
-        retryProfiles: computeRetryProfiles(step, input.profileCommands),
-        lastError: result.reason,
-        lastOutput: result.output,
-        attemptHistory,
-        decisionNumber,
-      });
-      const applied = applyWorkflowDecision({
-        decision,
-        step,
-        currentProfile: selectedProfile,
-        profileCommands: input.profileCommands,
-        lastError: result.reason,
-      });
-      if (applied.action === "retry") {
-        selectedProfile = applied.profile;
-        feedback = applied.feedback;
-        localRetriesLeft = retries;
-        if (applied.after !== undefined) {
-          if (!input.waitBeforeRetry) throw new Error("A retry delay was requested but no durable wait is configured");
-          const waiting = await input.waitBeforeRetry(applied.after, {
-            ...(selectedProfile === undefined ? {} : { profile: selectedProfile }),
-            feedback,
-            attemptHistory: [...attemptHistory],
-            decisionNumber,
-            localRetriesLeft,
-          });
-          if (waiting) return { status: "waiting", output: pipeInput, completedSteps, steps };
-        }
-        continue;
-      }
-      if (applied.action === "skip") {
-        completedSteps += 1;
-        steps.push({ step: id, status: "skipped", output: "", attempts: attemptHistory });
-        break;
-      }
-      if (applied.action === "accept") {
-        pipeInput = result.output;
-        completedSteps += 1;
-        steps.push({ step: id, status: "completed", output: result.output, attempts: attemptHistory });
-        break;
-      }
-      throw new Error(`${id} failed after ${totalAttempts} attempts: ${result.reason}`);
-    }
-  }
-  return { status: "completed", output: pipeInput, completedSteps, steps };
+export async function executeWorkflowAttempt(
+  input: WorkflowAttemptEnvironment,
+  request: WorkflowAttemptRequest,
+): Promise<WorkflowAttemptResult> {
+  return await executeAttempt(input, request);
 }
