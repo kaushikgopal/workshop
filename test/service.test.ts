@@ -254,6 +254,55 @@ test("service starts, lists, reads, and cancels a workflow run", async () => {
     rmSync(project.root, { recursive: true, force: true });
   }
 });
+test("different workflows progress while one run waits on a marker", { timeout: 20_000 }, async () => {
+  const command = [
+    `mkdir -p "$WORKSHOP_DATA_DIR"`,
+    `printf started > "$WORKSHOP_DATA_DIR/started"`,
+    `while [ ! -f "$WORKSHOP_DATA_DIR/release" ]; do sleep 0.01; done`,
+    `printf '%s' "$WORKSHOP_WORKFLOW"`,
+    "",
+  ].join("\n");
+  const project = createProject(command);
+  const otherWorkflow = join(project.root, "workflows", "news");
+  mkdirSync(otherWorkflow, { recursive: true });
+  writeFileSync(join(otherWorkflow, "workflow.md"), "---\ncron: '* * * * *'\n---\nA second service test workflow.\n");
+  writeFileSync(join(otherWorkflow, "10-task.sh"), command);
+  const storage = new MemoryStorage();
+  let harness: Awaited<ReturnType<typeof createHarness>> | undefined;
+  try {
+    harness = await createHarness(storage);
+    harness.resume();
+    const service = createWorkshopService({ projectRoot: project.root, harness });
+    const start = async (requestId: string, workflow: string) => {
+      const response = await service.handleRequest({ request_id: requestId, type: "start_workflow", workflow });
+      const runId = runIdFrom(response);
+      await waitForFile(join(project.root, "data", workflow, "started"));
+      return runId;
+    };
+    const clockRun = await start("start-clock", "clock");
+    const newsRun = await start("start-news", "news");
+
+    const active = await service.handleRequest({ request_id: "active-runs", type: "list_runs", limit: 10 });
+    assert.equal(active.ok, true);
+    const activeWorkflows = recordsFrom(active.runs)
+      .filter((run) => run.workflow === "clock" || run.workflow === "news")
+      .map((run) => [run.workflow, run.status]);
+    assert.deepEqual(activeWorkflows.sort(), [["clock", "running"], ["news", "running"]]);
+
+    writeFileSync(join(project.root, "data", "clock", "release"), "release");
+    await waitForRunStatus(service, storage, clockRun, "completed");
+    const newsStillRunning = await service.handleRequest({ request_id: "news-still-running", type: "read_run", run_id: newsRun });
+    assert.ok(isRecord(newsStillRunning.run));
+    assert.equal(newsStillRunning.run.status, "running");
+
+    writeFileSync(join(project.root, "data", "news", "release"), "release");
+    await waitForRunStatus(service, storage, newsRun, "completed");
+  } finally {
+    if (harness) await harness.close(BACKGROUND_CONTEXT);
+    rmSync(project.root, { recursive: true, force: true });
+  }
+});
+
 
 
 test("receipt namespace gate serializes a cancellation against a colliding pause", async () => {
