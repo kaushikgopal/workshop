@@ -70,6 +70,7 @@ export type WorkflowInterpreterInput = {
   executeAttempt?(request: WorkflowAttemptRequest): Promise<WorkflowAttemptResult>;
   waitBeforeRetry?(duration: string, resume: WorkflowInterpreterResume): Promise<boolean>;
   waitForDecision(input: WorkflowDecisionRequest): Promise<WorkflowDecision>;
+  signal?: AbortSignal;
 };
 
 export type WorkflowInterpretation = {
@@ -152,7 +153,7 @@ async function executeAttempt(input: WorkflowInterpreterInput, step: WorkflowSte
       attempt,
     });
     output = result.stdout;
-    if (result.exitCode === 99 && !result.timedOut) return { kind: "nothing-to-do", output };
+    if (result.exitCode === 99 && !result.timedOut && result.error === undefined) return { kind: "nothing-to-do", output };
     if (result.exitCode !== 0 || result.timedOut || result.error !== undefined) {
       return { kind: "failed", output, reason: processFailure(id, result, stepTimeout) };
     }
@@ -176,6 +177,9 @@ async function executeAttempt(input: WorkflowInterpreterInput, step: WorkflowSte
     }
   }
 
+  if (step.check && input.signal?.aborted) {
+    throw new Error(`${id} was cancelled before its check could start`);
+  }
   if (!step.check) return { kind: "accepted", output };
   const checkId = `${id}.check`;
   const checkTimeout = timeoutMilliseconds(step.check.timeout ?? step.timeout ?? input.workflow.timeout);

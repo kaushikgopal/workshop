@@ -50,6 +50,7 @@ async function executeAttemptTask(
     files: input.files,
     workflowRunId: input.runId,
     profileCommands: input.profileCommands,
+    signal: runtime.signal,
     executeProcess: (request) => executeProcess({
       ...request,
       workflow: input.workflow.name,

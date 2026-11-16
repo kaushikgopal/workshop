@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
 import { executeWorkflowProcess } from "../run/execute-workflow-process.ts";
-import { interpretWorkflow, parseMarkdownVerdict, type ProcessExecutionRequest, type ProcessExecutionResult, type WorkflowInterpreterInput, type WorkflowInterpreterResume } from "../workflow/interpret-workflow.ts";
+import { executeWorkflowAttempt, interpretWorkflow, parseMarkdownVerdict, type ProcessExecutionRequest, type ProcessExecutionResult, type WorkflowInterpreterInput, type WorkflowInterpreterResume } from "../workflow/interpret-workflow.ts";
 import type { Workflow, WorkflowDecision, WorkflowStep } from "../workflow/types.ts";
 
 const fixture = resolve("test/fixtures/profile-command.mjs");
@@ -563,4 +563,108 @@ test("a failed Markdown checker cannot accept its output", async () => {
       }],
     }],
   });
+});
+
+test("a pre-aborted attempt does not spawn its process", async () => {
+  await withRoot(async (root) => {
+    const marker = join(root, "spawned");
+    const controller = new AbortController();
+    controller.abort();
+    const result = await executeWorkflowProcess({
+      kind: "command",
+      command: [process.execPath, "-e", `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'spawned')`],
+      input: "",
+      step: "10-pre-aborted",
+      feedback: "",
+      attempt: 1,
+      workflow: "clock",
+      runId: "pre-aborted",
+      projectRoot: root,
+      dataDirectory: root,
+      stateDirectory: root,
+      cwd: root,
+      signal: controller.signal,
+    });
+
+    assert.equal(existsSync(marker), false);
+    assert.equal(result.timedOut, false);
+    assert.match(result.error ?? "", /cancelled before it started/);
+  });
+});
+
+test("abort remains the first stop cause when timeout fires during termination", { skip: process.platform === "win32" }, async () => {
+  await withRoot(async (root) => {
+    const marker = join(root, "ready");
+    const controller = new AbortController();
+    const pending = executeWorkflowProcess({
+      kind: "command",
+      command: [process.execPath, "-e", `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ready'); process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)`],
+      input: "",
+      step: "10-abort-before-timeout",
+      feedback: "",
+      attempt: 1,
+      timeoutMs: 1_000,
+      workflow: "clock",
+      runId: "abort-before-timeout",
+      projectRoot: root,
+      dataDirectory: root,
+      stateDirectory: root,
+      cwd: root,
+      signal: controller.signal,
+    });
+    const abortTimer = setTimeout(() => controller.abort(), 850);
+    const deadline = Date.now() + 2_000;
+    while (!existsSync(marker) && Date.now() < deadline) await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+    assert.ok(existsSync(marker), "the process started");
+    const result = await pending;
+    clearTimeout(abortTimer);
+
+    assert.equal(result.timedOut, false);
+    assert.equal(result.signal, "SIGKILL");
+  });
+});
+
+test("a worker that succeeds after cancellation does not start its checker", async () => {
+  const controller = new AbortController();
+  const calls: string[] = [];
+  const workflow = makeWorkflow([{
+    kind: "agent",
+    file: "10-write.md",
+    number: 10,
+    name: "write",
+    profile: "writer",
+    check: { kind: "command", file: "10-write.check.sh" },
+  }]);
+  const input = makeInput(workflow, async (request) => {
+    calls.push(request.kind);
+    controller.abort();
+    return successful("candidate");
+  }, undefined, {
+    documents: { "10-write.md": "Write." },
+    signal: controller.signal,
+  });
+
+  await assert.rejects(executeWorkflowAttempt(input, {
+    step: workflow.steps[0]!,
+    profile: "writer",
+    pipeInput: "",
+    feedback: "",
+    attempt: 1,
+  }), /cancelled before its check could start/);
+  assert.deepEqual(calls, ["agent"]);
+});
+
+test("exit 99 with a process error is a failed attempt, not nothing-to-do", async () => {
+  const workflow = makeWorkflow([{ kind: "command", file: "10-step.sh", number: 10, name: "step" }]);
+  const result = await executeWorkflowAttempt(makeInput(workflow, async () => ({
+    exitCode: 99, stdout: "partial", stderr: "", timedOut: false, error: "pipe failed",
+  })), {
+    step: workflow.steps[0]!,
+    pipeInput: "",
+    feedback: "",
+    attempt: 1,
+  });
+
+  assert.equal(result.kind, "failed");
+  if (result.kind === "failed") assert.match(result.reason, /pipe failed/);
 });

@@ -28,8 +28,13 @@ function terminateGroup(pid: number, signal: NodeJS.Signals): void {
 
 const terminationGraceMs = 250;
 
+type ProcessStopCause = { kind: "aborted" } | { kind: "timeout" };
+
 
 export async function executeWorkflowProcess(input: ExecuteWorkflowProcessInput): Promise<ProcessExecutionResult> {
+  if (input.signal?.aborted) {
+    return { exitCode: null, stdout: "", stderr: "", timedOut: false, error: "process cancelled before it started" };
+  }
   const [executable, ...args] = input.command;
   if (!executable) return { exitCode: null, stdout: "", stderr: "", timedOut: false, error: "process command is empty" };
 
@@ -66,11 +71,10 @@ export async function executeWorkflowProcess(input: ExecuteWorkflowProcessInput)
   return await new Promise((resolve) => {
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
-    let timedOut = false;
+    let stopCause: ProcessStopCause | undefined;
     let processError: string | undefined;
     let timeoutTimer: NodeJS.Timeout | undefined;
     let killTimer: NodeJS.Timeout | undefined;
-    let terminationStarted = false;
     let terminationComplete = true;
     let processClosed = false;
     let closeResult: { exitCode: number | null; signal: NodeJS.Signals | null } | undefined;
@@ -79,18 +83,18 @@ export async function executeWorkflowProcess(input: ExecuteWorkflowProcessInput)
       if (!processClosed || !terminationComplete || !closeResult) return;
       if (timeoutTimer) clearTimeout(timeoutTimer);
       if (killTimer) clearTimeout(killTimer);
-      input.signal?.removeEventListener("abort", stopProcessGroup);
+      input.signal?.removeEventListener("abort", onAbort);
       resolve({
         ...closeResult,
         stdout: Buffer.concat(stdout).toString("utf8"),
         stderr: Buffer.concat(stderr).toString("utf8"),
-        timedOut,
+        timedOut: stopCause?.kind === "timeout",
         ...(processError === undefined ? {} : { error: processError }),
       });
     };
-    const stopProcessGroup = () => {
-      if (terminationStarted) return;
-      terminationStarted = true;
+    const stopProcessGroup = (cause: ProcessStopCause) => {
+      if (stopCause !== undefined) return;
+      stopCause = cause;
       terminationComplete = false;
       try {
         if (child.pid !== undefined) terminateGroup(child.pid, "SIGTERM");
@@ -110,6 +114,7 @@ export async function executeWorkflowProcess(input: ExecuteWorkflowProcessInput)
         }
       }, terminationGraceMs);
     };
+    const onAbort = () => stopProcessGroup({ kind: "aborted" });
 
     stdoutStream.on("data", (chunk: Buffer) => stdout.push(chunk));
     stderrStream.on("data", (chunk: Buffer) => stderr.push(chunk));
@@ -123,13 +128,10 @@ export async function executeWorkflowProcess(input: ExecuteWorkflowProcessInput)
       if (timeoutTimer) clearTimeout(timeoutTimer);
       finish();
     });
-    if (input.signal?.aborted) stopProcessGroup();
-    else input.signal?.addEventListener("abort", stopProcessGroup, { once: true });
+    if (input.signal?.aborted) onAbort();
+    else input.signal?.addEventListener("abort", onAbort, { once: true });
     if (input.timeoutMs !== undefined) {
-      timeoutTimer = setTimeout(() => {
-        timedOut = true;
-        stopProcessGroup();
-      }, input.timeoutMs);
+      timeoutTimer = setTimeout(() => stopProcessGroup({ kind: "timeout" }), input.timeoutMs);
     }
     stdin.end(input.input);
   });
