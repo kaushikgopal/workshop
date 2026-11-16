@@ -10,6 +10,7 @@ type ProjectingTurn = {
   chatRequestId?: string;
   generationAttempt?: number;
   partialText: string;
+  replacePending: boolean;
   tools: ReadonlyMap<string, ProjectedTool>;
   nestedTools: ReadonlyMap<string, ProjectedTool>;
 };
@@ -101,6 +102,7 @@ function startTurn(turnId: string, submissionId?: string, chatRequestId?: string
     ...(submissionId === undefined ? {} : { submissionId }),
     ...(chatRequestId === undefined ? {} : { chatRequestId }),
     partialText: "",
+    replacePending: false,
     tools: new Map(),
     nestedTools: new Map(),
   };
@@ -130,6 +132,7 @@ function projectTurn(turn: ProjectingTurn, view: ChatView): { state: ProjectingT
   if (requestId === undefined) return { state: turn, events: [] };
 
   let partialText = turn.partialText;
+  let replacePending = turn.replacePending;
   const tools = new Map(turn.tools);
   const nestedTools = new Map(turn.nestedTools);
   const events: ChatEvent[] = [];
@@ -141,7 +144,12 @@ function projectTurn(turn: ProjectingTurn, view: ChatView): { state: ProjectingT
   if (text !== partialText) {
     const extendsText = text.startsWith(partialText);
     const delta = extendsText ? text.slice(partialText.length) : text;
-    if (delta.length > 0) emit("assistant.delta", { text: delta, ...(extendsText ? {} : { replace: true }) });
+    if (delta.length > 0) {
+      emit("assistant.delta", { text: delta, ...(replacePending || !extendsText ? { replace: true } : {}) });
+      replacePending = false;
+    } else if (partialText.length > 0 && text.length === 0) {
+      replacePending = true;
+    }
     partialText = text;
   }
 
@@ -192,7 +200,7 @@ function projectTurn(turn: ProjectingTurn, view: ChatView): { state: ProjectingT
     nestedTools.set(callId, { status: completed ? "done" : "pending", resultSent: completed || previous?.resultSent === true });
   }
 
-  return { state: { ...turn, partialText, tools, nestedTools }, events };
+  return { state: { ...turn, partialText, replacePending, tools, nestedTools }, events };
 }
 
 export function projectChatEvents(
@@ -237,7 +245,13 @@ export function projectChatEvents(
     turn = {
       ...previous,
       ...(previous.chatRequestId === undefined && observation.chatRequestId !== undefined ? { chatRequestId: observation.chatRequestId } : {}),
-      ...(newGeneration ? { generationAttempt: attempt, partialText: "", tools: new Map(), nestedTools: new Map() } : {}),
+      ...(newGeneration ? {
+        generationAttempt: attempt,
+        partialText: "",
+        replacePending: previous.replacePending || previous.partialText.length > 0,
+        tools: new Map(),
+        nestedTools: new Map(),
+      } : {}),
     };
   }
 

@@ -115,3 +115,40 @@ test("projector keeps one submission turn across generation tasks and ends it on
   assert.deepEqual(repeated.events, []);
   assert.deepEqual(repeated.state, settled.state);
 });
+
+test("projector keeps text replacement pending through an empty retry observation", () => {
+  const first = projectChatEvents(initialChatProjectorState(), {
+    view: view({
+      run: { taskId: "turn-1", inputs: ["submission-1"] },
+      generation: { attempt: 1, message: { content: [{ type: "text", text: "Old partial" }] } },
+    }),
+    chatRequestId: "chat-1",
+  });
+  const retryWaiting = projectChatEvents(first.state, {
+    view: view({
+      run: { taskId: "turn-1", inputs: ["submission-1"] },
+      generation: { attempt: 1, retry: { at: 1, error: "The provider is overloaded" } },
+    }),
+    chatRequestId: "chat-1",
+  });
+  assert.deepEqual(retryWaiting.events, []);
+  const emptyRetry = projectChatEvents(retryWaiting.state, {
+    view: view({
+      run: { taskId: "turn-1", inputs: ["submission-1"] },
+      generation: { attempt: 2, message: { content: [] } },
+    }),
+    chatRequestId: "chat-1",
+  });
+  assert.deepEqual(emptyRetry.events, []);
+
+  const answer = projectChatEvents(emptyRetry.state, {
+    view: view({
+      run: { taskId: "turn-1", inputs: ["submission-1"] },
+      generation: { attempt: 2, message: { content: [{ type: "text", text: "Replacement" }] } },
+    }),
+    chatRequestId: "chat-1",
+  });
+  assert.deepEqual(answer.events.map(({ type, text, replace }) => ({ type, text, replace })), [
+    { type: "assistant.delta", text: "Replacement", replace: true },
+  ]);
+});

@@ -131,6 +131,64 @@ test("interactive and --print modes receive the streamed answer", { timeout: 30_
   }
 });
 
+test("--print renders retry replacement text from the streamed projector events", { timeout: 30_000 }, async () => {
+  const projectRoot = createProject();
+  const storage = new MemoryStorage();
+  const faux = fauxProvider({ tokensPerSecond: 12, tokenSize: { min: 1, max: 1 } });
+  const models = createModels();
+  models.setProvider(faux.provider);
+  const model = faux.getModel();
+  assert.ok(model);
+  faux.setResponses([
+    fauxAssistantMessage("Partial text from the failed attempt.", { stopReason: "error", errorMessage: "The provider is overloaded" }),
+    fauxAssistantMessage("The retry produced the replacement answer."),
+  ]);
+  const configuredModel = {
+    model: { provider: model.provider, modelId: model.id },
+    thinkingLevel: "medium" as const,
+  };
+  let service: ReturnType<typeof createWorkshopService> | undefined;
+  let harness: Awaited<ReturnType<typeof openWorkshopHarness>> | undefined;
+  let socketServer: Awaited<ReturnType<typeof serveServiceSocket>> | undefined;
+  const chatEvents: Record<string, unknown>[] = [];
+  try {
+    harness = await openWorkshopHarness(storage, undefined, {
+      projectRoot,
+      models,
+      model: configuredModel,
+      escalationModel: configuredModel,
+      request: async (request) => {
+        if (!service) throw new Error("Workshop service is not ready");
+        return await service.handleRequest(request);
+      },
+    });
+    service = createWorkshopService({ projectRoot, harness });
+    harness.resume();
+    const stateDirectory = join(projectRoot, "state");
+    mkdirSync(stateDirectory, { recursive: true });
+    socketServer = await serveServiceSocket(join(stateDirectory, "service.sock"), async (value, send) => {
+      if (!service) throw new Error("Workshop service is not ready");
+      const request = parseServiceRequest(value);
+      if (request.type === "watch_chat") return await service.watchChat(request.request_id, (event) => {
+        chatEvents.push(event);
+        send(event);
+      });
+      send(await service.handleRequest(request));
+    });
+
+    const result = await executeChat(["--print", "Retry this partial answer"], projectRoot);
+    assert.equal(result.code, 0, result.stderr);
+    assert.ok(chatEvents.some((event) => event.type === "assistant.delta" && event.replace === true), JSON.stringify(chatEvents));
+    assert.match(result.stdout, /^Partial text from the failed attempt\.?\nThe retry produced the replacement answer\.\n$/);
+    assert.equal(result.stderr, "");
+  } finally {
+    if (socketServer) await socketServer.close();
+    if (harness) await harness.close(BACKGROUND_CONTEXT);
+    rmSync(projectRoot, { recursive: true, force: true });
+  }
+});
+
+
 test("--print ignores text from an earlier chat submission", { timeout: 30_000 }, async () => {
   const projectRoot = createProject();
   const storage = new MemoryStorage();
