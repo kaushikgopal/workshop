@@ -177,16 +177,26 @@ test("requires valid workflow frontmatter, known keys, and a parseable cron", ()
     const noFrontmatter = join(root, "no-frontmatter");
     mkdirSync(noFrontmatter);
     writeFileSync(join(noFrontmatter, "workflow.md"), "Just a description.\n");
+    const noClosing = join(root, "no-closing");
+    mkdirSync(noClosing);
+    writeFileSync(join(noClosing, "workflow.md"), '---\ncron: "*/5 * * * *"\n');
     const unknownKey = createWorkflow(root, "unknown-key", 'cron: "*/5 * * * *"\nother: true');
     const invalidCron = createWorkflow(root, "invalid-cron", "cron: not-a-cron");
+    const malformedYaml = createWorkflow(root, "malformed-yaml", "cron: [unclosed");
+    const duplicateKeys = createWorkflow(root, "duplicate-keys", 'cron: "*/5 * * * *"\ncron: "*/10 * * * *"');
+    const nonMapping = createWorkflow(root, "non-mapping", "true");
     const missingCron = createWorkflow(root, "missing-cron", "profile: writer");
     const result = loadWorkflows(root, profiles);
     assert.equal(result.workflows.length, 0);
     assert.match(errorReasons(result, "no-frontmatter/workflow.md").join(" "), /missing YAML frontmatter/);
+    assert.match(errorReasons(result, "no-closing/workflow.md").join(" "), /frontmatter is missing its closing delimiter/);
     assert.match(errorReasons(result, "unknown-key/workflow.md").join(" "), /Unrecognized key/);
     assert.match(errorReasons(result, "invalid-cron/workflow.md").join(" "), /valid cron expression/);
+    assert.match(errorReasons(result, "malformed-yaml/workflow.md").join(" "), /invalid YAML frontmatter/);
+    assert.match(errorReasons(result, "duplicate-keys/workflow.md").join(" "), /invalid YAML frontmatter/);
+    assert.match(errorReasons(result, "non-mapping/workflow.md").join(" "), /frontmatter must be a mapping/);
     assert.match(errorReasons(result, "missing-cron/workflow.md").join(" "), /cron: Invalid input/);
-    assert.ok(unknownKey && invalidCron && missingCron);
+    assert.ok(unknownKey && invalidCron && malformedYaml && duplicateKeys && nonMapping && missingCron);
   });
 });
 
