@@ -22,10 +22,15 @@ function liveRun(view: ConversationView): Record<string, unknown> | undefined {
   return isRecord(live) && isRecord(live.run) ? live.run : undefined;
 }
 
-function liveSubmissionIds(view: ConversationView): string[] {
+function liveSubmissionIds(view: ConversationView): SubmissionId[] {
   const run = liveRun(view);
   if (!run || !Array.isArray(run.inputs)) return [];
-  return run.inputs.flatMap((value) => typeof value === "string" || typeof value === "number" ? [String(value)] : []);
+  return run.inputs.flatMap((value) => {
+    const id = typeof value === "number" ? value : typeof value === "string" && String(Number(value)) === value ? Number(value) : undefined;
+    if (id === undefined || !Number.isSafeInteger(id) || id <= 0) return [];
+    // pi.live stores pi-durable submission IDs as numbers; only the erased TypeScript brand is missing here.
+    return [id as SubmissionId];
+  });
 }
 
 function chatRequestId(record: SubmissionRecord): string | undefined {
@@ -36,17 +41,14 @@ function chatRequestId(record: SubmissionRecord): string | undefined {
 
 async function loadLiveSubmissions(
   harness: Harness,
-  ids: readonly string[],
-  known: Map<string, SubmissionRecord>,
+  ids: readonly SubmissionId[],
+  known: Map<SubmissionId, SubmissionRecord>,
 ): Promise<void> {
-  const missing = new Set(ids.filter((id) => !known.has(id)));
-  if (missing.size === 0) return;
-  const inspection = await harness.inspect(BACKGROUND_CONTEXT);
-  for (const record of inspection.submissions) {
-    const id = String(record.id);
-    if (!missing.has(id)) continue;
-    known.set(id, record);
-    missing.delete(id);
+  for (const id of ids) {
+    if (known.has(id)) continue;
+    const submission = await harness.submission(id, BACKGROUND_CONTEXT);
+    const record = await submission?.status(BACKGROUND_CONTEXT);
+    if (record) known.set(id, record);
   }
 }
 
@@ -88,8 +90,9 @@ export function createWorkshopChat(input: { harness: Harness }): {
     const root = await input.harness.root(BACKGROUND_CONTEXT);
     const watch = await root.watch(BACKGROUND_CONTEXT);
     let projectorState: ChatProjectorState = initialChatProjectorState();
-    const knownSubmissions = new Map<string, SubmissionRecord>();
-    const trackedSubmissions = new Map<string, { id: SubmissionId; chatRequestId: string }>();
+    const knownSubmissions = new Map<SubmissionId, SubmissionRecord>();
+    const trackedSubmissions = new Map<SubmissionId, { id: SubmissionId; chatRequestId: string }>();
+    const settledSubmissions = new Set<SubmissionId>();
     let publishChain = Promise.resolve();
     let closed = false;
     const sendEvent = (event: ServiceResponse) => send({ request_id: requestId, ...event });
@@ -100,11 +103,11 @@ export function createWorkshopChat(input: { harness: Harness }): {
       for (const id of inputIds) {
         const record = knownSubmissions.get(id);
         const chatId = record === undefined ? undefined : chatRequestId(record);
-        if (record && record.status === "placed" && chatId !== undefined) {
+        const terminal = record?.status === "done" || record?.status === "unanswered";
+        if (record?.type === "input" && chatId !== undefined && (record.status === "placed" || (terminal && !settledSubmissions.has(id)))) {
           trackedSubmissions.set(id, { id: record.id, chatRequestId: chatId });
         }
       }
-
       for (const [key, tracked] of trackedSubmissions) {
         const submission = await input.harness.submission(tracked.id, BACKGROUND_CONTEXT);
         const record = await submission?.status(BACKGROUND_CONTEXT);
@@ -121,6 +124,7 @@ export function createWorkshopChat(input: { harness: Harness }): {
             answer: assistantText(entry),
           });
         }
+        settledSubmissions.add(key);
         trackedSubmissions.delete(key);
       }
 

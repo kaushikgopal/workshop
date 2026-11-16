@@ -1304,7 +1304,7 @@ test("the chat socket streams fake-model text and tool events to multiple watche
 });
 
 
-test("a replacement service watch recovers chat correlation and completion from durable submissions", { timeout: 30_000 }, async () => {
+test("a replacement service watch recovers chat correlation and completion when settlement wins submission lookup", { timeout: 30_000 }, async () => {
   const project = createProject("printf 'unused'\\n");
   const storage = new MemoryStorage();
   const faux = fauxProvider({ tokensPerSecond: 12, tokenSize: { min: 1, max: 1 } });
@@ -1315,10 +1315,14 @@ test("a replacement service watch recovers chat correlation and completion from 
   let markStarted = () => {};
   let releaseFirst = () => {};
   const started = new Promise<void>((resolveStarted) => { markStarted = resolveStarted; });
-  const gate = new Promise<void>((resolveGate) => { releaseFirst = resolveGate; });
+  const generationGate = new Promise<void>((resolveGate) => { releaseFirst = resolveGate; });
+  let markLookupStarted = () => {};
+  let releaseLookup = () => {};
+  const lookupStarted = new Promise<void>((resolveStarted) => { markLookupStarted = resolveStarted; });
+  const lookupGate = new Promise<void>((resolveGate) => { releaseLookup = resolveGate; });
   faux.setResponses([async () => {
     markStarted();
-    await gate;
+    await generationGate;
     return fauxAssistantMessage("Recovered answer from the durable submission.");
   }]);
   const configuredModel = {
@@ -1327,6 +1331,7 @@ test("a replacement service watch recovers chat correlation and completion from 
   };
   let harness: Awaited<ReturnType<typeof openWorkshopHarness>> | undefined;
   let watcher: Awaited<ReturnType<ReturnType<typeof createWorkshopService>["watchChat"]>> | undefined;
+  let watcherStarting: ReturnType<ReturnType<typeof createWorkshopService>["watchChat"]> | undefined;
   const events: Record<string, unknown>[] = [];
   try {
     harness = await openWorkshopHarness(storage, undefined, {
@@ -1337,6 +1342,20 @@ test("a replacement service watch recovers chat correlation and completion from 
       request: async () => ({ ok: true }),
     });
     harness.resume();
+    const originalInspect = harness.inspect.bind(harness);
+    const originalSubmission = harness.submission.bind(harness);
+    const waitForLookup = async () => {
+      markLookupStarted();
+      await lookupGate;
+    };
+    harness.inspect = async (context) => {
+      await waitForLookup();
+      return await originalInspect(context);
+    };
+    harness.submission = async (id, context) => {
+      await waitForLookup();
+      return await originalSubmission(id, context);
+    };
     const originalService = createWorkshopService({ projectRoot: project.root, harness });
     const submission = originalService.handleRequest({
       request_id: "recovered-chat",
@@ -1345,12 +1364,15 @@ test("a replacement service watch recovers chat correlation and completion from 
     });
     await started;
     const replacementService = createWorkshopService({ projectRoot: project.root, harness });
-    watcher = await replacementService.watchChat("replacement-watch", (event) => events.push(event));
-    assert.equal(events[0]?.type, "chat.attached");
+    watcherStarting = replacementService.watchChat("replacement-watch", (event) => events.push(event));
+    await lookupStarted;
     releaseFirst();
     const response = await submission;
     assert.equal(response.ok, true);
     assert.equal(response.answer, "Recovered answer from the durable submission.");
+    releaseLookup();
+    watcher = await watcherStarting;
+    assert.equal(events[0]?.type, "chat.attached");
     const waitFor = async (type: string) => {
       const deadline = Date.now() + 5_000;
       while (Date.now() < deadline) {
@@ -1361,12 +1383,13 @@ test("a replacement service watch recovers chat correlation and completion from 
       throw new Error(`Timed out waiting for ${type}: ${JSON.stringify(events)}`);
     };
     const final = await waitFor("assistant.final");
-    const end = await waitFor("run.end");
     assert.equal(final.chat_request_id, "recovered-chat");
     assert.equal(final.answer, response.answer);
-    assert.equal(end.chat_request_id, "recovered-chat");
+    assert.equal(events.filter((event) => event.type === "assistant.final").length, 1);
   } finally {
     releaseFirst();
+    releaseLookup();
+    await watcherStarting?.then(async (active) => { watcher = active; }).catch(() => undefined);
     if (watcher) await watcher.close();
     if (harness) await harness.close(BACKGROUND_CONTEXT);
     rmSync(project.root, { recursive: true, force: true });
