@@ -26,53 +26,99 @@ function xmlEscape(value: string): string {
     .replaceAll('"', "&quot;").replaceAll("'", "&apos;");
 }
 
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+type InstallStage =
+  | "validate prerequisites"
+  | "validate arguments and project"
+  | "inspect launch agent"
+  | "write LaunchAgent files"
+  | "bootstrap LaunchAgent";
+
 function install(): void {
-  if (process.platform !== "darwin") throw new Error("The Workshop launch agent can only be installed on macOS");
+  let stage: InstallStage = "validate prerequisites";
+  let recoveryCommand = "make service-install";
+  let plistPath: string | undefined;
+  try {
+    if (process.platform !== "darwin") throw new Error("The Workshop launch agent can only be installed on macOS");
 
-  const label = validateLabel(requireValue(process.argv[2], "LABEL"));
-  const repository = resolve(requireValue(process.argv[3], "repository path"));
-  if (!existsSync(join(repository, "workshop.yaml"))) throw new Error("workshop.yaml is required; run make setup first");
+    stage = "validate arguments and project";
+    const label = validateLabel(requireValue(process.argv[2], "LABEL"));
+    const repository = resolve(requireValue(process.argv[3], "repository path"));
+    recoveryCommand = `cd ${shellQuote(repository)} && make service-install LABEL=${shellQuote(label)}`;
+    if (!existsSync(join(repository, "workshop.yaml"))) {
+      recoveryCommand = `cd ${shellQuote(repository)} && make setup`;
+      throw new Error("workshop.yaml is required; run make setup first");
+    }
 
-  const uid = process.getuid?.();
-  if (uid === undefined) throw new Error("Could not determine the current user ID");
-  const domain = `gui/${uid}`;
-  const loaded = executeLaunchctl(["print", `${domain}/${label}`]);
-  if (loaded.status === 0) throw new Error(`Launch agent ${label} is already loaded; run make service-uninstall first`);
+    const uid = process.getuid?.();
+    if (uid === undefined) throw new Error("Could not determine the current user ID");
+    const domain = `gui/${uid}`;
 
-  const launchAgents = join(homedir(), "Library", "LaunchAgents");
-  const plistPath = join(launchAgents, `${label}.plist`);
-  if (existsSync(plistPath)) throw new Error(`${plistPath} already exists; remove it or choose another LABEL`);
+    stage = "inspect launch agent";
+    const loaded = executeLaunchctl(["print", `${domain}/${label}`]);
+    if (loaded.status === 0) {
+      recoveryCommand = `cd ${shellQuote(repository)} && make service-uninstall LABEL=${shellQuote(label)}`;
+      throw new Error(`Launch agent ${label} is already loaded; run make service-uninstall first`);
+    }
 
-  const nodePath = process.execPath;
-  const servicePath = [...new Set([
-    dirname(nodePath),
-    ...(process.env.PATH ?? "").split(delimiter).filter(Boolean),
-  ])].join(delimiter);
-  const logPath = join(repository, "state", "service.log");
-  const template = readFileSync(resolve(repository, "service/launch-service.plist.template"), "utf8");
-  const values: Record<string, string> = {
-    LABEL: label,
-    NODE_PATH: nodePath,
-    REPO_PATH: repository,
-    PATH: servicePath,
-    LOG_PATH: logPath,
-  };
-  const plist = template.replace(/\{\{([A-Z_]+)\}\}/g, (placeholder, name: string) => {
-    const value = values[name];
-    if (value === undefined) throw new Error(`Unknown launch agent placeholder ${placeholder}`);
-    return xmlEscape(value);
-  });
-  if (/\{\{[A-Z_]+\}\}/.test(plist)) throw new Error("Launch agent template contains an unresolved placeholder");
+    const launchAgents = join(homedir(), "Library", "LaunchAgents");
+    plistPath = join(launchAgents, `${label}.plist`);
+    if (existsSync(plistPath)) {
+      const retryLabel = `${label}.retry-${process.pid}`;
+      recoveryCommand = `cd ${shellQuote(repository)} && make service-install LABEL=${shellQuote(retryLabel)}`;
+      throw new Error(`${plistPath} already exists; choose another LABEL or inspect the existing plist`);
+    }
 
-  mkdirSync(launchAgents, { recursive: true });
-  mkdirSync(dirname(logPath), { recursive: true });
-  writeFileSync(plistPath, plist, { encoding: "utf8", flag: "wx", mode: 0o644 });
+    stage = "write LaunchAgent files";
+    const retryLabel = `${label}.retry-${process.pid}`;
+    recoveryCommand = `cd ${shellQuote(repository)} && make service-install LABEL=${shellQuote(retryLabel)}`;
+    const nodePath = process.execPath;
+    const servicePath = [...new Set([
+      dirname(nodePath),
+      ...(process.env.PATH ?? "").split(delimiter).filter(Boolean),
+    ])].join(delimiter);
+    const logPath = join(repository, "state", "service.log");
+    const template = readFileSync(resolve(repository, "service/launch-service.plist.template"), "utf8");
+    const values: Record<string, string> = {
+      LABEL: label,
+      NODE_PATH: nodePath,
+      REPO_PATH: repository,
+      PATH: servicePath,
+      LOG_PATH: logPath,
+    };
+    const plist = template.replace(/\{\{([A-Z_]+)\}\}/g, (placeholder, name: string) => {
+      const value = values[name];
+      if (value === undefined) throw new Error(`Unknown launch agent placeholder ${placeholder}`);
+      return xmlEscape(value);
+    });
+    if (/\{\{[A-Z_]+\}\}/.test(plist)) throw new Error("Launch agent template contains an unresolved placeholder");
 
-  const bootstrapped = executeLaunchctl(["bootstrap", domain, plistPath]);
-  if (bootstrapped.status !== 0) {
-    throw new Error(`launchctl bootstrap failed: ${bootstrapped.output.trim() || bootstrapped.status}`);
+    mkdirSync(launchAgents, { recursive: true });
+    mkdirSync(dirname(logPath), { recursive: true });
+    writeFileSync(plistPath, plist, { encoding: "utf8", flag: "wx", mode: 0o644 });
+
+    stage = "bootstrap LaunchAgent";
+    recoveryCommand = `/bin/launchctl bootstrap ${domain} ${shellQuote(plistPath)}`;
+    const bootstrapped = executeLaunchctl(["bootstrap", domain, plistPath]);
+    if (bootstrapped.status !== 0) {
+      throw new Error(`launchctl bootstrap failed: ${bootstrapped.output.trim() || bootstrapped.status}`);
+    }
+    console.log(`Installed launch agent ${label}. Logs: state/service.log`);
+  } catch (error) {
+    const lines = [`Install stopped at stage: ${stage}.`, errorMessage(error)];
+    if (plistPath !== undefined && existsSync(plistPath)) {
+      lines.push(`The plist at ${plistPath} was left untouched; no files were removed.`);
+    }
+    lines.push(`Recovery command: ${recoveryCommand}`);
+    throw new Error(lines.join("\n"), { cause: error });
   }
-  console.log(`Installed launch agent ${label}. Logs: state/service.log`);
 }
 
 try {
