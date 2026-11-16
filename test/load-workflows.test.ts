@@ -295,3 +295,13 @@ test("ignores top-level YAML examples only when requested and loads good workflo
     assert.match(errorReasons(workflows, "invalid.yaml").join(" "), /unknown file/);
   });
 });
+
+test("reports a missing workflow directory as a load issue", () => {
+  withRoot((root) => {
+    const result = loadWorkflows(join(root, "missing"), profiles);
+
+    assert.deepEqual(result.workflows, []);
+    assert.deepEqual(result.errors.map(({ file }) => file), ["."]);
+    assert.match(result.errors[0]?.reason ?? "", /^could not read workflow directory: /);
+  });
+});

@@ -508,3 +508,49 @@ test("a requested retry delay returns a resume checkpoint before rerunning the s
   assert.equal(resumed.status, "completed");
   assert.equal(resumed.output, "completed after wait");
 });
+
+test("a failed Markdown checker cannot accept its output", async () => {
+  const calls: ProcessExecutionRequest[] = [];
+  let decisionError: string | undefined;
+  const workflow = makeWorkflow([{
+    kind: "agent",
+    file: "10-write.md",
+    number: 10,
+    name: "write",
+    profile: "writer",
+    check: { kind: "agent", file: "10-write.check.md", profile: "judge" },
+  }]);
+  const result = await interpretWorkflow(makeInput(workflow, async (request) => {
+    calls.push(request);
+    return request.kind === "agent"
+      ? successful("draft")
+      : { exitCode: 7, stdout: "ACCEPT", stderr: "judge crashed", timedOut: false };
+  }, async ({ lastError }) => {
+    decisionError = lastError;
+    return { action: "skip" };
+  }, {
+    documents: {
+      "10-write.md": "Write a sentence.",
+      "10-write.check.md": "Judge the sentence.",
+    },
+  }));
+
+  assert.deepEqual(calls.map(({ kind }) => kind), ["agent", "agent-check"]);
+  assert.equal(decisionError, "10-write.check failed with exit code 7: judge crashed\nACCEPT");
+  assert.deepEqual(result, {
+    status: "completed",
+    output: "",
+    completedSteps: 1,
+    steps: [{
+      step: "10-write",
+      status: "skipped",
+      output: "",
+      attempts: [{
+        attempt: 1,
+        profile: "writer",
+        output: "draft",
+        error: "10-write.check failed with exit code 7: judge crashed\nACCEPT",
+      }],
+    }],
+  });
+});
