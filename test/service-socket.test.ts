@@ -93,3 +93,70 @@ test("the SQLite store lock refuses a second owner and releases cleanly", async 
     rmSync(stateDirectory, { recursive: true, force: true });
   }
 });
+
+test("socket permission failure cleans up its listener and path", async () => {
+  const stateDirectory = mkdtempSync(join(tmpdir(), "workshop-socket-permission-test-"));
+  const socketPath = join(stateDirectory, "service.sock");
+  let service: Awaited<ReturnType<typeof serveServiceSocket>> | undefined;
+  let failure: unknown;
+  try {
+    try {
+      service = await serveServiceSocket(socketPath, async () => {}, {
+        protectSocket: () => { throw new Error("injected chmod failure"); },
+      });
+    } catch (error) {
+      failure = error;
+    }
+    if (service) {
+      await service.close();
+      service = undefined;
+    }
+    assert.match(String(failure), /injected chmod failure/);
+    assert.equal(existsSync(socketPath), false);
+  } finally {
+    if (service) await service.close();
+    rmSync(stateDirectory, { recursive: true, force: true });
+  }
+});
+
+test("socket shutdown closes every watcher and listener after a watcher fails", async () => {
+  const stateDirectory = mkdtempSync(join(tmpdir(), "workshop-socket-watch-test-"));
+  const socketPath = join(stateDirectory, "service.sock");
+  let closeCalls = 0;
+  let attachedCount = 0;
+  let resolveAttached: (() => void) | undefined;
+  const watchersAttached = new Promise<void>((resolveWatchers) => { resolveAttached = resolveWatchers; });
+  const service = await serveServiceSocket(socketPath, async () => {
+    attachedCount += 1;
+    if (attachedCount === 2) resolveAttached?.();
+    return {
+      close: async () => {
+        closeCalls += 1;
+        if (closeCalls === 1) throw new Error("injected watcher close failure");
+      },
+    };
+  });
+  const clients = [connect(socketPath), connect(socketPath)];
+  try {
+    await Promise.all(clients.map((client) => new Promise<void>((resolveClient, rejectClient) => {
+      client.once("error", rejectClient);
+      client.once("connect", () => {
+        client.write('{"request_id":"watch","type":"watch_chat"}\n');
+        resolveClient();
+      });
+    })));
+    await watchersAttached;
+    await assert.rejects(service.close(), (error: unknown) => {
+      assert.ok(error instanceof AggregateError);
+      assert.match(error.message, /Service socket shutdown failed/);
+      assert.ok(error.errors.some((cause: unknown) => String(cause).includes("watcher close failure")));
+      return true;
+    });
+    assert.equal(closeCalls, 2);
+    assert.equal(existsSync(socketPath), false);
+  } finally {
+    for (const client of clients) client.destroy();
+    await service.close().catch(() => undefined);
+    rmSync(stateDirectory, { recursive: true, force: true });
+  }
+});

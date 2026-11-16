@@ -5,6 +5,8 @@ import type { ServiceResponse } from "./types.ts";
 const maximumRequestBytes = 1_048_576;
 type EventWriter = (event: ServiceResponse) => void;
 type SocketSession = { close(): Promise<void> };
+type SocketSessionOwner = { session: SocketSession; closing?: Promise<void> };
+export type ServiceSocketOptions = { protectSocket?: (socketPath: string) => void };
 type RequestHandler = (
   request: unknown,
   send: EventWriter,
@@ -78,21 +80,31 @@ async function removeStaleSocket(socketPath: string): Promise<void> {
   rmSync(socketPath);
 }
 
-export async function serveServiceSocket(socketPath: string, handler: RequestHandler): Promise<{ close(): Promise<void> }> {
+export async function serveServiceSocket(
+  socketPath: string,
+  handler: RequestHandler,
+  options: ServiceSocketOptions = {},
+): Promise<{ close(): Promise<void> }> {
   await removeStaleSocket(socketPath);
   const sockets = new Set<Socket>();
-  const sessions = new Map<Socket, SocketSession>();
-  const closeSession = async (socket: Socket): Promise<void> => {
-    const session = sessions.get(socket);
-    if (!session) return;
-    sessions.delete(socket);
-    await session.close();
+  const sessions = new Map<Socket, SocketSessionOwner>();
+  const closeSession = (socket: Socket): Promise<void> => {
+    const owner = sessions.get(socket);
+    if (!owner) return Promise.resolve();
+    if (!owner.closing) {
+      owner.closing = Promise.resolve().then(() => owner.session.close()).finally(() => {
+        if (sessions.get(socket) === owner) sessions.delete(socket);
+      });
+    }
+    return owner.closing;
   };
   const server: Server = createServer((socket) => {
     sockets.add(socket);
     socket.once("close", () => {
       sockets.delete(socket);
-      void closeSession(socket);
+      void closeSession(socket).catch((error: unknown) => {
+        console.error(`[workshop] chat watch close failed: ${errorMessage(error)}`);
+      });
     });
     socket.on("error", () => {});
     socket.setEncoding("utf8");
@@ -104,7 +116,9 @@ export async function serveServiceSocket(socketPath: string, handler: RequestHan
     const rejectSocket = (message: string) => {
       send(socket, { ok: false, error: message });
       socket.end();
-      void closeSession(socket);
+      void closeSession(socket).catch((error: unknown) => {
+        console.error(`[workshop] chat watch close failed: ${errorMessage(error)}`);
+      });
     };
     const processRequests = async () => {
       if (processing) return;
@@ -128,7 +142,7 @@ export async function serveServiceSocket(socketPath: string, handler: RequestHan
               send(socket, { request_id: requestId(JSON.parse(line)), ok: false, error: "A chat watch is already attached" });
             } else {
               persistent = true;
-              sessions.set(socket, session);
+              sessions.set(socket, { session });
               if (socket.destroyed) await closeSession(socket);
             }
           } else if (!persistent) {
@@ -171,7 +185,6 @@ export async function serveServiceSocket(socketPath: string, handler: RequestHan
       void processRequests();
     });
   });
-
   try {
     await new Promise<void>((resolve, reject) => {
       const onError = (error: NodeJS.ErrnoException) => {
@@ -185,21 +198,55 @@ export async function serveServiceSocket(socketPath: string, handler: RequestHan
       });
     });
   } catch (error) {
-    if (server.listening) server.close();
+    if (server.listening) {
+      await new Promise<void>((resolve, reject) => {
+        server.close((closeError) => closeError ? reject(closeError) : resolve());
+      });
+    }
     throw error;
   }
-  chmodSync(socketPath, 0o600);
-
-  return {
-    async close() {
-      await Promise.all([...sockets].map(async (socket) => {
-        await closeSession(socket);
-        socket.destroy();
-      }));
-      await new Promise<void>((resolve, reject) => {
+  let closePromise: Promise<void> | undefined;
+  const close = (): Promise<void> => {
+    if (closePromise) return closePromise;
+    closePromise = (async () => {
+      const failures: unknown[] = [];
+      const serverClosed = new Promise<void>((resolve, reject) => {
         server.close((error) => error ? reject(error) : resolve());
       });
-      rmSync(socketPath, { force: true });
-    },
+      const activeSockets = new Set([...sockets, ...sessions.keys()]);
+      await Promise.all([...activeSockets].map(async (socket) => {
+        try {
+          await closeSession(socket);
+        } catch (error) {
+          failures.push(error);
+        } finally {
+          socket.destroy();
+        }
+      }));
+      try {
+        await serverClosed;
+      } catch (error) {
+        failures.push(error);
+      }
+      try {
+        rmSync(socketPath, { force: true });
+      } catch (error) {
+        failures.push(error);
+      }
+      if (failures.length > 0) throw new AggregateError(failures, "Service socket shutdown failed");
+    })();
+    return closePromise;
   };
+  const service = { close };
+  try {
+    (options.protectSocket ?? ((path) => chmodSync(path, 0o600)))(socketPath);
+  } catch (error) {
+    try {
+      await close();
+    } catch (cleanupError) {
+      throw new AggregateError([error, cleanupError], "Service socket protection failed and cleanup was incomplete");
+    }
+    throw error;
+  }
+  return service;
 }
