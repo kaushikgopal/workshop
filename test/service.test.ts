@@ -918,6 +918,74 @@ test("later step files are loaded when each step starts", async () => {
   }
 });
 
+test("durable retries send check feedback to the worker and keep the accepted worker output", async () => {
+  const project = createProject("", "retries: 1\n");
+  const workflowDirectory = join(project.root, "workflows", "clock");
+  writeFileSync(join(workflowDirectory, "10-task.sh"), [
+    'log="$WORKSHOP_DATA_DIR/attempts.log"',
+    'marker="$WORKSHOP_DATA_DIR/first-worker"',
+    'if [ -f "$marker" ]; then',
+    '  printf "worker:second feedback=%s\n" "$WORKSHOP_FEEDBACK" >> "$log"',
+    '  printf "second worker output\n"',
+    'else',
+    '  : > "$marker"',
+    '  printf "worker:first feedback=%s\n" "$WORKSHOP_FEEDBACK" >> "$log"',
+    '  printf "first worker output\n"',
+    'fi',
+    "",
+  ].join("\n"));
+  writeFileSync(join(workflowDirectory, "10-task.check.sh"), [
+    "IFS= read -r candidate",
+    'case "$candidate" in',
+    '  "first worker output")',
+    '    printf "check:first\n" >> "$WORKSHOP_DATA_DIR/attempts.log"',
+    '    printf "expected a revision"',
+    "    exit 7",
+    "    ;;",
+    '  "second worker output")',
+    '    printf "check:second\n" >> "$WORKSHOP_DATA_DIR/attempts.log"',
+    '    printf "checker accepted second output"',
+    "    exit 0",
+    "    ;;",
+    "  *) exit 8 ;;",
+    "esac",
+    "",
+  ].join("\n"));
+  const storage = new MemoryStorage();
+  let harness: Awaited<ReturnType<typeof createHarness>> | undefined;
+  try {
+    harness = await createHarness(storage);
+    harness.resume();
+    const service = createWorkshopService({ projectRoot: project.root, harness });
+    const started = await service.handleRequest({ request_id: "retry-step", type: "start_workflow", workflow: "clock" });
+    const task = await waitForTask(storage, runIdFrom(started));
+    const settled = await harness.waitForTask(task.id, BACKGROUND_CONTEXT);
+
+    assert.equal(settled.state.status, "terminal");
+    if (settled.state.status !== "terminal") throw new Error("Durable workflow task did not finish");
+    assert.equal(settled.state.outcome.status, "completed");
+    if (settled.state.outcome.status !== "completed") throw new Error("Durable workflow task did not complete");
+    const result: unknown = settled.state.outcome.result;
+    assert.ok(isRecord(result));
+    if (!isRecord(result)) throw new Error("Durable workflow result is invalid");
+    assert.equal(result.output, "second worker output\n");
+    assert.ok(Array.isArray(result.steps));
+    const stepResult: unknown = result.steps[0];
+    assert.ok(isRecord(stepResult));
+    if (!isRecord(stepResult)) throw new Error("Durable step result is invalid");
+    assert.equal(stepResult.output, "second worker output\n");
+    assert.deepEqual(readFileSync(join(project.root, "data", "clock", "attempts.log"), "utf8").trim().split("\n"), [
+      "worker:first feedback=",
+      "check:first",
+      "worker:second feedback=expected a revision",
+      "check:second",
+    ]);
+  } finally {
+    if (harness) await harness.close(BACKGROUND_CONTEXT);
+    rmSync(project.root, { recursive: true, force: true });
+  }
+});
+
 test("submit_chat reuses the configured root conversation through the service", async () => {
   const project = createProject("printf 'unused'\n");
   const storage = new MemoryStorage();
