@@ -1,9 +1,7 @@
-import { AssistantEntry, type ConversationView, type Harness } from "@earendil-works/pi-durable";
+import { AssistantEntry, type ConversationView, type Harness, type SubmissionId, type SubmissionRecord } from "@earendil-works/pi-durable";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { ServiceRequest, ServiceResponse } from "./types.ts";
 import { initialChatProjectorState, projectChatEvents, type ChatProjectorState } from "./project-chat-events.ts";
-
-type ChatWatcher = { send(event: ServiceResponse): void; refresh(): void };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -19,16 +17,43 @@ function assistantText(entry: unknown): string {
   return entry.model.map((message) => isRecord(message) && message.role === "assistant" ? textContent(message.content) : "").join("");
 }
 
+function liveRun(view: ConversationView): Record<string, unknown> | undefined {
+  const live = view.docs["pi.live"];
+  return isRecord(live) && isRecord(live.run) ? live.run : undefined;
+}
+
+function liveSubmissionIds(view: ConversationView): string[] {
+  const run = liveRun(view);
+  if (!run || !Array.isArray(run.inputs)) return [];
+  return run.inputs.flatMap((value) => typeof value === "string" || typeof value === "number" ? [String(value)] : []);
+}
+
+function chatRequestId(record: SubmissionRecord): string | undefined {
+  if (record.type !== "input" || !record.requestId?.startsWith("chat:")) return undefined;
+  const requestId = record.requestId.slice("chat:".length);
+  return requestId.length > 0 ? requestId : undefined;
+}
+
+async function loadLiveSubmissions(
+  harness: Harness,
+  ids: readonly string[],
+  known: Map<string, SubmissionRecord>,
+): Promise<void> {
+  const missing = new Set(ids.filter((id) => !known.has(id)));
+  if (missing.size === 0) return;
+  const inspection = await harness.inspect(BACKGROUND_CONTEXT);
+  for (const record of inspection.submissions) {
+    const id = String(record.id);
+    if (!missing.has(id)) continue;
+    known.set(id, record);
+    missing.delete(id);
+  }
+}
+
 export function createWorkshopChat(input: { harness: Harness }): {
   submitChat(request: Extract<ServiceRequest, { type: "submit_chat" }>): Promise<ServiceResponse>;
   watchChat(requestId: string, send: (event: ServiceResponse) => void): Promise<{ close(): Promise<void> }>;
 } {
-  const chatWatchers = new Set<ChatWatcher>();
-  const chatSubmissions = new Map<string, string>();
-  const refreshChatWatchers = () => {
-    for (const watcher of chatWatchers) watcher.refresh();
-  };
-
   async function submitChat(request: Extract<ServiceRequest, { type: "submit_chat" }>): Promise<ServiceResponse> {
     const root = await input.harness.root(BACKGROUND_CONTEXT);
     const submission = await root.submit({
@@ -37,88 +62,98 @@ export function createWorkshopChat(input: { harness: Harness }): {
       requestId: `chat:${request.request_id}`,
       whenBusy: "followUp",
     }, BACKGROUND_CONTEXT);
-    const submissionId = String(submission.id);
-    chatSubmissions.set(submissionId, request.request_id);
-    refreshChatWatchers();
-    try {
-      const settled = await submission.wait(BACKGROUND_CONTEXT);
-      if (settled.status !== "done" || settled.type !== "input") {
-        return {
-          request_id: request.request_id,
-          ok: false,
-          error: "chat_unanswered",
-          conversation_id: root.id,
-          submission_id: submission.id,
-          reason: settled.status === "unanswered" ? settled.reason : "Unexpected submission type",
-        };
-      }
-      const entry = await input.harness.commit((tx) => tx.entry(AssistantEntry, settled.answer), BACKGROUND_CONTEXT);
-      const answer = assistantText(entry);
-      for (const watcher of chatWatchers) watcher.send({
-        ok: true,
-        type: "assistant.final",
-        chat_request_id: request.request_id,
-        conversation_id: root.id,
-        answer,
-      });
+    const settled = await submission.wait(BACKGROUND_CONTEXT);
+    if (settled.status !== "done" || settled.type !== "input") {
       return {
         request_id: request.request_id,
-        ok: true,
+        ok: false,
+        error: "chat_unanswered",
         conversation_id: root.id,
         submission_id: submission.id,
-        answer,
+        reason: settled.status === "unanswered" ? settled.reason : "Unexpected submission type",
       };
-    } finally {
-      chatSubmissions.delete(submissionId);
-      refreshChatWatchers();
     }
+    const entry = await input.harness.commit((tx) => tx.entry(AssistantEntry, settled.answer), BACKGROUND_CONTEXT);
+    const answer = assistantText(entry);
+    return {
+      request_id: request.request_id,
+      ok: true,
+      conversation_id: root.id,
+      submission_id: submission.id,
+      answer,
+    };
   }
 
   async function watchChat(requestId: string, send: (event: ServiceResponse) => void): Promise<{ close(): Promise<void> }> {
     const root = await input.harness.root(BACKGROUND_CONTEXT);
     const watch = await root.watch(BACKGROUND_CONTEXT);
     let projectorState: ChatProjectorState = initialChatProjectorState();
-    const watcher: ChatWatcher = {
-      send: (event) => send({ request_id: requestId, ...event }),
-      refresh: () => publish(watch.value),
-    };
-    const requestForView = (view: ConversationView): string | undefined => {
-      const live = view.docs["pi.live"];
-      const run = isRecord(live) && isRecord(live.run) ? live.run : undefined;
-      if (!isRecord(run) || !Array.isArray(run.inputs)) return undefined;
-      for (const submissionId of run.inputs) {
-        const chatRequestId = chatSubmissions.get(String(submissionId));
-        if (chatRequestId !== undefined) return chatRequestId;
+    const knownSubmissions = new Map<string, SubmissionRecord>();
+    const trackedSubmissions = new Map<string, { id: SubmissionId; chatRequestId: string }>();
+    let publishChain = Promise.resolve();
+    let closed = false;
+    const sendEvent = (event: ServiceResponse) => send({ request_id: requestId, ...event });
+
+    const publish = async (view: ConversationView): Promise<void> => {
+      const inputIds = liveSubmissionIds(view);
+      await loadLiveSubmissions(input.harness, inputIds, knownSubmissions);
+      for (const id of inputIds) {
+        const record = knownSubmissions.get(id);
+        const chatId = record === undefined ? undefined : chatRequestId(record);
+        if (record && record.status === "placed" && chatId !== undefined) {
+          trackedSubmissions.set(id, { id: record.id, chatRequestId: chatId });
+        }
       }
-      return undefined;
-    };
-    const publish = (view: ConversationView) => {
-      const projection = projectChatEvents(projectorState, { view, chatRequestId: requestForView(view) });
+
+      for (const [key, tracked] of trackedSubmissions) {
+        const submission = await input.harness.submission(tracked.id, BACKGROUND_CONTEXT);
+        const record = await submission?.status(BACKGROUND_CONTEXT);
+        if (!record) continue;
+        knownSubmissions.set(key, record);
+        if (record.status === "queued" || record.status === "placed") continue;
+        if (record.status === "done" && record.type === "input") {
+          const entry = await input.harness.commit((tx) => tx.entry(AssistantEntry, record.answer), BACKGROUND_CONTEXT);
+          sendEvent({
+            ok: true,
+            type: "assistant.final",
+            chat_request_id: tracked.chatRequestId,
+            conversation_id: root.id,
+            answer: assistantText(entry),
+          });
+        }
+        trackedSubmissions.delete(key);
+      }
+
+      const correlatedRequestId = inputIds.flatMap((id) => {
+        const record = knownSubmissions.get(id);
+        const chatId = record === undefined ? undefined : chatRequestId(record);
+        return chatId === undefined ? [] : [chatId];
+      })[0];
+      const projection = projectChatEvents(projectorState, { view, chatRequestId: correlatedRequestId });
       projectorState = projection.state;
-      for (const event of projection.events) watcher.send(event);
+      for (const event of projection.events) sendEvent(event);
+    };
+    const enqueuePublish = (view: ConversationView): Promise<void> => {
+      publishChain = publishChain.then(async () => {
+        if (!closed) await publish(view);
+      });
+      return publishChain;
     };
 
-    chatWatchers.add(watcher);
-    watcher.send({ ok: true, type: "chat.attached", conversation_id: root.id, busy: isRecord(viewLiveRun(watch.value)) });
-    publish(watch.value);
+    sendEvent({ ok: true, type: "chat.attached", conversation_id: root.id, busy: liveRun(watch.value) !== undefined });
+    await enqueuePublish(watch.value);
     watch.start(async (call) => {
-      if (call.kind === "value") publish(call.value);
+      if (call.kind === "value") await enqueuePublish(call.value);
     });
-    let closed = false;
     return {
       async close() {
         if (closed) return;
         closed = true;
-        chatWatchers.delete(watcher);
         await watch.stop();
+        await publishChain;
       },
     };
   }
 
   return { submitChat, watchChat };
-}
-
-function viewLiveRun(view: ConversationView): unknown {
-  const live = view.docs["pi.live"];
-  return isRecord(live) ? live.run : undefined;
 }

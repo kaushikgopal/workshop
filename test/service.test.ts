@@ -928,6 +928,76 @@ test("the chat socket streams fake-model text and tool events to multiple watche
 });
 
 
+test("a replacement service watch recovers chat correlation and completion from durable submissions", { timeout: 30_000 }, async () => {
+  const project = createProject("printf 'unused'\\n");
+  const storage = new MemoryStorage();
+  const faux = fauxProvider({ tokensPerSecond: 12, tokenSize: { min: 1, max: 1 } });
+  const models = createModels();
+  models.setProvider(faux.provider);
+  const model = faux.getModel();
+  assert.ok(model);
+  let markStarted = () => {};
+  let releaseFirst = () => {};
+  const started = new Promise<void>((resolveStarted) => { markStarted = resolveStarted; });
+  const gate = new Promise<void>((resolveGate) => { releaseFirst = resolveGate; });
+  faux.setResponses([async () => {
+    markStarted();
+    await gate;
+    return fauxAssistantMessage("Recovered answer from the durable submission.");
+  }]);
+  const configuredModel = {
+    model: { provider: model.provider, modelId: model.id },
+    thinkingLevel: "medium" as const,
+  };
+  let harness: Awaited<ReturnType<typeof openWorkshopHarness>> | undefined;
+  let watcher: Awaited<ReturnType<ReturnType<typeof createWorkshopService>["watchChat"]>> | undefined;
+  const events: Record<string, unknown>[] = [];
+  try {
+    harness = await openWorkshopHarness(storage, undefined, {
+      projectRoot: project.root,
+      models,
+      model: configuredModel,
+      escalationModel: configuredModel,
+      request: async () => ({ ok: true }),
+    });
+    harness.resume();
+    const originalService = createWorkshopService({ projectRoot: project.root, harness });
+    const submission = originalService.handleRequest({
+      request_id: "recovered-chat",
+      type: "submit_chat",
+      content: "Please answer after the service is replaced.",
+    });
+    await started;
+    const replacementService = createWorkshopService({ projectRoot: project.root, harness });
+    watcher = await replacementService.watchChat("replacement-watch", (event) => events.push(event));
+    assert.equal(events[0]?.type, "chat.attached");
+    releaseFirst();
+    const response = await submission;
+    assert.equal(response.ok, true);
+    assert.equal(response.answer, "Recovered answer from the durable submission.");
+    const waitFor = async (type: string) => {
+      const deadline = Date.now() + 5_000;
+      while (Date.now() < deadline) {
+        const event = events.find((item) => item.type === type);
+        if (event) return event;
+        await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+      }
+      throw new Error(`Timed out waiting for ${type}: ${JSON.stringify(events)}`);
+    };
+    const final = await waitFor("assistant.final");
+    const end = await waitFor("run.end");
+    assert.equal(final.chat_request_id, "recovered-chat");
+    assert.equal(final.answer, response.answer);
+    assert.equal(end.chat_request_id, "recovered-chat");
+  } finally {
+    releaseFirst();
+    if (watcher) await watcher.close();
+    if (harness) await harness.close(BACKGROUND_CONTEXT);
+    rmSync(project.root, { recursive: true, force: true });
+  }
+});
+
+
 test("the durable failure round records its keyed tool decision once", async () => {
   const project = createProject("printf 'broken'; exit 7\n", "retries: 0\n");
   const storage = new MemoryStorage();
