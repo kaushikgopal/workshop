@@ -29,7 +29,7 @@ start:
 	@npm start
 
 chat:
-	@node scripts/chat-workshop.ts
+	@node scripts/chat-workshop.ts $(if $(strip $(print)),--print "$(print)")
 
 service-install:
 	@test -f workshop.yaml || { echo "workshop.yaml is required; run make setup and edit the config first." >&2; exit 1; }

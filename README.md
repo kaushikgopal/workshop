@@ -63,7 +63,8 @@ Workshop v2 needs Node.js 24 or later and npm. Run these commands from the repos
    ```
 
 4. Run `make check`.
-5. Run `make start` to start the scheduled service. It exposes a private JSON API at `state/service.sock`; clients submit messages to the same root conversation with `submit_chat`.
+5. Run `make start` to start the scheduled service.
+6. Run `make chat` to attach to the persistent orchestrator conversation. Use Ctrl-C or Ctrl-D to exit. For a single reply, run `make chat print="What is running?"`.
 
 Use `make dev` while developing. It restarts the service when source files change.
 
@@ -108,11 +109,11 @@ Omit either orchestrator field to use Pi's configured default model. Put provide
 | `make check` | Validate config and workflows, typecheck, and run tests. |
 | `make dev` | Start the service in watch mode and restart it when source files change. |
 | `make start` | Start the durable service in the foreground. |
-| `make chat` | Placeholder until the interactive chat client is ported in part 2. |
+| `make chat` | Attach to the persistent orchestrator conversation; `make chat print="message"` sends one message and exits. |
 | `make service-install` | Install the macOS launch agent for the durable service. |
 | `make service-uninstall` | Remove the macOS launch agent. |
 
-The service listens on the private Unix socket `state/service.sock` and accepts one JSON request per connection. A chat client sends `{"request_id":"chat-1","type":"submit_chat","content":"What is running?"}` to reach the persistent root conversation. The response includes its `conversation_id` and answer. The service does not open a network port. See [the reference](docs/reference.md) for the full API and workflow behavior.
+The service listens on the private Unix socket `state/service.sock` and does not open a network port. `make chat` attaches to the root conversation, streams assistant text and tool progress, and queues messages behind any current turn. See [the reference](docs/reference.md) for the socket protocol.
 
 ## Contributing
 

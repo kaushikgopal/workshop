@@ -143,7 +143,7 @@ state/
 
 ## Local service API
 
-The service listens on `state/service.sock`, a Unix socket with mode `0600`. It does not open a network port. Each connection sends one JSON request followed by a newline and receives one JSON response followed by a newline. The request body limit is 1 MiB. Responses include `ok`; errors include `error` and may include `request_id`.
+The service listens on `state/service.sock`, a Unix socket with mode `0600`. It does not open a network port. Requests and responses are JSON lines, with a 1 MiB limit per request. Standard requests receive one response and close the connection. `watch_chat` keeps a connection open for chat events and later requests. Responses include `ok`; errors include `error` and may include `request_id`.
 
 Each request requires a `request_id` from 1 to 128 characters and a `type`. The service supports:
 
@@ -153,6 +153,7 @@ Each request requires a `request_id` from 1 to 128 characters and a `type`. The 
 | `list_runs` | — | `workflow`, `limit` |
 | `read_run` | `run_id` | — |
 | `start_workflow` | `workflow` | — |
+| `watch_chat` | — | — |
 | `submit_chat` | `content` | — |
 | `decide_blocked_run` | `run_id`, `decision_number`, `decision` | `source`, `note` |
 | `cancel_run` | `run_id` | — |
@@ -160,9 +161,12 @@ Each request requires a `request_id` from 1 to 128 characters and a `type`. The 
 | `resume_workflow` | `workflow` | — |
 | `list_actions` | — | `workflow`, `limit` |
 
-`submit_chat` sends the message to the persistent root conversation and waits for its full answer; the socket does not stream tokens. Use a new stable `request_id` for each chat message and reuse it to retry that request. The response includes `conversation_id`, `submission_id`, and `answer`. Repeated messages use the same conversation. For example:
+Send `watch_chat` first to attach a client to the root conversation. It returns `chat.attached`, then streams `assistant.delta`, `tool.call`, `tool.result`, `assistant.final`, and `run.end` JSON lines. `assistant.final` carries the complete answer for every watcher; `run.end` includes `status: "error"` and a reason when the model did not answer. A new attachment starts from the current live state, so a client can reconnect after a service restart. Multiple clients can watch at once. Close the socket to stop watching.
+
+While attached, send `submit_chat` lines on the same socket. The service uses `whenBusy: "followUp"`, streams progress to every watcher, and returns the full answer in the matching response when the turn settles. Use a new stable `request_id` for each message and reuse it to retry that request. All messages use the same root conversation. Example attachment and message:
 
 ```json
+{"request_id":"watch-1","type":"watch_chat"}
 {"request_id":"chat-1","type":"submit_chat","content":"What is running?"}
 ```
 
@@ -170,7 +174,7 @@ Workflow names use lowercase letters, digits, and hyphens. `decision_number` ide
 
 The service claims a SQLite owner row before opening pi-durable, so a second process cannot recover the first process's tasks or race stale-socket cleanup. It removes a stale socket only when it can confirm the socket is not active, and it will not replace a non-socket file. A fatal durable-storage error closes the service and exits with a nonzero status. `service/start-service.ts` requires Node.js 24 or newer. It registers the workflow, step-attempt, and schedule-tick tasks with pi-durable, opens SQLite, starts the scheduler, and serves requests.
 
-The daily-summary activity step uses this API to read recent runs and actions. `make chat` remains a placeholder, but a later client can reach the persistent root conversation by sending `submit_chat` over `state/service.sock`.
+The daily-summary activity step uses this API to read recent runs and actions. `make chat` is the interactive terminal client; `make chat print="message"` sends one message, prints its reply, and exits.
 
 ## Make targets
 
@@ -181,7 +185,7 @@ The daily-summary activity step uses this API to read recent runs and actions. `
 | `make check` | Checks config and profile executables, validates private workflows and examples, runs `npx tsc --noEmit`, and runs `npm test`. |
 | `make dev` | Starts the service in Node watch mode. It stays in the foreground; stop it with Ctrl-C. |
 | `make start` | Starts the service in the foreground; stop it with Ctrl-C. |
-| `make chat` | Placeholder until the interactive chat client is ported in part 2. |
+| `make chat` | Attaches to the persistent orchestrator conversation; use `make chat print="message"` for one reply. |
 | `make service-install` | Runs checks, then installs a macOS per-user LaunchAgent for the Node service. |
 | `make service-uninstall` | Removes the macOS LaunchAgent. It leaves workflow data and runtime state in place. |
 

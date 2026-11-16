@@ -9,6 +9,7 @@ const serviceRequestSchema = z.discriminatedUnion("type", [
   z.object({ request_id: requestId, type: z.literal("list_runs"), limit: listLimit, workflow: workflowName.optional() }).strict(),
   z.object({ request_id: requestId, type: z.literal("read_run"), run_id: z.string().min(1) }).strict(),
   z.object({ request_id: requestId, type: z.literal("start_workflow"), workflow: workflowName }).strict(),
+  z.object({ request_id: requestId, type: z.literal("watch_chat") }).strict(),
   z.object({ request_id: requestId, type: z.literal("submit_chat"), content: z.string().min(1) }).strict(),
   z.object({
     request_id: requestId,

@@ -78,7 +78,7 @@ Workshop is a Node.js and TypeScript service built on pi-durable. `make start` r
 
 `WorkflowTask` stores the validated workflow settings and ordered step list. It reads each step and check file when that step starts, then creates a `StepAttemptTask` for the work. The task checkpoint stores pipe input, results, attempts, retry state, and blocked decisions. Run-reference documents map public run IDs to durable task IDs. A bounded session document keeps recent admission, action, and decision-receipt history plus per-workflow schedule counters. A hard service crash can replay an unfinished command; external effects must be safe to repeat. Workshop does not write run snapshots or separate run-state files.
 
-After local retries fail, the workflow task saves the evidence and submits one keyed failure round to the root conversation. The root can decide through Workshop tools or call `consult`, a read-only child conversation using the escalation model. If it takes no safe action, Workshop records `give_up` and leaves the run blocked. A future chat client can send `submit_chat` through the private socket; `make chat` remains a placeholder.
+After local retries fail, the workflow task saves the evidence and submits one keyed failure round to the root conversation. The root can decide through Workshop tools or call `consult`, a read-only child conversation using the escalation model. If it takes no safe action, Workshop records `give_up` and leaves the run blocked. `make chat` attaches to the persistent root over the private socket and streams text and tool progress; submissions queue behind an active turn.
 
 The daily-summary example reads recent runs and actions through this service API. Steps still share `data/<workflow>/`, which is separate from the SQLite record. Commands and profile processes run with the service account's permissions. They are not sandboxed.
 
@@ -115,7 +115,7 @@ run/                             durable workflow admission, state, process exec
 schedule/                        cron-slot selection and durable schedule ticks
 service/                         Pi model runtime, root extension, harness, socket API, service entrypoint
 workflow/                        parsing, step loading, decisions, durable task definitions
-scripts/                         checks, activity reader, chat placeholder, copy, launch-agent setup
+scripts/                         checks, activity reader, chat client, copy, launch-agent setup
 test/                            unit, service, socket, and SQLite resume tests
 examples/workflows/              hemingway-clock and daily-summary folders
 workflows/                       private workflows; upstream keeps .gitkeep only

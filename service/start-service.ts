@@ -11,6 +11,7 @@ import { createOrchestratorRuntime, type OrchestratorRuntime } from "./create-or
 import { createWorkshopService, type WorkshopService } from "./create-workshop-service.ts";
 import { openWorkshopHarness } from "./open-workshop-harness.ts";
 import { serveServiceSocket } from "./serve-service-socket.ts";
+import { parseServiceRequest } from "./types.ts";
 
 const sqliteFile = "workshop.sqlite";
 
@@ -49,12 +50,17 @@ async function startService(): Promise<void> {
   let stopForStorageFailure: (() => void) | undefined;
   try {
     storeLock = await acquireStoreLock(join(stateDirectory, sqliteFile));
-    socket = await serveServiceSocket(join(stateDirectory, "service.sock"), async (request, send) => {
+    socket = await serveServiceSocket(join(stateDirectory, "service.sock"), async (request, send, connection) => {
       if (!workshop) {
         send({ ok: false, error: "Workshop service is starting" });
         return;
       }
-      send(await workshop.handleRequest(request));
+      const parsed = parseServiceRequest(request);
+      if (parsed.type === "watch_chat") {
+        if (connection.persistent) throw new Error("A chat watch is already attached");
+        return await workshop.watchChat(parsed.request_id, send);
+      }
+      send(await workshop.handleRequest(parsed));
     });
     storage = await openNodeSqliteStorage(join(stateDirectory, sqliteFile));
     orchestratorRuntime = await createOrchestratorRuntime(projectRoot, config);

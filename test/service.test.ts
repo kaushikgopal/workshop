@@ -1,3 +1,4 @@
+import { connect, type Socket } from "node:net";
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -12,6 +13,8 @@ import { createWorkflowStartPort } from "../run/start-workflow.ts";
 import { appendRecent, maxWorkshopHistoryRecords, workshopStateDocument, type MutationReceipt, type WorkshopAction, type WorkflowAdmission } from "../run/workshop-state.ts";
 import { createWorkshopService } from "../service/create-workshop-service.ts";
 import { openWorkshopHarness } from "../service/open-workshop-harness.ts";
+import { serveServiceSocket } from "../service/serve-service-socket.ts";
+import { parseServiceRequest } from "../service/types.ts";
 import { tickWorkflows } from "../schedule/tick-workflows.ts";
 import { StepAttemptTask } from "../workflow/define-step-attempt-task.ts";
 import { WorkflowTask, WORKFLOW_TASK_NAME } from "../workflow/define-workflow-task.ts";
@@ -523,6 +526,121 @@ test("submit_chat reuses the configured root conversation through the service", 
     rmSync(project.root, { recursive: true, force: true });
   }
 });
+
+test("the chat socket streams fake-model text and tool events to multiple watchers", { timeout: 30_000 }, async () => {
+  const project = createProject("printf 'unused'\n");
+  const storage = new MemoryStorage();
+  const faux = fauxProvider({ tokensPerSecond: 12, tokenSize: { min: 1, max: 1 } });
+  const models = createModels();
+  models.setProvider(faux.provider);
+  const model = faux.getModel();
+  assert.ok(model);
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("list_workflows", {}), { stopReason: "toolUse" }),
+    fauxAssistantMessage("Streaming text reaches both attached clients before this answer ends."),
+  ]);
+  const configuredModel = {
+    model: { provider: model.provider, modelId: model.id },
+    thinkingLevel: "medium" as const,
+  };
+  let service: ReturnType<typeof createWorkshopService> | undefined;
+  let harness: Awaited<ReturnType<typeof openWorkshopHarness>> | undefined;
+  let socketServer: Awaited<ReturnType<typeof serveServiceSocket>> | undefined;
+  const clients: Socket[] = [];
+  try {
+    harness = await openWorkshopHarness(storage, undefined, {
+      projectRoot: project.root,
+      models,
+      model: configuredModel,
+      escalationModel: configuredModel,
+      request: async (request) => {
+        if (!service) throw new Error("Workshop service is not ready");
+        return await service.handleRequest(request);
+      },
+    });
+    service = createWorkshopService({ projectRoot: project.root, harness });
+    harness.resume();
+    const socketDirectory = join(project.root, "state");
+    mkdirSync(socketDirectory, { recursive: true });
+    socketServer = await serveServiceSocket(join(socketDirectory, "service.sock"), async (value, send) => {
+      if (!service) throw new Error("Workshop service is not ready");
+      const request = parseServiceRequest(value);
+      if (request.type === "watch_chat") return await service.watchChat(request.request_id, send);
+      send(await service.handleRequest(request));
+    });
+
+    const attach = async (watchId: string) => {
+      const socket = connect(join(socketDirectory, "service.sock"));
+      clients.push(socket);
+      socket.setEncoding("utf8");
+      socket.on("error", () => {});
+      const events: Record<string, unknown>[] = [];
+      const waiters: { predicate: (event: Record<string, unknown>) => boolean; resolve: (event: Record<string, unknown>) => void }[] = [];
+      const waitFor = (predicate: (event: Record<string, unknown>) => boolean) => {
+        const existing = events.find(predicate);
+        if (existing) return Promise.resolve(existing);
+        return new Promise<Record<string, unknown>>((resolveEvent) => waiters.push({ predicate, resolve: resolveEvent }));
+      };
+      let buffer = "";
+      socket.on("data", (chunk: string) => {
+        buffer += chunk;
+        let newline = buffer.indexOf("\n");
+        while (newline >= 0) {
+          const line = buffer.slice(0, newline);
+          buffer = buffer.slice(newline + 1);
+          const value: unknown = JSON.parse(line);
+          if (isRecord(value)) {
+            events.push(value);
+            for (let index = waiters.length - 1; index >= 0; index -= 1) {
+              const waiter = waiters[index];
+              if (waiter && waiter.predicate(value)) {
+                waiters.splice(index, 1);
+                waiter.resolve(value);
+              }
+            }
+          }
+          newline = buffer.indexOf("\n");
+        }
+      });
+      const connected = new Promise<void>((resolveConnect, rejectConnect) => {
+        socket.once("connect", resolveConnect);
+        socket.once("error", rejectConnect);
+      });
+      const attached = waitFor((event) => event.type === "chat.attached");
+      await connected;
+      socket.write(`${JSON.stringify({ request_id: watchId, type: "watch_chat" })}\n`);
+      await attached;
+      return { socket, events, waitFor };
+    };
+
+    const first = await attach("watch-one");
+    const second = await attach("watch-two");
+    const answer = first.waitFor((event) => event.request_id === "chat-stream" && typeof event.answer === "string");
+    first.socket.write(`${JSON.stringify({ request_id: "chat-stream", type: "submit_chat", content: "Stream this answer." })}\n`);
+    const response = await answer;
+    assert.equal(response.ok, true);
+    assert.equal(response.answer, "Streaming text reaches both attached clients before this answer ends.");
+    await Promise.all([first, second].map((watcher) => watcher.waitFor((event) => event.type === "assistant.final" && event.answer === response.answer)));
+    for (const watcher of [first, second]) {
+      const calls = watcher.events.filter((event) => event.type === "tool.call");
+      const results = watcher.events.filter((event) => event.type === "tool.result");
+      const deltas = watcher.events.filter((event) => event.type === "assistant.delta");
+      assert.ok(calls.some((event) => event.name === "list_workflows"));
+      assert.ok(results.some((event) => event.name === "list_workflows" && event.status === "ok"));
+      const streamed = deltas.map((event) => typeof event.text === "string" ? event.text : "").join("");
+      assert.ok(response.answer.startsWith(streamed), `streamed ${JSON.stringify(streamed)} before answer ${JSON.stringify(response.answer)}`);
+      const finalIndex = watcher.events.findIndex((event) => event.type === "assistant.final" && event.answer === response.answer);
+      const deltaIndex = watcher.events.findIndex((event) => event.type === "assistant.delta");
+      assert.ok(deltaIndex >= 0 && finalIndex > deltaIndex, "text deltas arrive before the full answer event");
+    }
+  } finally {
+    for (const client of clients) client.destroy();
+    if (socketServer) await socketServer.close();
+    if (harness) await harness.close(BACKGROUND_CONTEXT);
+    rmSync(project.root, { recursive: true, force: true });
+  }
+});
+
 
 test("the durable failure round records its keyed tool decision once", async () => {
   const project = createProject("printf 'broken'; exit 7\n", "retries: 0\n");

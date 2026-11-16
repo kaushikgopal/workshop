@@ -4,7 +4,12 @@ import type { ServiceResponse } from "./types.ts";
 
 const maximumRequestBytes = 1_048_576;
 type EventWriter = (event: ServiceResponse) => void;
-type RequestHandler = (request: unknown, send: EventWriter) => Promise<void>;
+type SocketSession = { close(): Promise<void> };
+type RequestHandler = (
+  request: unknown,
+  send: EventWriter,
+  connection: { persistent: boolean },
+) => Promise<SocketSession | void>;
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "Service request failed";
@@ -24,21 +29,25 @@ function send(socket: Socket, event: ServiceResponse): void {
   socket.write(`${JSON.stringify(event)}\n`);
 }
 
-async function answer(socket: Socket, line: string, handler: RequestHandler): Promise<void> {
+async function answer(
+  socket: Socket,
+  line: string,
+  handler: RequestHandler,
+  persistent: boolean,
+): Promise<SocketSession | undefined> {
   let value: unknown;
   try {
     value = JSON.parse(line);
   } catch (error) {
     send(socket, { ok: false, error: `Invalid JSON request: ${errorMessage(error)}` });
-    socket.end();
-    return;
+    return undefined;
   }
   try {
-    await handler(value, (event) => send(socket, event));
+    const session = await handler(value, (event) => send(socket, event), { persistent });
+    return session && typeof session.close === "function" ? session : undefined;
   } catch (error) {
     send(socket, { request_id: requestId(value), ok: false, error: errorMessage(error) });
-  } finally {
-    socket.end();
+    return undefined;
   }
 }
 
@@ -72,38 +81,94 @@ async function removeStaleSocket(socketPath: string): Promise<void> {
 export async function serveServiceSocket(socketPath: string, handler: RequestHandler): Promise<{ close(): Promise<void> }> {
   await removeStaleSocket(socketPath);
   const sockets = new Set<Socket>();
+  const sessions = new Map<Socket, SocketSession>();
+  const closeSession = async (socket: Socket): Promise<void> => {
+    const session = sessions.get(socket);
+    if (!session) return;
+    sessions.delete(socket);
+    await session.close();
+  };
   const server: Server = createServer((socket) => {
     sockets.add(socket);
-    socket.once("close", () => sockets.delete(socket));
+    socket.once("close", () => {
+      sockets.delete(socket);
+      void closeSession(socket);
+    });
     socket.on("error", () => {});
     socket.setEncoding("utf8");
     let request = "";
-    let receivedLine = false;
+    let persistent = false;
+    let processing = false;
+    let ended = false;
+    const pending: string[] = [];
+    const rejectSocket = (message: string) => {
+      send(socket, { ok: false, error: message });
+      socket.end();
+      void closeSession(socket);
+    };
+    const processRequests = async () => {
+      if (processing) return;
+      processing = true;
+      try {
+        while (pending.length > 0 && !socket.destroyed) {
+          const line = pending.shift() ?? "";
+          if (line.trim().length === 0) {
+            send(socket, { ok: false, error: "Service request is empty" });
+            if (!persistent) {
+              socket.end();
+              pending.length = 0;
+              break;
+            }
+            continue;
+          }
+          const session = await answer(socket, line.trim(), handler, persistent);
+          if (session !== undefined) {
+            if (persistent) {
+              await session.close();
+              send(socket, { request_id: requestId(JSON.parse(line)), ok: false, error: "A chat watch is already attached" });
+            } else {
+              persistent = true;
+              sessions.set(socket, session);
+              if (socket.destroyed) await closeSession(socket);
+            }
+          } else if (!persistent) {
+            socket.end();
+            pending.length = 0;
+            break;
+          }
+        }
+        if (ended && persistent) {
+          await closeSession(socket);
+          socket.end();
+        }
+      } finally {
+        processing = false;
+      }
+    };
     socket.on("data", (chunk: string) => {
-      if (receivedLine) return;
       request += chunk;
+      let newline = request.indexOf("\n");
+      while (newline >= 0) {
+        const line = request.slice(0, newline);
+        request = request.slice(newline + 1);
+        if (Buffer.byteLength(line, "utf8") > maximumRequestBytes) {
+          rejectSocket("Service request exceeds the 1 MiB limit");
+          return;
+        }
+        pending.push(line);
+        newline = request.indexOf("\n");
+      }
       if (Buffer.byteLength(request, "utf8") > maximumRequestBytes) {
-        receivedLine = true;
-        request = "";
-        send(socket, { ok: false, error: "Service request exceeds the 1 MiB limit" });
-        socket.end();
+        rejectSocket("Service request exceeds the 1 MiB limit");
         return;
       }
-      const end = request.indexOf("\n");
-      if (end < 0) return;
-      receivedLine = true;
-      const line = request.slice(0, end).trim();
-      if (line.length === 0) {
-        send(socket, { ok: false, error: "Service request is empty" });
-        socket.end();
-        return;
-      }
-      void answer(socket, line, handler);
+      void processRequests();
     });
     socket.on("end", () => {
-      if (receivedLine || request.length === 0) return;
-      receivedLine = true;
-      void answer(socket, request.trim(), handler);
+      if (request.trim().length > 0) pending.push(request);
+      request = "";
+      ended = true;
+      void processRequests();
     });
   });
 
@@ -127,7 +192,10 @@ export async function serveServiceSocket(socketPath: string, handler: RequestHan
 
   return {
     async close() {
-      for (const socket of sockets) socket.destroy();
+      await Promise.all([...sockets].map(async (socket) => {
+        await closeSession(socket);
+        socket.destroy();
+      }));
       await new Promise<void>((resolve, reject) => {
         server.close((error) => error ? reject(error) : resolve());
       });
