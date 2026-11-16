@@ -240,7 +240,7 @@ function readWorkflow(
   errors: WorkflowIssue[],
 ): Workflow | undefined {
   const folder = join(root, directory);
-  const contents = readdirSync(folder, { withFileTypes: true });
+  const contents = readdirSync(folder, { withFileTypes: true }).sort((left, right) => left.name.localeCompare(right.name));
   const workflowFile = contents.find((entry) => entry.name === "workflow.md");
   let markdown: MarkdownDocument | undefined;
   let metadata: WorkflowMetadata | undefined;

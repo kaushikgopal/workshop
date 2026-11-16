@@ -158,6 +158,23 @@ test("rejects unknown root and workflow files", () => {
   });
 });
 
+test("reports workflow-folder issues in filename order", () => {
+  withRoot((root) => {
+    const directory = createWorkflow(root);
+    writeStep(directory, "10-step.sh");
+    mkdirSync(join(directory, "m-directory"));
+    writeStep(directory, "z-notes.txt", "unknown");
+    writeStep(directory, "a-notes.txt", "unknown");
+    const result = loadWorkflows(root, profiles);
+    assert.deepEqual(result.errors.map(({ file }) => file), [
+      "clock/a-notes.txt",
+      "clock/m-directory",
+      "clock/z-notes.txt",
+    ]);
+  });
+});
+
+
 test("rejects malformed step names while allowing only lowercase letters, digits, and hyphens", () => {
   withRoot((root) => {
     const directory = createWorkflow(root);
