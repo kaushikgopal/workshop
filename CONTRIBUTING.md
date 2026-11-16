@@ -142,31 +142,45 @@ config/                                   config loading and validation
   read-workshop-config.ts                 YAML, environment, and profile validation
 service/                                  durable service and local API
   acquire-store-lock.ts                   single-owner SQLite lock
+  cancel-workflow-run.ts                   run cancellation and recovery
   create-orchestrator-runtime.ts           Pi model registry and auth
+  create-service-failure.ts                stable mutation failure codes
+  create-workshop-chat.ts                  root conversation chat lifecycle
   create-workshop-extension.ts             root tools, status, and consult
-  create-workshop-service.ts               service request handling
+  create-workshop-service.ts               request routing and receipt gate
+  decide-blocked-run.ts                    blocked decision validation and receipt
   launch-service.plist.template            macOS service launch settings
   open-workshop-harness.ts                 durable task and conversation registry
+  project-chat-events.ts                   chat event state projection
+  project-workshop-status.ts               run status and capability projection
+  read-workshop-status.ts                  workflow and run reads
+  record-service-receipt.ts                mutation receipt replay and storage
   request-service.ts                       local API client
+  resolve-failure-round.ts                 automatic-round decision binding
   serve-service-socket.ts                  private JSON socket
+  set-workflow-pause.ts                    pause and resume state changes
   start-service.ts                         entrypoint and lifecycle
   types.ts                                 service request and response shapes
 workflow/                                 workflow loading and durable execution
+  accept-blocked-decision.ts               blocked decision acceptance rules
+  advance-workflow-state.ts                checkpoint validation and transitions
   apply-workflow-decision.ts               blocked-run decision rules
   build-orchestrator-brief.ts              failure-round prompt
   compute-retry-profiles.ts                allowed retry profiles
   define-step-attempt-task.ts              durable step-attempt task
   define-workflow-task.ts                  durable workflow task
-  define-workshop-state.ts                durable workshop state and history
-  interpret-workflow.ts                    command, agent, and check behavior
+  define-workshop-state.ts                 durable workshop state and history
+  interpret-workflow.ts                    single-attempt execution and process types
   list-workflow-status.ts                  workflow status for orchestrator tools
   load-workflow-step.ts                    step and check files at step start
   load-workflows.ts                        folder validation and workflow loading
   parse-workflow-decision.ts               decision validation
   types.ts                                 workflow and step shapes
 run/                                      admission and process execution
+  decide-workflow-admission.ts             start receipt and admission decisions
   execute-workflow-process.ts              command and profile process groups
   start-workflow.ts                        workflow admission and task creation
+  transition-workflow-pause.ts              idempotent pause and resume transitions
 schedule/                                 cron-slot selection and durable ticks
   decide-workflow-slot.ts                  slot and `max_runs` decisions
   tick-workflows.ts                        one-minute durable schedule tick
@@ -179,16 +193,26 @@ scripts/                                  checks and user-facing commands
   read-workshop-activity.ts                activity reader for daily-summary
   uninstall-launch-agent.ts                macOS LaunchAgent remover
 test/                                     unit and integration tests
+  accept-blocked-decision.test.ts          blocked decision transition outcomes
+  advance-workflow-state.test.ts           durable workflow transition outcomes
+  admit-workflow.test.ts                   workflow admission side effects
   chat-workshop.test.ts                    interactive and single-reply chat
   check-architecture-boundaries.test.ts    dependency direction
+  check-setup-scripts.test.ts              setup failure recovery output
   check-workflows.test.ts                  workflow validation
   crash-resume.test.ts                     SQLite task recovery
+  decide-workflow-admission.test.ts        start receipt and admission outcomes
   interpret-workflow.test.ts               command, agent, and check behavior
   load-workflows.test.ts                   workflow folder loading
+  open-workshop-harness.test.ts             service resource lifecycle
   orchestrate-workflow.test.ts             step attempts and decisions
+  project-chat-events.test.ts               ordered chat event projection
+  project-workshop-status.test.ts           run status and capability projection
   read-config.test.ts                      config and profile checks
   service-socket.test.ts                   socket behavior
   service.test.ts                          service operations and chat
+  transition-service-lifecycle.test.ts      startup and shutdown transitions
+  transition-workflow-pause.test.ts         idempotent pause and resume outcomes
 examples/workflows/                       hemingway-clock and daily-summary
 workflows/                                private workflows; upstream keeps .gitkeep only
 workshop.example.yaml                     public config template

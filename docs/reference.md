@@ -23,7 +23,7 @@ Every profile's first command argument must resolve to an executable on `PATH`. 
 
 Workshop reads `WORKSHOP_CONFIG` when set. Otherwise it reads `workshop.yaml` from the current directory. Make targets expect the project root. `make setup` copies `workshop.example.yaml` and `.env.example` only when the destination files do not exist. Upstream ignores `workshop.yaml` and `.env.local`.
 
-Workshop reads `.env.local` from the config file's directory. Existing process environment variables take precedence. `${NAME}` references in YAML string values expand from the environment. An unset variable is an error. Expansion does not apply to YAML keys, workflow files, or command output. Keep secrets in `.env.local`, not in tracked config.
+Workshop reads `.env.local` from the config file's directory. Existing process environment variables take precedence. Workshop parses and stages values from `.env.local`, expands `${NAME}` in YAML string values, and applies staged values to `process.env` only after YAML parsing, interpolation, and config-schema validation succeed. A failure in those checks leaves staged values unapplied. An unset variable is an error. Expansion does not apply to YAML keys, workflow files, or command output. Keep secrets in `.env.local`, not in tracked config.
 
 ## Orchestrator conversation
 
@@ -33,10 +33,11 @@ each failed workflow step gets one keyed failure round in this conversation;
 chat messages use the same root.
 
 The system prompt includes `agent/instructions.md` and a live Workshop status
-section. Status lists blocked runs, broken workflows, paused workflows, and
-recent actions. The root has in-process tools to list workflows and runs, read a
-run, start or cancel a run, decide a blocked run, pause or resume a workflow,
-and list actions.
+section. Status lists active and blocked runs, scheduler definition blocks, broken
+workflows, paused workflows, and recent actions. Run rows include phase, status
+message, and allowed actions; the list is capped at 100 rows. The root has
+in-process tools to list workflows and runs, read a run, start or cancel a run,
+decide a blocked run, pause or resume a workflow, and list actions.
 
 The `consult` tool creates a read-only child conversation with
 `orchestrator.escalation_model`. It can inspect workflows, runs, and recent
@@ -86,6 +87,8 @@ from durable source snapshots, so a file edit before a process starts can affect
 that attempt.
 Steps execute in order. The first step receives empty input. A command step runs as `sh <file>` for `.sh` or `node <file>` for `.ts`, with its working directory set to `data/<workflow>/`. Node.js applies built-in type stripping to supported TypeScript syntax. An agent step runs the selected profile command with its prompt on stdin. Workshop does not invoke a shell to start profile commands.
 
+The durable `workshop.workflow` task owns the whole workflow lifecycle. The former `interpretWorkflow` whole-workflow coordinator is retired; `executeWorkflowAttempt` handles one step and its check.
+
 A successful step's stdout becomes the next step's input without trimming. A command receives it on stdin. An agent receives it below an `Input` heading in its prompt. Steps can also pass longer-lived data through their shared `data/<workflow>/` working folder.
 
 Every child process inherits the service environment and receives these variables:
@@ -102,9 +105,9 @@ Every child process inherits the service environment and receives these variable
 
 Command processes receive workflow input through stdin. Agent processes receive the step prompt, then optional `## Input` and `## Feedback` sections. A check receives the worker's output as its input; its result does not replace the worker's output.
 
-A command step that exits with code `99` ends the run successfully with status `nothing-to-do`; its check does not run. Exit `99` from an agent or check has no special meaning. Each command or profile process starts in its own process group. A step timeout or run cancellation sends `SIGTERM`, then `SIGKILL` after 250 ms if the process group remains. This also stops descendants while the service is alive.
+A command step that exits with code `99` ends the run successfully with status `nothing-to-do`; its check does not run. Exit `99` from an agent or check has no special meaning. Each command or profile process starts in its own process group. A step timeout or run cancellation sends `SIGTERM`, then `SIGKILL` after 250 ms if the process group remains. This also stops descendants while the service is alive. Only a deadline expiration sets `timedOut`; an abort never becomes a timeout. If timeout and cancellation overlap, the first stop cause wins and later signals do not relabel the process.
 
-Pi-durable resumes unfinished tasks from their last checkpoint. It cannot reattach to an operating-system process after a hard service crash. An unfinished command may start again, and the original child process may still be running. If a step-attempt task completed before its parent checkpoint, the parent reuses that durable result after restart. Make external side effects safe to repeat for unfinished commands. Workshop does not provide exactly-once effects. A normal service shutdown aborts active task signals so Workshop can stop their process groups.
+Pi-durable resumes unfinished tasks from their last checkpoint. It cannot reattach to an operating-system process after a hard service crash. An unfinished command may start again, and the original child process may still be running. If a step-attempt task completed before its parent checkpoint, the parent reuses that durable result after restart. Make external side effects safe to repeat for unfinished commands. Workshop does not provide exactly-once effects. A normal service shutdown aborts active task signals so Workshop can stop their process groups. An invalid saved checkpoint fails with a `Workflow checkpoint integrity error` that names the bad field; Workshop does not interpret it as successful completion.
 
 ## Checks, retries, and blocked runs
 
@@ -127,13 +130,13 @@ A retry applies the step's existing profile and feedback rules. An agent step ca
 
 ## Scheduling, pause, and cancellation
 
-The service checks schedules once a minute in UTC. On each tick it loads config and valid workflows, then considers each enabled workflow. It finds the latest cron slot at or before the current time. After downtime it considers only the latest due slot, not every missed slot. A new workflow is eligible at the first tick.
+The service checks schedules once a minute in UTC. On each tick it loads config and valid workflows, then considers each enabled workflow. It finds the latest cron slot at or before the current time. After downtime it considers only the latest due slot, not every missed slot. A new workflow is eligible at the first tick. After config and workflow loading, one workflow's admission failure does not stop the tick from considering its siblings; Workshop logs and records that failure as a skipped admission.
 
 A paused workflow's newly observed slot is recorded as skipped with reason `paused`; resuming never replays it. The service starts at most one non-terminal task per workflow. If a run is active, waiting, sleeping before retry, or blocked, a later scheduled occurrence is recorded as skipped, not queued. Different workflows can run at the same time.
 
-`max_runs` counts distinct run IDs recorded as started, including manual starts. It limits scheduled starts only; manual starts ignore the limit but count toward it on later ticks. Manual starts refuse workflows with `enabled: false`. Pausing prevents manual starts and skips newly observed scheduled slots; it does not stop an active run. Resuming allows later ticks to start new slots. It does not replay skipped slots or start a run immediately.
+`max_runs` counts distinct run IDs recorded as started, including manual starts. It limits scheduled starts only; manual starts ignore the limit but count toward it on later ticks. Manual starts refuse workflows with `enabled: false`. A fresh scheduled admission rechecks the loaded workflow: if it is now disabled, the slot is skipped with reason `workflow is disabled`; if its cron changed and the slot is no longer due, it is skipped with reason `schedule slot is no longer due`. Other scheduled skip reasons are `paused`, `max_runs reached`, `workflow lock held`, and `admission failed`. A slot already recorded at or after the requested slot is rejected as `slot_already_indexed`. Pausing prevents manual starts and skips newly observed scheduled slots; it does not stop an active run. Resuming allows later ticks to start new slots. It does not replay skipped slots or start a run immediately.
 
-Cancelling a run asks pi-durable to abort its workflow task and owned step-attempt task before Workshop saves the cancellation action and receipt. The task's abort signal stops the active process group. Repeating the abort is safe. A cancellation request against a terminal run reports that it was not cancelled.
+Cancelling a live run asks pi-durable to abort its workflow task and owned step-attempt task before Workshop saves the cancellation action and receipt. The task's abort signal stops the active process group. Repeating the abort is safe. A cancellation request against a terminal non-cancelled run reports `cancelled: false` and its current status. A new request for a terminal-cancelled run also reports `cancelled: false` with status `cancelled` when that run already has a cancel action. If cancellation reached a terminal outcome before Workshop saved its action, a later request acknowledges recovery once with `cancelled: true` and status `cancellation-requested`, then records the action and receipt. The same request ID replays its saved response. An in-process keyed gate serializes receipt-namespace mutations that share a request ID from receipt lookup through effect and receipt write. No request-bound cancellation intent is persisted, so a hard crash can leave an abort without its original request identity.
 
 ## Durable state and files
 
@@ -191,7 +194,7 @@ The `workshop.state` document is version 2 and migrates version 1. The
 
 ## Local service API
 
-The service listens on `state/service.sock`, a Unix socket with mode `0600`. It does not open a network port. Requests and responses are JSON lines, with a 1 MiB limit per request. Standard requests receive one response and close the connection. `watch_chat` keeps a connection open for chat events and later requests. Responses include `ok`; errors include `error` and may include `request_id`.
+The service listens on `state/service.sock`, a Unix socket with mode `0600`. It does not open a network port. Requests and responses are JSON lines, with a 1 MiB limit per request. Standard requests receive one response and close the connection. `watch_chat` keeps a connection open for chat events and later requests. Responses include `ok`; errors include `error` and may include `request_id`. Failed mutation responses also include `error_code`; `error` remains the human-readable explanation.
 
 Each request requires a `request_id` from 1 to 128 characters and a `type`. The service supports:
 
@@ -218,7 +221,13 @@ While attached, send `submit_chat` lines on the same socket. The service uses `w
 {"request_id":"chat-1","type":"submit_chat","content":"What is running?"}
 ```
 
-Workflow names use lowercase letters, digits, and hyphens. `decision_number` identifies the current blocked occurrence in a run; a delayed decision for an earlier step is rejected. The service assigns decision source: `chat` for chat decisions and `round` for decisions made during an automatic failure round. The model cannot set `source`. Include `note` for a round decision. `limit` is an integer from 0 to 1,000; list requests default to 20. The decision object uses the actions described above. The service rejects unknown request fields and invalid values. A repeated blocked-run decision with the same request ID and payload returns its saved response while that receipt remains in the most recent 1,000; reusing that ID for a different payload is an error.
+Workflow names use lowercase letters, digits, and hyphens. `decision_number` identifies the current blocked occurrence in a run; a delayed decision for an earlier step is rejected. The service assigns decision source: `chat` for chat decisions and `round` for decisions made during an automatic failure round. The model cannot set `source`. Include `note` for a round decision. `limit` is an integer from 0 to 1,000; list requests default to 20. The decision object uses the actions described above. The service rejects unknown request fields and invalid values. A repeated blocked-run decision with the same request ID and payload returns its saved response while that receipt remains in the most recent 1,000; reusing that ID for a different payload returns `error_code: "request_id_conflict"`.
+
+A retained `start_workflow` receipt replays before Workshop reads config or checks profiles. A new start rechecks the request receipt atomically with admission. Current mutation error codes include `cancellation_in_progress`, `stale_decision`, `choice_already_recorded`, `empty_output`, `incompatible_profile`, `request_id_conflict`, `run_not_found`, `admission_skipped`, `workflow_busy`, and `slot_already_indexed`. Other mutation failures use `mutation_failed` when no narrower code applies.
+
+`read_run.run` keeps its existing `status` string and adds `phase`, `status_message`, and `allowed_actions`. `phase` distinguishes `waiting-for-round`, `awaiting-decision`, `decision-recorded`, and `cancellation-requested` without changing the existing `status`; `status_message` is one line. Run-level `allowed_actions` may include `cancel_run` and `decide_blocked_run`; the list is advisory, and each mutation rechecks its guards. A `completing` phase means an outcome is decided but owned work still holds the workflow lock. A `definition-unavailable` phase identifies scheduler compatibility blocks such as `migration_failed`, `task_too_old`, or `missing_task`; it is not an actionable user-decision block. Faulted reads keep their error text in `error`.
+
+A blocked `read_run.run.blocked_step` adds `allowed_actions` and `retry_profiles`. Decision actions are `retry`, `skip`, `accept`, and `fail`; `accept` appears only when the last output is trim-nonempty. Retry profiles come from the run's captured allowed list. `list_runs.runs[]` adds compact `phase`, `status_message`, and `allowed_actions` fields while keeping its existing string `blocked_step`; blocked rows add `blocked_step_allowed_actions` and `blocked_step_retry_profiles`. Terminal failed and cancelled reads reconstruct prior `steps` and `output` from child step-attempt receipts when those receipts make reconstruction possible. Workshop stores no new terminal evidence.
 
 The service claims a SQLite owner row before opening pi-durable, so a second process cannot recover the first process's tasks or race stale-socket cleanup. It removes a stale socket only when it can confirm the socket is not active, and it will not replace a non-socket file. A fatal durable-storage error closes the service and exits with a nonzero status. `service/start-service.ts` requires Node.js 24 or newer. It registers the workflow, step-attempt, and schedule-tick tasks with pi-durable, opens SQLite, starts the scheduler, and serves requests.
 
@@ -229,12 +238,12 @@ The daily-summary activity step uses this API to read recent runs and actions. `
 | Target | Behavior |
 | --- | --- |
 | `make setup` | Requires Node.js 24+. On macOS it can install Node with Homebrew if missing; elsewhere install Node first. Runs `npm ci` and creates missing config and environment files. |
-| `make copy to=<dir>` | Creates and sets up a private copy of the current committed branch. It does not copy uncommitted changes, secrets, data, or service state. |
+| `make copy to=<dir>` | Creates and sets up a private copy of the current committed branch. From detached HEAD it creates the `workshop-copy` branch at the source revision. It does not copy uncommitted changes, secrets, data, or service state. On failure it retains partial files and prints the failed stage and an exact recovery command. |
 | `make check` | Checks config and profile executables, validates private workflows and examples, runs `npx tsc --noEmit`, and runs `npm test`. |
 | `make dev` | Starts the service in Node watch mode. It stays in the foreground; stop it with Ctrl-C. |
 | `make start` | Starts the service in the foreground; stop it with Ctrl-C. |
 | `make chat` | Attaches to the persistent orchestrator conversation; use `make chat print="message"` for one reply. |
-| `make service-install` | Runs checks, then installs a per-user macOS LaunchAgent that starts `node service/start-service.ts` from the project root. The agent writes stdout and stderr to `state/service.log`. |
+| `make service-install` | Runs checks, then installs a per-user macOS LaunchAgent that starts `node service/start-service.ts` from the project root. The agent writes stdout and stderr to `state/service.log`. On failure the installer reports the stage and a recovery command; it leaves partial files in place for inspection. |
 | `make service-uninstall` | Removes the macOS LaunchAgent and plist. It leaves runtime state and workflow data in place. |
 
 The foreground `make start` and `make dev` commands write output to the terminal.
