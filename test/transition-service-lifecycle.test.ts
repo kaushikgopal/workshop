@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
+import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
+import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { test } from "node:test";
-import { createServiceLifecycle, serviceCanDispatchRequests, transitionServiceLifecycle } from "../service/start-service.ts";
+import { closeServiceStore, createServiceLifecycle, openServiceHarness, serviceCanDispatchRequests, transitionServiceLifecycle } from "../service/start-service.ts";
 
 test("service lifecycle admits dispatch only after readiness and stops once", () => {
   let state = createServiceLifecycle();
@@ -49,4 +51,57 @@ test("out-of-order lifecycle events leave the service state unchanged", () => {
   const rejected = transitionServiceLifecycle(starting, { type: "stopped", result: "success" });
   assert.deepEqual(rejected, { kind: "rejected", code: "invalid-transition", state: starting });
   assert.equal(starting.kind, "starting");
+});
+
+test("a failed harness cleanup retains storage ownership until closure is confirmed", async () => {
+  const storage = await openNodeSqliteStorage(":memory:");
+  const originalClose = storage.close.bind(storage);
+  let closeCalls = 0;
+  let releaseCalls = 0;
+  let storageClosed = false;
+  storage.close = async () => {
+    closeCalls += 1;
+    throw new Error("injected storage cleanup failure");
+  };
+  const lifecycle = createServiceLifecycle();
+  if (lifecycle.kind !== "starting") throw new Error("New service should be starting");
+  const resources = lifecycle.resources;
+  resources.storage = storage;
+  resources.storeLock = { release: async () => { releaseCalls += 1; } };
+
+  try {
+    await assert.rejects(openServiceHarness(resources, async () => {
+      try {
+        await storage.close(BACKGROUND_CONTEXT);
+      } catch (cleanupError) {
+        throw new AggregateError([new Error("injected harness initialization failure"), cleanupError], "harness startup and cleanup failed");
+      }
+      throw new Error("Expected the injected cleanup failure");
+    }), /harness startup and cleanup failed/);
+
+    const firstCleanup = await closeServiceStore(resources);
+    const ownershipAfterFailure = {
+      storageRetained: resources.storage === storage,
+      markedClosed: resources.storageClosed,
+      ownerReleased: releaseCalls > 0,
+      closeResult: firstCleanup.kind,
+      closeCalls,
+    };
+    storage.close = originalClose;
+    const secondCleanup = await closeServiceStore(resources);
+    storageClosed = ownershipAfterFailure.storageRetained && secondCleanup.kind === "closed";
+
+    assert.deepEqual(ownershipAfterFailure, {
+      storageRetained: true,
+      markedClosed: false,
+      ownerReleased: false,
+      closeResult: "failed",
+      closeCalls: 2,
+    });
+    assert.deepEqual(secondCleanup, { kind: "closed" });
+    assert.equal(releaseCalls, 1);
+  } finally {
+    storage.close = originalClose;
+    if (!storageClosed) await originalClose(BACKGROUND_CONTEXT);
+  }
 });

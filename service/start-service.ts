@@ -103,6 +103,47 @@ export function transitionServiceLifecycle(
     ? { kind: "accepted", state: { kind: "stopped", result: event.result } }
     : { kind: "rejected", code: "invalid-transition", state };
 }
+export type ServiceStoreCleanup =
+  | { kind: "closed" }
+  | { kind: "failed"; stage: "close" | "release"; error: unknown };
+
+export async function openServiceHarness(
+  resources: ServiceResources,
+  open: (storage: NonNullable<ServiceResources["storage"]>) => Promise<Harness>,
+): Promise<void> {
+  const storage = resources.storage;
+  if (!storage) throw new Error("Durable storage is not available for harness startup");
+  const harness = await open(storage);
+  resources.harness = harness;
+  resources.storage = undefined;
+}
+
+export async function closeServiceStore(resources: ServiceResources): Promise<ServiceStoreCleanup> {
+  let storeClosed = resources.storageClosed || (resources.harness === undefined && resources.storage === undefined);
+  if (!storeClosed) {
+    try {
+      if (resources.harness) await resources.harness.close(BACKGROUND_CONTEXT);
+      else if (resources.storage) await resources.storage.close(BACKGROUND_CONTEXT);
+      storeClosed = true;
+      resources.storageClosed = true;
+      resources.harness = undefined;
+      resources.storage = undefined;
+    } catch (error) {
+      return { kind: "failed", stage: "close", error };
+    }
+  }
+  if (storeClosed && resources.storeLock) {
+    try {
+      await resources.storeLock.release();
+      resources.storeLock = undefined;
+    } catch (error) {
+      return { kind: "failed", stage: "release", error };
+    }
+  }
+  return { kind: "closed" };
+}
+
+
 
 function checkNodeVersion(): void {
   const major = Number(process.versions.node.split(".")[0]);
@@ -152,7 +193,6 @@ export async function startService(): Promise<void> {
     const cause = lifecycle.kind === "stopping" ? lifecycle.cause : "service shutdown";
     console.log(JSON.stringify({ event: "stopping", signal: cause }));
     let failed = storageFailed;
-    let storeClosed = resources.storageClosed || (resources.harness === undefined && resources.storage === undefined);
     try {
       await resources.socket?.close();
       resources.socket = undefined;
@@ -161,17 +201,11 @@ export async function startService(): Promise<void> {
       process.exitCode = 1;
       logServiceError("socket shutdown failed", error);
     }
-    try {
-      if (resources.harness) await resources.harness.close(BACKGROUND_CONTEXT);
-      else if (resources.storage) await resources.storage.close(BACKGROUND_CONTEXT);
-      storeClosed = true;
-      resources.storageClosed = true;
-      resources.harness = undefined;
-      resources.storage = undefined;
-    } catch (error) {
+    const failedResult = await closeServiceStore(resources);
+    if (failedResult.kind === "failed") {
       failed = true;
       process.exitCode = 1;
-      logServiceError("durable store shutdown failed", error);
+      logServiceError(failedResult.stage === "close" ? "durable store shutdown failed" : "store lock release failed", failedResult.error);
     }
     try {
       await resources.orchestratorRuntime?.models.settleCredentialWrites();
@@ -180,16 +214,6 @@ export async function startService(): Promise<void> {
       failed = true;
       process.exitCode = 1;
       logServiceError("model runtime shutdown failed", error);
-    }
-    if (storeClosed) {
-      try {
-        await resources.storeLock?.release();
-        resources.storeLock = undefined;
-      } catch (error) {
-        failed = true;
-        process.exitCode = 1;
-        logServiceError("store lock release failed", error);
-      }
     }
     if (failed) process.exitCode = 1;
     const transition = transitionServiceLifecycle(lifecycle, { type: "stopped", result: failed ? "failed" : "success" });
@@ -258,37 +282,31 @@ export async function startService(): Promise<void> {
     assertStartupCanContinue();
 
     setStage("open-harness");
-    const storage = resources.storage;
-    if (!storage) throw new Error("Durable storage is not available for harness startup");
-    resources.storage = undefined;
-    try {
-      resources.harness = await openWorkshopHarness(storage, (report) => {
-        if (storageFailed) return;
-        storageFailed = true;
-        storageFailure = report.error;
-        process.exitCode = 1;
-        logServiceError("fatal durable storage failure", report.error);
-        if (lifecycle.kind === "starting") {
-          const failed = transitionServiceLifecycle(lifecycle, { type: "fail", error: report.error });
-          if (failed.kind === "accepted") lifecycle = failed.state;
-        } else if (lifecycle.kind === "ready") {
-          void requestStop("fatal durable storage failure");
-        }
-      }, {
-        projectRoot,
-        models: resources.orchestratorRuntime.models,
-        model: resources.orchestratorRuntime.model,
-        escalationModel: resources.orchestratorRuntime.escalationModel,
-        request: async (request, invocation) => {
-          const workshop = resources.workshop;
-          if (!serviceCanDispatchRequests(lifecycle) || !workshop) throw new Error("Workshop service is starting");
-          return await workshop.handleRequest(request, invocation);
-        },
-      });
-    } catch (error) {
-      resources.storageClosed = true;
-      throw error;
-    }
+    const orchestratorRuntime = resources.orchestratorRuntime;
+    if (!orchestratorRuntime) throw new Error("Orchestrator runtime is not available for harness startup");
+    await openServiceHarness(resources, (storage) => openWorkshopHarness(storage, (report) => {
+      if (storageFailed) return;
+      storageFailed = true;
+      storageFailure = report.error;
+      process.exitCode = 1;
+      logServiceError("fatal durable storage failure", report.error);
+      if (lifecycle.kind === "starting") {
+        const failed = transitionServiceLifecycle(lifecycle, { type: "fail", error: report.error });
+        if (failed.kind === "accepted") lifecycle = failed.state;
+      } else if (lifecycle.kind === "ready") {
+        void requestStop("fatal durable storage failure");
+      }
+    }, {
+      projectRoot,
+      models: orchestratorRuntime.models,
+      model: orchestratorRuntime.model,
+      escalationModel: orchestratorRuntime.escalationModel,
+      request: async (request, invocation) => {
+        const workshop = resources.workshop;
+        if (!serviceCanDispatchRequests(lifecycle) || !workshop) throw new Error("Workshop service is starting");
+        return await workshop.handleRequest(request, invocation);
+      },
+    }));
     assertStartupCanContinue();
 
     setStage("create-service");
@@ -326,7 +344,6 @@ export async function startService(): Promise<void> {
     process.removeListener("SIGTERM", onSignal);
   }
 }
-
 const invokedPath = process.argv[1];
 if (invokedPath !== undefined && pathToFileURL(resolve(invokedPath)).href === import.meta.url) {
   try {
