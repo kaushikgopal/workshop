@@ -11,7 +11,6 @@ export type StepAttemptTaskInput = {
   step: WorkflowStep;
   documents: Record<string, string>;
   files: Record<string, string>;
-  contents: Record<string, string>;
   profileCommands: Record<string, string[]>;
   runId: string;
   dataDirectory: string;
@@ -27,7 +26,6 @@ async function executeAttemptTask(input: StepAttemptTaskInput, runtime: StepAtte
     workflow: input.workflow,
     documents: input.documents,
     files: input.files,
-    contents: input.contents,
     workflowRunId: input.runId,
     profileCommands: input.profileCommands,
     executeProcess: (request) => executeWorkflowProcess({

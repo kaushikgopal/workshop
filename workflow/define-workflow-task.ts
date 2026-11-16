@@ -236,7 +236,7 @@ async function applyDecision(
       ...(applied.profile === undefined ? {} : { profile: applied.profile }),
       feedback: applied.feedback,
       decisionNumber: checkpoint.decisionNumber,
-      automaticRoundUsed: checkpoint.decisionSource === "round",
+      automaticRoundUsed: checkpoint.automaticRoundUsed || checkpoint.decisionSource === "round",
     };
     if (applied.after !== undefined) {
       const waitUntil = runtime.now() + durationMilliseconds(applied.after);
@@ -425,7 +425,6 @@ async function startStepAttempt(
     step,
     documents: loaded.documents,
     files: loaded.files,
-    contents: loaded.contents,
     profileCommands: input.profileCommands,
     runId: input.runId,
     dataDirectory: input.dataDirectory,

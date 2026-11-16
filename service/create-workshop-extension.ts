@@ -2,11 +2,12 @@ import { readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { Type } from "typebox";
 import { AssistantEntry, configure, defineExtension, defineTool, section } from "@earendil-works/pi-durable";
-import type { Extension, ToolRegistration } from "@earendil-works/pi-durable";
+import type { Extension, TaskId, ToolRegistration } from "@earendil-works/pi-durable";
 import type { ServiceResponse } from "./types.ts";
 import type { OrchestratorModel } from "./create-orchestrator-runtime.ts";
 
-export type WorkshopServiceRequest = (request: unknown) => Promise<ServiceResponse>;
+export type WorkshopServiceInvocation = { taskId: TaskId };
+export type WorkshopServiceRequest = (request: unknown, invocation?: WorkshopServiceInvocation) => Promise<ServiceResponse>;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -76,8 +77,8 @@ export function createWorkshopExtension(input: {
   const projectRoot = resolve(input.projectRoot);
   const request = input.request;
   const extensionRef: { current?: Extension } = {};
-  const send = async (type: string, fields: Record<string, unknown> = {}, requestId = `section:${type}`) =>
-    await request({ request_id: requestId, type, ...fields });
+  const send = async (type: string, fields: Record<string, unknown> = {}, requestId = `section:${type}`, invocation?: WorkshopServiceInvocation) =>
+    await request({ request_id: requestId, type, ...fields }, invocation);
 
   const listWorkflows = defineTool({
     name: "list_workflows",
@@ -111,15 +112,14 @@ export function createWorkshopExtension(input: {
   });
   const decideBlockedRun = defineTool({
     name: "decide_blocked_run",
-    description: "Decide a currently blocked run: retry, skip, accept, or fail. Include a note for automatic rounds.",
+    description: "Decide a currently blocked run: retry, skip, accept, or fail. Automatic failure rounds are bound to their blocked step by Workshop.",
     parameters: Type.Object({
       run_id: Type.String({ minLength: 1 }),
       decision_number: Type.Integer({ minimum: 1 }),
       decision: Type.Object({}, { additionalProperties: true }),
-      source: Type.Optional(Type.Union([Type.Literal("chat"), Type.Literal("round")])),
       note: Type.Optional(Type.String()),
     }),
-    execute: async (args, api, _context) => result(await send("decide_blocked_run", args, toolRequestId(api.callId))),
+    execute: async (args, api, _context) => result(await send("decide_blocked_run", args, toolRequestId(api.callId), { taskId: api.taskId })),
   });
   const cancelRun = defineTool({
     name: "cancel_run",

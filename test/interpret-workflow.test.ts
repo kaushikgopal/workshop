@@ -32,7 +32,6 @@ function makeInput(
     workflow,
     documents: {},
     files: Object.fromEntries(files.map((file) => [file, join("/workflows/clock", file)] as const)),
-    contents: Object.fromEntries(files.map((file) => [file, `fixture source for ${file}\n`] as const)),
     workflowRunId: "wrun_test_1",
     profileCommands: { writer: ["fake-writer"], judge: ["fake-judge"], fast: ["fake-writer", "--fast"] },
     executeProcess,
@@ -161,13 +160,7 @@ test("command checks accept on exit zero and feed a rejection back into the retr
     }
     if (request.kind === "command-check") return successful("");
     return successful(`candidate ${request.attempt}`);
-  }, undefined, {
-    contents: {
-      "10-checkable.sh": "printf 'captured step'\n",
-      "10-checkable.check.sh": "printf 'captured check'\n",
-    },
   }));
-
   assert.equal(result.output, "candidate 2");
   assert.deepEqual(calls.map(({ kind, input }) => [kind, input]), [
     ["command", ""],
@@ -175,11 +168,11 @@ test("command checks accept on exit zero and feed a rejection back into the retr
     ["command", ""],
     ["command-check", "candidate 2"],
   ]);
-  assert.deepEqual(calls.map(({ source }) => source?.content), [
-    "printf 'captured step'\n",
-    "printf 'captured check'\n",
-    "printf 'captured step'\n",
-    "printf 'captured check'\n",
+  assert.deepEqual(calls.map(({ command }) => command.map((part) => part.split("/").at(-1))), [
+    ["sh", "10-checkable.sh"],
+    ["sh", "10-checkable.check.sh"],
+    ["sh", "10-checkable.sh"],
+    ["sh", "10-checkable.check.sh"],
   ]);
   assert.equal(calls[2]?.feedback, "wrong output\nexpected a line");
 });
@@ -343,21 +336,20 @@ test("fake profile commands receive stdin and Workshop environment without a she
   });
 });
 
-test("command steps execute captured shell source with path and stdin semantics", async () => {
+test("command steps execute their file path with stdin semantics", async () => {
   await withRoot(async (root) => {
     const file = join(root, "10-step with spaces.sh");
-    writeFileSync(file, "printf 'live source'\n");
-    const content = `IFS= read -r line\nprintf 'captured:%s:%s' "$line" "$0"\n`;
+    const content = `IFS= read -r line\nprintf '%s:%s' "$line" "$0"\n`;
+    writeFileSync(file, content);
     const result = await executeWorkflowProcess({
       kind: "command",
       command: ["sh", file],
-      source: { path: file, content, kind: "shell" },
       input: "pipe content\n",
       step: "10-step",
       feedback: "",
       attempt: 1,
       workflow: "clock",
-      runId: "wrun_captured_shell",
+      runId: "wrun_file_path",
       projectRoot: root,
       dataDirectory: root,
       stateDirectory: root,
@@ -365,7 +357,49 @@ test("command steps execute captured shell source with path and stdin semantics"
     });
 
     assert.equal(result.exitCode, 0);
-    assert.equal(result.stdout, `captured:pipe content:${file}`);
+    assert.equal(result.stdout, `pipe content:${file}`);
+  });
+});
+
+test("typed TypeScript command steps and checks run through Node", async () => {
+  await withRoot(async (root) => {
+    const stepFile = join(root, "10-typed.ts");
+    const checkFile = join(root, "10-typed.check.ts");
+    writeFileSync(stepFile, [
+      "type Result = { text: string };",
+      'const result: Result = { text: "typed output" };',
+      "process.stdout.write(result.text);",
+      "",
+    ].join("\n"));
+    writeFileSync(checkFile, [
+      "let input = \"\";",
+      "for await (const chunk of process.stdin) input += chunk.toString();",
+      "const checked: string = input;",
+      'if (checked !== "typed output") throw new Error(`Unexpected input: ${checked}`);',
+      "",
+    ].join("\n"));
+    const workflow = makeWorkflow([{
+      kind: "command",
+      file: "10-typed.ts",
+      number: 10,
+      name: "typed",
+      check: { kind: "command", file: "10-typed.check.ts" },
+    }]);
+    const input = makeInput(workflow, (request) => executeWorkflowProcess({
+      ...request,
+      workflow: "clock",
+      runId: "typed-run",
+      projectRoot: root,
+      dataDirectory: root,
+      stateDirectory: root,
+      cwd: root,
+    }), undefined, {
+      files: { "10-typed.ts": stepFile, "10-typed.check.ts": checkFile },
+    });
+
+    const result = await interpretWorkflow(input);
+    assert.equal(result.status, "completed");
+    assert.equal(result.output, "typed output");
   });
 });
 
@@ -375,9 +409,8 @@ async function waitForProcessId(file: string): Promise<number> {
   const deadline = Date.now() + 5_000;
   while (Date.now() < deadline) {
     if (existsSync(file)) {
-      const pid = Number(readFileSync(file, "utf8"));
-      assert.ok(Number.isSafeInteger(pid) && pid > 0, "fixture must write a valid grandchild PID");
-      return pid;
+      const pid = Number(readFileSync(file, "utf8").trim());
+      if (Number.isSafeInteger(pid) && pid > 0) return pid;
     }
     await new Promise((resolveWait) => setTimeout(resolveWait, 20));
   }

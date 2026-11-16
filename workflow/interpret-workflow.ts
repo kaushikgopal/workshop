@@ -7,7 +7,6 @@ export type ProcessExecutionKind = "command" | "agent" | "command-check" | "agen
 export type ProcessExecutionRequest = {
   kind: ProcessExecutionKind;
   command: readonly string[];
-  source?: { path: string; content: string; kind: "shell" | "typescript" };
   input: string;
   step: string;
   feedback: string;
@@ -15,7 +14,6 @@ export type ProcessExecutionRequest = {
   attempt: number;
   profile?: string;
 };
-
 export type ProcessExecutionResult = {
   exitCode: number | null;
   stdout: string;
@@ -64,7 +62,6 @@ export type WorkflowInterpreterInput = {
   workflow: Workflow;
   documents: Record<string, string>;
   files: Record<string, string>;
-  contents?: Record<string, string>;
   workflowRunId: string;
   profileCommands: Record<string, string[]>;
   initialInput?: string;
@@ -143,12 +140,10 @@ async function executeAttempt(input: WorkflowInterpreterInput, step: WorkflowSte
   let output: string;
   if (step.kind === "command") {
     const file = input.files[step.file];
-    const content = input.contents?.[step.file];
-    if (file === undefined || content === undefined) throw new Error(`${id} file was not loaded when the step started`);
+    if (file === undefined) throw new Error(`${id} file was not loaded when the step started`);
     const result = await input.executeProcess({
       kind: "command",
-      command: [step.file.endsWith(".ts") ? "node" : "sh", file],
-      source: { path: file, content, kind: step.file.endsWith(".ts") ? "typescript" : "shell" },
+      command: [step.file.endsWith(".ts") ? process.execPath : "sh", file],
       input: pipeInput,
       step: id,
       feedback,
@@ -185,12 +180,10 @@ async function executeAttempt(input: WorkflowInterpreterInput, step: WorkflowSte
   const checkTimeout = timeoutMilliseconds(step.check.timeout ?? step.timeout ?? input.workflow.timeout);
   if (step.check.kind === "command") {
     const file = input.files[step.check.file];
-    const content = input.contents?.[step.check.file];
-    if (file === undefined || content === undefined) throw new Error(`${checkId} file was not loaded when the step started`);
+    if (file === undefined) throw new Error(`${checkId} file was not loaded when the step started`);
     const result = await input.executeProcess({
       kind: "command-check",
-      command: [step.check.file.endsWith(".ts") ? "node" : "sh", file],
-      source: { path: file, content, kind: step.check.file.endsWith(".ts") ? "typescript" : "shell" },
+      command: [step.check.file.endsWith(".ts") ? process.execPath : "sh", file],
       input: output,
       step: checkId,
       feedback,

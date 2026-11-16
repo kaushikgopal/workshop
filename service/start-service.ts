@@ -75,9 +75,9 @@ async function startService(): Promise<void> {
       models: orchestratorRuntime.models,
       model: orchestratorRuntime.model,
       escalationModel: orchestratorRuntime.escalationModel,
-      request: async (request) => {
+      request: async (request, invocation) => {
         if (!workshop) throw new Error("Workshop service is starting");
-        return await workshop.handleRequest(request);
+        return await workshop.handleRequest(request, invocation);
       },
     });
     workshop = createWorkshopService({ projectRoot, harness });

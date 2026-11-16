@@ -186,3 +186,114 @@ test("a killed service resumes the same parent and child tasks from SQLite", { s
     rmSync(projectRoot, { recursive: true, force: true });
   }
 });
+
+test("a completed step attempt is reused when the parent checkpoint lags", { skip: process.platform === "win32", timeout: 30_000 }, async () => {
+  const projectRoot = mkdtempSync(join(tmpdir(), "workshop-completed-attempt-test-"));
+  const workflowDirectory = join(projectRoot, "workflows", "clock");
+  const stateDirectory = join(projectRoot, "state");
+  const invocationFile = join(projectRoot, "invocations");
+  const checkpointFile = join(projectRoot, "child-completed");
+  mkdirSync(workflowDirectory, { recursive: true });
+  mkdirSync(stateDirectory, { recursive: true });
+  writeFileSync(join(projectRoot, "workshop.yaml"), [
+    "agent_profiles:",
+    `  writer:\n    command: ["${process.execPath}"]`,
+    "orchestrator: {}",
+    "",
+  ].join("\n"));
+  writeFileSync(join(workflowDirectory, "workflow.md"), "---\ncron: '* * * * *'\nretries: 0\n---\nCompleted-attempt fixture.\n");
+  writeFileSync(join(workflowDirectory, "10-finish.sh"), [
+    `printf 'called\\n' >> "$WORKSHOP_PROJECT_ROOT/invocations"`,
+    "printf 'finished output'",
+    "",
+  ].join("\n"));
+
+  let child: ReturnType<typeof spawn> | undefined;
+  let harness: Awaited<ReturnType<typeof createHarness>> | undefined;
+  let storage: Awaited<ReturnType<typeof openNodeSqliteStorage>> | undefined;
+  try {
+    const script = [
+      `import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";`,
+      `import { createModels } from "@earendil-works/pi-ai/models";`,
+      `import { createRegistry, Harness } from "@earendil-works/pi-durable";`,
+      `import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";`,
+      `import { startWorkflow, createWorkflowStartPort } from ${JSON.stringify(new URL("../run/start-workflow.ts", import.meta.url).href)};`,
+      `import { WorkflowTask } from ${JSON.stringify(new URL("../workflow/define-workflow-task.ts", import.meta.url).href)};`,
+      `import { StepAttemptTask } from ${JSON.stringify(new URL("../workflow/define-step-attempt-task.ts", import.meta.url).href)};`,
+      `const root = ${JSON.stringify(projectRoot)};`,
+      `const checkpointFile = ${JSON.stringify(checkpointFile)};`,
+      `const storage = await openNodeSqliteStorage(root + "/state/workshop.sqlite");`,
+      `const originalCommit = storage.commit.bind(storage);`,
+      `let paused = false;`,
+      `storage.commit = async (...args) => {`,
+      `  const result = await originalCommit(...args);`,
+      `  if (!paused) {`,
+      `    const page = await storage.scanTasks({}, 1000, undefined, BACKGROUND_CONTEXT);`,
+      `    const parent = page.items.find((task) => task.kind === "workshop.workflow" && task.state.checkpoint?.phase === "attempt");`,
+      `    const active = parent?.state.checkpoint?.activeAttempt;`,
+      `    const attempt = active ? await storage.task(active.taskId, BACKGROUND_CONTEXT) : undefined;`,
+      `    if (attempt?.state.status === "terminal" && attempt.state.outcome.status === "completed") {`,
+      `      paused = true;`,
+      `      const { writeFileSync } = await import("node:fs");`,
+      `      writeFileSync(checkpointFile, "child complete; parent still waiting");`,
+      `      await new Promise(() => {});`,
+      `    }`,
+      `  }`,
+      `  return result;`,
+      `};`,
+      `const registry = createRegistry(); registry.install({ name: "workshop", tasks: [WorkflowTask, StepAttemptTask] });`,
+      `const harness = await Harness.open(storage, { models: createModels(), registry }, BACKGROUND_CONTEXT);`,
+      `harness.resume();`,
+      `const port = await createWorkflowStartPort(harness);`,
+      `const started = await startWorkflow({ workflowName: "clock", projectRoot: root, port });`,
+      `process.stdout.write(JSON.stringify(started) + "\\n");`,
+      `setInterval(() => {}, 1000);`,
+    ].join("\n");
+    child = spawn(process.execPath, ["--input-type=module", "-e", script], {
+      cwd: resolve("."),
+      env: { ...process.env, WORKSHOP_CONFIG: join(projectRoot, "workshop.yaml") },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const runId = await startedRun(child);
+    const deadline = Date.now() + 10_000;
+    while (!existsSync(checkpointFile) && Date.now() < deadline) await new Promise((resolveWait) => setTimeout(resolveWait, 20));
+    assert.ok(existsSync(checkpointFile), "the child result reached storage before its parent checkpoint");
+    child.kill("SIGKILL");
+    await once(child, "exit");
+    child = undefined;
+
+    storage = await openNodeSqliteStorage(join(stateDirectory, "workshop.sqlite"));
+    harness = await createHarness(storage);
+    const beforeRestart = (await storage.scanTasks({ kind: WORKFLOW_TASK_NAME }, 100, undefined, BACKGROUND_CONTEXT)).items.find((record) => isRecord(record.input) && record.input.runId === runId);
+    assert.ok(beforeRestart, "SQLite retains the parent task");
+    if (!beforeRestart || beforeRestart.state.status !== "waiting" || !isRecord(beforeRestart.state.checkpoint)) return;
+    const active = beforeRestart.state.checkpoint.activeAttempt;
+    assert.ok(isRecord(active) && (typeof active.taskId === "string" || typeof active.taskId === "number"));
+    if (!isRecord(active) || (typeof active.taskId !== "string" && typeof active.taskId !== "number")) return;
+    const completedAttempt = await taskById(storage, active.taskId);
+    assert.equal(completedAttempt.kind, STEP_ATTEMPT_TASK_NAME);
+    assert.equal(completedAttempt.state.status, "terminal");
+    if (completedAttempt.state.status === "terminal") assert.equal(completedAttempt.state.outcome.status, "completed");
+
+    harness.resume();
+    const settled = await harness.waitForTask(beforeRestart.id, BACKGROUND_CONTEXT);
+    assert.equal(settled.state.status, "terminal");
+    if (settled.state.status === "terminal") {
+      assert.equal(settled.state.outcome.status, "completed");
+      if (settled.state.outcome.status === "completed") {
+        const result = settled.state.outcome.result;
+        assert.ok(isRecord(result));
+        if (isRecord(result)) assert.equal(result.output, "finished output");
+      }
+    }
+    assert.equal(readFileSync(invocationFile, "utf8").trim().split(/\r?\n/).length, 1);
+  } finally {
+    if (child && child.exitCode === null) {
+      child.kill("SIGKILL");
+      await once(child, "exit");
+    }
+    if (harness) await harness.close(BACKGROUND_CONTEXT);
+    else if (storage) await storage.close(BACKGROUND_CONTEXT);
+    rmSync(projectRoot, { recursive: true, force: true });
+  }
+});

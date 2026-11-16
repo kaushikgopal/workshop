@@ -1,7 +1,8 @@
 import { resolve } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { AssistantEntry, type ConversationView, type Harness, type TaskRecord } from "@earendil-works/pi-durable";
+import { AssistantEntry, LiveDoc, type ConversationView, type Harness, type TaskId, type TaskRecord } from "@earendil-works/pi-durable";
 import type { JsonValue } from "@earendil-works/chord/json";
+import type { WorkshopServiceInvocation } from "./create-workshop-extension.ts";
 import { checkProfileCommands, readConfig } from "../config/read-workshop-config.ts";
 import { createWorkflowStartPort, startWorkflow, type StartWorkflowOutcome } from "../run/start-workflow.ts";
 import { appendRecent, workshopStateDocument, workflowRunReferenceDocument, type WorkshopAction, type WorkshopState } from "../run/workshop-state.ts";
@@ -13,7 +14,7 @@ import { parseWorkflowDecision } from "../workflow/parse-workflow-decision.ts";
 import type { WorkflowDecision } from "../workflow/types.ts";
 
 export type WorkshopService = {
-  handleRequest(value: unknown): Promise<ServiceResponse>;
+  handleRequest(value: unknown, invocation?: WorkshopServiceInvocation): Promise<ServiceResponse>;
   watchChat(requestId: string, send: (event: ServiceResponse) => void): Promise<{ close(): Promise<void> }>;
 };
 
@@ -162,6 +163,63 @@ async function taskForRun(harness: Harness, runId: string): Promise<WorkflowTask
   return record;
 }
 
+type FailureRound = { runId: string; step: string; attempt: number; decisionNumber: number };
+
+function parseFailureRoundRequestId(requestId: string | undefined): Omit<FailureRound, "decisionNumber"> | undefined {
+  const match = requestId === undefined ? null : /^round:([^:]+):(.+):([1-9][0-9]*)$/.exec(requestId);
+  if (!match?.[1] || !match[2] || !match[3]) return undefined;
+  const attempt = Number(match[3]);
+  if (!Number.isSafeInteger(attempt)) return undefined;
+  return { runId: match[1], step: match[2], attempt };
+}
+
+async function failureRoundForTool(harness: Harness, taskId: TaskId): Promise<FailureRound | undefined> {
+  const tool = await harness.getTask(taskId, BACKGROUND_CONTEXT);
+  if (!tool) throw new Error("Decision tool task is unavailable");
+  const root = await harness.root(BACKGROUND_CONTEXT);
+  if (tool.conversationId !== root.id) throw new Error("Blocked-run decisions are only available in the root conversation");
+
+  const live = await harness.snapshot(LiveDoc, tool.conversationId, BACKGROUND_CONTEXT);
+  if (!live?.run) throw new Error("Blocked-run decision has no active orchestrator turn");
+  const rounds: Omit<FailureRound, "decisionNumber">[] = [];
+  for (const submissionId of live.run.inputs) {
+    const submission = await harness.submission(submissionId, BACKGROUND_CONTEXT);
+    const record = await submission?.status(BACKGROUND_CONTEXT);
+    if (!record?.requestId?.startsWith("round:")) continue;
+    const round = parseFailureRoundRequestId(record.requestId);
+    if (!round) throw new Error("Automatic failure round has an invalid request ID");
+    rounds.push(round);
+  }
+  if (rounds.length === 0) return undefined;
+  if (rounds.length !== 1) throw new Error("This orchestrator turn contains multiple failure rounds; no blocked-run decision was applied");
+  const round = rounds[0];
+  if (!round) throw new Error("Automatic failure round context is unavailable");
+
+  if (!isRecord(tool.input) || tool.input.kind !== "model" ||
+    (typeof tool.input.assistant !== "string" && typeof tool.input.assistant !== "number") || tool.owner === undefined) {
+    throw new Error("Automatic failure round tool context is unavailable");
+  }
+  const generation = await harness.getTask(tool.owner, BACKGROUND_CONTEXT);
+  if (!generation || generation.kind !== "pi.generation" || !isRecord(generation.state)) {
+    throw new Error("Automatic failure round generation is unavailable");
+  }
+  const generationCheckpoint = generation.state.checkpoint;
+  if (!isRecord(generationCheckpoint) || generationCheckpoint.phase !== "tools" ||
+    generationCheckpoint.assistant !== tool.input.assistant || !Array.isArray(generationCheckpoint.tools) ||
+    !generationCheckpoint.tools.some((id) => String(id) === String(tool.id)) ||
+    String(live.run.taskId) !== String(generation.id)) {
+    throw new Error("Automatic failure round does not match the current tool call");
+  }
+
+  const record = await taskForRun(harness, round.runId);
+  const checkpoint = record === undefined ? undefined : checkpointOf(record);
+  if (!checkpoint || checkpoint.phase !== "blocked" || checkpoint.failure.step !== round.step ||
+    checkpoint.failure.attemptHistory.at(-1)?.attempt !== round.attempt) {
+    throw new Error("This failure round no longer matches its blocked step");
+  }
+  return { ...round, decisionNumber: checkpoint.failure.decisionNumber };
+}
+
 function actionNote(decision: WorkflowDecision, source: "chat" | "round"): string {
   const by = source === "round" ? "automatic failure round" : "chat";
   if (decision.action === "retry") return [decision.hint, decision.after === undefined ? undefined : `retry after ${decision.after}`].filter(Boolean).join("; ") || `Step retried by ${by}.`;
@@ -297,7 +355,10 @@ export function createWorkshopService(input: { projectRoot: string; harness: Har
     for (const watcher of chatWatchers) watcher.refresh();
   };
 
-  async function decideBlockedRun(request: Extract<ServiceRequest, { type: "decide_blocked_run" }>): Promise<ServiceResponse> {
+  async function decideBlockedRun(
+    request: Extract<ServiceRequest, { type: "decide_blocked_run" }>,
+    source: "chat" | "round",
+  ): Promise<ServiceResponse> {
     const decision = parseWorkflowDecision(request.decision);
     const previousState = await input.harness.snapshot(workshopStateDocument, BACKGROUND_CONTEXT);
     const prior = previousState === undefined ? undefined : receiptFor(previousState, request);
@@ -329,9 +390,9 @@ export function createWorkshopService(input: { projectRoot: string; harness: Har
       }
       const document = await tx.doc(workflowDecisionDocument, record.id);
       if (document.choice !== null) throw new Error("A decision was already accepted for this blocked step");
-      document.choice = { requestId: request.request_id, decisionNumber: request.decision_number, decision, source: request.source ?? "chat" };
+      document.choice = { requestId: request.request_id, decisionNumber: request.decision_number, decision, source };
       const response: ServiceResponse = { request_id: request.request_id, ok: true, run_id: request.run_id, decision };
-      appendRecent(state.actions, actionForDecision(failure.workflow, request.run_id, failure.step, decision, request.source ?? "chat", request.note, new Date().toISOString()));
+      appendRecent(state.actions, actionForDecision(failure.workflow, request.run_id, failure.step, decision, source, request.note, new Date().toISOString()));
       saveReceipt(state, request, response);
       return response;
     }, BACKGROUND_CONTEXT);
@@ -534,7 +595,7 @@ export function createWorkshopService(input: { projectRoot: string; harness: Har
     };
   }
 
-  async function handleRequest(value: unknown): Promise<ServiceResponse> {
+  async function handleRequest(value: unknown, invocation?: WorkshopServiceInvocation): Promise<ServiceResponse> {
     const request = parseServiceRequest(value);
     switch (request.type) {
       case "list_workflows": {
@@ -619,8 +680,15 @@ export function createWorkshopService(input: { projectRoot: string; harness: Har
         });
         return result.kind === "replayed" ? responseFromReceipt(result.response) : startResponse(request.request_id, result);
       }
-      case "decide_blocked_run":
-        return await decideBlockedRun(request);
+      case "decide_blocked_run": {
+        const round = invocation === undefined ? undefined : await failureRoundForTool(input.harness, invocation.taskId);
+        if (round) return await decideBlockedRun({
+          ...request,
+          run_id: round.runId,
+          decision_number: round.decisionNumber,
+        }, "round");
+        return await decideBlockedRun(request, "chat");
+      }
       case "cancel_run": {
         const previous = await input.harness.snapshot(workshopStateDocument, BACKGROUND_CONTEXT);
         const prior = previous === undefined ? undefined : receiptFor(previous, request);
@@ -635,13 +703,15 @@ export function createWorkshopService(input: { projectRoot: string; harness: Har
         if (!record) throw new Error(`Workflow run ${request.run_id} was not found`);
         const run = runInputOf(record);
         if (!run) throw new Error("Durable workflow task has invalid run metadata");
-        const response = await input.harness.commit(async (tx) => {
+        const abortRequested = liveStatus(record);
+        const abortResult = abortRequested ? await input.harness.abortTask(record.id, BACKGROUND_CONTEXT) : undefined;
+        return await input.harness.commit(async (tx) => {
           const state = await tx.doc(workshopStateDocument);
           const prior = receiptFor(state, request);
           if (prior) return prior;
           const current = await tx.task(record.id);
           if (!current || current.kind !== WORKFLOW_TASK_NAME) throw new Error(`Workflow run ${request.run_id} was not found`);
-          const cancelled = liveStatus(current);
+          const cancelled = statusOf(current) === "cancelled" || (abortRequested && abortResult === "marked");
           const result: ServiceResponse = cancelled
             ? { request_id: request.request_id, ok: true, run_id: request.run_id, workflow: run.workflow, status: "cancellation-requested", cancelled: true }
             : { request_id: request.request_id, ok: true, run_id: request.run_id, workflow: run.workflow, status: statusOf(current), cancelled: false };
@@ -657,8 +727,6 @@ export function createWorkshopService(input: { projectRoot: string; harness: Har
           saveReceipt(state, request, result);
           return result;
         }, BACKGROUND_CONTEXT);
-        if (response.cancelled === true) await input.harness.abortTask(record.id, BACKGROUND_CONTEXT);
-        return response;
       }
       case "pause_workflow":
       case "resume_workflow":

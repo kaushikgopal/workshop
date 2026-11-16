@@ -1,6 +1,4 @@
 import { spawn } from "node:child_process";
-import { pathToFileURL } from "node:url";
-import type { Writable } from "node:stream";
 import type { ProcessExecutionRequest, ProcessExecutionResult } from "../workflow/interpret-workflow.ts";
 
 type ExecuteWorkflowProcessInput = ProcessExecutionRequest & {
@@ -30,26 +28,9 @@ function terminateGroup(pid: number, signal: NodeJS.Signals): void {
 
 const terminationGraceMs = 250;
 
-function commandForInput(input: ExecuteWorkflowProcessInput): readonly string[] {
-  const source = input.source;
-  if (!source) return input.command;
-  if (source.kind === "shell") return ["sh", "-c", "eval \"$(cat <&3)\"", source.path];
-
-  const loader = [
-    'import { readFileSync } from "node:fs";',
-    'import { registerHooks } from "node:module";',
-    `const entry = ${JSON.stringify(pathToFileURL(source.path).href)};`,
-    'registerHooks({ load(url, context, nextLoad) {',
-    '  if (url === entry) return { format: "module", source: readFileSync(3, "utf8"), shortCircuit: true };',
-    '  return nextLoad(url, context);',
-    '} });',
-  ].join("\n");
-  const loaderUrl = `data:text/javascript;base64,${Buffer.from(loader).toString("base64")}`;
-  return [process.execPath, "--experimental-strip-types", "--import", loaderUrl, source.path];
-}
 
 export async function executeWorkflowProcess(input: ExecuteWorkflowProcessInput): Promise<ProcessExecutionResult> {
-  const [executable, ...args] = commandForInput(input);
+  const [executable, ...args] = input.command;
   if (!executable) return { exitCode: null, stdout: "", stderr: "", timedOut: false, error: "process command is empty" };
 
   let child: ReturnType<typeof spawn>;
@@ -67,7 +48,7 @@ export async function executeWorkflowProcess(input: ExecuteWorkflowProcessInput)
         WORKSHOP_FEEDBACK: input.feedback,
       },
       detached: process.platform !== "win32",
-      stdio: input.source === undefined ? ["pipe", "pipe", "pipe"] : ["pipe", "pipe", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "pipe"],
     });
   } catch (error) {
     return { exitCode: null, stdout: "", stderr: "", timedOut: false, error: error instanceof Error ? error.message : String(error) };
@@ -76,8 +57,7 @@ export async function executeWorkflowProcess(input: ExecuteWorkflowProcessInput)
   const stdin = child.stdin;
   const stdoutStream = child.stdout;
   const stderrStream = child.stderr;
-  const sourceStream = input.source === undefined ? undefined : child.stdio[3] as Writable | null;
-  if (!stdin || !stdoutStream || !stderrStream || (input.source !== undefined && !sourceStream)) {
+  if (!stdin || !stdoutStream || !stderrStream) {
     if (child.pid !== undefined) terminateGroup(child.pid, "SIGKILL");
     else child.kill("SIGKILL");
     return { exitCode: null, stdout: "", stderr: "", timedOut: false, error: "process pipes could not be opened" };
@@ -136,9 +116,6 @@ export async function executeWorkflowProcess(input: ExecuteWorkflowProcessInput)
     stdin.on("error", (error: NodeJS.ErrnoException) => {
       if (error.code !== "EPIPE") processError = error.message;
     });
-    sourceStream?.on("error", (error: NodeJS.ErrnoException) => {
-      if (error.code !== "EPIPE") processError = error.message;
-    });
     child.once("error", (error) => { processError = error.message; });
     child.once("close", (exitCode, exitSignal) => {
       processClosed = true;
@@ -154,7 +131,6 @@ export async function executeWorkflowProcess(input: ExecuteWorkflowProcessInput)
         stopProcessGroup();
       }, input.timeoutMs);
     }
-    if (input.source !== undefined) sourceStream?.end(input.source.content);
     stdin.end(input.input);
   });
 }

@@ -17,7 +17,6 @@ const serviceRequestSchema = z.discriminatedUnion("type", [
     run_id: z.string().min(1),
     decision_number: z.number().int().positive(),
     decision: z.unknown(),
-    source: z.enum(["chat", "round"]).optional(),
     note: z.string().optional(),
   }).strict(),
   z.object({ request_id: requestId, type: z.literal("cancel_run"), run_id: z.string().min(1) }).strict(),

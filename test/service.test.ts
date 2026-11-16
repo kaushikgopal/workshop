@@ -7,11 +7,11 @@ import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
-import { createRegistry, defineDoc, Harness, MemoryStorage, type TaskRecord } from "@earendil-works/pi-durable";
+import { createRegistry, defineDoc, Harness, MemoryStorage, type Storage, type TaskRecord } from "@earendil-works/pi-durable";
 import type { JsonValue } from "@earendil-works/chord/json";
 import { test } from "node:test";
-import { createWorkflowStartPort } from "../run/start-workflow.ts";
-import { appendRecent, maxWorkshopHistoryRecords, workshopStateDocument, type MutationReceipt, type WorkshopAction, type WorkflowAdmission } from "../run/workshop-state.ts";
+import { createWorkflowStartPort, startWorkflow } from "../run/start-workflow.ts";
+import { appendRecent, maxWorkshopHistoryRecords, workshopStateDocument, workflowRunReferenceDocument, type MutationReceipt, type WorkshopAction, type WorkflowAdmission } from "../run/workshop-state.ts";
 import { createWorkshopService } from "../service/create-workshop-service.ts";
 import { openWorkshopHarness } from "../service/open-workshop-harness.ts";
 import { serveServiceSocket } from "../service/serve-service-socket.ts";
@@ -37,7 +37,7 @@ function createProject(command: string, extraFrontmatter = ""): { root: string }
   return { root };
 }
 
-function createHarness(storage: MemoryStorage) {
+function createHarness(storage: Storage) {
   const registry = createRegistry();
   registry.install({ name: "workshop", tasks: [WorkflowTask, StepAttemptTask] });
   return Harness.open(storage, { models: createModels(), registry }, BACKGROUND_CONTEXT);
@@ -70,7 +70,7 @@ function transcriptText(messages: unknown): string {
   }).join("\n");
 }
 
-async function waitForTask(storage: MemoryStorage, runId: string): Promise<TaskRecord<JsonValue, JsonValue, JsonValue>> {
+async function waitForTask(storage: Storage, runId: string): Promise<TaskRecord<JsonValue, JsonValue, JsonValue>> {
   for (let attempt = 0; attempt < 200; attempt += 1) {
     const page = await storage.scanTasks({ kind: WORKFLOW_TASK_NAME }, 100, undefined, BACKGROUND_CONTEXT);
     const found = page.items.find((record) => isRecord(record.input) && record.input.runId === runId);
@@ -89,7 +89,7 @@ async function waitForFile(file: string, timeoutMs = 5_000): Promise<void> {
   throw new Error(`Timed out waiting for ${file}`);
 }
 
-async function waitForRunStatus(service: ReturnType<typeof createWorkshopService>, storage: MemoryStorage, runId: string, expected: string): Promise<Record<string, unknown>> {
+async function waitForRunStatus(service: ReturnType<typeof createWorkshopService>, storage: Storage, runId: string, expected: string): Promise<Record<string, unknown>> {
   let lastRun: unknown;
   for (let attempt = 0; attempt < 200; attempt += 1) {
     const response = await service.handleRequest({ request_id: `read-${attempt}`, type: "read_run", run_id: runId });
@@ -205,7 +205,27 @@ test("service starts, lists, reads, and cancels a workflow run", async () => {
     assert.ok(isRecord(reading.run));
     assert.ok(["running", "blocked"].includes(String(reading.run.status)));
 
-    const cancelled = await service.handleRequest({ request_id: "cancel", type: "cancel_run", run_id: runId });
+    const cancelRequest = { request_id: "cancel", type: "cancel_run", run_id: runId };
+    const abort = harness.abortTask.bind(harness);
+    harness.abortTask = async () => { throw new Error("simulated crash before abort"); };
+    await assert.rejects(service.handleRequest(cancelRequest), /simulated crash before abort/);
+    const beforeRetry = await harness.snapshot(workshopStateDocument, BACKGROUND_CONTEXT);
+    assert.equal(beforeRetry?.receipts.some((receipt) => receipt.request_id === "cancel"), false);
+    assert.equal(beforeRetry?.actions.some((action) => action.decision.action === "cancel"), false);
+    harness.abortTask = async (taskId, context) => {
+      await abort(taskId, context);
+      throw new Error("simulated crash after abort");
+    };
+    await assert.rejects(service.handleRequest(cancelRequest), /simulated crash after abort/);
+    const settledAfterAbort = await harness.waitForTask(task.id, BACKGROUND_CONTEXT);
+    assert.equal(settledAfterAbort.state.status, "terminal");
+    if (settledAfterAbort.state.status === "terminal") assert.equal(settledAfterAbort.state.outcome.status, "aborted");
+    const afterAbort = await harness.snapshot(workshopStateDocument, BACKGROUND_CONTEXT);
+    assert.equal(afterAbort?.receipts.some((receipt) => receipt.request_id === "cancel"), false);
+    assert.equal(afterAbort?.actions.some((action) => action.decision.action === "cancel"), false);
+    harness.abortTask = abort;
+
+    const cancelled = await service.handleRequest(cancelRequest);
     assert.equal(cancelled.ok, true);
     assert.equal(cancelled.cancelled, true);
     const settled = await harness.waitForTask(task.id, BACKGROUND_CONTEXT);
@@ -260,6 +280,55 @@ test("service decisions wake blocked tasks and deduplicate retried requests", as
   }
 });
 
+test("a blocked run accepts a chat decision after reopening SQLite", { timeout: 30_000 }, async () => {
+  const project = createProject("exit 7\n", "retries: 0\n");
+  const stateDirectory = join(project.root, "state");
+  mkdirSync(stateDirectory, { recursive: true });
+  const databasePath = join(stateDirectory, "workshop.sqlite");
+  let firstHarness: Awaited<ReturnType<typeof createHarness>> | undefined;
+  let secondHarness: Awaited<ReturnType<typeof createHarness>> | undefined;
+  let firstStorage: Storage | undefined;
+  try {
+    firstStorage = await openNodeSqliteStorage(databasePath);
+    firstHarness = await createHarness(firstStorage);
+    firstHarness.resume();
+    const firstService = createWorkshopService({ projectRoot: project.root, harness: firstHarness });
+    const started = await firstService.handleRequest({ request_id: "start-before-reopen", type: "start_workflow", workflow: "clock" });
+    const runId = runIdFrom(started);
+    await waitForRunStatus(firstService, firstStorage, runId, "blocked");
+    await firstHarness.close(BACKGROUND_CONTEXT);
+    firstHarness = undefined;
+    firstStorage = undefined;
+
+    secondHarness = await createHarness(await openNodeSqliteStorage(databasePath));
+    secondHarness.resume();
+    const secondService = createWorkshopService({ projectRoot: project.root, harness: secondHarness });
+    const decision = await secondService.handleRequest({
+      request_id: "decision-after-reopen",
+      type: "decide_blocked_run",
+      run_id: runId,
+      decision_number: 1,
+      decision: { action: "skip" },
+    });
+    assert.equal(decision.ok, true);
+
+    const reference = await secondHarness.snapshot(workflowRunReferenceDocument, runId, BACKGROUND_CONTEXT);
+    assert.ok(reference);
+    if (!reference) return;
+    const settled = await secondHarness.waitForTask(reference.task_id, BACKGROUND_CONTEXT);
+    assert.equal(settled.state.status, "terminal");
+    if (settled.state.status === "terminal") assert.equal(settled.state.outcome.status, "completed");
+    const state = await secondHarness.snapshot(workshopStateDocument, BACKGROUND_CONTEXT);
+    const action = state?.actions.find((entry) => entry.run_id === runId && entry.decision.action === "skip");
+    assert.equal(action?.source, "chat");
+  } finally {
+    if (firstHarness) await firstHarness.close(BACKGROUND_CONTEXT);
+    if (secondHarness) await secondHarness.close(BACKGROUND_CONTEXT);
+    rmSync(project.root, { recursive: true, force: true });
+  }
+});
+
+
 test("service rejects accepting an empty blocked result", async () => {
   const project = createProject("exit 7\n", "retries: 0\n");
   const storage = new MemoryStorage();
@@ -281,6 +350,57 @@ test("service rejects accepting an empty blocked result", async () => {
     rmSync(project.root, { recursive: true, force: true });
   }
 });
+test("two concurrent conflicting decisions allow only one winner", async () => {
+  const project = createProject("exit 7\n", "retries: 0\n");
+  const storage = new MemoryStorage();
+  let harness: Awaited<ReturnType<typeof createHarness>> | undefined;
+  try {
+    harness = await createHarness(storage);
+    harness.resume();
+    const service = createWorkshopService({ projectRoot: project.root, harness });
+    const started = await service.handleRequest({ request_id: "start-conflicting", type: "start_workflow", workflow: "clock" });
+    const runId = runIdFrom(started);
+    await waitForRunStatus(service, storage, runId, "blocked");
+    const requests = [
+      { request_id: "choose-skip", type: "decide_blocked_run", run_id: runId, decision_number: 1, decision: { action: "skip" } },
+      { request_id: "choose-fail", type: "decide_blocked_run", run_id: runId, decision_number: 1, decision: { action: "fail" } },
+    ] as const;
+
+    const results = await Promise.allSettled(requests.map((request) => service.handleRequest(request)));
+    const winners = results.flatMap((result, index) => result.status === "fulfilled" && result.value.ok ? [{ request: requests[index], response: result.value }] : []);
+    assert.equal(winners.length, 1);
+    const winner = winners[0];
+    assert.ok(winner);
+    assert.equal(results.filter((result) => result.status === "rejected").length, 1);
+    const task = await waitForTask(storage, runId);
+    const settled = await harness.waitForTask(task.id, BACKGROUND_CONTEXT);
+    assert.equal(settled.state.status, "terminal");
+    if (settled.state.status === "terminal") {
+      const winningAction = isRecord(winner.response.decision) ? winner.response.decision.action : undefined;
+      if (winningAction === "skip") assert.equal(settled.state.outcome.status, "completed");
+      else assert.equal(settled.state.outcome.status, "failed");
+    }
+    const state = await harness.snapshot(workshopStateDocument, BACKGROUND_CONTEXT);
+    assert.equal(state?.actions.filter((action) => action.run_id === runId && action.source === "chat" &&
+      (action.decision.action === "skip" || action.decision.action === "fail")).length, 1);
+  } finally {
+    if (harness) await harness.close(BACKGROUND_CONTEXT);
+    rmSync(project.root, { recursive: true, force: true });
+  }
+});
+
+test("decision source is not accepted from service requests", () => {
+  assert.throws(() => parseServiceRequest({
+    request_id: "forged-source",
+    type: "decide_blocked_run",
+    run_id: "run-1",
+    decision_number: 1,
+    decision: { action: "skip" },
+    source: "round",
+  }), /source/);
+});
+
+
 
 test("a delayed decision cannot affect a later blocked step in the same run", async () => {
   const project = createProject("printf 'first failure'; exit 7\n", "retries: 0\n");
@@ -368,6 +488,33 @@ test("scheduled ticks start once per slot and persist max_runs skips", async () 
     rmSync(project.root, { recursive: true, force: true });
   }
 });
+test("concurrent starts of one workflow slot create one run", async () => {
+  const project = createProject("printf 'slot'\n");
+  const storage = new MemoryStorage();
+  let harness: Awaited<ReturnType<typeof createHarness>> | undefined;
+  try {
+    harness = await createHarness(storage);
+    const port = await createWorkflowStartPort(harness);
+    const start = {
+      workflowName: "clock",
+      projectRoot: project.root,
+      port,
+      slot: "2026-11-15T12:00:00.000Z",
+      at: new Date("2026-11-15T12:00:30.000Z"),
+    };
+    const results = await Promise.all([startWorkflow(start), startWorkflow(start)]);
+    assert.deepEqual(results.map(({ kind }) => kind).sort(), ["already-indexed", "started"]);
+    const tasks = await storage.scanTasks({ kind: WORKFLOW_TASK_NAME }, 100, undefined, BACKGROUND_CONTEXT);
+    assert.equal(tasks.items.filter((task) => isRecord(task.input) && task.input.workflowName === "clock").length, 1);
+    const state = await harness.snapshot(workshopStateDocument, BACKGROUND_CONTEXT);
+    assert.equal(state?.admissions.filter((admission) => admission.slot === start.slot).length, 1);
+  } finally {
+    if (harness) await harness.close(BACKGROUND_CONTEXT);
+    rmSync(project.root, { recursive: true, force: true });
+  }
+});
+
+
 
 
 test("workflow named constructor keeps its own schedule counters", async () => {
@@ -794,10 +941,9 @@ test("the durable failure round records its keyed tool decision once", async () 
       const match = /with run_id ([^,]+), decision_number ([0-9]+)/.exec(prompt);
       if (!match?.[1] || !match[2]) throw new Error(`failure prompt omitted run and decision IDs: ${prompt}`);
       return fauxAssistantMessage(fauxToolCall("decide_blocked_run", {
-        run_id: match[1],
-        decision_number: Number(match[2]),
+        run_id: "model-selected-another-run",
+        decision_number: 999,
         decision: { action: "skip" },
-        source: "round",
         note: "Skipped after the command failed.",
       }), { stopReason: "toolUse" });
     },
@@ -815,9 +961,9 @@ test("the durable failure round records its keyed tool decision once", async () 
       models,
       model: configuredModel,
       escalationModel: configuredModel,
-      request: async (request) => {
+      request: async (request, invocation) => {
         if (!service) throw new Error("Workshop service is not ready");
-        return await service.handleRequest(request);
+        return await service.handleRequest(request, invocation);
       },
     });
     service = createWorkshopService({ projectRoot: project.root, harness });
@@ -849,8 +995,178 @@ test("the durable failure round records its keyed tool decision once", async () 
     const roundAction = recordsFrom(actions.actions).find((action) => action.source === "round");
     assert.ok(roundAction);
     assert.equal(isRecord(roundAction.decision) ? roundAction.decision.action : undefined, "skip");
+    assert.equal(roundAction.run_id, runId);
     assert.equal(roundAction.note, "Skipped after the command failed.");
     assert.equal(faux.state.callCount, 2);
+  } finally {
+    if (harness) await harness.close(BACKGROUND_CONTEXT);
+    rmSync(project.root, { recursive: true, force: true });
+  }
+});
+
+test("a failed retry from the failure round stays blocked for chat", { timeout: 30_000 }, async () => {
+  const project = createProject("printf 'still broken'; exit 7\n", "retries: 0\n");
+  const storage = new MemoryStorage();
+  const faux = fauxProvider();
+  const models = createModels();
+  models.setProvider(faux.provider);
+  const model = faux.getModel();
+  assert.ok(model);
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("decide_blocked_run", {
+      run_id: "wrong-run",
+      decision_number: 999,
+      decision: { action: "retry", hint: "Retry once." },
+      note: "Retry the blocked step.",
+    }), { stopReason: "toolUse" }),
+    fauxAssistantMessage("The retry was requested."),
+  ]);
+  const configuredModel = {
+    model: { provider: model.provider, modelId: model.id },
+    thinkingLevel: "medium" as const,
+  };
+  let service: ReturnType<typeof createWorkshopService> | undefined;
+  let harness: Awaited<ReturnType<typeof openWorkshopHarness>> | undefined;
+  try {
+    harness = await openWorkshopHarness(storage, undefined, {
+      projectRoot: project.root,
+      models,
+      model: configuredModel,
+      escalationModel: configuredModel,
+      request: async (request, invocation) => {
+        if (!service) throw new Error("Workshop service is not ready");
+        return await service.handleRequest(request, invocation);
+      },
+    });
+    service = createWorkshopService({ projectRoot: project.root, harness });
+    harness.resume();
+    const started = await service.handleRequest({ request_id: "start-round-retry", type: "start_workflow", workflow: "clock" });
+    const runId = runIdFrom(started);
+    let secondBlocked: Record<string, unknown> | undefined;
+    for (let attempt = 0; attempt < 500; attempt += 1) {
+      const response = await service.handleRequest({ request_id: `read-round-retry-${attempt}`, type: "read_run", run_id: runId });
+      if (isRecord(response.run) && isRecord(response.run.blocked_step) && response.run.blocked_step.decision_number === 2) {
+        secondBlocked = response.run;
+        break;
+      }
+      await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+    }
+    assert.ok(secondBlocked, "the failed retry should leave decision 2 blocked");
+    const root = await harness.root(BACKGROUND_CONTEXT);
+    const submissions = await storage.scanSubmissions({ conversationId: root.id }, 100, undefined, BACKGROUND_CONTEXT);
+    assert.deepEqual(submissions.items.filter((submission) => submission.requestId?.startsWith(`round:${runId}:`)).map(({ requestId }) => requestId), [
+      `round:${runId}:10-task:1`,
+    ]);
+    const beforeChat = await service.handleRequest({ request_id: "round-retry-actions", type: "list_actions", limit: 20 });
+    const roundAction = recordsFrom(beforeChat.actions).find((action) => action.run_id === runId && action.source === "round");
+    assert.ok(roundAction);
+    assert.equal(isRecord(roundAction.decision) ? roundAction.decision.action : undefined, "retry");
+
+    const decision = await service.handleRequest({
+      request_id: "chat-resolves-round-retry",
+      type: "decide_blocked_run",
+      run_id: runId,
+      decision_number: 2,
+      decision: { action: "skip" },
+    });
+    assert.equal(decision.ok, true);
+    const task = await waitForTask(storage, runId);
+    const settled = await harness.waitForTask(task.id, BACKGROUND_CONTEXT);
+    assert.equal(settled.state.status, "terminal");
+    if (settled.state.status === "terminal") assert.equal(settled.state.outcome.status, "completed");
+    const state = await harness.snapshot(workshopStateDocument, BACKGROUND_CONTEXT);
+    const decisions = state?.actions.filter((action) => action.run_id === runId && (action.decision.action === "skip" || action.decision.action === "retry"));
+    assert.deepEqual(decisions?.map(({ source, decision: choice }) => [source, choice.action]), [["round", "retry"], ["chat", "skip"]]);
+    assert.equal(faux.state.callCount, 2);
+  } finally {
+    if (harness) await harness.close(BACKGROUND_CONTEXT);
+    rmSync(project.root, { recursive: true, force: true });
+  }
+});
+
+test("a chat retry after the failure round does not submit another automatic round", { timeout: 30_000 }, async () => {
+  const project = createProject("printf 'still broken'; exit 7\n", "retries: 0\n");
+  const storage = new MemoryStorage();
+  const faux = fauxProvider();
+  const models = createModels();
+  models.setProvider(faux.provider);
+  const model = faux.getModel();
+  assert.ok(model);
+  faux.setResponses([fauxAssistantMessage("No safe automatic action.")]);
+  const configuredModel = {
+    model: { provider: model.provider, modelId: model.id },
+    thinkingLevel: "medium" as const,
+  };
+  let service: ReturnType<typeof createWorkshopService> | undefined;
+  let harness: Awaited<ReturnType<typeof openWorkshopHarness>> | undefined;
+  try {
+    harness = await openWorkshopHarness(storage, undefined, {
+      projectRoot: project.root,
+      models,
+      model: configuredModel,
+      escalationModel: configuredModel,
+      request: async (request, invocation) => {
+        if (!service) throw new Error("Workshop service is not ready");
+        return await service.handleRequest(request, invocation);
+      },
+    });
+    service = createWorkshopService({ projectRoot: project.root, harness });
+    harness.resume();
+    const started = await service.handleRequest({ request_id: "start-chat-retry", type: "start_workflow", workflow: "clock" });
+    const runId = runIdFrom(started);
+    let gaveUp = false;
+    for (let attempt = 0; attempt < 500; attempt += 1) {
+      const response = await service.handleRequest({ request_id: `read-give-up-${attempt}`, type: "list_actions", limit: 20 });
+      gaveUp = recordsFrom(response.actions).some((action) => action.run_id === runId && action.source === "round" && isRecord(action.decision) && action.decision.action === "give_up");
+      if (gaveUp) break;
+      await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+    }
+    assert.equal(gaveUp, true);
+    const firstBlocked = await waitForRunStatus(service, storage, runId, "blocked");
+    assert.ok(isRecord(firstBlocked.blocked_step));
+
+    const retried = await service.handleRequest({
+      request_id: "retry-from-chat",
+      type: "decide_blocked_run",
+      run_id: runId,
+      decision_number: 1,
+      decision: { action: "retry" },
+    });
+    assert.equal(retried.ok, true);
+    let secondBlocked: Record<string, unknown> | undefined;
+    for (let attempt = 0; attempt < 500; attempt += 1) {
+      const response = await service.handleRequest({ request_id: `read-chat-retry-${attempt}`, type: "read_run", run_id: runId });
+      if (isRecord(response.run) && isRecord(response.run.blocked_step) && response.run.blocked_step.decision_number === 2) {
+        secondBlocked = response.run;
+        break;
+      }
+      await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+    }
+    assert.ok(secondBlocked, "the chat retry should leave decision 2 blocked");
+    const task = await waitForTask(storage, runId);
+    assert.ok(isRecord(task.state.checkpoint));
+    if (isRecord(task.state.checkpoint)) {
+      assert.equal(task.state.checkpoint.phase, "blocked");
+      assert.equal(task.state.checkpoint.roundStatus, "settled");
+      assert.equal(task.state.checkpoint.automaticRoundUsed, true);
+    }
+    const root = await harness.root(BACKGROUND_CONTEXT);
+    const submissions = await storage.scanSubmissions({ conversationId: root.id }, 100, undefined, BACKGROUND_CONTEXT);
+    assert.deepEqual(submissions.items.filter((submission) => submission.requestId?.startsWith(`round:${runId}:`)).map(({ requestId }) => requestId), [
+      `round:${runId}:10-task:1`,
+    ]);
+
+    const skipped = await service.handleRequest({
+      request_id: "skip-after-chat-retry",
+      type: "decide_blocked_run",
+      run_id: runId,
+      decision_number: 2,
+      decision: { action: "skip" },
+    });
+    assert.equal(skipped.ok, true);
+    const settled = await harness.waitForTask(task.id, BACKGROUND_CONTEXT);
+    assert.equal(settled.state.status, "terminal");
+    assert.equal(faux.state.callCount, 1);
   } finally {
     if (harness) await harness.close(BACKGROUND_CONTEXT);
     rmSync(project.root, { recursive: true, force: true });

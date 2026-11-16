@@ -80,11 +80,11 @@ Unknown files, subfolders, malformed frontmatter, unknown keys, invalid profile 
 ## Step execution
 
 A workflow start stores its validated settings and ordered step list in the
-durable task. It reads each step file and its check when that step starts,
-including when a retry starts. An edit to a later step can affect an active run;
-an edit to the current step does not change an attempt that has already started.
-
-Steps execute in order. The first step receives empty input. A command step runs as `sh <file>` for `.sh` or `node <file>` for `.ts`, with its working directory set to `data/<workflow>/`. An agent step runs the selected profile command with its prompt on stdin. Workshop does not invoke a shell to start profile commands.
+durable task. It loads each step file and its check when that step starts,
+including when a retry starts. Command steps run from their file paths rather than
+from durable source snapshots, so a file edit before a process starts can affect
+that attempt.
+Steps execute in order. The first step receives empty input. A command step runs as `sh <file>` for `.sh` or `node <file>` for `.ts`, with its working directory set to `data/<workflow>/`. Node.js applies built-in type stripping to supported TypeScript syntax. An agent step runs the selected profile command with its prompt on stdin. Workshop does not invoke a shell to start profile commands.
 
 A successful step's stdout becomes the next step's input without trimming. A command receives it on stdin. An agent receives it below an `Input` heading in its prompt. Steps can also pass longer-lived data through their shared `data/<workflow>/` working folder.
 
@@ -104,7 +104,7 @@ Command processes receive workflow input through stdin. Agent processes receive 
 
 A command step that exits with code `99` ends the run successfully with status `nothing-to-do`; its check does not run. Exit `99` from an agent or check has no special meaning. Each command or profile process starts in its own process group. A step timeout or run cancellation sends `SIGTERM`, then `SIGKILL` after 250 ms if the process group remains. This also stops descendants while the service is alive.
 
-Pi-durable resumes unfinished tasks from their last checkpoint. It cannot reattach to an operating-system process after a hard service crash. An unfinished command may start again, and the original child process may still be running. Make external side effects safe to repeat. Workshop does not provide exactly-once effects. A normal service shutdown aborts active task signals so Workshop can stop their process groups.
+Pi-durable resumes unfinished tasks from their last checkpoint. It cannot reattach to an operating-system process after a hard service crash. An unfinished command may start again, and the original child process may still be running. If a step-attempt task completed before its parent checkpoint, the parent reuses that durable result after restart. Make external side effects safe to repeat for unfinished commands. Workshop does not provide exactly-once effects. A normal service shutdown aborts active task signals so Workshop can stop their process groups.
 
 ## Checks, retries, and blocked runs
 
@@ -114,7 +114,7 @@ A check rejection retries the whole step, then checks the new output. `retries` 
 
 Timeouts resolve from the check, then the step, then the workflow. They must be positive integer durations in seconds, minutes, or hours that fit within `2,147,483,647` milliseconds. There is no default timeout. After a failed attempt, command processes receive its reason in `WORKSHOP_FEEDBACK`; agent prompts receive it under `## Feedback`.
 
-After local retries run out, the task saves the failed step and attempt history, then submits one durable failure round to the root orchestrator conversation. The submission uses `round:<run_id>:<step_id>:<attempt>` as its request ID and `followUp` when the conversation is busy. The root model can call Workshop tools to retry, skip, accept non-empty output, or fail the run. It can call `consult` for read-only advice from the escalation model. If the round is unanswered or takes no action, Workshop records `give_up` with source `round` and leaves the run blocked. The settled round is not submitted again after recovery; chat can still resolve the blocked run.
+After local retries run out, the task saves the failed step and attempt history, then submits one durable failure round to the root orchestrator conversation. The submission uses `round:<run_id>:<step_id>:<attempt>` as its request ID and `followUp` when the conversation is busy. Workshop binds any decision made during that turn to the matching run, step, and attempt; different `run_id` or `decision_number` arguments cannot redirect it. The root model can call Workshop tools to retry, skip, accept non-empty output, or fail the run. It can call `consult` for read-only advice from the escalation model. If the round is unanswered or takes no action, Workshop records `give_up` with source `round` and leaves the run blocked. Workshop submits at most one automatic failure round for each step in a run. If a retry fails after that round, the step stays blocked for chat. A settled round is not submitted again after recovery; chat can still resolve the blocked run.
 
 A blocked run remains a non-terminal durable task, so the scheduler treats its workflow as busy. The service API accepts these decisions:
 
@@ -133,7 +133,7 @@ A paused workflow's newly observed slot is recorded as skipped with reason `paus
 
 `max_runs` counts distinct run IDs recorded as started, including manual starts. It limits scheduled starts only; manual starts ignore the limit but count toward it on later ticks. Manual starts refuse workflows with `enabled: false`. Pausing prevents manual starts and skips newly observed scheduled slots; it does not stop an active run. Resuming allows later ticks to start new slots. It does not replay skipped slots or start a run immediately.
 
-Cancelling a run aborts its durable workflow task and owned step-attempt task. The task's abort signal stops the active process group. A cancellation request against a terminal run reports that it was not cancelled.
+Cancelling a run asks pi-durable to abort its workflow task and owned step-attempt task before Workshop saves the cancellation action and receipt. The task's abort signal stops the active process group. Repeating the abort is safe. A cancellation request against a terminal run reports that it was not cancelled.
 
 ## Durable state and files
 
@@ -203,7 +203,7 @@ Each request requires a `request_id` from 1 to 128 characters and a `type`. The 
 | `start_workflow` | `workflow` | — |
 | `watch_chat` | — | — |
 | `submit_chat` | `content` | — |
-| `decide_blocked_run` | `run_id`, `decision_number`, `decision` | `source`, `note` |
+| `decide_blocked_run` | `run_id`, `decision_number`, `decision` | `note` |
 | `cancel_run` | `run_id` | — |
 | `pause_workflow` | `workflow` | — |
 | `resume_workflow` | `workflow` | — |
@@ -218,7 +218,7 @@ While attached, send `submit_chat` lines on the same socket. The service uses `w
 {"request_id":"chat-1","type":"submit_chat","content":"What is running?"}
 ```
 
-Workflow names use lowercase letters, digits, and hyphens. `decision_number` identifies the current blocked occurrence in a run; a delayed decision for an earlier step is rejected. `source` is `chat` or `round`; include `note` for a round decision. `limit` is an integer from 0 to 1,000; list requests default to 20. The decision object uses the actions described above. The service rejects unknown request fields and invalid values. A repeated blocked-run decision with the same request ID and payload returns its saved response while that receipt remains in the most recent 1,000; reusing that ID for a different payload is an error.
+Workflow names use lowercase letters, digits, and hyphens. `decision_number` identifies the current blocked occurrence in a run; a delayed decision for an earlier step is rejected. The service assigns decision source: `chat` for chat decisions and `round` for decisions made during an automatic failure round. The model cannot set `source`. Include `note` for a round decision. `limit` is an integer from 0 to 1,000; list requests default to 20. The decision object uses the actions described above. The service rejects unknown request fields and invalid values. A repeated blocked-run decision with the same request ID and payload returns its saved response while that receipt remains in the most recent 1,000; reusing that ID for a different payload is an error.
 
 The service claims a SQLite owner row before opening pi-durable, so a second process cannot recover the first process's tasks or race stale-socket cleanup. It removes a stale socket only when it can confirm the socket is not active, and it will not replace a non-socket file. A fatal durable-storage error closes the service and exits with a nonzero status. `service/start-service.ts` requires Node.js 24 or newer. It registers the workflow, step-attempt, and schedule-tick tasks with pi-durable, opens SQLite, starts the scheduler, and serves requests.
 
