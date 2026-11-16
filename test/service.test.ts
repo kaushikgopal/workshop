@@ -1,6 +1,6 @@
 import { connect, type Socket } from "node:net";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createModels } from "@earendil-works/pi-ai/models";
@@ -1554,6 +1554,99 @@ test("a chat retry after the failure round does not submit another automatic rou
     assert.equal(settled.state.status, "terminal");
     assert.equal(faux.state.callCount, 1);
   } finally {
+    if (harness) await harness.close(BACKGROUND_CONTEXT);
+    rmSync(project.root, { recursive: true, force: true });
+  }
+});
+
+test("daily-summary gathers service activity and saves its report", { timeout: 20_000 }, async () => {
+  const project = createProject("printf 'source activity\\n'\n");
+  const summaryWorkflow = join(project.root, "workflows", "daily-summary");
+  cpSync(new URL("../examples/workflows/daily-summary", import.meta.url), summaryWorkflow, { recursive: true });
+  const scriptsDirectory = join(project.root, "scripts");
+  const serviceDirectory = join(project.root, "service");
+  mkdirSync(scriptsDirectory, { recursive: true });
+  mkdirSync(serviceDirectory, { recursive: true });
+  cpSync(new URL("../scripts/read-workshop-activity.ts", import.meta.url), join(scriptsDirectory, "read-workshop-activity.ts"));
+  cpSync(new URL("../service/request-service.ts", import.meta.url), join(serviceDirectory, "request-service.ts"));
+  cpSync(new URL("../service/types.ts", import.meta.url), join(serviceDirectory, "types.ts"));
+
+  const fakeWriter = join(project.root, "fake-writer.mjs");
+  writeFileSync(fakeWriter, [
+    "for await (const chunk of process.stdin) { void chunk; }",
+    `process.stdout.write(${JSON.stringify("# Activity summary\n\nRecorded test activity.\n")});`,
+    "",
+  ].join("\n"));
+  writeFileSync(join(project.root, "workshop.yaml"), [
+    "agent_profiles:",
+    "  writer:",
+    `    command: ${JSON.stringify([process.execPath, fakeWriter])}`,
+    "orchestrator: {}",
+    "",
+  ].join("\n"));
+
+  const storage = new MemoryStorage();
+  let harness: Awaited<ReturnType<typeof createHarness>> | undefined;
+  let socket: Awaited<ReturnType<typeof serveServiceSocket>> | undefined;
+  try {
+    harness = await createHarness(storage);
+    harness.resume();
+    const service = createWorkshopService({ projectRoot: project.root, harness });
+    const stateDirectory = join(project.root, "state");
+    mkdirSync(stateDirectory, { recursive: true });
+    socket = await serveServiceSocket(join(stateDirectory, "service.sock"), async (value, send) => {
+      send(await service.handleRequest(parseServiceRequest(value)));
+    });
+
+    const activityStart = await service.handleRequest({ request_id: "activity-start", type: "start_workflow", workflow: "clock" });
+    const activityRunId = runIdFrom(activityStart);
+    await waitForRunStatus(service, storage, activityRunId, "completed");
+
+    const summaryStart = await service.handleRequest({ request_id: "summary-start", type: "start_workflow", workflow: "daily-summary" });
+    const summaryRunId = runIdFrom(summaryStart);
+    await waitForRunStatus(service, storage, summaryRunId, "completed");
+
+    const read = await service.handleRequest({ request_id: "summary-read", type: "read_run", run_id: summaryRunId });
+    assert.ok(isRecord(read.run));
+    const steps = recordsFrom(read.run.steps);
+    const gather = steps.find((step) => step.step === "10-gather-activity");
+    assert.ok(gather);
+    assert.equal(gather.status, "completed");
+    assert.equal(typeof gather.output, "string");
+    if (typeof gather.output !== "string") throw new Error("Daily-summary gather step did not return JSON");
+    const report: unknown = JSON.parse(gather.output);
+    assert.ok(isRecord(report));
+    assert.deepEqual(Object.keys(report).sort(), ["actions", "runs", "window_end", "window_start"]);
+    if (typeof report.window_start !== "string" || typeof report.window_end !== "string") {
+      throw new Error("Daily-summary report did not include its time window");
+    }
+    assert.ok(Number.isFinite(Date.parse(report.window_start)));
+    assert.ok(Number.isFinite(Date.parse(report.window_end)));
+    assert.ok(Date.parse(report.window_start) <= Date.parse(report.window_end));
+
+    const runs = recordsFrom(report.runs);
+    const recordedRun = runs.find((run) => run.run_id === activityRunId);
+    assert.ok(recordedRun);
+    assert.equal(recordedRun.workflow, "clock");
+    assert.equal(recordedRun.status, "completed");
+    const actions = recordsFrom(report.actions);
+    const recordedStart = actions.find((action) => action.run_id === activityRunId);
+    assert.ok(recordedStart);
+    assert.equal(recordedStart.workflow, "clock");
+    assert.deepEqual(recordedStart.decision, { action: "start" });
+
+    const save = steps.find((step) => step.step === "30-save-summary");
+    assert.ok(save);
+    assert.equal(save.status, "completed");
+    const dataDirectory = join(project.root, "data", "daily-summary");
+    const savedFiles = readdirSync(dataDirectory);
+    assert.equal(savedFiles.length, 1);
+    const savedFile = savedFiles[0];
+    assert.ok(savedFile);
+    assert.match(savedFile, /^summary-\d{4}-\d{2}-\d{2}\.md$/);
+    assert.equal(readFileSync(join(dataDirectory, savedFile), "utf8"), "# Activity summary\n\nRecorded test activity.\n");
+  } finally {
+    if (socket) await socket.close();
     if (harness) await harness.close(BACKGROUND_CONTEXT);
     rmSync(project.root, { recursive: true, force: true });
   }
