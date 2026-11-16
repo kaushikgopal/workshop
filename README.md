@@ -19,11 +19,12 @@ brings me in only when something truly needs me.
    step needs it.
 4. **Durable.** A run survives crashes, restarts, and reboots, and resumes
    where it stopped. Unattended work must not lose progress.
-5. **One durable orchestrator conversation.** I can ask what is running, why
-   something failed, or nudge stuck work along. After local retries, the root
-   model gets one durable failure round. It can act on a failed run or consult
-   the escalation model for read-only advice. If no action is safe, it records
-   `give_up` and leaves the run blocked for chat.
+5. **An orchestrator I can talk to.** I can reach one agent directly, on the
+   machine or over SSH from a laptop, to ask what is running, why something
+   failed, or to nudge stuck work along. It also tries to fix failing steps
+   on its own, escalating to a smarter model before it asks me. It records
+   anything significant it does and flags runs it cannot fix. I need one
+   place to understand and steer everything.
 6. **Convention over configuration.** Dropping a folder of numbered step
    files into `workflows/` creates a workflow, with no registration or
    wiring. Adding a workflow should take minutes.
