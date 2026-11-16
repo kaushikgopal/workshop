@@ -89,6 +89,12 @@ reads each step and check file when that step starts. Steps share
 `data/<workflow>/`. See [the reference](docs/reference.md) for validation and
 execution rules.
 
+## Several workflows
+
+Each folder in `workflows/` is a separate workflow with its own schedule. Different workflows run at the same time, and each one has at most one open run. A blocked run holds up only its own workflow.
+
+One orchestrator conversation watches every workflow. Chat messages and automatic failure rounds take turns in that conversation. When several runs fail at once, their rounds queue and the orchestrator handles them one at a time.
+
 ## Agent profiles
 
 `agent_profiles` configure command-line agents for workflow steps. The orchestrator uses Pi's model registry and authentication instead. Example configuration:
