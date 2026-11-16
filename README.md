@@ -69,6 +69,26 @@ Workshop v2 needs Node.js 24 or later and npm. Run these commands from the repos
 
 Use `make dev` while developing. It restarts the service when source files change.
 
+## Running a demo
+
+The Quick start installs `hemingway-clock`, a small workflow that writes one original sentence every three minutes and stops after six runs. Each run has three steps:
+
+1. `10-get-timestamp.sh` prints the current time.
+2. `20-write-line.md` asks the `writer` agent for a new sentence. `20-write-line.check.md` has the agent judge it, and a rejected sentence is retried with the reason.
+3. `30-save-line.sh` appends the accepted sentence to `data/hemingway-clock/results.md`.
+
+With `make start` running, try these in a second terminal:
+
+- `tail -F data/hemingway-clock/results.md` shows each new sentence as it lands.
+- `make chat print="What is running?"` asks the orchestrator what it sees.
+- `make chat print="Pause hemingway-clock"` pauses the workflow. Wait for the next three-minute slot to pass, then run `make chat print="Resume hemingway-clock"`. The slot that came while it was paused never runs.
+
+To clean up, stop `make start` with Ctrl-C and remove the demo:
+
+```fish
+rm -r workflows/hemingway-clock data/hemingway-clock
+```
+
 ## Workflow folders
 
 Each workflow lives in its own folder. The filename extension sets the step type:
