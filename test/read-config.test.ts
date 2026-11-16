@@ -16,7 +16,7 @@ function writeConfig(directory: string, source: string): string {
 }
 
 function basicConfig(command = "[node, -e, hello]"): string {
-  return `agent_profiles:\n  writer:\n    command: ${command}\norchestrator:\n  profile: writer\n  escalation_profile: writer\n`;
+  return `agent_profiles:\n  writer:\n    command: ${command}\norchestrator:\n  model: provider/model:thinking\n  escalation_model: provider/escalation\n`;
 }
 
 test("config loads .env.local without overwriting the environment and substitutes parsed string values", () => {
@@ -35,13 +35,14 @@ test("config loads .env.local without overwriting the environment and substitute
   process.env[specialName] = specialValue;
   try {
     writeFileSync(join(directory, ".env.local"), `${envName}=value-from-file\n${existingName}=ignored-file-value\n${quotedName}="value # from file"\n${specialName}=ignored-special-value\n`);
-    const file = writeConfig(directory, `agent_profiles:\n  writer:\n    command: [node, "\${${envName}}", "\${${existingName}}", "\${${quotedName}}", "\${${specialName}}"]\n    context_window: 64000\norchestrator:\n  profile: writer\n  escalation_profile: writer\n`);
+    const file = writeConfig(directory, `agent_profiles:\n  writer:\n    command: [node, "\${${envName}}", "\${${existingName}}", "\${${quotedName}}", "\${${specialName}}"]\n    context_window: 64000\norchestrator: {}\n`);
     process.env[configName] = file;
     const config = readConfig();
     assert.deepEqual(config.agent_profiles.writer, {
       command: ["node", "value-from-file", "kept-from-process", "value # from file", specialValue],
       context_window: 64000,
     });
+    assert.deepEqual(config.orchestrator, {});
     assert.equal(process.env[envName], "value-from-file");
     assert.equal(process.env[existingName], "kept-from-process");
     assert.equal(process.env[quotedName], "value # from file");
@@ -64,7 +65,7 @@ test("config errors name an unset interpolation variable", () => {
   const previousConfig = process.env[configName];
   delete process.env[envName];
   try {
-    const file = writeConfig(directory, `agent_profiles:\n  writer:\n    command: [node, "\${${envName}}"]\norchestrator:\n  profile: writer\n  escalation_profile: writer\n`);
+    const file = writeConfig(directory, `agent_profiles:\n  writer:\n    command: [node, "\${${envName}}"]\norchestrator: {}\n`);
     process.env[configName] = file;
     assert.throws(() => readConfig(), (error: unknown) => {
       assert.ok(error instanceof ConfigReadError);
@@ -80,15 +81,16 @@ test("config errors name an unset interpolation variable", () => {
   }
 });
 
-test("config validates command arrays, profile names, profile references, and context windows", () => {
+test("config validates command arrays, agent profile names, and context windows", () => {
   const directory = createDirectory();
   try {
     const invalidConfigs = [
       { source: basicConfig("[]"), message: /at least one argument/ },
       { source: basicConfig("[\"\"]"), message: /must not be empty/ },
       { source: basicConfig().replace("writer:", "Writer:"), message: /lowercase letters, digits, and hyphens/ },
-      { source: basicConfig().replace("profile: writer", "profile: missing"), message: /does not exist in agent_profiles/ },
+      { source: basicConfig().replace("model: provider/model:thinking", "model: ''"), message: /Too small/ },
       { source: basicConfig().replace("command:", "unknown: true\n    command:"), message: /Unrecognized key/ },
+      { source: basicConfig().replace("model: provider/model:thinking", "profile: writer"), message: /Unrecognized key/ },
       { source: basicConfig().replace("command:", "context_window: 0\n    command:"), message: /context_window: Too small/ },
       { source: basicConfig().replace("command:", "context_window: 1.5\n    command:"), message: /context_window: Invalid input/ },
     ];
@@ -131,7 +133,7 @@ test("profile command check requires each first argument to be an executable fil
         pathDirectory: { command: ["directory-command"] },
         explicitDirectory: { command: [explicitDirectory] },
       },
-      orchestrator: { profile: "found", escalation_profile: "found" },
+      orchestrator: {},
     };
     const issues = checkProfileCommands(config, bin);
     assert.equal(issues.length, 3);

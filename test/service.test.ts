@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createModels } from "@earendil-works/pi-ai/models";
+import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createRegistry, defineDoc, Harness, MemoryStorage, type TaskRecord } from "@earendil-works/pi-durable";
 import type { JsonValue } from "@earendil-works/chord/json";
@@ -19,12 +20,12 @@ function createProject(command: string, extraFrontmatter = ""): { root: string }
   const root = mkdtempSync(join(tmpdir(), "workshop-service-test-"));
   const workflow = join(root, "workflows", "clock");
   mkdirSync(workflow, { recursive: true });
+  mkdirSync(join(root, "agent"), { recursive: true });
+  writeFileSync(join(root, "agent", "instructions.md"), "Manage the test workflows.\n");
   writeFileSync(join(root, "workshop.yaml"), [
     "agent_profiles:",
     `  writer:\n    command: ["${process.execPath}"]`,
-    "orchestrator:",
-    "  profile: writer",
-    "  escalation_profile: writer",
+    "orchestrator: {}",
     "",
   ].join("\n"));
   writeFileSync(join(workflow, "workflow.md"), `---\ncron: '* * * * *'\n${extraFrontmatter}---\nA service test workflow.\n`);
@@ -47,6 +48,22 @@ function recordsFrom(value: unknown): Record<string, unknown>[] {
   const records = value.filter(isRecord);
   if (records.length !== value.length) throw new Error("Service response list contains an invalid item");
   return records;
+}
+
+function transcriptText(messages: unknown): string {
+  if (!Array.isArray(messages)) return "";
+  return messages.map((message) => {
+    if (!isRecord(message)) return "";
+    const body = typeof message.content === "string"
+      ? message.content
+      : Array.isArray(message.content)
+        ? message.content.flatMap((item) => isRecord(item) && item.type === "text" && typeof item.text === "string" ? [item.text] : []).join("")
+        : "";
+    const sections = isRecord(message.sections)
+      ? Object.values(message.sections).filter((section): section is string => typeof section === "string")
+      : [];
+    return [body, ...sections].join("\n");
+  }).join("\n");
 }
 
 async function waitForTask(storage: MemoryStorage, runId: string): Promise<TaskRecord<JsonValue, JsonValue, JsonValue>> {
@@ -223,12 +240,15 @@ test("service decisions wake blocked tasks and deduplicate retried requests", as
     assert.deepEqual(await service.handleRequest(request), decision);
     await assert.rejects(service.handleRequest({ ...request, decision: { action: "fail" } }), /already used for a different request/);
 
+    const root = await harness.root(BACKGROUND_CONTEXT);
+    const roundSubmissions = await storage.scanSubmissions({ conversationId: root.id }, 100, undefined, BACKGROUND_CONTEXT);
+    assert.ok(roundSubmissions.items.some((submission) => submission.requestId === `round:${runId}:10-task:1`));
     const settled = await harness.waitForTask(task.id, BACKGROUND_CONTEXT);
     assert.equal(settled.state.status, "terminal");
     if (settled.state.status === "terminal") assert.equal(settled.state.outcome.status, "completed");
     const actions = await service.handleRequest({ request_id: "actions", type: "list_actions", limit: 10 });
     assert.deepEqual(recordsFrom(actions.actions).map((entry) => [entry.source, isRecord(entry.decision) ? entry.decision.action : undefined]), [
-      ["chat", "skip"], ["round-1", "give_up"], ["chat", "start"],
+      ["chat", "skip"], ["round", "give_up"], ["chat", "start"],
     ]);
   } finally {
     if (harness) await harness.close(BACKGROUND_CONTEXT);
@@ -434,6 +454,147 @@ test("later step files are loaded when each step starts", async () => {
         if (isRecord(result)) assert.equal(result.output, "fresh output");
       }
     }
+  } finally {
+    if (harness) await harness.close(BACKGROUND_CONTEXT);
+    rmSync(project.root, { recursive: true, force: true });
+  }
+});
+
+test("submit_chat reuses the configured root conversation through the service", async () => {
+  const project = createProject("printf 'unused'\n");
+  const storage = new MemoryStorage();
+  const faux = fauxProvider();
+  const models = createModels();
+  models.setProvider(faux.provider);
+  const model = faux.getModel();
+  assert.ok(model);
+  faux.setResponses([
+    (context) => {
+      const prompt = transcriptText(context.messages);
+      assert.match(prompt, /## Workshop status/);
+      assert.match(prompt, /### Blocked runs/);
+      assert.match(prompt, /### Broken workflows/);
+      assert.match(prompt, /### Paused workflows/);
+      assert.match(prompt, /### Recent actions/);
+      return fauxAssistantMessage(fauxToolCall("list_workflows", {}), { stopReason: "toolUse" });
+    },
+    fauxAssistantMessage(fauxToolCall("consult", { question: "Review the loaded workflow." }), { stopReason: "toolUse" }),
+    fauxAssistantMessage("Independent advice: the workflow is ready."),
+    (context) => {
+      assert.match(transcriptText(context.messages), /Independent advice: the workflow is ready/);
+      return fauxAssistantMessage("First answer.");
+    },
+    fauxAssistantMessage("Second answer."),
+  ]);
+  const configuredModel = {
+    model: { provider: model.provider, modelId: model.id },
+    thinkingLevel: "medium" as const,
+  };
+  let service: ReturnType<typeof createWorkshopService> | undefined;
+  let harness: Awaited<ReturnType<typeof openWorkshopHarness>> | undefined;
+  try {
+    harness = await openWorkshopHarness(storage, undefined, {
+      projectRoot: project.root,
+      models,
+      model: configuredModel,
+      escalationModel: configuredModel,
+      request: async (request) => {
+        if (!service) throw new Error("Workshop service is not ready");
+        return await service.handleRequest(request);
+      },
+    });
+    service = createWorkshopService({ projectRoot: project.root, harness });
+    harness.resume();
+    const first = await service.handleRequest({ request_id: "chat-1", type: "submit_chat", content: "Hello." });
+    const replay = await service.handleRequest({ request_id: "chat-1", type: "submit_chat", content: "Hello." });
+    const second = await service.handleRequest({ request_id: "chat-2", type: "submit_chat", content: "Continue." });
+    const rootConversation = await harness.root(BACKGROUND_CONTEXT);
+    const chatSubmissions = await storage.scanSubmissions({ conversationId: rootConversation.id }, 100, undefined, BACKGROUND_CONTEXT);
+    assert.equal(first.ok, true, JSON.stringify({ first, chatSubmissions: chatSubmissions.items }));
+    assert.equal(first.answer, "First answer.");
+    assert.deepEqual(replay, first);
+    assert.equal(second.ok, true);
+    assert.equal(second.answer, "Second answer.");
+    assert.equal(first.conversation_id, second.conversation_id);
+    assert.ok(chatSubmissions.items.some((submission) => submission.requestId === "chat:chat-1"));
+    assert.equal(faux.state.callCount, 5);
+  } finally {
+    if (harness) await harness.close(BACKGROUND_CONTEXT);
+    rmSync(project.root, { recursive: true, force: true });
+  }
+});
+
+test("the durable failure round records its keyed tool decision once", async () => {
+  const project = createProject("printf 'broken'; exit 7\n", "retries: 0\n");
+  const storage = new MemoryStorage();
+  const faux = fauxProvider();
+  const models = createModels();
+  models.setProvider(faux.provider);
+  const model = faux.getModel();
+  assert.ok(model);
+  faux.setResponses([
+    (context) => {
+      const prompt = transcriptText(context.messages);
+      const match = /with run_id ([^,]+), decision_number ([0-9]+)/.exec(prompt);
+      if (!match?.[1] || !match[2]) throw new Error(`failure prompt omitted run and decision IDs: ${prompt}`);
+      return fauxAssistantMessage(fauxToolCall("decide_blocked_run", {
+        run_id: match[1],
+        decision_number: Number(match[2]),
+        decision: { action: "skip" },
+        source: "round",
+        note: "Skipped after the command failed.",
+      }), { stopReason: "toolUse" });
+    },
+    fauxAssistantMessage("I recorded the skip."),
+  ]);
+  const configuredModel = {
+    model: { provider: model.provider, modelId: model.id },
+    thinkingLevel: "medium" as const,
+  };
+  let service: ReturnType<typeof createWorkshopService> | undefined;
+  let harness: Awaited<ReturnType<typeof openWorkshopHarness>> | undefined;
+  try {
+    harness = await openWorkshopHarness(storage, undefined, {
+      projectRoot: project.root,
+      models,
+      model: configuredModel,
+      escalationModel: configuredModel,
+      request: async (request) => {
+        if (!service) throw new Error("Workshop service is not ready");
+        return await service.handleRequest(request);
+      },
+    });
+    service = createWorkshopService({ projectRoot: project.root, harness });
+    harness.resume();
+    const started = await service.handleRequest({ request_id: "start-round", type: "start_workflow", workflow: "clock" });
+    const runId = runIdFrom(started);
+    const task = await waitForTask(storage, runId);
+    const settled = await harness.waitForTask(task.id, BACKGROUND_CONTEXT);
+    assert.equal(settled.state.status, "terminal");
+    if (settled.state.status === "terminal") {
+      assert.equal(settled.state.outcome.status, "completed");
+      if (settled.state.outcome.status === "completed") {
+        const result = settled.state.outcome.result;
+        assert.ok(isRecord(result));
+        if (isRecord(result)) {
+          assert.equal(result.status, "completed");
+          assert.ok(Array.isArray(result.steps));
+          if (Array.isArray(result.steps)) {
+            assert.ok(isRecord(result.steps[0]));
+            if (isRecord(result.steps[0])) assert.equal(result.steps[0].status, "skipped");
+          }
+        }
+      }
+    }
+    const root = await harness.root(BACKGROUND_CONTEXT);
+    const submissions = await storage.scanSubmissions({ conversationId: root.id }, 100, undefined, BACKGROUND_CONTEXT);
+    assert.equal(submissions.items.filter((submission) => submission.requestId === `round:${runId}:10-task:1`).length, 1);
+    const actions = await service.handleRequest({ request_id: "round-actions", type: "list_actions", limit: 10 });
+    const roundAction = recordsFrom(actions.actions).find((action) => action.source === "round");
+    assert.ok(roundAction);
+    assert.equal(isRecord(roundAction.decision) ? roundAction.decision.action : undefined, "skip");
+    assert.equal(roundAction.note, "Skipped after the command failed.");
+    assert.equal(faux.state.callCount, 2);
   } finally {
     if (harness) await harness.close(BACKGROUND_CONTEXT);
     rmSync(project.root, { recursive: true, force: true });

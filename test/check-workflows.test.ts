@@ -21,18 +21,14 @@ test("workflow check uses local profiles for workflows and example profiles for 
     "agent_profiles:",
     "  local:",
     "    command: [node]",
-    "orchestrator:",
-    "  profile: local",
-    "  escalation_profile: local",
+    "orchestrator: {}",
     "",
   ].join("\n"));
   writeFileSync(exampleConfig, [
     "agent_profiles:",
     "  example:",
     "    command: [node]",
-    "orchestrator:",
-    "  profile: example",
-    "  escalation_profile: example",
+    "orchestrator: {}",
     "",
   ].join("\n"));
   writeFileSync(join(localWorkflow, "workflow.md"), "---\ncron: '* * * * *'\n---\nLocal fixture.\n");

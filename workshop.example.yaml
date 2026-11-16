@@ -1,15 +1,14 @@
 agent_profiles:
-  pi-fast:
+  writer:
     command: [pi, -p, --no-session, --model, "<provider>/<model>"]
   claude:
     command: [claude, -p, --model, "<model>"]
   codex:
     command: [codex, exec, "-"]
-  orchestrator:
-    command: [pi, -p, --no-session, --no-tools, --no-extensions, --no-skills, --model, "<provider>/<model>"]
-    context_window: 32000
-  writer:
-    command: [pi, -p, --no-session, --model, "<provider>/<model>"]
-orchestrator:
-  profile: orchestrator
-  escalation_profile: writer
+# Optional Pi model patterns use Pi's model registry and auth store.
+# Omit either field to use Pi's configured default model.
+orchestrator: {}
+
+# To override defaults, replace {} above with:
+#   model: <provider>/<model>
+#   escalation_model: <provider>/<model>

@@ -5,12 +5,12 @@ import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite
 import type { Harness } from "@earendil-works/pi-durable";
 import { checkProfileCommands, readConfig } from "../config/read-workshop-config.ts";
 import { loadWorkflows } from "../workflow/load-workflows.ts";
+import { ensureWorkflowTicker } from "../schedule/tick-workflows.ts";
 import { acquireStoreLock } from "./acquire-store-lock.ts";
+import { createOrchestratorRuntime, type OrchestratorRuntime } from "./create-orchestrator-runtime.ts";
 import { createWorkshopService, type WorkshopService } from "./create-workshop-service.ts";
 import { openWorkshopHarness } from "./open-workshop-harness.ts";
-import type { ServiceResponse } from "./types.ts";
 import { serveServiceSocket } from "./serve-service-socket.ts";
-import { ensureWorkflowTicker } from "../schedule/tick-workflows.ts";
 
 const sqliteFile = "workshop.sqlite";
 
@@ -42,6 +42,7 @@ async function startService(): Promise<void> {
   let harness: Harness | undefined;
   let workshop: WorkshopService | undefined;
   let storage: Awaited<ReturnType<typeof openNodeSqliteStorage>> | undefined;
+  let orchestratorRuntime: OrchestratorRuntime | undefined;
   let socket: Awaited<ReturnType<typeof serveServiceSocket>> | undefined;
   let storeLock: Awaited<ReturnType<typeof acquireStoreLock>> | undefined;
   let storageFailed = false;
@@ -53,16 +54,25 @@ async function startService(): Promise<void> {
         send({ ok: false, error: "Workshop service is starting" });
         return;
       }
-      const response = await workshop.handleRequest(request);
-      send(response);
+      send(await workshop.handleRequest(request));
     });
     storage = await openNodeSqliteStorage(join(stateDirectory, sqliteFile));
+    orchestratorRuntime = await createOrchestratorRuntime(projectRoot, config);
     harness = await openWorkshopHarness(storage, (report) => {
       if (storageFailed) return;
       storageFailed = true;
       process.exitCode = 1;
       logServiceError("fatal durable storage failure", report.error);
       stopForStorageFailure?.();
+    }, {
+      projectRoot,
+      models: orchestratorRuntime.models,
+      model: orchestratorRuntime.model,
+      escalationModel: orchestratorRuntime.escalationModel,
+      request: async (request) => {
+        if (!workshop) throw new Error("Workshop service is starting");
+        return await workshop.handleRequest(request);
+      },
     });
     workshop = createWorkshopService({ projectRoot, harness });
     await ensureWorkflowTicker({ projectRoot, harness });
@@ -89,6 +99,12 @@ async function startService(): Promise<void> {
         } catch (error) {
           process.exitCode = 1;
           logServiceError("durable store shutdown failed", error);
+        }
+        try {
+          await orchestratorRuntime?.models.settleCredentialWrites();
+        } catch (error) {
+          process.exitCode = 1;
+          logServiceError("model runtime shutdown failed", error);
         }
         if (storeClosed) {
           try {
@@ -121,6 +137,12 @@ async function startService(): Promise<void> {
     } catch (closeError) {
       process.exitCode = 1;
       logServiceError("durable store cleanup failed", closeError);
+    }
+    try {
+      await orchestratorRuntime?.models.settleCredentialWrites();
+    } catch (closeError) {
+      process.exitCode = 1;
+      logServiceError("model runtime cleanup failed", closeError);
     }
     if (storeClosed) {
       try {

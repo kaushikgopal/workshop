@@ -10,21 +10,28 @@ This reference defines Workshop v2's configuration, workflow files, execution, s
 agent_profiles:
   writer:
     command: [pi, -p, --no-session, --model, "<provider>/<model>"]
-  orchestrator:
-    command: [pi, -p, --no-session, --no-tools, --no-extensions, --no-skills, --model, "<provider>/<model>"]
-    context_window: 32000
 orchestrator:
-  profile: orchestrator
-  escalation_profile: writer
+  model: <provider>/<model>
+  escalation_model: <provider>/<model>
 ```
 
-`agent_profiles` must contain at least one profile. A profile name uses lowercase letters, digits, and hyphens. Its required `command` is a non-empty argument list. Workshop starts it directly, without a shell. `context_window` is an optional positive integer. The current service does not use it.
+`agent_profiles` configures command-line agents for workflow steps. A profile name uses lowercase letters, digits, and hyphens. Its required `command` is a non-empty argument list. Workshop starts it directly, without a shell. `context_window` is an optional positive integer; Workshop does not use it.
 
-Both orchestrator profile names must refer to declared profiles. Every profile's first command argument must resolve to an executable on `PATH`. Relative executable paths resolve from the config file's directory. Startup and `make check` validate all profiles, including unused ones. They do not check model access or login. Part 1 does not call orchestrator profiles; its automatic-round stub blocks failed runs after local retries.
+`orchestrator.model` selects the persistent root conversation's model. `orchestrator.escalation_model` selects the model for its read-only `consult` subagent. Both fields accept Pi CLI model patterns and are optional; Workshop resolves them through Pi's model registry, settings, and auth store. If either field is omitted, that model uses Pi's configured default. Keep provider credentials in Pi's auth store, not in `workshop.yaml`.
+
+Every profile's first command argument must resolve to an executable on `PATH`. Relative executable paths resolve from the config file's directory. Startup and `make check` validate all profiles, including unused ones. They do not check model access or login.
 
 Workshop reads `WORKSHOP_CONFIG` when set. Otherwise it reads `workshop.yaml` from the current directory. Make targets expect the project root. `make setup` copies `workshop.example.yaml` and `.env.example` only when the destination files do not exist. Upstream ignores `workshop.yaml` and `.env.local`.
 
 Workshop reads `.env.local` from the config file's directory. Existing process environment variables take precedence. `${NAME}` references in YAML string values expand from the environment. An unset variable is an error. Expansion does not apply to YAML keys, workflow files, or command output. Keep secrets in `.env.local`, not in tracked config.
+
+## Orchestrator conversation
+
+Workshop keeps one root conversation in `state/workshop.sqlite`. It uses `orchestrator.model` and the Pi registry/auth store. Automatic failure rounds and chat submissions use the same conversation.
+
+The system prompt includes `agent/instructions.md` and a live Workshop status section. Status lists blocked runs, broken workflows, paused workflows, and recent actions. The root has in-process tools to list workflows and runs, read a run, start or cancel a run, decide a blocked run, pause or resume a workflow, and list actions.
+
+The `consult` tool creates a read-only child conversation with `orchestrator.escalation_model`. It can inspect workflows, runs, and recent actions, but it has no tools that mutate Workshop state. The failure round can use `consult` for independent advice before it calls `decide_blocked_run`.
 
 ## Workflow folders and validation
 
@@ -93,7 +100,7 @@ A check rejection retries the whole step, then checks the new output. `retries` 
 
 Timeouts resolve from the check, then the step, then the workflow. They must be positive integer durations in seconds, minutes, or hours that fit within `2,147,483,647` milliseconds. There is no default timeout. After a failed attempt, command processes receive its reason in `WORKSHOP_FEEDBACK`; agent prompts receive it under `## Feedback`.
 
-After local retries run out, the service calls one automatic decision round. The current round is a stub that reports automatic decisions as unavailable. Workshop records a `give_up` action, saves the failed step and attempt history in the workflow task checkpoint, and waits for a service decision. Part 2 will replace this stub with the orchestrator.
+After local retries run out, the task saves the failed step and attempt history, then submits one durable failure round to the root orchestrator conversation. The submission uses `round:<run_id>:<step_id>:<attempt>` as its request ID and `followUp` when the conversation is busy. The root model can call Workshop tools to retry, skip, accept non-empty output, or fail the run. It can call `consult` for read-only advice from the escalation model. If the round is unanswered or takes no action, Workshop records `give_up` with source `round` and leaves the run blocked. The settled round is not submitted again after recovery; chat can still resolve the blocked run.
 
 A blocked run remains a non-terminal durable task, so the scheduler treats its workflow as busy. The service API accepts these decisions:
 
@@ -116,9 +123,9 @@ Cancelling a run aborts its durable workflow task and owned step-attempt task. T
 
 ## Durable state and files
 
-Run Workshop from the project root. `state/workshop.sqlite` is the only record of run admission, task checkpoints and outcomes, step results, blocked details, decisions, and pause state. Each run has a durable reference from its run ID to its task ID, so the service can inspect older runs without scanning every task.
+Run Workshop from the project root. `state/workshop.sqlite` is the only record of run admission, task checkpoints and outcomes, step results, blocked details, decisions, pause state, and the persistent root and consult conversations. Each run has a durable reference from its run ID to its task ID, so the service can inspect older runs without scanning every task.
 
-The session document keeps the most recent 1,000 admission records, actions, and blocked-decision request receipts. Separate per-workflow counters preserve `max_runs` and the latest scheduled slot after older records roll off. Run tasks and their references remain in SQLite. There are no run snapshots, JSONL indexes, paused-workflow files, blocked-step files, or process registry files.
+The session document keeps the most recent 1,000 admission records, actions, and mutation receipts. Separate per-workflow counters preserve `max_runs` and the latest scheduled slot after older records roll off. Run tasks and their references remain in SQLite. There are no run snapshots, JSONL indexes, paused-workflow files, blocked-step files, or process registry files.
 
 ```text
 workshop.yaml                    local config; ignored upstream
@@ -146,17 +153,24 @@ Each request requires a `request_id` from 1 to 128 characters and a `type`. The 
 | `list_runs` | — | `workflow`, `limit` |
 | `read_run` | `run_id` | — |
 | `start_workflow` | `workflow` | — |
-| `decide_blocked_run` | `run_id`, `decision_number`, `decision` | — |
+| `submit_chat` | `content` | — |
+| `decide_blocked_run` | `run_id`, `decision_number`, `decision` | `source`, `note` |
 | `cancel_run` | `run_id` | — |
 | `pause_workflow` | `workflow` | — |
 | `resume_workflow` | `workflow` | — |
 | `list_actions` | — | `workflow`, `limit` |
 
-Workflow names use lowercase letters, digits, and hyphens. `decision_number` identifies the current blocked occurrence in a run; a delayed decision for an earlier step is rejected. `limit` is an integer from 0 to 1,000; list requests default to 20. The decision object uses the actions described above. The service rejects unknown request fields and invalid values. A repeated blocked-run decision with the same request ID and payload returns its saved response while that receipt remains in the most recent 1,000; reusing that ID for a different payload is an error.
+`submit_chat` sends the message to the persistent root conversation and waits for its full answer; the socket does not stream tokens. Use a new stable `request_id` for each chat message and reuse it to retry that request. The response includes `conversation_id`, `submission_id`, and `answer`. Repeated messages use the same conversation. For example:
+
+```json
+{"request_id":"chat-1","type":"submit_chat","content":"What is running?"}
+```
+
+Workflow names use lowercase letters, digits, and hyphens. `decision_number` identifies the current blocked occurrence in a run; a delayed decision for an earlier step is rejected. `source` is `chat` or `round`; include `note` for a round decision. `limit` is an integer from 0 to 1,000; list requests default to 20. The decision object uses the actions described above. The service rejects unknown request fields and invalid values. A repeated blocked-run decision with the same request ID and payload returns its saved response while that receipt remains in the most recent 1,000; reusing that ID for a different payload is an error.
 
 The service claims a SQLite owner row before opening pi-durable, so a second process cannot recover the first process's tasks or race stale-socket cleanup. It removes a stale socket only when it can confirm the socket is not active, and it will not replace a non-socket file. A fatal durable-storage error closes the service and exits with a nonzero status. `service/start-service.ts` requires Node.js 24 or newer. It registers the workflow, step-attempt, and schedule-tick tasks with pi-durable, opens SQLite, starts the scheduler, and serves requests.
 
-The daily-summary activity step uses this API to read recent runs and actions. The interactive chat client is not part of part 1; `make chat` is a placeholder until part 2.
+The daily-summary activity step uses this API to read recent runs and actions. `make chat` remains a placeholder, but a later client can reach the persistent root conversation by sending `submit_chat` over `state/service.sock`.
 
 ## Make targets
 

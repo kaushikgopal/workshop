@@ -11,11 +11,13 @@ import type { Workflow } from "../workflow/types.ts";
 import { WorkflowTask, WORKFLOW_TASK_NAME, type WorkflowTaskInput, workflowDecisionDocument } from "../workflow/define-workflow-task.ts";
 import { appendRecent, workshopStateDocument, workflowRunReferenceDocument, type WorkshopAction, type WorkflowRunReference, type WorkshopState } from "./workshop-state.ts";
 
-export type StartWorkflowResult =
+export type StartWorkflowOutcome =
   | { kind: "started"; workflow: string; run_id: string; slot: string | null; task_id: string }
   | { kind: "skipped"; workflow: string; slot: string; reason: string }
   | { kind: "already-indexed"; workflow: string; slot: string }
   | { kind: "locked"; workflow: string; reason: string };
+
+export type StartWorkflowResult = StartWorkflowOutcome | { kind: "replayed"; response: JsonValue };
 
 export type WorkflowStartPort = {
   conversationId: ConversationId;
@@ -121,14 +123,23 @@ function recordStartAction(state: WorkshopState, workflow: string, runId: string
   appendRecent(state.actions, action);
 }
 
-export async function startWorkflow(input: {
+type StartWorkflowInput = {
   workflowName: string;
   projectRoot: string;
   port: WorkflowStartPort;
   slot?: string;
   at?: Date;
   source?: "chat";
-}): Promise<StartWorkflowResult> {
+  idempotency?: {
+    requestId: string;
+    fingerprint: string;
+    response(outcome: StartWorkflowOutcome): JsonValue;
+  };
+};
+
+export function startWorkflow(input: Omit<StartWorkflowInput, "idempotency">): Promise<StartWorkflowOutcome>;
+export function startWorkflow(input: StartWorkflowInput & { idempotency: NonNullable<StartWorkflowInput["idempotency"]> }): Promise<StartWorkflowResult>;
+export async function startWorkflow(input: StartWorkflowInput): Promise<StartWorkflowResult> {
   if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(input.workflowName)) throw new Error(`Invalid workflow name: ${input.workflowName}`);
   const projectRoot = resolve(input.projectRoot);
   const { config, workflow } = configurationFor(projectRoot, input.workflowName);
@@ -151,31 +162,45 @@ export async function startWorkflow(input: {
     stateDirectory,
     workflow,
     profileCommands: Object.fromEntries(Object.entries(config.agent_profiles).map(([name, profile]) => [name, profile.command])),
-    orchestrator: { profile: config.orchestrator.profile, escalationProfile: config.orchestrator.escalation_profile },
   };
 
   return await input.port.commit(async (tx) => {
     const state = await tx.doc(workshopStateDocument);
+    if (input.idempotency) {
+      const receipt = state.receipts.find((item) => item.request_id === input.idempotency?.requestId);
+      if (receipt) {
+        if (receipt.fingerprint !== input.idempotency.fingerprint) throw new Error("Request ID was already used for a different request");
+        return { kind: "replayed", response: receipt.response };
+      }
+    }
+    const finish = (outcome: StartWorkflowOutcome): StartWorkflowOutcome => {
+      if (input.idempotency) appendRecent(state.receipts, {
+        request_id: input.idempotency.requestId,
+        fingerprint: input.idempotency.fingerprint,
+        response: input.idempotency.response(outcome),
+      });
+      return outcome;
+    };
     if (slot !== null && slotWasIndexed(state, workflow.name, slot)) {
-      return { kind: "already-indexed", workflow: workflow.name, slot };
+      return finish({ kind: "already-indexed", workflow: workflow.name, slot });
     }
     if (slot === null && state.paused.includes(workflow.name)) {
-      throw new Error(`Workflow "${workflow.name}" is paused; resume it before starting manually.`);
+      throw new Error(`Workflow "${input.workflowName}" is paused; resume it before starting manually.`);
     }
     if (slot !== null && state.paused.includes(workflow.name)) {
       recordAdmission(state, workflow.name, slot, null, "skipped", at.toISOString(), "paused");
-      return { kind: "skipped", workflow: workflow.name, slot, reason: "paused" };
+      return finish({ kind: "skipped", workflow: workflow.name, slot, reason: "paused" });
     }
     if (slot !== null && workflow.max_runs !== undefined && startedCountForWorkflow(state, workflow.name) >= workflow.max_runs) {
       recordAdmission(state, workflow.name, slot, null, "skipped", at.toISOString(), "max_runs reached");
-      return { kind: "skipped", workflow: workflow.name, slot, reason: "max_runs reached" };
+      return finish({ kind: "skipped", workflow: workflow.name, slot, reason: "max_runs reached" });
     }
 
     const records = await liveTasksInTransaction(tx);
     if (records.some((record) => isLive(record) && workflowOf(record) === workflow.name)) {
-      if (slot === null) return { kind: "locked", workflow: workflow.name, reason: "workflow already has an open run" };
+      if (slot === null) return finish({ kind: "locked", workflow: workflow.name, reason: "workflow already has an open run" });
       recordAdmission(state, workflow.name, slot, null, "skipped", at.toISOString(), "workflow lock held");
-      return { kind: "skipped", workflow: workflow.name, slot, reason: "workflow lock held" };
+      return finish({ kind: "skipped", workflow: workflow.name, slot, reason: "workflow lock held" });
     }
 
     const taskId = await tx.createTask(WorkflowTask, taskInput, {
@@ -192,6 +217,6 @@ export async function startWorkflow(input: {
     });
     recordAdmission(state, workflow.name, slot, runId, "started", at.toISOString());
     if (input.source === "chat") recordStartAction(state, workflow.name, runId, at.toISOString());
-    return { kind: "started", workflow: workflow.name, run_id: runId, slot, task_id: String(taskId) };
+    return finish({ kind: "started", workflow: workflow.name, run_id: runId, slot, task_id: String(taskId) });
   });
 }

@@ -19,12 +19,11 @@ brings me in only when something truly needs me.
    step needs it.
 4. **Durable.** A run survives crashes, restarts, and reboots, and resumes
    where it stopped. Unattended work must not lose progress.
-5. **An orchestrator I can talk to.** I can reach one agent directly, on the
-   machine or over SSH from a laptop, to ask what is running, why something
-   failed, or to nudge stuck work along. It also tries to fix failing steps
-   on its own, escalating to a smarter model before it asks me. It records
-   anything significant it does and flags runs it cannot fix. I need one
-   place to understand and steer everything.
+5. **One durable orchestrator conversation.** I can ask what is running, why
+   something failed, or nudge stuck work along. After local retries, the root
+   model gets one durable failure round. It can act on a failed run or consult
+   the escalation model for read-only advice. If no action is safe, it records
+   `give_up` and leaves the run blocked for chat.
 6. **Convention over configuration.** Dropping a folder of numbered step
    files into `workflows/` creates a workflow, with no registration or
    wiring. Adding a workflow should take minutes.
@@ -56,7 +55,7 @@ brings me in only when something truly needs me.
 Workshop v2 needs Node.js 24 or later and npm. Run these commands from the repository root:
 
 1. Run `make setup` to install dependencies and create `workshop.yaml` and `.env.local` from their templates.
-2. Edit `workshop.yaml`. Set `agent_profiles` to commands available on this machine. Point `orchestrator.profile` and `orchestrator.escalation_profile` at the profiles that should handle chat and automatic decisions.
+2. Edit `workshop.yaml`. Set `agent_profiles` to commands available on this machine. Optionally set `orchestrator.model` and `orchestrator.escalation_model` to Pi model patterns. If you omit either, Workshop uses Pi's configured default model.
 3. Copy an example workflow into `workflows/`, for example:
 
    ```fish
@@ -64,7 +63,7 @@ Workshop v2 needs Node.js 24 or later and npm. Run these commands from the repos
    ```
 
 4. Run `make check`.
-5. Run `make start` to start the scheduled service. It exposes a local JSON API at `state/service.sock`. The `make chat` target remains a placeholder until part 2.
+5. Run `make start` to start the scheduled service. It exposes a private JSON API at `state/service.sock`; clients submit messages to the same root conversation with `submit_chat`.
 
 Use `make dev` while developing. It restarts the service when source files change.
 
@@ -87,21 +86,18 @@ Workshop stores durable state in `state/workshop.sqlite`. It does not copy run s
 
 ## Agent profiles
 
-Profiles in `workshop.yaml` name command-line agents for workflow steps and reserve the orchestrator choices for part 2. This build does not call those orchestrator profiles; its automatic-round stub blocks a run after local retries fail. Example configuration:
+`agent_profiles` configure command-line agents for workflow steps. The orchestrator uses Pi's model registry and authentication instead. Example configuration:
 
 ```yaml
 agent_profiles:
   writer:
     command: [pi, -p, --no-session, --model, "<provider>/<model>"]
-  orchestrator:
-    command: [pi, -p, --no-session, --no-tools, --no-extensions, --no-skills, --model, "<provider>/<model>"]
-    context_window: 32000
 orchestrator:
-  profile: orchestrator
-  escalation_profile: writer
+  model: <provider>/<model>
+  escalation_model: <provider>/<model>
 ```
 
-Replace the placeholders and remove profiles for tools you do not use. Put secrets in `.env.local` and refer to them as `${NAME}` in `workshop.yaml`.
+Omit either orchestrator field to use Pi's configured default model. Put provider credentials in Pi's auth store, not in `workshop.yaml`. Put secrets for workflow commands in `.env.local` and refer to them as `${NAME}` in `workshop.yaml`.
 
 ## Make targets
 
@@ -116,7 +112,7 @@ Replace the placeholders and remove profiles for tools you do not use. Put secre
 | `make service-install` | Install the macOS launch agent for the durable service. |
 | `make service-uninstall` | Remove the macOS launch agent. |
 
-The service listens on the private Unix socket `state/service.sock` and accepts one JSON request per connection. It does not open a network port. See [the v2 contract](docs/reference.md) for the request format, scheduling, blocked runs, and files on disk.
+The service listens on the private Unix socket `state/service.sock` and accepts one JSON request per connection. A chat client sends `{"request_id":"chat-1","type":"submit_chat","content":"What is running?"}` to reach the persistent root conversation. The response includes its `conversation_id` and answer. The service does not open a network port. See [the reference](docs/reference.md) for the full API and workflow behavior.
 
 ## Contributing
 

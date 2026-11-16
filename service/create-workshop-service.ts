@@ -1,9 +1,9 @@
 import { resolve } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import type { Harness, TaskRecord } from "@earendil-works/pi-durable";
+import { AssistantEntry, type Harness, type TaskRecord } from "@earendil-works/pi-durable";
 import type { JsonValue } from "@earendil-works/chord/json";
 import { checkProfileCommands, readConfig } from "../config/read-workshop-config.ts";
-import { createWorkflowStartPort, startWorkflow } from "../run/start-workflow.ts";
+import { createWorkflowStartPort, startWorkflow, type StartWorkflowOutcome } from "../run/start-workflow.ts";
 import { appendRecent, workshopStateDocument, workflowRunReferenceDocument, type WorkshopAction, type WorkshopState } from "../run/workshop-state.ts";
 import { parseServiceRequest, type ServiceRequest, type ServiceResponse } from "./types.ts";
 import { WORKFLOW_TASK_NAME, workflowDecisionDocument, type WorkflowTaskCheckpoint } from "../workflow/define-workflow-task.ts";
@@ -25,12 +25,24 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function textContent(content: unknown): string {
+  if (!Array.isArray(content)) return "";
+  return content.flatMap((item) => isRecord(item) && item.type === "text" && typeof item.text === "string" ? [item.text] : []).join("");
+}
+
+function assistantText(entry: unknown): string {
+  if (!isRecord(entry) || !Array.isArray(entry.model)) return "";
+  return entry.model.map((message) => isRecord(message) ? textContent(message.content) : "").join("");
+}
+
 function isWorkflowTaskCheckpoint(value: unknown): value is WorkflowTaskCheckpoint {
   if (!isRecord(value) || !["step", "attempt", "blocked", "decision"].includes(String(value.phase))) return false;
   if (!Number.isSafeInteger(value.stepIndex) || typeof value.pipeInput !== "string" || !Array.isArray(value.results) || !Array.isArray(value.attemptHistory)) return false;
   if (typeof value.localRetriesLeft !== "number" || typeof value.feedback !== "string" || typeof value.decisionNumber !== "number" || typeof value.automaticRoundUsed !== "boolean") return false;
   if (value.profile !== undefined && typeof value.profile !== "string") return false;
   if (value.waitUntil !== undefined && typeof value.waitUntil !== "number") return false;
+  if (value.roundStatus !== undefined && value.roundStatus !== "pending" && value.roundStatus !== "settled") return false;
+  if (value.decisionSource !== undefined && value.decisionSource !== "chat" && value.decisionSource !== "round") return false;
   if (value.phase === "attempt" && (!isRecord(value.activeAttempt) || (typeof value.activeAttempt.taskId !== "string" && typeof value.activeAttempt.taskId !== "number") || !isRecord(value.activeAttempt.request))) return false;
   if (value.phase === "blocked" || value.phase === "decision") {
     if (!isRecord(value.failure) || typeof value.failure.step !== "string" || typeof value.failure.lastError !== "string" || typeof value.failure.lastOutput !== "string" || !Array.isArray(value.failure.retryProfiles) || !Array.isArray(value.failure.attemptHistory)) return false;
@@ -101,15 +113,18 @@ async function taskForRun(harness: Harness, runId: string): Promise<WorkflowTask
   return record;
 }
 
-function actionNote(decision: WorkflowDecision): string {
-  if (decision.action === "retry") return [decision.hint, decision.after === undefined ? undefined : `retry after ${decision.after}`].filter(Boolean).join("; ");
-  if (decision.action === "skip") return "Step skipped by chat decision.";
-  if (decision.action === "accept") return "Last output accepted by chat decision.";
-  return "Run failed by chat decision.";
+function actionNote(decision: WorkflowDecision, source: "chat" | "round"): string {
+  const by = source === "round" ? "automatic failure round" : "chat";
+  if (decision.action === "retry") return [decision.hint, decision.after === undefined ? undefined : `retry after ${decision.after}`].filter(Boolean).join("; ") || `Step retried by ${by}.`;
+  if (decision.action === "skip") return `Step skipped by ${by}.`;
+  if (decision.action === "accept") return `Last output accepted by ${by}.`;
+  return `Run failed by ${by}.`;
 }
 
-function actionForDecision(workflow: string, runId: string, step: string, decision: WorkflowDecision, at: string): WorkshopAction {
-  return { at, workflow, run_id: runId, step, source: "chat", decision, note: actionNote(decision) };
+function actionForDecision(workflow: string, runId: string, step: string, decision: WorkflowDecision, source: "chat" | "round", note: string | undefined, at: string): WorkshopAction {
+  const noteText = source === "round" && note?.trim() ? note.trim() : actionNote(decision, source);
+  const actionDecision: WorkshopAction["decision"] = source === "round" ? { ...decision, note: noteText } : decision;
+  return { at, workflow, run_id: runId, step, source, decision: actionDecision, note: noteText };
 }
 
 function statusResult(record: WorkflowTaskRecord): { returnValue?: Record<string, unknown>; error?: string } {
@@ -199,6 +214,12 @@ function responseFromReceipt(value: JsonValue): ServiceResponse {
   };
 }
 
+function startResponse(requestId: string, outcome: StartWorkflowOutcome): ServiceResponse {
+  if (outcome.kind === "skipped" || outcome.kind === "locked") return { request_id: requestId, ok: false, error: outcome.reason };
+  if (outcome.kind === "already-indexed") return { request_id: requestId, ok: false, error: `Workflow slot ${outcome.slot} was already indexed` };
+  return { request_id: requestId, ok: true, workflow: outcome.workflow, run_id: outcome.run_id };
+}
+
 function receiptFor(state: WorkshopState, request: ServiceRequest): ServiceResponse | undefined {
   const receipt = state.receipts.find((entry) => entry.request_id === request.request_id);
   if (!receipt) return undefined;
@@ -253,9 +274,9 @@ export function createWorkshopService(input: { projectRoot: string; harness: Har
       }
       const document = await tx.doc(workflowDecisionDocument, record.id);
       if (document.choice !== null) throw new Error("A decision was already accepted for this blocked step");
-      document.choice = { requestId: request.request_id, decisionNumber: request.decision_number, decision };
+      document.choice = { requestId: request.request_id, decisionNumber: request.decision_number, decision, source: request.source ?? "chat" };
       const response: ServiceResponse = { request_id: request.request_id, ok: true, run_id: request.run_id, decision };
-      appendRecent(state.actions, actionForDecision(failure.workflow, request.run_id, failure.step, decision, new Date().toISOString()));
+      appendRecent(state.actions, actionForDecision(failure.workflow, request.run_id, failure.step, decision, request.source ?? "chat", request.note, new Date().toISOString()));
       saveReceipt(state, request, response);
       return response;
     }, BACKGROUND_CONTEXT);
@@ -263,8 +284,13 @@ export function createWorkshopService(input: { projectRoot: string; harness: Har
 
   async function pauseWorkflow(request: Extract<ServiceRequest, { type: "pause_workflow" | "resume_workflow" }>): Promise<ServiceResponse> {
     const paused = request.type === "pause_workflow";
+    const previous = await input.harness.snapshot(workshopStateDocument, BACKGROUND_CONTEXT);
+    const prior = previous === undefined ? undefined : receiptFor(previous, request);
+    if (prior) return prior;
     return await input.harness.commit(async (tx) => {
       const state = await tx.doc(workshopStateDocument);
+      const prior = receiptFor(state, request);
+      if (prior) return prior;
       if (paused && !state.paused.includes(request.workflow)) state.paused.push(request.workflow);
       if (!paused) state.paused = state.paused.filter((workflow) => workflow !== request.workflow);
       state.paused.sort();
@@ -278,8 +304,39 @@ export function createWorkshopService(input: { projectRoot: string; harness: Har
         decision: { action },
         note: paused ? "Workflow paused from chat." : "Workflow resumed from chat.",
       });
-      return { request_id: request.request_id, ok: true, workflow: request.workflow, paused, paused_workflows: state.paused };
+      const response = { request_id: request.request_id, ok: true, workflow: request.workflow, paused, paused_workflows: state.paused };
+      saveReceipt(state, request, response);
+      return response;
     }, BACKGROUND_CONTEXT);
+  }
+
+  async function submitChat(request: Extract<ServiceRequest, { type: "submit_chat" }>): Promise<ServiceResponse> {
+    const root = await input.harness.root(BACKGROUND_CONTEXT);
+    const submission = await root.submit({
+      type: "input",
+      content: request.content,
+      requestId: `chat:${request.request_id}`,
+      whenBusy: "followUp",
+    }, BACKGROUND_CONTEXT);
+    const settled = await submission.wait(BACKGROUND_CONTEXT);
+    if (settled.status !== "done" || settled.type !== "input") {
+      return {
+        request_id: request.request_id,
+        ok: false,
+        error: "chat_unanswered",
+        conversation_id: root.id,
+        submission_id: submission.id,
+        reason: settled.status === "unanswered" ? settled.reason : "Unexpected submission type",
+      };
+    }
+    const entry = await input.harness.commit((tx) => tx.entry(AssistantEntry, settled.answer), BACKGROUND_CONTEXT);
+    return {
+      request_id: request.request_id,
+      ok: true,
+      conversation_id: root.id,
+      submission_id: submission.id,
+      answer: assistantText(entry),
+    };
   }
 
   async function handleRequest(value: unknown): Promise<ServiceResponse> {
@@ -343,6 +400,8 @@ export function createWorkshopService(input: { projectRoot: string; harness: Har
         if (!record) throw new Error(`Workflow run ${request.run_id} was not found`);
         return { request_id: request.request_id, ok: true, run: runDetails(record) };
       }
+      case "submit_chat":
+        return await submitChat(request);
       case "start_workflow": {
         const port = await createWorkflowStartPort(input.harness);
         const result = await startWorkflow({
@@ -350,36 +409,59 @@ export function createWorkshopService(input: { projectRoot: string; harness: Har
           projectRoot,
           port,
           source: "chat",
+          idempotency: {
+            requestId: request.request_id,
+            fingerprint: fingerprint(request),
+            response: (outcome: StartWorkflowOutcome) => {
+              const response = startResponse(request.request_id, outcome);
+              const serialized = JSON.stringify(response);
+              if (serialized === undefined) throw new Error("Start response could not be saved");
+              return JSON.parse(serialized);
+            },
+          },
         });
-        if (result.kind === "skipped" || result.kind === "locked") return { request_id: request.request_id, ok: false, error: result.reason };
-        if (result.kind === "already-indexed") return { request_id: request.request_id, ok: false, error: `Workflow slot ${result.slot} was already indexed` };
-        return { request_id: request.request_id, ok: true, workflow: result.workflow, run_id: result.run_id };
+        return result.kind === "replayed" ? responseFromReceipt(result.response) : startResponse(request.request_id, result);
       }
       case "decide_blocked_run":
         return await decideBlockedRun(request);
       case "cancel_run": {
+        const previous = await input.harness.snapshot(workshopStateDocument, BACKGROUND_CONTEXT);
+        const prior = previous === undefined ? undefined : receiptFor(previous, request);
+        if (prior) {
+          if (prior.cancelled === true) {
+            const priorTask = await taskForRun(input.harness, request.run_id);
+            if (priorTask) await input.harness.abortTask(priorTask.id, BACKGROUND_CONTEXT);
+          }
+          return prior;
+        }
         const record = await taskForRun(input.harness, request.run_id);
         if (!record) throw new Error(`Workflow run ${request.run_id} was not found`);
         const run = runInputOf(record);
         if (!run) throw new Error("Durable workflow task has invalid run metadata");
-        const status = statusOf(record);
-        if (!liveStatus(record)) return { request_id: request.request_id, ok: true, run_id: request.run_id, workflow: run.workflow, status, cancelled: false };
-        await input.harness.abortTask(record.id, BACKGROUND_CONTEXT);
-        await input.harness.commit(async (tx) => {
+        const response = await input.harness.commit(async (tx) => {
           const state = await tx.doc(workshopStateDocument);
-          if (!state.actions.some((action) => action.run_id === request.run_id && action.source === "chat" && action.decision.action === "cancel")) {
-            appendRecent(state.actions, {
-              at: new Date().toISOString(),
-              workflow: run.workflow,
-              run_id: request.run_id,
-              step: null,
-              source: "chat",
-              decision: { action: "cancel" },
-              note: "Workflow run cancelled from chat.",
-            });
-          }
+          const prior = receiptFor(state, request);
+          if (prior) return prior;
+          const current = await tx.task(record.id);
+          if (!current || current.kind !== WORKFLOW_TASK_NAME) throw new Error(`Workflow run ${request.run_id} was not found`);
+          const cancelled = liveStatus(current);
+          const result: ServiceResponse = cancelled
+            ? { request_id: request.request_id, ok: true, run_id: request.run_id, workflow: run.workflow, status: "cancellation-requested", cancelled: true }
+            : { request_id: request.request_id, ok: true, run_id: request.run_id, workflow: run.workflow, status: statusOf(current), cancelled: false };
+          if (cancelled) appendRecent(state.actions, {
+            at: new Date().toISOString(),
+            workflow: run.workflow,
+            run_id: request.run_id,
+            step: null,
+            source: "chat",
+            decision: { action: "cancel" },
+            note: "Workflow run cancellation requested from chat.",
+          });
+          saveReceipt(state, request, result);
+          return result;
         }, BACKGROUND_CONTEXT);
-        return { request_id: request.request_id, ok: true, run_id: request.run_id, workflow: run.workflow, status: "cancellation-requested", cancelled: true };
+        if (response.cancelled === true) await input.harness.abortTask(record.id, BACKGROUND_CONTEXT);
+        return response;
       }
       case "pause_workflow":
       case "resume_workflow":

@@ -13,8 +13,8 @@ export type AgentProfile = {
 export type WorkshopConfig = {
   agent_profiles: Record<string, AgentProfile>;
   orchestrator: {
-    profile: string;
-    escalation_profile: string;
+    model?: string;
+    escalation_model?: string;
   };
 };
 
@@ -52,21 +52,10 @@ const agentProfilesSchema = z.record(z.string(), agentProfileSchema)
 const configSchema = z.object({
   agent_profiles: agentProfilesSchema,
   orchestrator: z.object({
-    profile: profileName,
-    escalation_profile: profileName,
+    model: z.string().min(1).optional(),
+    escalation_model: z.string().min(1).optional(),
   }).strict(),
-}).strict().superRefine((config, context) => {
-  for (const key of ["profile", "escalation_profile"] as const) {
-    const name = config.orchestrator[key];
-    if (!Object.hasOwn(config.agent_profiles, name)) {
-      context.addIssue({
-        code: "custom",
-        path: ["orchestrator", key],
-        message: `profile "${name}" does not exist in agent_profiles`,
-      });
-    }
-  }
-});
+}).strict();
 
 function makeIssue(file: string, reason: string): ConfigReadError {
   return new ConfigReadError([{ file, reason }]);

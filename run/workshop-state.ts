@@ -1,7 +1,6 @@
 import type { JsonValue } from "@earendil-works/chord/json";
 import { defineDoc, defineDocFamily, type TaskId } from "@earendil-works/pi-durable";
 import type { OrchestratorDecision, WorkflowDecision } from "../workflow/types.ts";
-import { parseOrchestratorDecision } from "../workflow/parse-orchestrator-decision.ts";
 import { parseWorkflowDecision } from "../workflow/parse-workflow-decision.ts";
 
 export type WorkflowAdmission = {
@@ -18,7 +17,7 @@ export type WorkshopAction = {
   workflow: string;
   run_id: string | null;
   step: string | null;
-  source: "chat" | "round-1";
+  source: "chat" | "round";
   decision: WorkflowDecision | OrchestratorDecision | { action: "start" | "cancel" | "pause" | "resume" };
   note: string;
 };
@@ -75,15 +74,11 @@ function parseActionDecision(value: JsonValue | undefined): WorkshopAction["deci
   if (value.action === "cancel") return { action: "cancel" };
   if (value.action === "pause") return { action: "pause" };
   if (value.action === "resume") return { action: "resume" };
-  if (typeof value.note === "string") {
-    const raw = JSON.stringify(value);
-    if (raw === undefined) throw new Error("Stored orchestrator decision could not be read");
-    const decision = parseOrchestratorDecision(raw, {
-      allowedRetryProfiles: typeof value.profile === "string" ? [value.profile] : [],
-      lastOutput: "migrated action history",
-    });
-    if (decision.action !== value.action || decision.note !== value.note) throw new Error("Stored orchestrator decision is invalid");
-    return decision;
+  if (value.note !== undefined) {
+    if (typeof value.note !== "string") throw new Error("Stored orchestrator decision note is invalid");
+    if (value.action === "give_up") return { action: "give_up", note: value.note };
+    const { note, ...decisionValue } = value;
+    return { ...parseWorkflowDecision(decisionValue), note } as OrchestratorDecision;
   }
   return parseWorkflowDecision(value);
 }
@@ -93,7 +88,7 @@ function parseActions(value: JsonValue | undefined): WorkshopAction[] {
   return value.slice(-maxWorkshopHistoryRecords).map((entry) => {
     if (!isJsonObject(entry) || typeof entry.at !== "string" || typeof entry.workflow !== "string" ||
       (entry.run_id !== null && typeof entry.run_id !== "string") || (entry.step !== null && typeof entry.step !== "string") ||
-      (entry.source !== "chat" && entry.source !== "round-1") || typeof entry.note !== "string") {
+      (entry.source !== "chat" && entry.source !== "round" && entry.source !== "round-1") || typeof entry.note !== "string") {
       throw new Error("Stored workshop action is invalid");
     }
     return {
@@ -101,7 +96,7 @@ function parseActions(value: JsonValue | undefined): WorkshopAction[] {
       workflow: entry.workflow,
       run_id: entry.run_id,
       step: entry.step,
-      source: entry.source,
+      source: entry.source === "round-1" ? "round" : entry.source,
       decision: parseActionDecision(entry.decision),
       note: entry.note,
     };

@@ -440,23 +440,14 @@ test("aborting the step task signal kills the active process tree", { skip: proc
   });
 });
 
-test("automatic retry delay returns a durable resume checkpoint before rerunning the step", async () => {
+test("a requested retry delay returns a resume checkpoint before rerunning the step", async () => {
   let attempts = 0;
   let retryResume: WorkflowInterpreterResume | undefined;
   const workflow = makeWorkflow([{ kind: "command", file: "10-run.sh", number: 10, name: "run", retries: 0 }]);
-  const input = makeInput(workflow, async (request) => {
-    if (request.kind === "orchestrator") {
-      return successful(JSON.stringify({ action: "retry", after: "30s", note: "Wait before the next attempt." }));
-    }
+  const input = makeInput(workflow, async () => {
     attempts += 1;
     return failed("partial", "first attempt failed");
-  }, undefined, {
-    orchestrator: {
-      profile: "writer",
-      escalationProfile: "writer",
-      recordDecision: async () => {},
-    },
-  });
+  }, async () => ({ action: "retry", after: "30s", hint: "Wait before retrying." }));
   input.waitBeforeRetry = async (duration, resume) => {
     assert.equal(duration, "30s");
     retryResume = resume;
@@ -467,10 +458,9 @@ test("automatic retry delay returns a durable resume checkpoint before rerunning
   assert.equal(waiting.status, "waiting");
   assert.equal(attempts, 1);
   assert.ok(retryResume);
-  assert.equal(retryResume.automaticRound, 2);
   assert.equal(retryResume.localRetriesLeft, 0);
   assert.equal(retryResume.attemptHistory.length, 1);
-  assert.match(retryResume.feedback, /first attempt failed/);
+  assert.match(retryResume.feedback, /Wait before retrying/);
 
   const resumed = await interpretWorkflow({
     ...input,

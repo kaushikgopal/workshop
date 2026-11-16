@@ -118,9 +118,7 @@ test("a killed service resumes the same parent and child tasks from SQLite", { s
   writeFileSync(join(projectRoot, "workshop.yaml"), [
     "agent_profiles:",
     `  writer:\n    command: ["${process.execPath}"]`,
-    "orchestrator:",
-    "  profile: writer",
-    "  escalation_profile: writer",
+    "orchestrator: {}",
     "",
   ].join("\n"));
   writeFileSync(join(workflowDirectory, "workflow.md"), "---\ncron: '* * * * *'\nretries: 0\n---\nCrash-resume fixture.\n");

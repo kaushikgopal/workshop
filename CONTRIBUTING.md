@@ -74,11 +74,11 @@ Other plain verbs (`start`, `send`, `cancel`, `pause`, `resume`) are fine when n
 
 ## How the code works
 
-Workshop is a Node.js and TypeScript service built on pi-durable. `make start` runs `service/start-service.ts`; `make dev` watches source files and restarts the service. Startup checks config and workflows, claims a singleton owner row in `state/workshop.sqlite`, then opens the harness and listens on a private Unix socket. This lock comes before task recovery so two processes cannot recover the same work. A durable tick task checks schedules once a minute.
+Workshop is a Node.js and TypeScript service built on pi-durable. `make start` runs `service/start-service.ts`; `make dev` watches source files and restarts the service. Startup validates config and workflows, claims the SQLite owner row before task recovery, resolves orchestrator models through Pi's registry and auth store, opens the harness, and listens on a private Unix socket. The harness keeps one root conversation in SQLite for client chat and automatic failure rounds. A durable tick task checks schedules once a minute.
 
 `WorkflowTask` stores the validated workflow settings and ordered step list. It reads each step and check file when that step starts, then creates a `StepAttemptTask` for the work. The task checkpoint stores pipe input, results, attempts, retry state, and blocked decisions. Run-reference documents map public run IDs to durable task IDs. A bounded session document keeps recent admission, action, and decision-receipt history plus per-workflow schedule counters. A hard service crash can replay an unfinished command; external effects must be safe to repeat. Workshop does not write run snapshots or separate run-state files.
 
-After local retries fail, `workflow/execute-orchestrator-round.ts` returns the current stub outcome. The workflow task records the `give_up` decision and waits in a blocked checkpoint. The service API can list and inspect runs, start and cancel work, accept a blocked-run decision, pause or resume workflows, and list actions. Interactive chat is part 2; `make chat` remains a placeholder.
+After local retries fail, the workflow task saves the evidence and submits one keyed failure round to the root conversation. The root can decide through Workshop tools or call `consult`, a read-only child conversation using the escalation model. If it takes no safe action, Workshop records `give_up` and leaves the run blocked. A future chat client can send `submit_chat` through the private socket; `make chat` remains a placeholder.
 
 The daily-summary example reads recent runs and actions through this service API. Steps still share `data/<workflow>/`, which is separate from the SQLite record. Commands and profile processes run with the service account's permissions. They are not sandboxed.
 
@@ -94,10 +94,14 @@ flowchart TD
   LOAD --> ATTEMPT[workflow/define-step-attempt-task.ts]
   ATTEMPT --> PROCESS[sh, node, or profile command]
   PROCESS --> DATA[data/<workflow>/]
-  TASK -->|local retries exhausted| STUB[automatic-round stub]
-  STUB --> BLOCKED[blocked task checkpoint]
+  TASK -->|local retries exhausted| ROUND[one keyed failure round]
+  ROUND --> ROOT[persistent root conversation]
+  ROOT -->|decide_blocked_run| DECISION[durable decision document]
+  DECISION --> TASK
+  ROOT --> CONSULT[read-only consult conversation]
   SOCKET --> API[service/create-workshop-service.ts]
   API --> HARNESS
+  API -->|submit_chat| ROOT
 ```
 
 ### Code map
@@ -105,11 +109,11 @@ flowchart TD
 Folders and filenames follow [Naming files](#naming-files).
 
 ```text
-agent/instructions.md            orchestrator rules reserved for part 2
+agent/instructions.md            root orchestrator instructions
 config/                          config loading and validation
 run/                             durable workflow admission, state, process execution
 schedule/                        cron-slot selection and durable schedule ticks
-service/                         harness registration, socket API, service entrypoint
+service/                         Pi model runtime, root extension, harness, socket API, service entrypoint
 workflow/                        parsing, step loading, decisions, durable task definitions
 scripts/                         checks, activity reader, chat placeholder, copy, launch-agent setup
 test/                            unit, service, socket, and SQLite resume tests

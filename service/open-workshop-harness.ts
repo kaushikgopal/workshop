@@ -1,18 +1,34 @@
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { createModels } from "@earendil-works/pi-ai/models";
+import { createModels, type Models } from "@earendil-works/pi-ai/models";
 import { createRegistry, defineExtension, Harness, type Report, type Storage } from "@earendil-works/pi-durable";
 import { WorkflowTask } from "../workflow/define-workflow-task.ts";
 import { StepAttemptTask } from "../workflow/define-step-attempt-task.ts";
 import { WorkflowTickTask } from "../schedule/tick-workflows.ts";
+import { createWorkshopExtension, type WorkshopServiceRequest } from "./create-workshop-extension.ts";
+import type { OrchestratorModel } from "./create-orchestrator-runtime.ts";
 
-export async function openWorkshopHarness(storage: Storage, onStorageFailure?: (report: Report) => void): Promise<Harness> {
+export type WorkshopHarnessOptions = {
+  projectRoot: string;
+  request: WorkshopServiceRequest;
+  models: Models;
+  model: OrchestratorModel;
+  escalationModel: OrchestratorModel;
+};
+
+export async function openWorkshopHarness(
+  storage: Storage,
+  onStorageFailure?: (report: Report) => void,
+  options?: WorkshopHarnessOptions,
+): Promise<Harness> {
   const registry = createRegistry();
   registry.install(defineExtension({
-    name: "workshop",
+    name: "workshop-workflows",
     tasks: [WorkflowTask, StepAttemptTask, WorkflowTickTask],
   }));
+  const workshop = options === undefined ? undefined : createWorkshopExtension(options);
+  if (workshop) registry.install(workshop);
   const harness = await Harness.open(storage, {
-    models: createModels(),
+    models: options?.models ?? createModels(),
     registry,
     onReport: (report) => {
       const message = report.error instanceof Error ? report.error.message : String(report.error);
@@ -20,6 +36,19 @@ export async function openWorkshopHarness(storage: Storage, onStorageFailure?: (
       if (report.kind === "storage_failed") onStorageFailure?.(report);
     },
   }, BACKGROUND_CONTEXT);
-  await harness.root(BACKGROUND_CONTEXT);
+  if (workshop && options) {
+    const tools = workshop.tools ?? [];
+    const agent = {
+      model: options.model.model,
+      thinkingLevel: options.model.thinkingLevel,
+      extensions: [workshop],
+      tools,
+      modelTools: tools,
+    };
+    const root = await harness.root(BACKGROUND_CONTEXT, { agent });
+    await root.configure(agent, BACKGROUND_CONTEXT);
+  } else {
+    await harness.root(BACKGROUND_CONTEXT);
+  }
   return harness;
 }

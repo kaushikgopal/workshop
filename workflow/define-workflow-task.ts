@@ -5,10 +5,8 @@ import { applyWorkflowDecision } from "./apply-workflow-decision.ts";
 import { buildOrchestratorBrief } from "./build-orchestrator-brief.ts";
 import { computeRetryProfiles } from "./compute-retry-profiles.ts";
 import { StepAttemptTask } from "./define-step-attempt-task.ts";
-import { executeOrchestratorRound } from "./execute-orchestrator-round.ts";
 import { loadWorkflowStep } from "./load-workflow-step.ts";
-import { failedOrchestratorDecision, parseOrchestratorDecision } from "./parse-orchestrator-decision.ts";
-import type { AutomaticDecisionLog, WorkflowAttemptRequest, WorkflowAttemptResult, WorkflowDecisionRequest, WorkflowInterpretation } from "./interpret-workflow.ts";
+import type { WorkflowAttemptRequest, WorkflowAttemptResult, WorkflowDecisionRequest, WorkflowInterpretation } from "./interpret-workflow.ts";
 import type { AttemptHistoryEntry, OrchestratorDecision, Workflow, WorkflowDecision, WorkflowStep, WorkflowStepResult } from "./types.ts";
 import { appendRecent, workshopStateDocument } from "../run/workshop-state.ts";
 
@@ -24,7 +22,6 @@ export type WorkflowTaskInput = {
   stateDirectory: string;
   workflow: Workflow;
   profileCommands: Record<string, string[]>;
-  orchestrator: { profile: string; escalationProfile: string };
 };
 
 type ActiveAttempt = {
@@ -45,14 +42,14 @@ type CheckpointPosition = {
 };
 type StepCheckpoint = CheckpointPosition & { phase: "step" };
 type AttemptCheckpoint = CheckpointPosition & { phase: "attempt"; activeAttempt: ActiveAttempt };
-type BlockedCheckpoint = CheckpointPosition & { phase: "blocked"; failure: WorkflowDecisionRequest };
-type DecisionCheckpoint = CheckpointPosition & { phase: "decision"; failure: WorkflowDecisionRequest; decision: WorkflowDecision };
+type BlockedCheckpoint = CheckpointPosition & { phase: "blocked"; failure: WorkflowDecisionRequest; roundStatus?: "pending" | "settled" };
+type DecisionCheckpoint = CheckpointPosition & { phase: "decision"; failure: WorkflowDecisionRequest; decision: WorkflowDecision; decisionSource?: "chat" | "round" };
 export type WorkflowTaskCheckpoint = StepCheckpoint | AttemptCheckpoint | BlockedCheckpoint | DecisionCheckpoint;
 export type WorkflowTaskResult = WorkflowInterpretation;
 type WorkflowTaskRuntime = TaskRuntime<WorkflowTaskInput, WorkflowTaskCheckpoint, WorkflowTaskResult, object>;
 
 type DecisionDocument = {
-  choice: { requestId: string; decisionNumber?: number; decision: WorkflowDecision } | null;
+  choice: { requestId: string; decisionNumber?: number; decision: WorkflowDecision; source?: "chat" | "round" } | null;
 };
 
 export const workflowDecisionDocument = defineDoc<DecisionDocument>({
@@ -170,33 +167,6 @@ async function finishFailed(
   await runtime.commit(() => ({ status: "terminal", outcome: { status: "failed", error } }), context);
 }
 
-async function recordAutomaticDecision(runtime: WorkflowTaskRuntime, decision: AutomaticDecisionLog, context: typeof BACKGROUND_CONTEXT): Promise<void> {
-  await runtime.commit(async (tx) => {
-    const state = await tx.doc(workshopStateDocument);
-    appendRecent(state.actions, {
-      at: new Date(runtime.now()).toISOString(),
-      workflow: decision.workflow,
-      run_id: decision.runId,
-      step: decision.step,
-      source: "round-1",
-      decision: decision.decision,
-      note: decision.note,
-    });
-  }, context);
-}
-
-function workflowDecision(decision: OrchestratorDecision): WorkflowDecision | undefined {
-  if (decision.action === "give_up") return undefined;
-  if (decision.action === "retry") {
-    return {
-      action: "retry",
-      ...(decision.hint === undefined ? {} : { hint: decision.hint }),
-      ...(decision.profile === undefined ? {} : { profile: decision.profile }),
-      ...(decision.after === undefined ? {} : { after: decision.after }),
-    };
-  }
-  return { action: decision.action };
-}
 
 function failureFor(input: WorkflowTaskInput, checkpoint: CheckpointPosition, step: WorkflowStep, lastError: string, lastOutput: string): WorkflowDecisionRequest {
   return {
@@ -217,6 +187,7 @@ async function blockRun(
   failure: WorkflowDecisionRequest,
   runtime: WorkflowTaskRuntime,
   context: typeof BACKGROUND_CONTEXT,
+  roundStatus: "pending" | "settled",
 ): Promise<void> {
   const blocked: BlockedCheckpoint = {
     phase: "blocked",
@@ -230,6 +201,7 @@ async function blockRun(
     decisionNumber: failure.decisionNumber,
     automaticRoundUsed: true,
     failure,
+    roundStatus,
   };
   await runtime.commit(() => ({ status: "running", checkpoint: blocked }), context);
 }
@@ -264,7 +236,7 @@ async function applyDecision(
       ...(applied.profile === undefined ? {} : { profile: applied.profile }),
       feedback: applied.feedback,
       decisionNumber: checkpoint.decisionNumber,
-      automaticRoundUsed: false,
+      automaticRoundUsed: checkpoint.decisionSource === "round",
     };
     if (applied.after !== undefined) {
       const waitUntil = runtime.now() + durationMilliseconds(applied.after);
@@ -279,11 +251,76 @@ async function applyDecision(
   await commitStepResult(input, checkpoint, stepResult, nextPipe, runtime, context);
 }
 
-async function waitForDecision(
+
+function roundFailureNote(settled: { status: string; reason?: string }): string {
+  return settled.status === "unanswered"
+    ? `Automatic failure round gave up: ${settled.reason ?? "the submission was unanswered"}`
+    : "Automatic failure round returned without a decision; the run remains blocked.";
+}
+
+async function submitFailureRound(
+  input: WorkflowTaskInput,
   checkpoint: BlockedCheckpoint,
   runtime: WorkflowTaskRuntime,
   context: typeof BACKGROUND_CONTEXT,
 ): Promise<void> {
+  const step = input.workflow.steps[checkpoint.stepIndex];
+  if (!step) throw new Error(`Workflow step ${checkpoint.failure.step} is missing from the workflow`);
+  const loaded = loadWorkflowStep(join(input.projectRoot, "workflows"), input.workflow, step);
+  const brief = buildOrchestratorBrief({
+    workflow: input.workflow,
+    step,
+    stepId: checkpoint.failure.step,
+    runId: input.runId,
+    decisionNumber: checkpoint.failure.decisionNumber,
+    stepContent: loaded.contents[step.file] ?? loaded.documents[step.file] ?? "",
+    lastOutput: checkpoint.failure.lastOutput,
+    lastError: checkpoint.failure.lastError,
+    attemptHistory: checkpoint.failure.attemptHistory,
+    allowedRetryProfiles: checkpoint.failure.retryProfiles,
+  });
+  const conversation = await runtime.conversation(runtime.conversationId, context);
+  if (!conversation) throw new Error("Root orchestrator conversation is unavailable");
+  const attempt = checkpoint.failure.attemptHistory.at(-1)?.attempt ?? 1;
+  const submission = await conversation.submit({
+    type: "input",
+    content: brief.prompt,
+    requestId: `round:${input.runId}:${checkpoint.failure.step}:${attempt}`,
+    whenBusy: "followUp",
+  }, context);
+  const settled = await submission.wait(context);
+  await runtime.commit(async (tx) => {
+    const decision = await tx.doc(workflowDecisionDocument, runtime.taskId);
+    if (decision.choice === null) {
+      const state = await tx.doc(workshopStateDocument);
+      const note = roundFailureNote(settled);
+      const action: OrchestratorDecision = { action: "give_up", note };
+      appendRecent(state.actions, {
+        at: new Date(runtime.now()).toISOString(),
+        workflow: input.workflowName,
+        run_id: input.runId,
+        step: checkpoint.failure.step,
+        source: "round",
+        decision: action,
+        note,
+      });
+    }
+    return { status: "running", checkpoint: { ...checkpoint, roundStatus: "settled" } };
+  }, context);
+}
+
+async function waitForDecision(
+  input: WorkflowTaskInput,
+  checkpoint: BlockedCheckpoint,
+  runtime: WorkflowTaskRuntime,
+  context: typeof BACKGROUND_CONTEXT,
+): Promise<void> {
+  const latest = await runtime.snapshot(workflowDecisionDocument, runtime.taskId, context);
+  if (latest === undefined) throw new Error("Decision document is missing");
+  if (latest.choice === null && checkpoint.roundStatus === "pending") {
+    await submitFailureRound(input, checkpoint, runtime, context);
+    return;
+  }
   const watch = await runtime.watchDoc(workflowDecisionDocument, runtime.taskId, context);
   if (!watch) throw new Error("Decision document is missing");
   try {
@@ -332,6 +369,7 @@ async function waitForDecision(
         automaticRoundUsed: checkpoint.automaticRoundUsed,
         failure: checkpoint.failure,
         decision: accepted.decision,
+        decisionSource: accepted.source ?? "chat",
       };
       return { status: "running", checkpoint: decisionCheckpoint };
     }, context);
@@ -340,7 +378,7 @@ async function waitForDecision(
   }
 }
 
-async function decideAutomatically(
+async function blockAfterFailure(
   input: WorkflowTaskInput,
   checkpoint: AttemptCheckpoint,
   step: WorkflowStep,
@@ -348,90 +386,8 @@ async function decideAutomatically(
   runtime: WorkflowTaskRuntime,
   context: typeof BACKGROUND_CONTEXT,
 ): Promise<void> {
-  if (checkpoint.automaticRoundUsed) {
-    await blockRun(checkpoint, failureFor(input, checkpoint, step, result.reason, result.output), runtime, context);
-    return;
-  }
-
-  const loaded = loadWorkflowStep(join(input.projectRoot, "workflows"), input.workflow, step);
-  const allowedRetryProfiles = computeRetryProfiles(step, input.profileCommands);
-  const brief = buildOrchestratorBrief({
-    round: 1,
-    workflow: input.workflow,
-    step,
-    stepId: stepId(step),
-    stepContent: loaded.contents[step.file] ?? loaded.documents[step.file] ?? "",
-    lastOutput: result.output,
-    lastError: result.reason,
-    attemptHistory: checkpoint.attemptHistory,
-    allowedRetryProfiles,
-  });
-  const timeout = step.timeout ?? input.workflow.timeout;
-  const execution = await executeOrchestratorRound({
-    workflow: input.workflowName,
-    runId: input.runId,
-    profile: input.orchestrator.profile,
-    round: 1,
-    input: brief.prompt,
-    step: `${stepId(step)}.orchestrator-round-1`,
-    ...(timeout === undefined ? {} : { timeoutMs: durationMilliseconds(timeout) }),
-    allowedRetryProfiles: [...allowedRetryProfiles],
-    lastOutput: result.output,
-    signal: runtime.signal,
-  });
-  const decision = execution.exitCode === 0 && !execution.timedOut && execution.error === undefined
-    ? parseOrchestratorDecision(execution.stdout, { allowedRetryProfiles, lastOutput: result.output })
-    : failedOrchestratorDecision(execution.error ?? (execution.stderr || `exit code ${execution.exitCode}`));
-  await recordAutomaticDecision(runtime, {
-    workflow: input.workflowName,
-    runId: input.runId,
-    step: stepId(step),
-    round: 1,
-    decision,
-    note: decision.note,
-  }, context);
-
-  const actionable = workflowDecision(decision);
-  if (actionable === undefined) {
-    await blockRun(checkpoint, failureFor(input, checkpoint, step, decision.note || result.reason, result.output), runtime, context);
-    return;
-  }
-  const applied = applyWorkflowDecision({
-    decision: actionable,
-    step,
-    currentProfile: checkpoint.profile ?? checkpoint.activeAttempt.request.profile ?? step.profile,
-    profileCommands: input.profileCommands,
-    lastError: result.reason,
-  });
-  if (applied.action === "fail") {
-    await finishFailed(step, failureFor(input, checkpoint, step, result.reason, result.output), runtime, context);
-    return;
-  }
-  if (applied.action === "skip" || applied.action === "accept") {
-    const failure = failureFor(input, checkpoint, step, result.reason, result.output);
-    const stepResult = resultForDecision(failure, applied.action);
-    const nextPipe = applied.action === "accept" ? result.output : checkpoint.pipeInput;
-    await commitStepResult(input, checkpoint, stepResult, nextPipe, runtime, context);
-    return;
-  }
-  const nextCheckpoint: StepCheckpoint = {
-    phase: "step",
-    stepIndex: checkpoint.stepIndex,
-    pipeInput: checkpoint.pipeInput,
-    results: checkpoint.results,
-    attemptHistory: checkpoint.attemptHistory,
-    localRetriesLeft: 0,
-    ...(applied.profile === undefined ? {} : { profile: applied.profile }),
-    feedback: applied.feedback,
-    decisionNumber: checkpoint.decisionNumber,
-    automaticRoundUsed: true,
-  };
-  if (applied.after !== undefined) {
-    const waitUntil = runtime.now() + durationMilliseconds(applied.after);
-    await runtime.sleepUntil(waitUntil, { ...nextCheckpoint, waitUntil }, context);
-  } else {
-    await runtime.commit(() => ({ status: "running", checkpoint: nextCheckpoint }), context);
-  }
+  const failure = failureFor(input, checkpoint, step, result.reason, result.output);
+  await blockRun(checkpoint, failure, runtime, context, checkpoint.automaticRoundUsed ? "settled" : "pending");
 }
 
 async function startStepAttempt(
@@ -537,7 +493,7 @@ async function receiveStepAttempt(
     await runtime.commit(() => ({ status: "running", checkpoint: nextCheckpoint }), context);
     return;
   }
-  await decideAutomatically(input, position, step, attemptResult, runtime, context);
+  await blockAfterFailure(input, position, step, attemptResult, runtime, context);
 }
 
 export const WorkflowTask = defineTask<WorkflowTaskInput, WorkflowTaskCheckpoint, WorkflowTaskResult, object>({
@@ -561,7 +517,7 @@ export const WorkflowTask = defineTask<WorkflowTaskInput, WorkflowTaskCheckpoint
   phases: {
     step: async (task, runtime, context) => startStepAttempt(task.input, task.state.checkpoint, runtime, context),
     attempt: async (task, runtime, context) => receiveStepAttempt(task.input, task.state.checkpoint, runtime, context),
-    blocked: async (task, runtime, context) => waitForDecision(task.state.checkpoint, runtime, context),
+    blocked: async (task, runtime, context) => waitForDecision(task.input, task.state.checkpoint, runtime, context),
     decision: async (task, runtime, context) => applyDecision(task.input, task.state.checkpoint, runtime, context),
   },
   abort: async (_task, runtime, context) => {
