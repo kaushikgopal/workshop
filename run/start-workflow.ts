@@ -10,6 +10,8 @@ import { loadWorkflows } from "../workflow/load-workflows.ts";
 import type { Workflow } from "../workflow/types.ts";
 import { WorkflowTask, WORKFLOW_TASK_NAME, type WorkflowTaskInput, workflowDecisionDocument } from "../workflow/define-workflow-task.ts";
 import { appendRecent, workshopStateDocument, workflowRunReferenceDocument, type WorkshopAction, type WorkflowRunReference, type WorkshopState } from "../workflow/define-workshop-state.ts";
+import { decideWorkflowAdmission, type WorkflowAdmissionCommand, type WorkflowAdmissionDecision } from "./decide-workflow-admission.ts";
+import { latestCronSlot } from "../schedule/decide-workflow-slot.ts";
 
 export type StartWorkflowOutcome =
   | { kind: "started"; workflow: string; run_id: string; slot: string | null; task_id: string }
@@ -26,6 +28,10 @@ export type WorkflowStartPort = {
 };
 
 type WorkflowTaskRecord = TaskRecord<JsonValue, JsonValue, unknown>;
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -83,10 +89,6 @@ function runReferenceFor(record: WorkflowTaskRecord): WorkflowRunReference | und
 }
 
 
-function slotWasIndexed(state: WorkshopState, workflow: string, slot: string): boolean {
-  const lastSlot = Object.hasOwn(state.lastSlots, workflow) ? state.lastSlots[workflow] : undefined;
-  return lastSlot !== undefined && lastSlot >= slot;
-}
 
 function startedCountForWorkflow(state: WorkshopState, workflow: string): number {
   return Object.hasOwn(state.startedCounts, workflow) ? state.startedCounts[workflow] ?? 0 : 0;
@@ -137,20 +139,148 @@ type StartWorkflowInput = {
   };
 };
 
+type StartIdempotency = NonNullable<StartWorkflowInput["idempotency"]>;
+
+function receiptResult(state: WorkshopState | undefined, idempotency?: StartIdempotency): StartWorkflowResult | undefined {
+  if (!idempotency) return undefined;
+  const receipt = state?.receipts.find((item) => item.request_id === idempotency.requestId);
+  const decision = decideWorkflowAdmission({
+    phase: "receipt-lookup",
+    requestId: idempotency.requestId,
+    fingerprint: idempotency.fingerprint,
+    ...(receipt === undefined ? {} : { receipt }),
+  });
+  if (decision.kind === "unseen-receipt") return undefined;
+  if (decision.kind === "replayed-receipt") return { kind: "replayed", response: decision.response };
+  if (decision.kind === "receipt-conflict") throw new Error(decision.reason);
+  throw new Error(`Unexpected receipt decision: ${decision.kind}`);
+}
+
+function finishStart(
+  state: WorkshopState,
+  idempotency: StartIdempotency | undefined,
+  outcome: StartWorkflowOutcome,
+): StartWorkflowOutcome {
+  if (idempotency) appendRecent(state.receipts, {
+    request_id: idempotency.requestId,
+    fingerprint: idempotency.fingerprint,
+    response: idempotency.response(outcome),
+  });
+  return outcome;
+}
+
+function decideLoadedAdmission(
+  state: WorkshopState,
+  workflow: Workflow,
+  command: WorkflowAdmissionCommand,
+  dueSlot: string | undefined,
+  hasOpenRun: boolean,
+): WorkflowAdmissionDecision {
+  const lastSlot = command.kind === "scheduled" && Object.hasOwn(state.lastSlots, workflow.name)
+    ? state.lastSlots[workflow.name]
+    : undefined;
+  return decideWorkflowAdmission({
+    phase: "admit",
+    command: command.kind === "scheduled"
+      ? { ...command, dueSlot: dueSlot ?? command.slot }
+      : command,
+    availability: { kind: "loaded", enabled: workflow.enabled !== false },
+    paused: state.paused.includes(workflow.name),
+    startedCount: startedCountForWorkflow(state, workflow.name),
+    ...(workflow.max_runs === undefined ? {} : { maxRuns: workflow.max_runs }),
+    ...(lastSlot === undefined ? {} : { lastSlot }),
+    hasOpenRun,
+  });
+}
+
+function outcomeFromAdmission(
+  decision: WorkflowAdmissionDecision,
+  workflow: string,
+  slot: string | null,
+): StartWorkflowOutcome | undefined {
+  switch (decision.kind) {
+    case "admitted":
+      return undefined;
+    case "skipped":
+      if (slot === null) throw new Error("Manual workflow admission cannot be skipped");
+      return { kind: "skipped", workflow, slot, reason: decision.reason };
+    case "already-indexed":
+      if (slot === null) throw new Error("Manual workflow admission cannot be already indexed");
+      return { kind: "already-indexed", workflow, slot };
+    case "locked":
+      return { kind: "locked", workflow, reason: decision.reason };
+    case "rejected":
+      throw new Error(decision.reason);
+    case "unseen-receipt":
+    case "replayed-receipt":
+    case "receipt-conflict":
+      throw new Error(`Unexpected admission decision: ${decision.kind}`);
+  }
+}
+
+async function recordScheduledAdmissionFailure(
+  input: StartWorkflowInput,
+  workflowName: string,
+  slot: string,
+  at: Date,
+  error: unknown,
+): Promise<StartWorkflowResult> {
+  console.error(`[workshop] scheduled admission failed (${workflowName} at ${slot}): ${errorMessage(error)}`);
+  return await input.port.commit(async (tx) => {
+    const state = await tx.doc(workshopStateDocument);
+    const replay = receiptResult(state, input.idempotency);
+    if (replay) return replay;
+    const lastSlot = Object.hasOwn(state.lastSlots, workflowName) ? state.lastSlots[workflowName] : undefined;
+    const decision = decideWorkflowAdmission({
+      phase: "admit",
+      command: { kind: "scheduled", workflow: workflowName, slot, dueSlot: slot },
+      availability: { kind: "failed" },
+      paused: state.paused.includes(workflowName),
+      startedCount: startedCountForWorkflow(state, workflowName),
+      ...(lastSlot === undefined ? {} : { lastSlot }),
+      hasOpenRun: false,
+    });
+    if (decision.kind === "already-indexed") {
+      return finishStart(state, input.idempotency, { kind: "already-indexed", workflow: workflowName, slot });
+    }
+    if (decision.kind !== "skipped") throw new Error(`Unexpected admission failure decision: ${decision.kind}`);
+    const outcome: StartWorkflowOutcome = { kind: "skipped", workflow: workflowName, slot, reason: decision.reason };
+    recordAdmission(state, workflowName, slot, null, "skipped", at.toISOString(), decision.reason);
+    return finishStart(state, input.idempotency, outcome);
+  });
+}
+
 export function startWorkflow(input: Omit<StartWorkflowInput, "idempotency">): Promise<StartWorkflowOutcome>;
 export function startWorkflow(input: StartWorkflowInput & { idempotency: NonNullable<StartWorkflowInput["idempotency"]> }): Promise<StartWorkflowResult>;
 export async function startWorkflow(input: StartWorkflowInput): Promise<StartWorkflowResult> {
   if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(input.workflowName)) throw new Error(`Invalid workflow name: ${input.workflowName}`);
   const projectRoot = resolve(input.projectRoot);
-  const { config, workflow } = configurationFor(projectRoot, input.workflowName);
   const slot = input.slot ?? null;
   const at = input.at ?? new Date();
   if (!Number.isFinite(at.getTime())) throw new Error("Workflow start time must be a valid date");
-  if (slot === null && workflow.enabled === false) throw new Error(`Workflow "${input.workflowName}" is disabled and cannot be started manually.`);
+
+  const replay = receiptResult(input.idempotency ? await input.port.readState() : undefined, input.idempotency);
+  if (replay) return replay;
+
+  let config: WorkshopConfig;
+  let workflow: Workflow;
+  let dueSlot: string | undefined;
+  try {
+    ({ config, workflow } = configurationFor(projectRoot, input.workflowName));
+    if (slot !== null) dueSlot = latestCronSlot(workflow.cron, at);
+  } catch (error) {
+    if (slot === null) throw error;
+    return await recordScheduledAdmissionFailure(input, input.workflowName, slot, at, error);
+  }
 
   const stateDirectory = resolve(projectRoot, "state");
   const dataDirectory = resolve(projectRoot, "data", input.workflowName);
-  mkdirSync(dataDirectory, { recursive: true });
+  try {
+    mkdirSync(dataDirectory, { recursive: true });
+  } catch (error) {
+    if (slot === null) throw error;
+    return await recordScheduledAdmissionFailure(input, workflow.name, slot, at, error);
+  }
   const runId = randomUUID();
   const taskInput: WorkflowTaskInput = {
     runId,
@@ -163,45 +293,32 @@ export async function startWorkflow(input: StartWorkflowInput): Promise<StartWor
     workflow,
     profileCommands: Object.fromEntries(Object.entries(config.agent_profiles).map(([name, profile]) => [name, profile.command])),
   };
+  const command: WorkflowAdmissionCommand = slot === null
+    ? { kind: "manual", workflow: workflow.name }
+    : { kind: "scheduled", workflow: workflow.name, slot, dueSlot: dueSlot ?? slot };
 
   return await input.port.commit(async (tx) => {
     const state = await tx.doc(workshopStateDocument);
-    if (input.idempotency) {
-      const receipt = state.receipts.find((item) => item.request_id === input.idempotency?.requestId);
-      if (receipt) {
-        if (receipt.fingerprint !== input.idempotency.fingerprint) throw new Error("Request ID was already used for a different request");
-        return { kind: "replayed", response: receipt.response };
+    const receiptReplay = receiptResult(state, input.idempotency);
+    if (receiptReplay) return receiptReplay;
+
+    const finishDecision = (decision: WorkflowAdmissionDecision): StartWorkflowOutcome | undefined => {
+      const outcome = outcomeFromAdmission(decision, workflow.name, slot);
+      if (outcome?.kind === "skipped" && slot !== null) {
+        recordAdmission(state, workflow.name, slot, null, "skipped", at.toISOString(), outcome.reason);
       }
-    }
-    const finish = (outcome: StartWorkflowOutcome): StartWorkflowOutcome => {
-      if (input.idempotency) appendRecent(state.receipts, {
-        request_id: input.idempotency.requestId,
-        fingerprint: input.idempotency.fingerprint,
-        response: input.idempotency.response(outcome),
-      });
       return outcome;
     };
-    if (slot !== null && slotWasIndexed(state, workflow.name, slot)) {
-      return finish({ kind: "already-indexed", workflow: workflow.name, slot });
-    }
-    if (slot === null && state.paused.includes(workflow.name)) {
-      throw new Error(`Workflow "${input.workflowName}" is paused; resume it before starting manually.`);
-    }
-    if (slot !== null && state.paused.includes(workflow.name)) {
-      recordAdmission(state, workflow.name, slot, null, "skipped", at.toISOString(), "paused");
-      return finish({ kind: "skipped", workflow: workflow.name, slot, reason: "paused" });
-    }
-    if (slot !== null && workflow.max_runs !== undefined && startedCountForWorkflow(state, workflow.name) >= workflow.max_runs) {
-      recordAdmission(state, workflow.name, slot, null, "skipped", at.toISOString(), "max_runs reached");
-      return finish({ kind: "skipped", workflow: workflow.name, slot, reason: "max_runs reached" });
-    }
+
+    const initialDecision = decideLoadedAdmission(state, workflow, command, dueSlot, false);
+    const initialOutcome = finishDecision(initialDecision);
+    if (initialOutcome) return finishStart(state, input.idempotency, initialOutcome);
 
     const records = await liveTasksInTransaction(tx);
-    if (records.some((record) => isLive(record) && workflowOf(record) === workflow.name)) {
-      if (slot === null) return finish({ kind: "locked", workflow: workflow.name, reason: "workflow already has an open run" });
-      recordAdmission(state, workflow.name, slot, null, "skipped", at.toISOString(), "workflow lock held");
-      return finish({ kind: "skipped", workflow: workflow.name, slot, reason: "workflow lock held" });
-    }
+    const isLocked = records.some((record) => isLive(record) && workflowOf(record) === workflow.name);
+    const decision = decideLoadedAdmission(state, workflow, command, dueSlot, isLocked);
+    const outcome = finishDecision(decision);
+    if (outcome) return finishStart(state, input.idempotency, outcome);
 
     const taskId = await tx.createTask(WorkflowTask, taskInput, {
       ownership: { kind: "conversation" },
@@ -217,6 +334,6 @@ export async function startWorkflow(input: StartWorkflowInput): Promise<StartWor
     });
     recordAdmission(state, workflow.name, slot, runId, "started", at.toISOString());
     if (input.source === "chat") recordStartAction(state, workflow.name, runId, at.toISOString());
-    return finish({ kind: "started", workflow: workflow.name, run_id: runId, slot, task_id: String(taskId) });
+    return finishStart(state, input.idempotency, { kind: "started", workflow: workflow.name, run_id: runId, slot, task_id: String(taskId) });
   });
 }

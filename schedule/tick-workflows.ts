@@ -78,35 +78,43 @@ export async function tickWorkflows(input: {
 
   for (const workflow of loaded.workflows) {
     if (workflow.enabled === false) continue;
-    const lastSlot = Object.hasOwn(state.lastSlots, workflow.name) ? state.lastSlots[workflow.name] : undefined;
-    const startedCount = Object.hasOwn(state.startedCounts, workflow.name) ? state.startedCounts[workflow.name] ?? 0 : 0;
-    const decision = decideWorkflowSlot({
-      cron: workflow.cron,
-      now,
-      ...(lastSlot === undefined ? {} : { lastSlot }),
-      startedCount,
-      ...(workflow.max_runs === undefined ? {} : { maxRuns: workflow.max_runs }),
-      paused: state.paused.includes(workflow.name),
-    });
-    if (decision.kind === "already-indexed") {
-      results.push({ workflow: workflow.name, kind: "already-indexed", slot: decision.slot });
-      continue;
-    }
-    const admission = await startWorkflow({
-      workflowName: workflow.name,
-      projectRoot: input.projectRoot,
-      port: input.port,
-      slot: decision.slot,
-      at: now,
-    });
-    if (admission.kind === "started") {
-      results.push({ workflow: workflow.name, kind: "start", slot: decision.slot, run_id: admission.run_id });
-    } else if (admission.kind === "skipped") {
-      results.push({ workflow: workflow.name, kind: "skip", slot: decision.slot, reason: admission.reason });
-    } else if (admission.kind === "already-indexed") {
-      results.push({ workflow: workflow.name, kind: "already-indexed", slot: decision.slot });
-    } else {
-      results.push({ workflow: workflow.name, kind: "skip", slot: decision.slot, reason: admission.reason });
+    let slot: string | undefined;
+    try {
+      const lastSlot = Object.hasOwn(state.lastSlots, workflow.name) ? state.lastSlots[workflow.name] : undefined;
+      const startedCount = Object.hasOwn(state.startedCounts, workflow.name) ? state.startedCounts[workflow.name] ?? 0 : 0;
+      const decision = decideWorkflowSlot({
+        cron: workflow.cron,
+        now,
+        ...(lastSlot === undefined ? {} : { lastSlot }),
+        startedCount,
+        ...(workflow.max_runs === undefined ? {} : { maxRuns: workflow.max_runs }),
+        paused: state.paused.includes(workflow.name),
+      });
+      slot = decision.slot;
+      if (decision.kind === "already-indexed") {
+        results.push({ workflow: workflow.name, kind: "already-indexed", slot: decision.slot });
+        continue;
+      }
+      const admission = await startWorkflow({
+        workflowName: workflow.name,
+        projectRoot: input.projectRoot,
+        port: input.port,
+        slot: decision.slot,
+        at: now,
+      });
+      if (admission.kind === "started") {
+        results.push({ workflow: workflow.name, kind: "start", slot: decision.slot, run_id: admission.run_id });
+      } else if (admission.kind === "skipped") {
+        results.push({ workflow: workflow.name, kind: "skip", slot: decision.slot, reason: admission.reason });
+      } else if (admission.kind === "already-indexed") {
+        results.push({ workflow: workflow.name, kind: "already-indexed", slot: decision.slot });
+      } else {
+        results.push({ workflow: workflow.name, kind: "skip", slot: decision.slot, reason: admission.reason });
+      }
+    } catch (error) {
+      const reason = "admission failed";
+      console.error(`[workshop] scheduled admission failed (${workflow.name}${slot === undefined ? "" : ` at ${slot}`}): ${error instanceof Error ? error.message : String(error)}`);
+      if (slot !== undefined) results.push({ workflow: workflow.name, kind: "skip", slot, reason });
     }
   }
   return results;
