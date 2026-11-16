@@ -46,6 +46,74 @@ export type WorkflowAttemptResult =
   | { kind: "accepted"; output: string }
   | { kind: "failed"; output: string; reason: string }
   | { kind: "nothing-to-do"; output: string };
+export type WorkflowAttemptState =
+  | { kind: "worker" }
+  | { kind: "checking"; output: string }
+  | { kind: "accepted"; output: string }
+  | { kind: "rejected"; output: string; feedback: string }
+  | { kind: "failed"; output: string; reason: string }
+  | { kind: "nothing-to-do"; output: string }
+  | { kind: "cancelled"; output: string; reason: string };
+
+export type WorkflowAttemptEvent =
+  | { kind: "worker-succeeded"; output: string; hasCheck: boolean }
+  | { kind: "worker-failed"; output: string; reason: string }
+  | { kind: "worker-nothing-to-do"; output: string }
+  | { kind: "check-accepted" }
+  | { kind: "check-rejected"; feedback: string }
+  | { kind: "cancelled"; output: string; reason: string };
+
+export type WorkflowAttemptEffect = { kind: "check"; output: string };
+
+export type WorkflowAttemptTransition =
+  | { kind: "accepted"; state: WorkflowAttemptState; effects: WorkflowAttemptEffect[] }
+  | { kind: "rejected"; code: "out-of-order" | "already-terminal"; message: string };
+
+function acceptAttemptState(
+  state: WorkflowAttemptState,
+  effects: WorkflowAttemptEffect[] = [],
+ ): WorkflowAttemptTransition {
+  return { kind: "accepted", state, effects };
+}
+
+function rejectAttemptEvent(state: WorkflowAttemptState, event: WorkflowAttemptEvent): WorkflowAttemptTransition {
+  if (state.kind === "accepted" || state.kind === "rejected" || state.kind === "failed" || state.kind === "nothing-to-do" || state.kind === "cancelled") {
+    return { kind: "rejected", code: "already-terminal", message: `Attempt is already ${state.kind}` };
+  }
+  return {
+    kind: "rejected",
+    code: "out-of-order",
+    message: event.kind === "check-accepted"
+      ? `Cannot accept a check while attempt phase is ${state.kind}`
+      : event.kind === "check-rejected"
+        ? `Cannot reject a check while attempt phase is ${state.kind}`
+        : `Cannot complete ${event.kind.startsWith("worker-") ? "the worker" : "the attempt"} while attempt phase is ${state.kind}`,
+  };
+}
+
+export function transitionWorkflowAttempt(
+  state: WorkflowAttemptState,
+  event: WorkflowAttemptEvent,
+ ): WorkflowAttemptTransition {
+  if (state.kind === "worker") {
+    if (event.kind === "worker-succeeded") {
+      return event.hasCheck
+        ? acceptAttemptState({ kind: "checking", output: event.output }, [{ kind: "check", output: event.output }])
+        : acceptAttemptState({ kind: "accepted", output: event.output });
+    }
+    if (event.kind === "worker-failed") return acceptAttemptState({ kind: "failed", output: event.output, reason: event.reason });
+    if (event.kind === "worker-nothing-to-do") return acceptAttemptState({ kind: "nothing-to-do", output: event.output });
+    if (event.kind === "cancelled") return acceptAttemptState({ kind: "cancelled", output: event.output, reason: event.reason });
+    return rejectAttemptEvent(state, event);
+  }
+  if (state.kind === "checking") {
+    if (event.kind === "check-accepted") return acceptAttemptState({ kind: "accepted", output: state.output });
+    if (event.kind === "check-rejected") return acceptAttemptState({ kind: "rejected", output: state.output, feedback: event.feedback });
+    if (event.kind === "cancelled") return acceptAttemptState({ kind: "cancelled", output: state.output, reason: event.reason });
+    return rejectAttemptEvent(state, event);
+  }
+  return rejectAttemptEvent(state, event);
+}
 
 export type WorkflowAttemptEnvironment = {
   workflow: Workflow;
@@ -101,14 +169,39 @@ export function parseMarkdownVerdict(output: string): { accepted: boolean; reaso
   };
 }
 
+function attemptResult(state: WorkflowAttemptState): WorkflowAttemptResult {
+  switch (state.kind) {
+    case "accepted":
+      return { kind: "accepted", output: state.output };
+    case "rejected":
+      return { kind: "failed", output: state.output, reason: state.feedback };
+    case "failed":
+      return { kind: "failed", output: state.output, reason: state.reason };
+    case "nothing-to-do":
+      return { kind: "nothing-to-do", output: state.output };
+    case "cancelled":
+      throw new Error(state.reason);
+    case "worker":
+    case "checking":
+      throw new Error(`Attempt did not reach a terminal phase: ${state.kind}`);
+  }
+}
+
 async function executeAttempt(
   input: WorkflowAttemptEnvironment,
   request: WorkflowAttemptRequest,
-): Promise<WorkflowAttemptResult> {
+ ): Promise<WorkflowAttemptResult> {
   const { step, profile, pipeInput, feedback, attempt } = request;
   const id = stepId(step);
   const stepTimeout = timeoutMilliseconds(step.timeout ?? input.workflow.timeout);
-  let output: string;
+  let state: WorkflowAttemptState = { kind: "worker" };
+  const transition = (event: WorkflowAttemptEvent) => {
+    const result = transitionWorkflowAttempt(state, event);
+    if (result.kind === "rejected") throw new Error(`Workflow attempt transition rejected (${result.code}): ${result.message}`);
+    state = result.state;
+    return result;
+  };
+  let workerOutput: string;
   if (step.kind === "command") {
     const file = input.files[step.file];
     if (file === undefined) throw new Error(`${id} file was not loaded when the step started`);
@@ -121,10 +214,12 @@ async function executeAttempt(
       timeoutMs: stepTimeout,
       attempt,
     });
-    output = result.stdout;
-    if (result.exitCode === 99 && !result.timedOut && result.error === undefined) return { kind: "nothing-to-do", output };
+    workerOutput = result.stdout;
+    if (result.exitCode === 99 && !result.timedOut && result.error === undefined) {
+      return attemptResult(transition({ kind: "worker-nothing-to-do", output: workerOutput }).state);
+    }
     if (result.exitCode !== 0 || result.timedOut || result.error !== undefined) {
-      return { kind: "failed", output, reason: processFailure(id, result, stepTimeout) };
+      return attemptResult(transition({ kind: "worker-failed", output: workerOutput, reason: processFailure(id, result, stepTimeout) }).state);
     }
   } else {
     const command = input.profileCommands[profile ?? step.profile ?? ""];
@@ -141,16 +236,24 @@ async function executeAttempt(
       attempt,
       ...(profile === undefined ? {} : { profile }),
     });
-    output = result.stdout;
+    workerOutput = result.stdout;
     if (result.exitCode !== 0 || result.timedOut || result.error !== undefined) {
-      return { kind: "failed", output, reason: processFailure(`${id} profile`, result, stepTimeout) };
+      return attemptResult(transition({
+        kind: "worker-failed", output: workerOutput, reason: processFailure(`${id} profile`, result, stepTimeout),
+      }).state);
     }
   }
 
+  const workerTransition = transition({ kind: "worker-succeeded", output: workerOutput, hasCheck: step.check !== undefined });
+  state = workerTransition.state;
+  if (state.kind === "accepted") return attemptResult(state);
+  const checkEffect = workerTransition.effects.find((effect) => effect.kind === "check");
+  if (state.kind !== "checking" || !checkEffect) throw new Error(`Successful worker entered unexpected attempt phase ${state.kind}`);
+  workerOutput = checkEffect.output;
   if (step.check && input.signal?.aborted) {
-    throw new Error(`${id} was cancelled before its check could start`);
+    return attemptResult(transition({ kind: "cancelled", output: workerOutput, reason: `${id} was cancelled before its check could start` }).state);
   }
-  if (!step.check) return { kind: "accepted", output };
+  if (!step.check) throw new Error("Attempt entered checking without a check definition");
   const checkId = `${id}.check`;
   const checkTimeout = timeoutMilliseconds(step.check.timeout ?? step.timeout ?? input.workflow.timeout);
   if (step.check.kind === "command") {
@@ -159,17 +262,19 @@ async function executeAttempt(
     const result = await input.executeProcess({
       kind: "command-check",
       command: [step.check.file.endsWith(".ts") ? process.execPath : "sh", file],
-      input: output,
+      input: workerOutput,
       step: checkId,
       feedback,
       timeoutMs: checkTimeout,
       attempt,
     });
-    if (result.exitCode === 0 && !result.timedOut && result.error === undefined) return { kind: "accepted", output };
+    if (result.exitCode === 0 && !result.timedOut && result.error === undefined) {
+      return attemptResult(transition({ kind: "check-accepted" }).state);
+    }
     const reason = result.timedOut || result.error !== undefined
       ? processFailure(checkId, result, checkTimeout)
       : [result.stdout.trim(), result.stderr.trim()].filter(Boolean).join("\n") || `${checkId} exited ${result.exitCode}`;
-    return { kind: "failed", output, reason };
+    return attemptResult(transition({ kind: "check-rejected", feedback: reason }).state);
   }
 
   const checkProfile = step.check.profile ?? profile ?? step.profile;
@@ -180,7 +285,7 @@ async function executeAttempt(
   const result = await input.executeProcess({
     kind: "agent-check",
     command,
-    input: renderAgentPrompt(prompt, output, ""),
+    input: renderAgentPrompt(prompt, workerOutput, ""),
     step: checkId,
     feedback: "",
     timeoutMs: checkTimeout,
@@ -188,10 +293,14 @@ async function executeAttempt(
     profile: checkProfile,
   });
   if (result.exitCode !== 0 || result.timedOut || result.error !== undefined) {
-    return { kind: "failed", output, reason: processFailure(checkId, result, checkTimeout) };
+    return attemptResult(transition({
+      kind: "check-rejected", feedback: processFailure(checkId, result, checkTimeout),
+    }).state);
   }
   const verdict = parseMarkdownVerdict(result.stdout);
-  return verdict.accepted ? { kind: "accepted", output } : { kind: "failed", output, reason: verdict.reason };
+  return attemptResult(transition(verdict.accepted
+    ? { kind: "check-accepted" }
+    : { kind: "check-rejected", feedback: verdict.reason }).state);
 }
 
 export async function executeWorkflowAttempt(

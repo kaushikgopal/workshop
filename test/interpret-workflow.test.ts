@@ -4,8 +4,8 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
-import { executeWorkflowProcess } from "../run/execute-workflow-process.ts";
-import { executeWorkflowAttempt, parseMarkdownVerdict, type ProcessExecutionRequest, type ProcessExecutionResult, type WorkflowAttemptEnvironment } from "../workflow/interpret-workflow.ts";
+import { createWorkflowProcessState, executeWorkflowProcess, transitionWorkflowProcess } from "../run/execute-workflow-process.ts";
+import { executeWorkflowAttempt, parseMarkdownVerdict, transitionWorkflowAttempt, type ProcessExecutionRequest, type ProcessExecutionResult, type WorkflowAttemptEnvironment } from "../workflow/interpret-workflow.ts";
 import type { Workflow, WorkflowStep } from "../workflow/types.ts";
 
 const fixture = resolve("test/fixtures/profile-command.mjs");
@@ -344,4 +344,73 @@ test("a worker that succeeds after cancellation does not start its checker", asy
     step: firstStep(workflow), profile: "writer", pipeInput: "", feedback: "", attempt: 1,
   }), /cancelled before its check could start/);
   assert.deepEqual(calls, ["agent"]);
+});
+
+test("process transitions preserve the first stop cause and reject repeated or out-of-order events", () => {
+  const spawning = createWorkflowProcessState();
+  assert.deepEqual(transitionWorkflowProcess(spawning, { kind: "closed", exitCode: 0, signal: null }), {
+    kind: "rejected", code: "out-of-order", message: "Cannot close a process while it is spawning",
+  });
+
+  const running = transitionWorkflowProcess(spawning, { kind: "spawned" });
+  assert.deepEqual(running, { kind: "accepted", state: { kind: "running" }, effects: [] });
+  if (running.kind !== "accepted") throw new Error("Spawning process should become running");
+
+  const stopping = transitionWorkflowProcess(running.state, { kind: "stop-requested", cause: { kind: "aborted" } });
+  assert.deepEqual(stopping, {
+    kind: "accepted",
+    state: { kind: "stopping", cause: { kind: "aborted" }, phase: "waiting-for-close-and-grace" },
+    effects: [{ kind: "signal", signal: "SIGTERM" }, { kind: "schedule-kill", delayMs: 250 }],
+  });
+  if (stopping.kind !== "accepted") throw new Error("Running process should stop");
+  assert.deepEqual(transitionWorkflowProcess(stopping.state, { kind: "stop-requested", cause: { kind: "timeout" } }), {
+    kind: "rejected", code: "already-stopping", message: "Process is already stopping for aborted",
+  });
+
+  const closed = transitionWorkflowProcess(stopping.state, { kind: "closed", exitCode: null, signal: "SIGTERM" });
+  assert.deepEqual(closed, {
+    kind: "accepted",
+    state: {
+      kind: "stopping", cause: { kind: "aborted" }, phase: "waiting-for-grace",
+      closeResult: { exitCode: null, signal: "SIGTERM" },
+    },
+    effects: [],
+  });
+  if (closed.kind !== "accepted") throw new Error("Stopping process should record its close");
+  const exited = transitionWorkflowProcess(closed.state, { kind: "grace-elapsed" });
+  assert.deepEqual(exited, {
+    kind: "accepted",
+    state: { kind: "exited", cause: { kind: "aborted" }, closeResult: { exitCode: null, signal: "SIGTERM" } },
+    effects: [{ kind: "signal", signal: "SIGKILL" }],
+  });
+  if (exited.kind !== "accepted") throw new Error("Closed process should exit after the grace period");
+  assert.deepEqual(transitionWorkflowProcess(exited.state, { kind: "closed", exitCode: null, signal: "SIGKILL" }), {
+    kind: "rejected", code: "already-exited", message: "Process has already exited",
+  });
+});
+
+test("attempt transitions reject repeated, out-of-order, and terminal events", () => {
+  const worker = { kind: "worker" } as const;
+  const checking = transitionWorkflowAttempt(worker, { kind: "worker-succeeded", output: "draft", hasCheck: true });
+  assert.deepEqual(checking, {
+    kind: "accepted", state: { kind: "checking", output: "draft" }, effects: [{ kind: "check", output: "draft" }],
+  });
+  if (checking.kind !== "accepted") throw new Error("Successful worker should enter checking");
+  assert.deepEqual(transitionWorkflowAttempt(checking.state, { kind: "worker-succeeded", output: "duplicate", hasCheck: true }), {
+    kind: "rejected", code: "out-of-order", message: "Cannot complete the worker while attempt phase is checking",
+  });
+
+  const rejected = transitionWorkflowAttempt(checking.state, { kind: "check-rejected", feedback: "expected a line" });
+  assert.deepEqual(rejected, {
+    kind: "accepted",
+    state: { kind: "rejected", output: "draft", feedback: "expected a line" },
+    effects: [],
+  });
+  if (rejected.kind !== "accepted") throw new Error("Rejected check should finish the attempt");
+  assert.deepEqual(transitionWorkflowAttempt(rejected.state, { kind: "check-accepted" }), {
+    kind: "rejected", code: "already-terminal", message: "Attempt is already rejected",
+  });
+  assert.deepEqual(transitionWorkflowAttempt(worker, { kind: "check-accepted" }), {
+    kind: "rejected", code: "out-of-order", message: "Cannot accept a check while attempt phase is worker",
+  });
 });

@@ -28,7 +28,96 @@ function terminateGroup(pid: number, signal: NodeJS.Signals): void {
 
 const terminationGraceMs = 250;
 
-type ProcessStopCause = { kind: "aborted" } | { kind: "timeout" };
+export type ProcessStopCause = { kind: "aborted" } | { kind: "timeout" };
+type ProcessExitCause = ProcessStopCause | { kind: "completed" };
+type ProcessCloseResult = { exitCode: number | null; signal: NodeJS.Signals | null };
+
+export type WorkflowProcessState =
+  | { kind: "spawning" }
+  | { kind: "running" }
+  | { kind: "stopping"; cause: ProcessStopCause; phase: "waiting-for-close-and-grace" }
+  | { kind: "stopping"; cause: ProcessStopCause; phase: "waiting-for-grace"; closeResult: ProcessCloseResult }
+  | { kind: "stopping"; cause: ProcessStopCause; phase: "waiting-for-close" }
+  | { kind: "exited"; cause: ProcessExitCause; closeResult: ProcessCloseResult };
+
+export type WorkflowProcessEvent =
+  | { kind: "spawned" }
+  | { kind: "stop-requested"; cause: ProcessStopCause }
+  | { kind: "closed"; exitCode: number | null; signal: NodeJS.Signals | null }
+  | { kind: "grace-elapsed" };
+
+export type WorkflowProcessEffect =
+  | { kind: "signal"; signal: "SIGTERM" | "SIGKILL" }
+  | { kind: "schedule-kill"; delayMs: number };
+
+export type WorkflowProcessTransition =
+  | { kind: "accepted"; state: WorkflowProcessState; effects: WorkflowProcessEffect[] }
+  | { kind: "rejected"; code: "out-of-order" | "already-stopping" | "already-exited"; message: string };
+
+export function createWorkflowProcessState(): WorkflowProcessState {
+  return { kind: "spawning" };
+}
+
+function processAccepted(state: WorkflowProcessState, effects: WorkflowProcessEffect[] = []): WorkflowProcessTransition {
+  return { kind: "accepted", state, effects };
+}
+
+function rejectProcessEvent(state: WorkflowProcessState, message: string): WorkflowProcessTransition {
+  return state.kind === "exited"
+    ? { kind: "rejected", code: "already-exited", message: "Process has already exited" }
+    : { kind: "rejected", code: "out-of-order", message };
+}
+
+export function transitionWorkflowProcess(
+  state: WorkflowProcessState,
+  event: WorkflowProcessEvent,
+ ): WorkflowProcessTransition {
+  if (event.kind === "spawned") {
+    return state.kind === "spawning"
+      ? processAccepted({ kind: "running" })
+      : rejectProcessEvent(state, `Cannot start a process while it is ${state.kind}`);
+  }
+  if (event.kind === "stop-requested") {
+    if (state.kind === "running") {
+      return processAccepted(
+        { kind: "stopping", cause: event.cause, phase: "waiting-for-close-and-grace" },
+        [{ kind: "signal", signal: "SIGTERM" }, { kind: "schedule-kill", delayMs: terminationGraceMs }],
+      );
+    }
+    if (state.kind === "stopping") {
+      return { kind: "rejected", code: "already-stopping", message: `Process is already stopping for ${state.cause.kind}` };
+    }
+    return rejectProcessEvent(state, `Cannot stop a process while it is ${state.kind}`);
+  }
+  if (event.kind === "closed") {
+    const closeResult = { exitCode: event.exitCode, signal: event.signal };
+    if (state.kind === "running") {
+      return processAccepted({ kind: "exited", cause: { kind: "completed" }, closeResult });
+    }
+    if (state.kind !== "stopping") return rejectProcessEvent(state, `Cannot close a process while it is ${state.kind}`);
+    if (state.phase === "waiting-for-close-and-grace") {
+      return processAccepted({ kind: "stopping", cause: state.cause, phase: "waiting-for-grace", closeResult });
+    }
+    if (state.phase === "waiting-for-close") {
+      return processAccepted({ kind: "exited", cause: state.cause, closeResult });
+    }
+    return { kind: "rejected", code: "out-of-order", message: "Process has already closed while waiting for termination grace" };
+  }
+  if (state.kind !== "stopping") return rejectProcessEvent(state, `Cannot finish termination grace while process is ${state.kind}`);
+  if (state.phase === "waiting-for-close-and-grace") {
+    return processAccepted(
+      { kind: "stopping", cause: state.cause, phase: "waiting-for-close" },
+      [{ kind: "signal", signal: "SIGKILL" }],
+    );
+  }
+  if (state.phase === "waiting-for-grace") {
+    return processAccepted(
+      { kind: "exited", cause: state.cause, closeResult: state.closeResult },
+      [{ kind: "signal", signal: "SIGKILL" }],
+    );
+  }
+  return { kind: "rejected", code: "out-of-order", message: "Termination grace has already elapsed" };
+}
 
 
 export async function executeWorkflowProcess(input: ExecuteWorkflowProcessInput): Promise<ProcessExecutionResult> {
@@ -71,49 +160,43 @@ export async function executeWorkflowProcess(input: ExecuteWorkflowProcessInput)
   return await new Promise((resolve) => {
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
-    let stopCause: ProcessStopCause | undefined;
+    let state = createWorkflowProcessState();
     let processError: string | undefined;
     let timeoutTimer: NodeJS.Timeout | undefined;
     let killTimer: NodeJS.Timeout | undefined;
-    let terminationComplete = true;
-    let processClosed = false;
-    let closeResult: { exitCode: number | null; signal: NodeJS.Signals | null } | undefined;
 
     const finish = () => {
-      if (!processClosed || !terminationComplete || !closeResult) return;
+      if (state.kind !== "exited") return;
       if (timeoutTimer) clearTimeout(timeoutTimer);
       if (killTimer) clearTimeout(killTimer);
       input.signal?.removeEventListener("abort", onAbort);
       resolve({
-        ...closeResult,
+        ...state.closeResult,
         stdout: Buffer.concat(stdout).toString("utf8"),
         stderr: Buffer.concat(stderr).toString("utf8"),
-        timedOut: stopCause?.kind === "timeout",
+        timedOut: state.cause.kind === "timeout",
         ...(processError === undefined ? {} : { error: processError }),
       });
     };
-    const stopProcessGroup = (cause: ProcessStopCause) => {
-      if (stopCause !== undefined) return;
-      stopCause = cause;
-      terminationComplete = false;
-      try {
-        if (child.pid !== undefined) terminateGroup(child.pid, "SIGTERM");
-        else child.kill("SIGTERM");
-      } catch (error) {
-        processError = error instanceof Error ? error.message : String(error);
-      }
-      killTimer = setTimeout(() => {
-        try {
-          if (child.pid !== undefined) terminateGroup(child.pid, "SIGKILL");
-          else child.kill("SIGKILL");
-        } catch (error) {
-          processError ??= error instanceof Error ? error.message : String(error);
-        } finally {
-          terminationComplete = true;
-          finish();
+    const dispatch = (event: WorkflowProcessEvent): void => {
+      const transition = transitionWorkflowProcess(state, event);
+      if (transition.kind !== "accepted") return;
+      state = transition.state;
+      for (const effect of transition.effects) {
+        if (effect.kind === "signal") {
+          try {
+            if (child.pid !== undefined) terminateGroup(child.pid, effect.signal);
+            else child.kill(effect.signal);
+          } catch (error) {
+            processError ??= error instanceof Error ? error.message : String(error);
+          }
+        } else {
+          killTimer = setTimeout(() => dispatch({ kind: "grace-elapsed" }), effect.delayMs);
         }
-      }, terminationGraceMs);
+      }
+      finish();
     };
+    const stopProcessGroup = (cause: ProcessStopCause) => dispatch({ kind: "stop-requested", cause });
     const onAbort = () => stopProcessGroup({ kind: "aborted" });
 
     stdoutStream.on("data", (chunk: Buffer) => stdout.push(chunk));
@@ -123,11 +206,10 @@ export async function executeWorkflowProcess(input: ExecuteWorkflowProcessInput)
     });
     child.once("error", (error) => { processError = error.message; });
     child.once("close", (exitCode, exitSignal) => {
-      processClosed = true;
-      closeResult = { exitCode, signal: exitSignal };
       if (timeoutTimer) clearTimeout(timeoutTimer);
-      finish();
+      dispatch({ kind: "closed", exitCode, signal: exitSignal });
     });
+    dispatch({ kind: "spawned" });
     if (input.signal?.aborted) onAbort();
     else input.signal?.addEventListener("abort", onAbort, { once: true });
     if (input.timeoutMs !== undefined) {
