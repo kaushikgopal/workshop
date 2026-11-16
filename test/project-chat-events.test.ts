@@ -1,0 +1,96 @@
+import assert from "node:assert/strict";
+import type { JsonObject } from "@earendil-works/pi-durable";
+import type { ConversationView } from "@earendil-works/pi-durable";
+import { test } from "node:test";
+import { initialChatProjectorState, projectChatEvents } from "../service/project-chat-events.ts";
+
+function view(live: JsonObject): Pick<ConversationView, "entries" | "docs"> {
+  return { entries: [], docs: { "pi.live": live } };
+}
+
+test("projector sends text and tools already present when it attaches", () => {
+  const projection = projectChatEvents(initialChatProjectorState(), {
+    view: view({
+      run: { taskId: "turn-1", inputs: ["submission-1"] },
+      generation: { attempt: 1, message: { content: [{ type: "text", text: "Text already generated" }] } },
+      tools: [{ callId: "tool-1", name: "search", status: "pending" }],
+    }),
+    chatRequestId: "chat-1",
+  });
+
+  assert.deepEqual(projection.events.map(({ type, chat_request_id, text, call_id }) => ({ type, chat_request_id, text, call_id })), [
+    { type: "assistant.delta", chat_request_id: "chat-1", text: "Text already generated", call_id: undefined },
+    { type: "tool.call", chat_request_id: "chat-1", text: undefined, call_id: "tool-1" },
+  ]);
+});
+
+test("projector retains unsent events until durable correlation arrives", () => {
+  const observation = view({
+    run: { taskId: "turn-1", inputs: ["submission-1"] },
+    generation: { attempt: 1, message: { content: [{ type: "text", text: "Already generated" }] } },
+    tools: [{ callId: "tool-1", name: "search", status: "pending" }],
+  });
+  const unattached = projectChatEvents(initialChatProjectorState(), { view: observation });
+  assert.deepEqual(unattached.events, []);
+
+  const correlated = projectChatEvents(unattached.state, { view: observation, chatRequestId: "chat-recovered" });
+  assert.deepEqual(correlated.events.map(({ type, chat_request_id, text, call_id }) => ({ type, chat_request_id, text, call_id })), [
+    { type: "assistant.delta", chat_request_id: "chat-recovered", text: "Already generated", call_id: undefined },
+    { type: "tool.call", chat_request_id: "chat-recovered", text: undefined, call_id: "tool-1" },
+  ]);
+});
+
+test("projector emits nested tool completion when a later observation adds its summary", () => {
+  const initial = projectChatEvents(initialChatProjectorState(), {
+    view: view({
+      run: { taskId: "turn-1", inputs: ["submission-1"] },
+      generation: { attempt: 1, message: { content: [] } },
+      nestedTools: [{ callId: "nested-1", name: "consult", arguments: { question: "Review" } }],
+    }),
+    chatRequestId: "chat-1",
+  });
+  assert.deepEqual(initial.events.map(({ type }) => type), ["tool.call"]);
+
+  const completed = projectChatEvents(initial.state, {
+    view: view({
+      run: { taskId: "turn-1", inputs: ["submission-1"] },
+      generation: { attempt: 1, message: { content: [] } },
+      nestedTools: [{ callId: "nested-1", name: "consult", arguments: { question: "Review" }, summary: { isError: true } }],
+    }),
+    chatRequestId: "chat-1",
+  });
+  assert.deepEqual(completed.events.map(({ type, status, nested }) => ({ type, status, nested })), [
+    { type: "tool.result", status: "error", nested: undefined },
+  ]);
+});
+
+test("projector ends the prior turn on identity replacement and ignores older generations", () => {
+  const first = projectChatEvents(initialChatProjectorState(), {
+    view: view({
+      run: { taskId: "turn-1", inputs: ["submission-1"] },
+      generation: { attempt: 1, message: { content: [{ type: "text", text: "first" }] } },
+    }),
+    chatRequestId: "chat-first",
+  });
+  const replacement = projectChatEvents(first.state, {
+    view: view({
+      run: { taskId: "turn-2", inputs: ["submission-2"] },
+      generation: { attempt: 2, message: { content: [{ type: "text", text: "second" }] } },
+    }),
+    chatRequestId: "chat-second",
+  });
+  assert.deepEqual(replacement.events.map(({ type, chat_request_id, status }) => ({ type, chat_request_id, status })), [
+    { type: "run.end", chat_request_id: "chat-first", status: "done" },
+    { type: "assistant.delta", chat_request_id: "chat-second", status: undefined },
+  ]);
+
+  const stale = projectChatEvents(replacement.state, {
+    view: view({
+      run: { taskId: "turn-2", inputs: ["submission-2"] },
+      generation: { attempt: 1, message: { content: [{ type: "text", text: "stale" }] } },
+    }),
+    chatRequestId: "chat-second",
+  });
+  assert.deepEqual(stale.events, []);
+  assert.deepEqual(stale.state, replacement.state);
+});
