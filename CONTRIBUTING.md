@@ -10,9 +10,9 @@ A reader should know what a file does from its path alone, before opening it.
 
 ### Folders are nouns, files are verbs
 
-- **Folders** name the domain things the code is about: `agent/`, `workflow/`, `run/`, and `schedule/`. Use the same nouns as the data model and user-facing terms.
-- **Files** lead with a verb that says what they do: `workflow/load-workflows.ts`, `workflow/interpret-workflow.ts`, `run/read-run-index.ts`. A noun alone (`types.ts`) says what a file is about, not what it does.
-- **Exception: pure shape.** A file that only declares types or a schema keeps a noun name, such as `workflow/types.ts` or `run/types.ts`. So does an entrypoint (`agent/agent.ts`) and a command tool (`agent/tools/list_runs.ts`).
+- **Folders** name the domain things the code is about: `config/`, `workflow/`, `run/`, `schedule/`, and `service/`. Use the same nouns as the data model and user-facing terms.
+- **Files** lead with a verb that says what they do: `workflow/load-workflows.ts`, `workflow/interpret-workflow.ts`, `service/serve-service-socket.ts`. A noun alone (`types.ts`) says what a file is about, not what it does.
+- **Exception: pure shape.** A file that only declares types or a schema keeps a noun name, such as `workflow/types.ts` or `service/types.ts`.
 
 ### Use one verb per kind of work
 
@@ -24,11 +24,12 @@ Give each verb one meaning and reuse it for that meaning:
 | `check` | apply fixed rules and report errors | `scripts/check-workflows.ts` |
 | `load` | read a file and return checked data | `workflow/load-workflows.ts` |
 | `build` | assemble input for another program | `workflow/build-orchestrator-brief.ts` |
-| `create` | make a new snapshot | `workflow/create-workflow-snapshot.ts` |
-| `execute` | carry out a unit of work | `agent/lib/execute-workflow-process.ts` |
-| `locate` | find a state file | `run/locate-blocked-step.ts` |
-| `record` | append an action record | `run/record-action-log.ts` |
-| `read` | read stored records | `run/read-run-index.ts` |
+| `create` | assemble an in-process component | `service/create-workshop-service.ts` |
+| `define` | register a durable task | `workflow/define-workflow-task.ts` |
+| `execute` | carry out a unit of work | `run/execute-workflow-process.ts` |
+| `load` | read a file and return checked data | `workflow/load-workflow-step.ts` |
+| `open` | initialize a durable harness | `service/open-workshop-harness.ts` |
+| `serve` | expose the local JSON API | `service/serve-service-socket.ts` |
 
 Other plain verbs (`start`, `send`, `cancel`, `pause`, `resume`) are fine when no verb above already covers the job. Before adding a verb, check that it does not overlap one in the table; if it will recur, add it to the table.
 
@@ -57,7 +58,7 @@ Other plain verbs (`start`, `send`, `cancel`, `pause`, `resume`) are fine when n
 ## This project
 
 - A **workflow** is a folder of settings and ordered steps. A **run** is one execution of that workflow. A **step** is a command or an agent operation.
-- Eve owns durable workflow execution. Workshop loads workflow folders, interprets steps, starts scheduled work, and exposes the orchestrator tools.
+- pi-durable owns durable workflow tasks and the persistent orchestrator conversation. Workshop loads workflow folders, interprets steps, starts scheduled work, and supplies the orchestrator tools.
 - `make check` validates local config and workflow folders, typechecks the project, and runs its tests.
 - Before review, run:
 
@@ -65,37 +66,38 @@ Other plain verbs (`start`, `send`, `cancel`, `pause`, `resume`) are fine when n
   npx tsc --noEmit
   npm test
   make check
-  npx eve build
   ```
 
 - [Code map](#code-map) describes the folders and their boundaries; update it when you add or move a file.
 
 ## How the code works
 
-Workshop is a Node.js and TypeScript application built on Eve. `make dev` starts Eve's development server; `make start` builds the app and starts its local service. Eve owns the schedule, chat session, and durable workflow execution.
+## How the code works
 
-The configured orchestrator profile powers chat through an Eve model adapter. Eve exposes Workshop's tools for listing workflows and runs, reading runs, starting or cancelling work, deciding blocked steps, pausing or resuming workflows, and reading actions. A one-minute UTC schedule checks each workflow and starts its latest due slot.
+Workshop is a Node.js and TypeScript service built on pi-durable. `make start` runs `service/start-service.ts`; `make dev` watches source files and restarts the service. Startup checks config and workflows, claims a singleton owner row in `state/workshop.sqlite`, then opens the harness and listens on a private Unix socket. This lock comes before task recovery so two processes cannot recover the same work. A durable tick task checks schedules once a minute.
 
-A workflow start records admission, copies the source folder into a run snapshot, and interprets its numbered steps in order. Command steps run with `sh` or `node`; agent steps and Markdown checks run through a configured profile command. Accepted output becomes the next step's stdin or is appended to the next agent prompt under `Input`. Checks and retries apply before the automatic orchestrator rounds. A run waits on an Eve hook when chat must decide what happens next.
+`WorkflowTask` stores the validated workflow settings and ordered step list. It reads each step and check file when that step starts, then creates a `StepAttemptTask` for the work. The task checkpoint stores pipe input, results, attempts, retry state, and blocked decisions. Run-reference documents map public run IDs to durable task IDs. A bounded session document keeps recent admission, action, and decision-receipt history plus per-workflow schedule counters. A hard service crash can replay an unfinished command; external effects must be safe to repeat. Workshop does not write run snapshots or separate run-state files.
 
-Steps share the persistent `data/<workflow>/` folder. Workshop keeps a run index, action log, pause list, and blocked-step records under `state/`; Eve owns the durable execution state. Commands and agent profiles run with the user's permissions. They are not sandboxed, and an interrupted external action can repeat.
+After local retries fail, `workflow/execute-orchestrator-round.ts` returns the current stub outcome. The workflow task records the `give_up` decision and waits in a blocked checkpoint. The service API can list and inspect runs, start and cancel work, accept a blocked-run decision, pause or resume workflows, and list actions. Interactive chat is part 2; `make chat` remains a placeholder.
+
+The daily-summary example reads recent runs and actions through this service API. Steps still share `data/<workflow>/`, which is separate from the SQLite record. Commands and profile processes run with the service account's permissions. They are not sandboxed.
 
 ```mermaid
 flowchart TD
-  MAKE[make dev or make start] --> EVE[Eve app]
-  EVE --> AGENT[agent/agent.ts and Workshop tools]
-  EVE --> SCHEDULE[one-minute UTC schedule]
-  SCHEDULE --> START[agent/tools/start_workflow.ts]
-  AGENT --> START
-  START --> SNAPSHOT[workflow snapshot]
-  SNAPSHOT --> INTERPRETER[workflow/interpret-workflow.ts]
-  INTERPRETER --> PROCESS[sh, node, or profile command]
+  MAKE[make dev or make start] --> SERVICE[service/start-service.ts]
+  SERVICE --> SOCKET[private Unix JSON socket]
+  SERVICE --> HARNESS[pi-durable harness and state/workshop.sqlite]
+  HARNESS --> TICK[durable schedule tick]
+  TICK --> START[run/start-workflow.ts]
+  START --> TASK[workflow/define-workflow-task.ts]
+  TASK --> LOAD[load current step and check]
+  LOAD --> ATTEMPT[workflow/define-step-attempt-task.ts]
+  ATTEMPT --> PROCESS[sh, node, or profile command]
   PROCESS --> DATA[data/<workflow>/]
-  INTERPRETER -->|exhausted retries| ROUNDS[automatic orchestrator rounds]
-  ROUNDS -->|needs a decision| HOOK[Eve decision hook]
-  HOOK --> AGENT
-  START --> INDEX[state/runs.jsonl]
-  AGENT --> ACTIONS[state/actions.jsonl]
+  TASK -->|local retries exhausted| STUB[automatic-round stub]
+  STUB --> BLOCKED[blocked task checkpoint]
+  SOCKET --> API[service/create-workshop-service.ts]
+  API --> HARNESS
 ```
 
 ### Code map
@@ -103,28 +105,23 @@ flowchart TD
 Folders and filenames follow [Naming files](#naming-files).
 
 ```text
-agent/                         Eve application and Workshop chat integration
-├─ agent.ts                    configured profile as Eve's chat model
-├─ instructions.md             orchestrator rules and first-message routine
-├─ channels/eve.ts             local-request authentication
-├─ lib/                        config, profile model, child process, hook decisions
-├─ schedules/                  one-minute workflow scheduler
-└─ tools/                      chat tools for runs, decisions, pause, and actions
-workflow/                      workflow parsing, snapshots, interpretation, and retries
-run/                           run index, blocked-step records, and action log
-schedule/                      latest due cron-slot selection
-scripts/                       config/workflow checks, private copy, launch-agent setup
-service/                       launch-agent plist template
-test/                          v2 tests and fake profile fixtures
-examples/workflows/             hemingway-clock and daily-summary folders
-workflows/                      private workflows; upstream keeps .gitkeep only
-workshop.example.yaml           config template
-workshop.yaml                   local config, ignored upstream
-Makefile                        setup, checks, service, and copy commands
+agent/instructions.md            orchestrator rules reserved for part 2
+config/                          config loading and validation
+run/                             durable workflow admission, state, process execution
+schedule/                        cron-slot selection and durable schedule ticks
+service/                         harness registration, socket API, service entrypoint
+workflow/                        parsing, step loading, decisions, durable task definitions
+scripts/                         checks, activity reader, chat placeholder, copy, launch-agent setup
+test/                            unit, service, socket, and SQLite resume tests
+examples/workflows/              hemingway-clock and daily-summary folders
+workflows/                       private workflows; upstream keeps .gitkeep only
+workshop.example.yaml            config template
+workshop.yaml                    local config, ignored upstream
+Makefile                         setup, checks, service, chat, and copy commands
 ```
 
-`agent/` contains Eve entry points. The workflow parser and interpreter stay in `workflow/` and do not depend on chat tools. `run/` and `schedule/` hold file-backed records and slot rules. `test/` uses fake profile commands so the suite does not need model credentials.
+`workflow/` does not depend on the service API. `run/` and `schedule/` use the durable store through the service harness. Tests use fake commands and do not need model credentials.
 
 ### Tests and validation
 
-`npm test` runs the Node test suite in `test/`. `make check` validates config and workflows, then runs the typecheck and tests. `npx eve build` checks the Eve app bundle.
+`npm test` runs the Node test suite in `test/`. It includes an SQLite crash-resume test that verifies the same parent and child task IDs resume. `make check` validates config and workflows, then runs the typecheck and tests.

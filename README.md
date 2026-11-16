@@ -56,7 +56,7 @@ brings me in only when something truly needs me.
 Workshop v2 needs Node.js 24 or later and npm. Run these commands from the repository root:
 
 1. Run `make setup` to install dependencies and create `workshop.yaml` and `.env.local` from their templates.
-2. Edit `workshop.yaml`. Set `agent_profiles` to commands available on this machine. Point `orchestrator.profile` and `orchestrator.escalation_profile` at profiles you keep.
+2. Edit `workshop.yaml`. Set `agent_profiles` to commands available on this machine. Point `orchestrator.profile` and `orchestrator.escalation_profile` at the profiles that should handle chat and automatic decisions.
 3. Copy an example workflow into `workflows/`, for example:
 
    ```fish
@@ -64,9 +64,9 @@ Workshop v2 needs Node.js 24 or later and npm. Run these commands from the repos
    ```
 
 4. Run `make check`.
-5. Run `make start` to build and start the scheduled service. In another terminal, run `make chat` to talk to the orchestrator.
+5. Run `make start` to start the scheduled service. It exposes a local JSON API at `state/service.sock`. The `make chat` target remains a placeholder until part 2.
 
-Use `make dev` instead of `make start` while developing. It starts Eve's development server with reloads.
+Use `make dev` while developing. It restarts the service when source files change.
 
 ## Workflow folders
 
@@ -81,11 +81,13 @@ workflows/hemingway-clock/
 └─ 30-save-line.sh
 ```
 
-`workflow.md` holds schedule settings and defaults. A numbered `.md` file is an agent step; `.sh` and `.ts` files are command steps. A matching `.check.md`, `.check.sh`, or `.check.ts` checks a step's output. See [the reference](docs/reference.md) for validation and execution rules.
+`workflow.md` holds schedule settings and defaults. A numbered `.md` file is an agent step; `.sh` and `.ts` files are command steps. A matching `.check.md`, `.check.sh`, or `.check.ts` checks a step's output.
+
+Workshop stores durable state in `state/workshop.sqlite`. It does not copy run snapshots. It loads each step and check file when that step starts. Steps share `data/<workflow>/`. See [the reference](docs/reference.md) for validation and execution rules.
 
 ## Agent profiles
 
-Profiles in `workshop.yaml` name command-line agents. Steps select a profile, not a command or model. For example, `pi` can use a local login and model:
+Profiles in `workshop.yaml` name command-line agents for workflow steps and reserve the orchestrator choices for part 2. This build does not call those orchestrator profiles; its automatic-round stub blocks a run after local retries fail. Example configuration:
 
 ```yaml
 agent_profiles:
@@ -93,12 +95,13 @@ agent_profiles:
     command: [pi, -p, --no-session, --model, "<provider>/<model>"]
   orchestrator:
     command: [pi, -p, --no-session, --no-tools, --no-extensions, --no-skills, --model, "<provider>/<model>"]
+    context_window: 32000
 orchestrator:
   profile: orchestrator
   escalation_profile: writer
 ```
 
-Replace the placeholder and remove profiles for tools you do not use. Put secrets in `.env.local` and refer to them as `${NAME}` in `workshop.yaml`.
+Replace the placeholders and remove profiles for tools you do not use. Put secrets in `.env.local` and refer to them as `${NAME}` in `workshop.yaml`.
 
 ## Make targets
 
@@ -107,13 +110,13 @@ Replace the placeholder and remove profiles for tools you do not use. Put secret
 | `make setup` | Install dependencies and create missing local config files. |
 | `make copy to=<dir>` | Create and set up a private copy of the current committed branch. |
 | `make check` | Validate config and workflows, typecheck, and run tests. |
-| `make dev` | Start Eve's local development server on port 2000. |
-| `make start` | Build and start the service on port 3000. |
-| `make chat` | Connect to the service started by `make start` or `make dev`. |
-| `make service-install` | Install the macOS launch agent. |
+| `make dev` | Start the service in watch mode and restart it when source files change. |
+| `make start` | Start the durable service in the foreground. |
+| `make chat` | Placeholder until the interactive chat client is ported in part 2. |
+| `make service-install` | Install the macOS launch agent for the durable service. |
 | `make service-uninstall` | Remove the macOS launch agent. |
 
-The service listens on loopback. See [the v2 contract](docs/reference.md) for config, scheduling, blocked runs, files on disk, and service details.
+The service listens on the private Unix socket `state/service.sock` and accepts one JSON request per connection. It does not open a network port. See [the v2 contract](docs/reference.md) for the request format, scheduling, blocked runs, and files on disk.
 
 ## Contributing
 

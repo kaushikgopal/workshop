@@ -1,6 +1,6 @@
 # Workshop reference
 
-This document defines Workshop v2's configuration, workflow folders, execution, scheduling, files on disk, and operations. See the [README](../README.md) for a quick start.
+This reference defines Workshop v2's configuration, workflow files, execution, scheduling, durable state, and local service API. See the [README](../README.md) for a quick start.
 
 ## Configuration
 
@@ -18,17 +18,17 @@ orchestrator:
   escalation_profile: writer
 ```
 
-`agent_profiles` must contain at least one profile. A profile name uses lowercase letters, digits, and hyphens. Its required `command` is a non-empty argument list; Workshop starts it directly, without a shell. `context_window` is an optional positive integer. It sets the Eve chat model's context size when used on `orchestrator.profile` (default 32,000); it does not configure worker or automatic-round processes.
+`agent_profiles` must contain at least one profile. A profile name uses lowercase letters, digits, and hyphens. Its required `command` is a non-empty argument list. Workshop starts it directly, without a shell. `context_window` is an optional positive integer. The current service does not use it.
 
-Both orchestrator profile names must refer to declared profiles. Every profile's first command argument must resolve to an executable on `PATH`. A command beginning with a relative path is resolved from the config file's directory. Startup and `make check` validate all profiles, including unused ones. They do not check the CLI's model access or login.
+Both orchestrator profile names must refer to declared profiles. Every profile's first command argument must resolve to an executable on `PATH`. Relative executable paths resolve from the config file's directory. Startup and `make check` validate all profiles, including unused ones. They do not check model access or login. Part 1 does not call orchestrator profiles; its automatic-round stub blocks failed runs after local retries.
 
-Workshop reads `WORKSHOP_CONFIG` when set; otherwise it reads `workshop.yaml` from the current directory. The Make targets expect the project root. `make setup` copies `workshop.example.yaml` and `.env.example` only when the destination files do not exist. Upstream ignores `workshop.yaml` and `.env.local`.
+Workshop reads `WORKSHOP_CONFIG` when set. Otherwise it reads `workshop.yaml` from the current directory. Make targets expect the project root. `make setup` copies `workshop.example.yaml` and `.env.example` only when the destination files do not exist. Upstream ignores `workshop.yaml` and `.env.local`.
 
-Workshop loads `.env.local` from the config file's directory. Existing process environment variables take precedence. `${NAME}` references in YAML string values expand from the environment; an unset variable is an error. Expansion does not apply to YAML keys, workflow files, or command output. Keep secrets in `.env.local`, not in tracked config.
+Workshop reads `.env.local` from the config file's directory. Existing process environment variables take precedence. `${NAME}` references in YAML string values expand from the environment. An unset variable is an error. Expansion does not apply to YAML keys, workflow files, or command output. Keep secrets in `.env.local`, not in tracked config.
 
 ## Workflow folders and validation
 
-Put each workflow in its own folder under `workflows/`. The folder name and the `name` part of each step use lowercase letters, digits, and hyphens.
+Put each workflow in its own folder under `workflows/`. The folder name and each step name use lowercase letters, digits, and hyphens.
 
 ```text
 workflows/<name>/
@@ -55,15 +55,13 @@ workflows/<name>/
 
 Step files are named `N-name.md`, `N-name.sh`, or `N-name.ts`. Markdown files are agent steps; shell and TypeScript files are command steps. `N` is a safe integer. Leading zeros and gaps are allowed, but numbers must be unique. Steps execute in numeric order.
 
-A check must match both the number and name of an existing step: `N-name.check.md`, `.check.sh`, or `.check.ts`. Only one check may belong to each step. A Markdown step or check needs YAML frontmatter followed by a non-empty body. Its frontmatter accepts `profile`, `retries`, and `timeout` only. Each agent step and Markdown check needs its own `profile` or a workflow-level default. A check does not inherit a worker's explicit profile override during validation. Shell and TypeScript files have no frontmatter settings.
+A check must match both the number and name of an existing step: `N-name.check.md`, `.check.sh`, or `.check.ts`. Only one check may belong to each step. A Markdown step or check needs YAML frontmatter followed by a non-empty body. Its frontmatter accepts `profile`, `retries`, and `timeout` only. Each agent step and Markdown check needs its own profile or a workflow-level default. A check does not inherit a worker's explicit profile override during validation. Shell and TypeScript files have no frontmatter settings.
 
-Unknown files, subfolders, malformed frontmatter, unknown keys, invalid profile names, duplicate numbers, unmatched checks, and missing profiles invalidate that workflow. Invalid workflows are reported and omitted while valid siblings remain available. `make check` reports errors in both `workflows/` and `examples/workflows/`; service startup logs invalid workflows and skips them. Workshop validates a run's workflow again when it creates that run's snapshot.
-
-The examples in `examples/workflows/` are not scheduled automatically. Copy a workflow folder into `workflows/` to use it.
+Unknown files, subfolders, malformed frontmatter, unknown keys, invalid profile names, duplicate numbers, unmatched checks, and missing profiles invalidate that workflow. Invalid workflows are reported and omitted while valid siblings remain available. `make check` reports errors in both `workflows/` and `examples/workflows/`; service startup logs and skips invalid workflows. The examples in `examples/workflows/` are not scheduled automatically. Copy a workflow folder into `workflows/` to use it.
 
 ## Step execution
 
-A run copies its workflow into `state/snapshots/<run_id>/<workflow>/` before executing. Each run uses that snapshot even if you edit the source folder. Workshop removes the snapshot when the run ends normally, including after a blocked run receives a decision.
+A workflow start stores its validated settings and ordered step list in the durable task. Workshop does not copy a run snapshot. It reads each step file and its check when that step starts, including when a retry starts. An edit to a later step can therefore affect an active run; an edit to the current step does not change an attempt that has already started.
 
 Steps execute in order. The first step receives empty input. A command step runs as `sh <file>` for `.sh` or `node <file>` for `.ts`, with its working directory set to `data/<workflow>/`. An agent step runs the selected profile command with its prompt on stdin. Workshop does not invoke a shell to start profile commands.
 
@@ -74,65 +72,53 @@ Every child process inherits the service environment and receives these variable
 | Variable | Meaning |
 | --- | --- |
 | `WORKSHOP_WORKFLOW` | Workflow folder name. |
-| `WORKSHOP_RUN_ID` | Eve workflow run ID. |
+| `WORKSHOP_RUN_ID` | Workshop workflow run ID. |
 | `WORKSHOP_STEP` | Current step or check ID. |
 | `WORKSHOP_DATA_DIR` | Absolute path to the workflow's shared data folder. |
 | `WORKSHOP_STATE_DIR` | Absolute path to the Workshop state folder. |
+| `WORKSHOP_PROJECT_ROOT` | Absolute path to the project root. |
 | `WORKSHOP_FEEDBACK` | Failure reason and any retry hint for the current attempt. |
 
 Command processes receive workflow input through stdin. Agent processes receive the step prompt, then optional `## Input` and `## Feedback` sections. A check receives the worker's output as its input; its result does not replace the worker's output.
 
-A command step that exits with code `99` ends the run successfully with status `nothing-to-do`; its check does not run. Exit `99` from an agent or a check does not have this meaning. Each command or profile process starts in its own process group. Workshop records each active process group under `state/processes/<run_id>.json` and removes its entry when the process exits. A step timeout or run cancellation sends the group `SIGTERM`, then `SIGKILL` after 250 ms if it remains; this also stops descendants. A parent-service crash can leave a child process running, and an unfinished step can repeat when Eve resumes it. Make external effects safe to repeat; Workshop does not provide exactly-once effects.
+A command step that exits with code `99` ends the run successfully with status `nothing-to-do`; its check does not run. Exit `99` from an agent or check has no special meaning. Each command or profile process starts in its own process group. A step timeout or run cancellation sends `SIGTERM`, then `SIGKILL` after 250 ms if the process group remains. This also stops descendants while the service is alive.
 
-## Checks, attempts, and feedback
+Pi-durable resumes unfinished tasks from their last checkpoint. It cannot reattach to an operating-system process after a hard service crash. An unfinished command may start again, and the original child process may still be running. Make external side effects safe to repeat. Workshop does not provide exactly-once effects. A normal service shutdown aborts active task signals so Workshop can stop their process groups.
 
-Command checks receive the step's output on stdin. Exit code `0` accepts it. Any other exit, timeout, or launch error rejects the attempt; stdout and stderr help explain a nonzero result. A Markdown check runs as an agent. Its first output line must start with the token `ACCEPT` or `REJECT`, case-insensitively, followed by an optional separator and reason. `ACCEPTED` is not a valid verdict. Other output is not the verdict.
+## Checks, retries, and blocked runs
+
+Command checks receive the step's output on stdin. Exit code `0` accepts it. Any other exit, timeout, or launch error rejects the attempt. Stdout and stderr help explain a nonzero result. A Markdown check runs as an agent. Its first output line must start with `ACCEPT` or `REJECT`, case-insensitively, followed by an optional separator and reason. `ACCEPTED` is not a valid verdict. Other output is not the verdict.
 
 A check rejection retries the whole step, then checks the new output. `retries` means extra attempts: `retries: 2` permits up to three total attempts. The retry count resolves as `step.retries`, then `check.retries`, then `workflow.retries`, then zero. A check's `retries` is a fallback count for the step, not a separate check-only loop. A failure, timeout, or rejected result consumes one attempt.
 
 Timeouts resolve from the check, then the step, then the workflow. They must be positive integer durations in seconds, minutes, or hours that fit within `2,147,483,647` milliseconds. There is no default timeout. After a failed attempt, command processes receive its reason in `WORKSHOP_FEEDBACK`; agent prompts receive it under `## Feedback`.
 
-## Blocked runs and decisions
+After local retries run out, the service calls one automatic decision round. The current round is a stub that reports automatic decisions as unavailable. Workshop records a `give_up` action, saves the failed step and attempt history in the workflow task checkpoint, and waits for a service decision. Part 2 will replace this stub with the orchestrator.
 
-After local retries run out, Workshop asks the configured orchestrator to decide twice: first with `orchestrator.profile`, then with `orchestrator.escalation_profile` if another round is needed. Each automatic round receives a failure brief with the workflow description, step content, last output and error, attempt history, and allowed actions. It must return strict JSON for one of these actions:
+A blocked run remains a non-terminal durable task, so the scheduler treats its workflow as busy. The service API accepts these decisions:
 
-- `retry`, with an optional hint, allowed profile, and delay (`after`);
+- `retry`, with an optional hint, an allowed profile, and a delay (`after`);
 - `skip` the failed step;
 - `accept` its last output, when that output is non-empty;
-- `fail` or `give_up`.
+- `fail` the run.
 
-A retry runs the step once. If it fails, the next round gets a chance. An automatic `fail` ends the run immediately in either round. `give_up` escalates from round one and waits for chat after round two. Invalid JSON, an invalid choice, or an orchestrator process failure counts as `give_up`. An automatic retry can switch an agent step to another profile only when both profile commands have the exact same first argument. Command steps cannot switch profiles.
+A retry applies the step's existing profile and feedback rules. An agent step can switch profiles only when the executable at the start of both profile commands matches. A command step cannot switch profiles. `skip` keeps the last successful pipe input for the next step. `accept` uses the failed attempt's last output. `fail` ends the run. Decisions are saved in a durable task document before the task resumes.
 
-A run waiting on chat keeps its per-workflow lock. Its decision record is written to `state/blocked/<run_id>.json`, and Eve holds a durable hook for the answer. Chat can choose `retry`, `skip`, `accept`, or `fail`. A chat retry can include a hint, a profile allowed for that step, and a delay. It resets the local retry budget. `skip` keeps the last successful pipe input for the next step. `accept` uses the failed attempt's last output. `fail` ends the run. The orchestrator can also cancel a run, pause or resume a workflow, and start a workflow.
+## Scheduling, pause, and cancellation
 
-Eve's chat agent uses `orchestrator.profile` and the Workshop tools below. Its model adapter sends the conversation and tool definitions to the profile command and parses a JSON reply. Workshop disables Eve's default tools and instructs the agent not to use shell commands or edit workflow files. These restrictions are not an operating-system sandbox: the configured CLI may have its own tools, and child processes run with the service account's permissions.
+The service checks schedules once a minute in UTC. On each tick it loads config and valid workflows, then considers each enabled workflow. It finds the latest cron slot at or before the current time. After downtime it considers only the latest due slot, not every missed slot. A new workflow is eligible at the first tick.
 
-On its first message in a chat session, the agent lists runs, reads blocked runs, lists workflows, and reads recent actions. It can use these tools:
+A paused workflow's newly observed slot is recorded as skipped with reason `paused`; resuming never replays it. The service starts at most one non-terminal task per workflow. If a run is active, waiting, sleeping before retry, or blocked, a later scheduled occurrence is recorded as skipped, not queued. Different workflows can run at the same time.
 
-| Tool | Purpose |
-| --- | --- |
-| `list_workflows` | List valid workflows and their settings. |
-| `list_runs` | List recent runs and all runs waiting on a decision. |
-| `read_run` | Read a run's status, available outputs, errors, or blocked-step history. |
-| `start_workflow` | Start a workflow manually. |
-| `decide_blocked_run` | Retry, skip, accept, or fail a blocked step. |
-| `cancel_run` | Request cancellation through Eve and stop the active process group. |
-| `pause_workflow` / `resume_workflow` | Pause or resume future workflow starts. |
-| `list_actions` | Read recent automatic and chat actions. |
+`max_runs` counts distinct run IDs recorded as started, including manual starts. It limits scheduled starts only; manual starts ignore the limit but count toward it on later ticks. Manual starts refuse workflows with `enabled: false`. Pausing prevents manual starts and skips newly observed scheduled slots; it does not stop an active run. Resuming allows later ticks to start new slots. It does not replay skipped slots or start a run immediately.
 
-Run output is not written to a separate log file. `read_run` reads Eve's completed return value or the saved blocked-step record; it is not a live process log. Cancelling first asks Eve to cancel the run, then Workshop sends `SIGTERM` to its recorded active process groups and `SIGKILL` after 250 ms if they remain. Interrupted steps end with the cancelled run instead of retrying.
+Cancelling a run aborts its durable workflow task and owned step-attempt task. The task's abort signal stops the active process group. A cancellation request against a terminal run reports that it was not cancelled.
 
-## Scheduling and admission
+## Durable state and files
 
-One Eve schedule ticks every minute in UTC. On each tick, Workshop loads config and valid workflows, then considers each enabled workflow. It finds the latest cron slot at or before the current time. A paused workflow's new slot is indexed as skipped with reason `paused`; resuming never replays it. For an unpaused workflow, if the slot is newer than the last indexed slot and `max_runs` is not reached, Workshop starts the workflow. After downtime it considers only the latest due slot, not every missed slot. A new workflow is eligible at the first tick.
+Run Workshop from the project root. `state/workshop.sqlite` is the only record of run admission, task checkpoints and outcomes, step results, blocked details, decisions, and pause state. Each run has a durable reference from its run ID to its task ID, so the service can inspect older runs without scanning every task.
 
-A hook lock is named for each workflow. It skips another occurrence of that same workflow while a run is active, waiting, sleeping before retry, or blocked. The skipped slot is recorded, not queued. Different workflows can run at the same time. The README's “one run at a time” wording is broader than the implementation: the current lock is per workflow, not global.
-
-`max_runs` counts unique run IDs indexed as `started`, not successful completions. It limits scheduled starts only: manual starts ignore `max_runs`, count toward the limit for later scheduled starts, and refuse workflows with `enabled: false`. Pausing a workflow prevents manual starts and skips each newly observed scheduled slot; it does not stop an active run. Resuming allows later ticks to start new slots. It does not replay skipped slots or start a run immediately. A scheduled run is indexed as started before config and snapshot preparation finishes, so failed preparation can count against `max_runs`.
-
-## Files on disk
-
-Run Workshop from the project root. Its working folders and records are relative to that directory:
+The session document keeps the most recent 1,000 admission records, actions, and blocked-decision request receipts. Separate per-workflow counters preserve `max_runs` and the latest scheduled slot after older records roll off. Run tasks and their references remain in SQLite. There are no run snapshots, JSONL indexes, paused-workflow files, blocked-step files, or process registry files.
 
 ```text
 workshop.yaml                    local config; ignored upstream
@@ -141,38 +127,48 @@ workflows/<name>/                user workflow folders
 examples/workflows/<name>/       shipped examples; not auto-started
 data/<workflow>/                persistent shared working files for steps
 state/
-├─ runs.jsonl                    run admission index
-├─ actions.jsonl                 orchestrator and chat action history
-├─ paused.json                   JSON list of paused workflow names
-├─ blocked/<run_id>.json         current blocked-step decision details
-├─ processes/<run_id>.json       active process group IDs for cancellation
-├─ snapshots/<run_id>/<workflow>/ workflow copy used by a run
+├─ workshop.sqlite               durable tasks and Workshop state documents
+├─ service.sock                  private local JSON API socket
 └─ service.log                   launch-agent stdout and stderr
-.eve/                            Eve-managed local workflow state
-.output/                         Eve build output
 ```
 
-`state/runs.jsonl` has one JSON object per indexed start or skipped slot. Entries include `workflow`, `slot`, `run_id`, `outcome` (`started` or `skipped`), timestamp `at`, and an optional `reason`. A manual run has a null slot. The index supports scheduling, `max_runs`, and recent-run lookup; Eve owns run status and durable step results.
+`data/<workflow>/` belongs to workflow steps, not to Workshop's run-state record. It remains in place between runs. Runtime state, data, and logs are ignored by Git. The service removes its socket when it shuts down.
 
-`state/actions.jsonl` records automatic round decisions and chat actions. Each entry includes a timestamp, workflow, nullable run and step IDs, source (`round-1`, `round-2`, or `chat`), decision, and note. `state/paused.json` is an array of workflow names. Workshop removes a blocked-step record after a decision settles.
+## Local service API
 
-The launch agent writes stdout and stderr to `state/service.log`. Foreground `make start` and `make dev` output goes to the terminal instead. `.eve/` and `.output/` belong to Eve; do not edit them. Runtime state, snapshots, data, and logs are ignored by Git.
+The service listens on `state/service.sock`, a Unix socket with mode `0600`. It does not open a network port. Each connection sends one JSON request followed by a newline and receives one JSON response followed by a newline. The request body limit is 1 MiB. Responses include `ok`; errors include `error` and may include `request_id`.
 
-## Make targets and service
+Each request requires a `request_id` from 1 to 128 characters and a `type`. The service supports:
+
+| Type | Required fields | Optional fields |
+| --- | --- | --- |
+| `list_workflows` | — | — |
+| `list_runs` | — | `workflow`, `limit` |
+| `read_run` | `run_id` | — |
+| `start_workflow` | `workflow` | — |
+| `decide_blocked_run` | `run_id`, `decision_number`, `decision` | — |
+| `cancel_run` | `run_id` | — |
+| `pause_workflow` | `workflow` | — |
+| `resume_workflow` | `workflow` | — |
+| `list_actions` | — | `workflow`, `limit` |
+
+Workflow names use lowercase letters, digits, and hyphens. `decision_number` identifies the current blocked occurrence in a run; a delayed decision for an earlier step is rejected. `limit` is an integer from 0 to 1,000; list requests default to 20. The decision object uses the actions described above. The service rejects unknown request fields and invalid values. A repeated blocked-run decision with the same request ID and payload returns its saved response while that receipt remains in the most recent 1,000; reusing that ID for a different payload is an error.
+
+The service claims a SQLite owner row before opening pi-durable, so a second process cannot recover the first process's tasks or race stale-socket cleanup. It removes a stale socket only when it can confirm the socket is not active, and it will not replace a non-socket file. A fatal durable-storage error closes the service and exits with a nonzero status. `service/start-service.ts` requires Node.js 24 or newer. It registers the workflow, step-attempt, and schedule-tick tasks with pi-durable, opens SQLite, starts the scheduler, and serves requests.
+
+The daily-summary activity step uses this API to read recent runs and actions. The interactive chat client is not part of part 1; `make chat` is a placeholder until part 2.
+
+## Make targets
 
 | Target | Behavior |
 | --- | --- |
 | `make setup` | Requires Node.js 24+. On macOS it can install Node with Homebrew if missing; elsewhere install Node first. Runs `npm ci` and creates missing config and environment files. |
-| `make copy to=<dir>` | Clones the current committed branch into a new destination, renames its remote to `upstream`, makes `workshop.yaml` trackable there, and runs setup. It does not copy uncommitted changes, secrets, data, or service state. |
+| `make copy to=<dir>` | Creates and sets up a private copy of the current committed branch. It does not copy uncommitted changes, secrets, data, or service state. |
 | `make check` | Checks config and profile executables, validates private workflows and examples, runs `npx tsc --noEmit`, and runs `npm test`. |
-| `make dev` | Starts `eve dev` on `127.0.0.1:2000`. |
-| `make start` | Builds, then starts Eve on `127.0.0.1:3000` with local request auth enabled. It stays in the foreground; stop it with Ctrl-C. |
-| `make chat` | Connects to the start port first, then the dev port. It does not start a service. |
-| `make service-install` | Runs checks and a build, then installs a macOS per-user LaunchAgent that starts and keeps Eve running at login. |
+| `make dev` | Starts the service in Node watch mode. It stays in the foreground; stop it with Ctrl-C. |
+| `make start` | Starts the service in the foreground; stop it with Ctrl-C. |
+| `make chat` | Placeholder until the interactive chat client is ported in part 2. |
+| `make service-install` | Runs checks, then installs a macOS per-user LaunchAgent for the Node service. |
 | `make service-uninstall` | Removes the macOS LaunchAgent. It leaves workflow data and runtime state in place. |
 
-The service binds to loopback. `make chat` connects locally; use SSH to reach a machine from another computer rather than opening the service port. The installed LaunchAgent writes to `state/service.log`.
-
-## Eve version and upgrades
-
-`package.json` and `package-lock.json` pin `eve` to exactly `1.0.0-rc.18`. Keep the exact pin in both files. Upgrade Eve only when no workflow runs are open, including runs waiting on a decision or retry delay. Local Workflow World runs can be stranded across Eve versions. Finish open work before changing the version. Do not treat a cancellation request as proof that its child process has stopped. The upgrade rule is an operator check, not an automatic guard.
+The LaunchAgent writes stdout and stderr to `state/service.log`. Foreground `make start` and `make dev` output goes to the terminal instead.
