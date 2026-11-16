@@ -1,6 +1,7 @@
 import type { JsonValue } from "@earendil-works/chord/json";
 import { appendRecent, type WorkshopState } from "../workflow/define-workshop-state.ts";
 import type { StartWorkflowOutcome } from "../run/start-workflow.ts";
+import { ServiceFailure } from "./create-service-failure.ts";
 import type { ServiceRequest, ServiceResponse } from "./types.ts";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -30,7 +31,7 @@ export function responseFromReceipt(value: JsonValue): ServiceResponse {
 export function receiptFor(state: WorkshopState, request: ServiceRequest): ServiceResponse | undefined {
   const receipt = state.receipts.find((entry) => entry.request_id === request.request_id);
   if (!receipt) return undefined;
-  if (receipt.fingerprint !== fingerprint(request)) throw new Error("Request ID was already used for a different request");
+  if (receipt.fingerprint !== fingerprint(request)) throw new ServiceFailure("request_id_conflict", "Request ID was already used for a different request");
   return responseFromReceipt(receipt.response);
 }
 
@@ -42,7 +43,8 @@ export function saveReceipt(state: WorkshopState, request: ServiceRequest, respo
 }
 
 export function startResponse(requestId: string, outcome: StartWorkflowOutcome): ServiceResponse {
-  if (outcome.kind === "skipped" || outcome.kind === "locked") return { request_id: requestId, ok: false, error: outcome.reason };
-  if (outcome.kind === "already-indexed") return { request_id: requestId, ok: false, error: `Workflow slot ${outcome.slot} was already indexed` };
+  if (outcome.kind === "skipped") return { request_id: requestId, ok: false, error: outcome.reason, error_code: "admission_skipped" };
+  if (outcome.kind === "locked") return { request_id: requestId, ok: false, error: outcome.reason, error_code: "workflow_busy" };
+  if (outcome.kind === "already-indexed") return { request_id: requestId, ok: false, error: `Workflow slot ${outcome.slot} was already indexed`, error_code: "slot_already_indexed" };
   return { request_id: requestId, ok: true, workflow: outcome.workflow, run_id: outcome.run_id };
 }

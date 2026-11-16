@@ -19,7 +19,7 @@ import { parseServiceRequest } from "../service/types.ts";
 import { tickWorkflows } from "../schedule/tick-workflows.ts";
 import { executeWorkflowProcess } from "../run/execute-workflow-process.ts";
 import { createStepAttemptTask } from "../workflow/define-step-attempt-task.ts";
-import { WorkflowTask, WORKFLOW_TASK_NAME } from "../workflow/define-workflow-task.ts";
+import { WorkflowTask, WORKFLOW_TASK_NAME, workflowDecisionDocument } from "../workflow/define-workflow-task.ts";
 
 function createProject(command: string, extraFrontmatter = ""): { root: string } {
   const root = mkdtempSync(join(tmpdir(), "workshop-service-test-"));
@@ -201,15 +201,26 @@ test("service starts, lists, reads, and cancels a workflow run", async () => {
     await waitForFile(marker);
 
     const listed = await service.handleRequest({ request_id: "runs", type: "list_runs", limit: 10 });
-    assert.ok(recordsFrom(listed.runs).some((run) => run.run_id === runId));
+    const listedRun = recordsFrom(listed.runs).find((run) => run.run_id === runId);
+    assert.ok(listedRun);
+    assert.equal(typeof listedRun?.phase, "string");
+    assert.equal(typeof listedRun?.status_message, "string");
+    assert.ok(Array.isArray(listedRun?.allowed_actions));
     const reading = await service.handleRequest({ request_id: "read", type: "read_run", run_id: runId });
     assert.ok(isRecord(reading.run));
     assert.ok(["running", "blocked"].includes(String(reading.run.status)));
+    assert.equal(typeof reading.run.phase, "string");
+    assert.equal(typeof reading.run.status_message, "string");
+    assert.ok(Array.isArray(reading.run.allowed_actions));
+    if (Array.isArray(reading.run.allowed_actions)) assert.ok(reading.run.allowed_actions.includes("cancel_run"));
 
     const cancelRequest = { request_id: "cancel", type: "cancel_run", run_id: runId };
     const abort = harness.abortTask.bind(harness);
     harness.abortTask = async () => { throw new Error("simulated crash before abort"); };
-    await assert.rejects(service.handleRequest(cancelRequest), /simulated crash before abort/);
+    const beforeAbortFailure = await service.handleRequest(cancelRequest);
+    assert.equal(beforeAbortFailure.ok, false);
+    assert.equal(beforeAbortFailure.error_code, "mutation_failed");
+    assert.match(String(beforeAbortFailure.error), /simulated crash before abort/);
     const beforeRetry = await harness.snapshot(workshopStateDocument, BACKGROUND_CONTEXT);
     assert.equal(beforeRetry?.receipts.some((receipt) => receipt.request_id === "cancel"), false);
     assert.equal(beforeRetry?.actions.some((action) => action.decision.action === "cancel"), false);
@@ -217,7 +228,10 @@ test("service starts, lists, reads, and cancels a workflow run", async () => {
       await abort(taskId, context);
       throw new Error("simulated crash after abort");
     };
-    await assert.rejects(service.handleRequest(cancelRequest), /simulated crash after abort/);
+    const afterAbortFailure = await service.handleRequest(cancelRequest);
+    assert.equal(afterAbortFailure.ok, false);
+    assert.equal(afterAbortFailure.error_code, "mutation_failed");
+    assert.match(String(afterAbortFailure.error), /simulated crash after abort/);
     const settledAfterAbort = await harness.waitForTask(task.id, BACKGROUND_CONTEXT);
     assert.equal(settledAfterAbort.state.status, "terminal");
     if (settledAfterAbort.state.status === "terminal") assert.equal(settledAfterAbort.state.outcome.status, "aborted");
@@ -242,6 +256,82 @@ test("service starts, lists, reads, and cancels a workflow run", async () => {
 });
 
 
+test("receipt namespace gate serializes a cancellation against a colliding pause", async () => {
+  const project = createProject(`printf started > "$WORKSHOP_DATA_DIR/started"\nsleep 30\n`);
+  const storage = new MemoryStorage();
+  let harness: Awaited<ReturnType<typeof createHarness>> | undefined;
+  try {
+    harness = await createHarness(storage);
+    harness.resume();
+    const service = createWorkshopService({ projectRoot: project.root, harness });
+    const started = await service.handleRequest({ request_id: "start", type: "start_workflow", workflow: "clock" });
+    const runId = runIdFrom(started);
+    const task = await waitForTask(storage, runId);
+    await waitForFile(join(project.root, "data", "clock", "started"));
+    const abort = harness.abortTask.bind(harness);
+    let enterAbort!: () => void;
+    let releaseAbort!: () => void;
+    const abortEntered = new Promise<void>((resolveEntered) => { enterAbort = resolveEntered; });
+    const abortBarrier = new Promise<void>((resolveBarrier) => { releaseAbort = resolveBarrier; });
+    harness.abortTask = async (taskId, context) => {
+      enterAbort();
+      await abortBarrier;
+      return await abort(taskId, context);
+    };
+
+    const cancellation = service.handleRequest({ request_id: "shared-id", type: "cancel_run", run_id: runId });
+    await abortEntered;
+    let pauseFinished = false;
+    const pause = service.handleRequest({ request_id: "shared-id", type: "pause_workflow", workflow: "clock" })
+      .finally(() => { pauseFinished = true; });
+    await new Promise((resolveWait) => setTimeout(resolveWait, 30));
+    assert.equal(pauseFinished, false, "the pause must wait behind cancellation's receipt gate");
+    releaseAbort();
+    const [cancelResponse, pauseResponse] = await Promise.all([cancellation, pause]);
+    assert.equal(cancelResponse.ok, true);
+    assert.equal(cancelResponse.cancelled, true);
+    assert.equal(pauseResponse.ok, false);
+    assert.equal(pauseResponse.error_code, "request_id_conflict");
+    const state = await harness.snapshot(workshopStateDocument, BACKGROUND_CONTEXT);
+    assert.equal(state?.actions.filter((action) => action.decision.action === "cancel").length, 1);
+    assert.equal(state?.actions.some((action) => action.decision.action === "pause"), false);
+    assert.equal(state?.paused.includes("clock"), false);
+    assert.ok(task);
+  } finally {
+    if (harness) await harness.close(BACKGROUND_CONTEXT);
+    rmSync(project.root, { recursive: true, force: true });
+  }
+});
+
+test("a new cancellation of a terminal-cancelled run reports cancelled false", async () => {
+  const project = createProject(`printf started > "$WORKSHOP_DATA_DIR/started"\nsleep 30\n`);
+  const storage = new MemoryStorage();
+  let harness: Awaited<ReturnType<typeof createHarness>> | undefined;
+  try {
+    harness = await createHarness(storage);
+    harness.resume();
+    const service = createWorkshopService({ projectRoot: project.root, harness });
+    const started = await service.handleRequest({ request_id: "start", type: "start_workflow", workflow: "clock" });
+    const runId = runIdFrom(started);
+    const task = await waitForTask(storage, runId);
+    await waitForFile(join(project.root, "data", "clock", "started"));
+    const first = await service.handleRequest({ request_id: "cancel-first", type: "cancel_run", run_id: runId });
+    assert.equal(first.cancelled, true);
+    await harness.waitForTask(task.id, BACKGROUND_CONTEXT);
+    const secondRequest = { request_id: "cancel-terminal", type: "cancel_run", run_id: runId };
+    const second = await service.handleRequest(secondRequest);
+    assert.equal(second.ok, true);
+    assert.equal(second.cancelled, false);
+    assert.equal(second.status, "cancelled");
+    assert.deepEqual(await service.handleRequest(secondRequest), second);
+    const state = await harness.snapshot(workshopStateDocument, BACKGROUND_CONTEXT);
+    assert.equal(state?.actions.filter((action) => action.run_id === runId && action.decision.action === "cancel").length, 1);
+  } finally {
+    if (harness) await harness.close(BACKGROUND_CONTEXT);
+    rmSync(project.root, { recursive: true, force: true });
+  }
+});
+
 test("service decisions wake blocked tasks and deduplicate retried requests", async () => {
   const project = createProject("printf 'bad output'; exit 7\n", "retries: 0\n");
   const storage = new MemoryStorage();
@@ -257,13 +347,19 @@ test("service decisions wake blocked tasks and deduplicate retried requests", as
     assert.ok(isRecord(blocked.blocked_step));
     assert.equal(blocked.blocked_step.step, "10-task");
     assert.equal(typeof blocked.blocked_step.decision_number, "number");
+    assert.ok(Array.isArray(blocked.allowed_actions));
+    assert.ok(Array.isArray(blocked.blocked_step.allowed_actions));
+    assert.deepEqual(blocked.blocked_step.retry_profiles, []);
     const decisionNumber = blocked.blocked_step.decision_number;
 
     const request = { request_id: "decision", type: "decide_blocked_run", run_id: runId, decision_number: decisionNumber, decision: { action: "skip" } };
     const decision = await service.handleRequest(request);
     assert.equal(decision.ok, true);
     assert.deepEqual(await service.handleRequest(request), decision);
-    await assert.rejects(service.handleRequest({ ...request, decision: { action: "fail" } }), /already used for a different request/);
+    const conflict = await service.handleRequest({ ...request, decision: { action: "fail" } });
+    assert.equal(conflict.ok, false);
+    assert.equal(conflict.error_code, "request_id_conflict");
+    assert.match(String(conflict.error), /already used for a different request/);
 
     const root = await harness.root(BACKGROUND_CONTEXT);
     const roundSubmissions = await storage.scanSubmissions({ conversationId: root.id }, 100, undefined, BACKGROUND_CONTEXT);
@@ -275,6 +371,125 @@ test("service decisions wake blocked tasks and deduplicate retried requests", as
     assert.deepEqual(recordsFrom(actions.actions).map((entry) => [entry.source, isRecord(entry.decision) ? entry.decision.action : undefined]), [
       ["chat", "skip"], ["round", "give_up"], ["chat", "start"],
     ]);
+  } finally {
+    if (harness) await harness.close(BACKGROUND_CONTEXT);
+    rmSync(project.root, { recursive: true, force: true });
+  }
+});
+
+test("invalid workflow checkpoints keep their integrity error in run reads", { timeout: 30_000 }, async () => {
+  const project = createProject("printf 'unused'\\n");
+  const storage = new MemoryStorage();
+  let harness: Awaited<ReturnType<typeof createHarness>> | undefined;
+  try {
+    harness = await createHarness(storage);
+    const root = await harness.root(BACKGROUND_CONTEXT);
+    const runId = "integrity-run";
+    const workflow = {
+      name: "clock",
+      directory: join(project.root, "workflows", "clock"),
+      cron: "* * * * *",
+      description: "Invalid checkpoint test.",
+      steps: [],
+    };
+    const taskId = await root.commit(async (tx) => {
+      const task = await tx.createTask(WorkflowTask, {
+        runId,
+        workflowName: "clock",
+        startedAt: new Date().toISOString(),
+        slot: null,
+        projectRoot: project.root,
+        dataDirectory: join(project.root, "data", "clock"),
+        stateDirectory: join(project.root, "state"),
+        workflow,
+        profileCommands: { writer: [process.execPath] },
+      }, { ownership: { kind: "conversation" }, conversationId: root.id });
+      await tx.doc(workflowRunReferenceDocument, runId, {
+        run_id: runId, task_id: task, workflow: "clock", slot: null, started_at: new Date().toISOString(),
+      });
+      return task;
+    }, BACKGROUND_CONTEXT);
+    harness.resume();
+    const settled = await harness.waitForTask(taskId, BACKGROUND_CONTEXT);
+    assert.equal(settled.state.status, "terminal");
+    if (settled.state.status === "terminal") assert.equal(settled.state.outcome.status, "faulted");
+    const service = createWorkshopService({ projectRoot: project.root, harness });
+    const reading = await service.handleRequest({ request_id: "read-integrity", type: "read_run", run_id: runId });
+    assert.ok(isRecord(reading.run));
+    assert.equal(reading.run.status, "faulted");
+    assert.match(String(reading.run.error), /Workflow checkpoint integrity error at input\.workflow\.steps/);
+    assert.match(String(reading.run.status_message), /Workflow checkpoint integrity error at input\.workflow\.steps/);
+  } finally {
+    if (harness) await harness.close(BACKGROUND_CONTEXT);
+    rmSync(project.root, { recursive: true, force: true });
+  }
+});
+
+test("terminal failures retain prior step receipts on read", { timeout: 30_000 }, async () => {
+  const project = createProject("printf 'prior-output'\n", "retries: 0\n");
+  writeFileSync(join(project.root, "workflows", "clock", "20-last.sh"), "printf 'failed-output'; exit 7\n");
+  const storage = new MemoryStorage();
+  let harness: Awaited<ReturnType<typeof createHarness>> | undefined;
+  try {
+    harness = await createHarness(storage);
+    harness.resume();
+    const service = createWorkshopService({ projectRoot: project.root, harness });
+    const started = await service.handleRequest({ request_id: "start", type: "start_workflow", workflow: "clock" });
+    const runId = runIdFrom(started);
+    await waitForRunStatus(service, storage, runId, "blocked");
+    const decision = await service.handleRequest({
+      request_id: "fail-blocked", type: "decide_blocked_run", run_id: runId, decision_number: 1, decision: { action: "fail" },
+    });
+    assert.equal(decision.ok, true);
+    const task = await waitForTask(storage, runId);
+    const settled = await harness.waitForTask(task.id, BACKGROUND_CONTEXT);
+    assert.equal(settled.state.status, "terminal");
+    if (settled.state.status === "terminal") assert.equal(settled.state.outcome.status, "failed");
+    const reading = await service.handleRequest({ request_id: "read-failed", type: "read_run", run_id: runId });
+    assert.ok(isRecord(reading.run));
+    assert.equal(reading.run.status, "failed");
+    assert.match(String(reading.run.error), /^20-last failed: 20-last failed with exit code 7/);
+    assert.ok(Array.isArray(reading.run.steps));
+    if (Array.isArray(reading.run.steps)) {
+      assert.equal(reading.run.steps.length, 1);
+      assert.ok(isRecord(reading.run.steps[0]));
+      if (isRecord(reading.run.steps[0])) {
+        assert.equal(reading.run.steps[0].step, "10-task");
+        assert.equal(reading.run.steps[0].output, "prior-output");
+      }
+    }
+    assert.equal(reading.run.output, "prior-output");
+  } finally {
+    if (harness) await harness.close(BACKGROUND_CONTEXT);
+    rmSync(project.root, { recursive: true, force: true });
+  }
+});
+
+test("terminal cancellations retain prior step receipts on read", { timeout: 30_000 }, async () => {
+  const project = createProject("printf 'prior-output'\n");
+  writeFileSync(join(project.root, "workflows", "clock", "20-wait.sh"), `printf started > "$WORKSHOP_DATA_DIR/started"\nsleep 30\n`);
+  const storage = new MemoryStorage();
+  let harness: Awaited<ReturnType<typeof createHarness>> | undefined;
+  try {
+    harness = await createHarness(storage);
+    harness.resume();
+    const service = createWorkshopService({ projectRoot: project.root, harness });
+    const started = await service.handleRequest({ request_id: "start", type: "start_workflow", workflow: "clock" });
+    const runId = runIdFrom(started);
+    await waitForFile(join(project.root, "data", "clock", "started"));
+    const cancelled = await service.handleRequest({ request_id: "cancel", type: "cancel_run", run_id: runId });
+    assert.equal(cancelled.cancelled, true);
+    const task = await waitForTask(storage, runId);
+    await harness.waitForTask(task.id, BACKGROUND_CONTEXT);
+    const reading = await service.handleRequest({ request_id: "read-cancelled", type: "read_run", run_id: runId });
+    assert.ok(isRecord(reading.run));
+    assert.equal(reading.run.status, "cancelled");
+    assert.ok(Array.isArray(reading.run.steps));
+    if (Array.isArray(reading.run.steps)) {
+      assert.equal(reading.run.steps.length, 1);
+      assert.ok(isRecord(reading.run.steps[0]));
+      if (isRecord(reading.run.steps[0])) assert.equal(reading.run.steps[0].output, "prior-output");
+    }
   } finally {
     if (harness) await harness.close(BACKGROUND_CONTEXT);
     rmSync(project.root, { recursive: true, force: true });
@@ -342,15 +557,51 @@ test("service rejects accepting an empty blocked result", async () => {
     const runId = runIdFrom(started);
     const blocked = await waitForRunStatus(service, storage, runId, "blocked");
     assert.ok(isRecord(blocked.blocked_step));
-    await assert.rejects(
-      service.handleRequest({ request_id: "accept-empty", type: "decide_blocked_run", run_id: runId, decision_number: 1, decision: { action: "accept" } }),
-      /empty output/,
-    );
+    const rejected = await service.handleRequest({ request_id: "accept-empty", type: "decide_blocked_run", run_id: runId, decision_number: 1, decision: { action: "accept" } });
+    assert.equal(rejected.ok, false);
+    assert.equal(rejected.error_code, "empty_output");
+    assert.match(String(rejected.error), /empty output/);
   } finally {
     if (harness) await harness.close(BACKGROUND_CONTEXT);
     rmSync(project.root, { recursive: true, force: true });
   }
 });
+test("a blocked decision is rejected after cancellation is requested", async () => {
+  const project = createProject("exit 7\n", "retries: 0\n");
+  const storage = new MemoryStorage();
+  let harness: Awaited<ReturnType<typeof createHarness>> | undefined;
+  try {
+    harness = await createHarness(storage);
+    harness.resume();
+    const service = createWorkshopService({ projectRoot: project.root, harness });
+    const started = await service.handleRequest({ request_id: "start", type: "start_workflow", workflow: "clock" });
+    const runId = runIdFrom(started);
+    const task = await waitForTask(storage, runId);
+    await waitForRunStatus(service, storage, runId, "blocked");
+    assert.equal(await harness.abortTask(task.id, BACKGROUND_CONTEXT), "marked");
+    await harness.waitForTask(task.id, BACKGROUND_CONTEXT);
+
+    const decision = await service.handleRequest({
+      request_id: "decision-during-cancel",
+      type: "decide_blocked_run",
+      run_id: runId,
+      decision_number: 1,
+      decision: { action: "skip" },
+    });
+    assert.equal(decision.ok, false);
+    assert.equal(decision.error_code, "cancellation_in_progress", JSON.stringify(decision));
+    assert.match(String(decision.error), /cancellation/i);
+    const state = await harness.snapshot(workshopStateDocument, BACKGROUND_CONTEXT);
+    assert.equal(state?.receipts.some((receipt) => receipt.request_id === "decision-during-cancel"), false);
+    assert.equal(state?.actions.some((action) => action.run_id === runId && action.decision.action === "skip"), false);
+    const mailbox = await harness.snapshot(workflowDecisionDocument, task.id, BACKGROUND_CONTEXT);
+    assert.equal(mailbox?.choice ?? null, null);
+  } finally {
+    if (harness) await harness.close(BACKGROUND_CONTEXT);
+    rmSync(project.root, { recursive: true, force: true });
+  }
+});
+
 test("two concurrent conflicting decisions allow only one winner", async () => {
   const project = createProject("exit 7\n", "retries: 0\n");
   const storage = new MemoryStorage();
@@ -372,7 +623,9 @@ test("two concurrent conflicting decisions allow only one winner", async () => {
     assert.equal(winners.length, 1);
     const winner = winners[0];
     assert.ok(winner);
-    assert.equal(results.filter((result) => result.status === "rejected").length, 1);
+    const rejected = results.filter((result) => result.status === "fulfilled" && !result.value.ok);
+    assert.equal(rejected.length, 1);
+    if (rejected[0]?.status === "fulfilled") assert.equal(rejected[0].value.error_code, "choice_already_recorded");
     const task = await waitForTask(storage, runId);
     const settled = await harness.waitForTask(task.id, BACKGROUND_CONTEXT);
     assert.equal(settled.state.status, "terminal");
@@ -433,10 +686,10 @@ test("a delayed decision cannot affect a later blocked step in the same run", as
       await new Promise((resolveWait) => setTimeout(resolveWait, 10));
     }
     assert.ok(secondBlocked, "second step did not block with decision number 2");
-    await assert.rejects(
-      service.handleRequest({ ...firstDecision, request_id: "delayed-first-decision" }),
-      /stale; current decision is 2/,
-    );
+    const rejected = await service.handleRequest({ ...firstDecision, request_id: "delayed-first-decision" });
+    assert.equal(rejected.ok, false);
+    assert.equal(rejected.error_code, "stale_decision");
+    assert.match(String(rejected.error), /stale; current decision is 2/);
   } finally {
     if (harness) await harness.close(BACKGROUND_CONTEXT);
     rmSync(project.root, { recursive: true, force: true });
@@ -452,13 +705,24 @@ test("pause and resume update durable workflow state", async () => {
     const service = createWorkshopService({ projectRoot: project.root, harness });
     const paused = await service.handleRequest({ request_id: "pause", type: "pause_workflow", workflow: "clock" });
     assert.equal(paused.paused, true);
-    await assert.rejects(service.handleRequest({ request_id: "start", type: "start_workflow", workflow: "clock" }), /is paused/);
+    const repeatedPause = await service.handleRequest({ request_id: "pause-again", type: "pause_workflow", workflow: "clock" });
+    assert.equal(repeatedPause.paused, true);
+    assert.deepEqual(repeatedPause.paused_workflows, ["clock"]);
+    const denied = await service.handleRequest({ request_id: "start", type: "start_workflow", workflow: "clock" });
+    assert.equal(denied.ok, false);
+    assert.equal(denied.error_code, "mutation_failed");
+    assert.match(String(denied.error), /is paused/);
     const listed = await service.handleRequest({ request_id: "list", type: "list_workflows" });
     assert.equal(recordsFrom(listed.workflows)[0]?.paused, true);
     const resumed = await service.handleRequest({ request_id: "resume", type: "resume_workflow", workflow: "clock" });
     assert.equal(resumed.paused, false);
+    const repeatedResume = await service.handleRequest({ request_id: "resume-again", type: "resume_workflow", workflow: "clock" });
+    assert.equal(repeatedResume.paused, false);
+    assert.deepEqual(repeatedResume.paused_workflows, []);
     const state = await harness.snapshot(workshopStateDocument, BACKGROUND_CONTEXT);
     assert.deepEqual(state?.paused, []);
+    assert.equal(state?.actions.filter((action) => action.decision.action === "pause").length, 1);
+    assert.equal(state?.actions.filter((action) => action.decision.action === "resume").length, 1);
   } finally {
     if (harness) await harness.close(BACKGROUND_CONTEXT);
     rmSync(project.root, { recursive: true, force: true });
@@ -624,8 +888,10 @@ test("submit_chat reuses the configured root conversation through the service", 
     (context) => {
       const prompt = transcriptText(context.messages);
       assert.match(prompt, /## Workshop status/);
+      assert.match(prompt, /Run list is capped at 100 rows/);
       assert.match(prompt, /### Active runs/);
       assert.match(prompt, /### Blocked runs/);
+      assert.match(prompt, /### Definition-unavailable runs/);
       assert.match(prompt, /### Broken workflows/);
       assert.match(prompt, /### Paused workflows/);
       assert.match(prompt, /### Recent actions/);

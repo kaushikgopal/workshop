@@ -29,6 +29,10 @@ export type WorkflowStartPort = {
 
 type WorkflowTaskRecord = TaskRecord<JsonValue, JsonValue, unknown>;
 
+class WorkflowAdmissionConflict extends Error {
+  readonly code = "request_id_conflict";
+}
+
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -152,7 +156,7 @@ function receiptResult(state: WorkshopState | undefined, idempotency?: StartIdem
   });
   if (decision.kind === "unseen-receipt") return undefined;
   if (decision.kind === "replayed-receipt") return { kind: "replayed", response: decision.response };
-  if (decision.kind === "receipt-conflict") throw new Error(decision.reason);
+  if (decision.kind === "receipt-conflict") throw new WorkflowAdmissionConflict(decision.reason);
   throw new Error(`Unexpected receipt decision: ${decision.kind}`);
 }
 

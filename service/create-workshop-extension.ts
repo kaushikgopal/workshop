@@ -35,12 +35,23 @@ function formatList(value: unknown, format: (entry: Record<string, unknown>) => 
 
 function renderStatus(workflows: ServiceResponse, runs: ServiceResponse, actions: ServiceResponse): string {
   if (!workflows.ok || !runs.ok || !actions.ok) throw new Error("Workshop status could not be read");
-  const active = formatList(runs.runs, (item) => ["pending", "running", "waiting", "sleeping"].includes(String(item.status))
-    ? `- ${String(item.workflow)} / ${String(item.run_id)} — ${String(item.status)}`
-    : "").filter(Boolean);
-  const blocked = formatList(runs.runs, (item) => item.status === "blocked"
-    ? `- ${String(item.workflow)} / ${String(item.run_id)} — step ${String(item.blocked_step ?? "unknown")}: ${String(item.last_error ?? "no error recorded")}`
-    : "").filter(Boolean);
+  const renderRun = (item: Record<string, unknown>) => {
+    const choices = Array.isArray(item.allowed_actions)
+      ? item.allowed_actions.filter((action): action is string => typeof action === "string").join(", ")
+      : "none";
+    return `- ${String(item.workflow)} / ${String(item.run_id)} — ${String(item.status)} (${String(item.phase)}): ${String(item.status_message)} Allowed actions: ${choices || "none"}.`;
+  };
+  const activePhases = new Set(["queued", "executing", "waiting-for-attempt", "waiting", "retry-scheduled", "completing", "cancellation-requested"]);
+  const blockedPhases = new Set(["waiting-for-round", "awaiting-decision", "decision-recorded"]);
+  const active = formatList(runs.runs, (item) => activePhases.has(String(item.phase)) ? renderRun(item) : "").filter(Boolean);
+  const blocked = formatList(runs.runs, (item) => {
+    if (!blockedPhases.has(String(item.phase))) return "";
+    const stepChoices = Array.isArray(item.blocked_step_allowed_actions)
+      ? item.blocked_step_allowed_actions.filter((action): action is string => typeof action === "string").join(", ")
+      : "none";
+    return `${renderRun(item)} Blocked-step actions: ${stepChoices || "none"}.`;
+  }).filter(Boolean);
+  const unavailable = formatList(runs.runs, (item) => item.phase === "definition-unavailable" ? renderRun(item) : "").filter(Boolean);
   const broken = formatList(workflows.broken_workflows, (item) => {
     const errors = formatList(item.errors, (error) => `${String(error.file)}: ${String(error.reason)}`);
     return `- ${String(item.name)}${errors.length ? ` — ${errors.join("; ")}` : ""}`;
@@ -52,11 +63,16 @@ function renderStatus(workflows: ServiceResponse, runs: ServiceResponse, actions
   return [
     "## Workshop status",
     "",
+    "Run list is capped at 100 rows.",
+    "",
     "### Active runs",
     ...(active.length ? active : ["- None"]),
     "",
     "### Blocked runs",
     ...(blocked.length ? blocked : ["- None"]),
+    "",
+    "### Definition-unavailable runs",
+    ...(unavailable.length ? unavailable : ["- None"]),
     "",
     "### Broken workflows",
     ...(broken.length ? broken : ["- None"]),
@@ -89,7 +105,7 @@ export function createWorkshopExtension(input: {
   });
   const listRuns = defineTool({
     name: "list_runs",
-    description: "List recent workflow runs, with blocked runs first.",
+    description: "List recent runs with status, phase, status_message, and allowed_actions. Blocked rows include compact step-action and retry-profile choices.",
     parameters: Type.Object({
       workflow: Type.Optional(Type.String()),
       limit: Type.Optional(Type.Integer({ minimum: 0, maximum: 1_000 })),
@@ -99,7 +115,7 @@ export function createWorkshopExtension(input: {
   });
   const readRun = defineTool({
     name: "read_run",
-    description: "Read a workflow run, including its blocked step, output, and attempt history.",
+    description: "Read a workflow run's status, phase, status_message, allowed_actions, and full blocked-step details, output, and attempt history.",
     parameters: Type.Object({ run_id: Type.String({ minLength: 1 }) }),
     replay: "safe",
     execute: async (args, _api, _context) => result(await send("read_run", args)),
@@ -112,7 +128,7 @@ export function createWorkshopExtension(input: {
   });
   const decideBlockedRun = defineTool({
     name: "decide_blocked_run",
-    description: "Decide a currently blocked run: retry, skip, accept, or fail. Automatic failure rounds are bound to their blocked step by Workshop.",
+    description: "Choose only an action from blocked_step.allowed_actions and a retry profile from blocked_step.retry_profiles. Automatic failure rounds are bound to their blocked step by Workshop.",
     parameters: Type.Object({
       run_id: Type.String({ minLength: 1 }),
       decision_number: Type.Integer({ minimum: 1 }),
