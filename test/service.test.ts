@@ -11,13 +11,14 @@ import { createRegistry, defineDoc, Harness, MemoryStorage, type Storage, type T
 import type { JsonValue } from "@earendil-works/chord/json";
 import { test } from "node:test";
 import { createWorkflowStartPort, startWorkflow } from "../run/start-workflow.ts";
-import { appendRecent, maxWorkshopHistoryRecords, workshopStateDocument, workflowRunReferenceDocument, type MutationReceipt, type WorkshopAction, type WorkflowAdmission } from "../run/workshop-state.ts";
+import { appendRecent, maxWorkshopHistoryRecords, workshopStateDocument, workflowRunReferenceDocument, type MutationReceipt, type WorkshopAction, type WorkflowAdmission } from "../workflow/define-workshop-state.ts";
 import { createWorkshopService } from "../service/create-workshop-service.ts";
 import { openWorkshopHarness } from "../service/open-workshop-harness.ts";
 import { serveServiceSocket } from "../service/serve-service-socket.ts";
 import { parseServiceRequest } from "../service/types.ts";
 import { tickWorkflows } from "../schedule/tick-workflows.ts";
-import { StepAttemptTask } from "../workflow/define-step-attempt-task.ts";
+import { executeWorkflowProcess } from "../run/execute-workflow-process.ts";
+import { createStepAttemptTask } from "../workflow/define-step-attempt-task.ts";
 import { WorkflowTask, WORKFLOW_TASK_NAME } from "../workflow/define-workflow-task.ts";
 
 function createProject(command: string, extraFrontmatter = ""): { root: string } {
@@ -39,7 +40,7 @@ function createProject(command: string, extraFrontmatter = ""): { root: string }
 
 function createHarness(storage: Storage) {
   const registry = createRegistry();
-  registry.install({ name: "workshop", tasks: [WorkflowTask, StepAttemptTask] });
+  registry.install({ name: "workshop", tasks: [WorkflowTask, createStepAttemptTask(executeWorkflowProcess)] });
   return Harness.open(storage, { models: createModels(), registry }, BACKGROUND_CONTEXT);
 }
 

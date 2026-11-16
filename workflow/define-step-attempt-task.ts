@@ -1,7 +1,7 @@
 import { defineTask, type TaskRuntime } from "@earendil-works/pi-durable";
-import { executeWorkflowProcess } from "../run/execute-workflow-process.ts";
-import { executeWorkflowAttempt, type WorkflowAttemptRequest, type WorkflowAttemptResult, type WorkflowInterpreterInput } from "./interpret-workflow.ts";
+import { executeWorkflowAttempt, type ProcessExecutionRequest, type ProcessExecutionResult, type WorkflowAttemptRequest, type WorkflowAttemptResult, type WorkflowInterpreterInput } from "./interpret-workflow.ts";
 import type { Workflow, WorkflowStep } from "./types.ts";
+
 
 export const STEP_ATTEMPT_TASK_NAME = "workshop.step-attempt";
 
@@ -20,15 +20,37 @@ export type StepAttemptTaskInput = {
 
 type StepAttemptCheckpoint = { phase: "execute" };
 type StepAttemptRuntime = TaskRuntime<StepAttemptTaskInput, StepAttemptCheckpoint, WorkflowAttemptResult, object>;
+export type StepAttemptProcessRequest = ProcessExecutionRequest & {
+  workflow: string;
+  runId: string;
+  projectRoot: string;
+  dataDirectory: string;
+  stateDirectory: string;
+  cwd: string;
+  signal: AbortSignal;
+};
+export type StepAttemptProcessExecutor = (request: StepAttemptProcessRequest) => Promise<ProcessExecutionResult>;
 
-async function executeAttemptTask(input: StepAttemptTaskInput, runtime: StepAttemptRuntime): Promise<WorkflowAttemptResult> {
+const unconfiguredProcessExecutor: StepAttemptProcessExecutor = async () => ({
+  exitCode: null,
+  stdout: "",
+  stderr: "",
+  timedOut: false,
+  error: "Step attempt task has no process executor",
+});
+
+async function executeAttemptTask(
+  input: StepAttemptTaskInput,
+  runtime: StepAttemptRuntime,
+  executeProcess: StepAttemptProcessExecutor,
+): Promise<WorkflowAttemptResult> {
   const interpreter: WorkflowInterpreterInput = {
     workflow: input.workflow,
     documents: input.documents,
     files: input.files,
     workflowRunId: input.runId,
     profileCommands: input.profileCommands,
-    executeProcess: (request) => executeWorkflowProcess({
+    executeProcess: (request) => executeProcess({
       ...request,
       workflow: input.workflow.name,
       runId: input.runId,
@@ -43,17 +65,21 @@ async function executeAttemptTask(input: StepAttemptTaskInput, runtime: StepAtte
   return await executeWorkflowAttempt(interpreter, { ...input.request, step: input.step });
 }
 
-export const StepAttemptTask = defineTask<StepAttemptTaskInput, StepAttemptCheckpoint, WorkflowAttemptResult, object>({
-  name: STEP_ATTEMPT_TASK_NAME,
-  version: 1,
-  initial: (): StepAttemptCheckpoint => ({ phase: "execute" }),
-  phases: {
-    execute: async (task, runtime, context) => {
-      const result = await executeAttemptTask(task.input, runtime);
-      await runtime.commit(() => ({ status: "terminal", outcome: { status: "completed", result } }), context);
+export function createStepAttemptTask(executeProcess: StepAttemptProcessExecutor) {
+  return defineTask<StepAttemptTaskInput, StepAttemptCheckpoint, WorkflowAttemptResult, object>({
+    name: STEP_ATTEMPT_TASK_NAME,
+    version: 1,
+    initial: (): StepAttemptCheckpoint => ({ phase: "execute" }),
+    phases: {
+      execute: async (task, runtime, context) => {
+        const result = await executeAttemptTask(task.input, runtime, executeProcess);
+        await runtime.commit(() => ({ status: "terminal", outcome: { status: "completed", result } }), context);
+      },
     },
-  },
-  abort: async (_task, runtime, context) => {
-    await runtime.commit(() => ({ status: "terminal", outcome: { status: "aborted", reason: "cancelled" } }), context);
-  },
-});
+    abort: async (_task, runtime, context) => {
+      await runtime.commit(() => ({ status: "terminal", outcome: { status: "aborted", reason: "cancelled" } }), context);
+    },
+  });
+}
+
+export const StepAttemptTask = createStepAttemptTask(unconfiguredProcessExecutor);

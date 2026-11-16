@@ -2,7 +2,8 @@ import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createModels, type Models } from "@earendil-works/pi-ai/models";
 import { createRegistry, defineExtension, Harness, type Report, type Storage } from "@earendil-works/pi-durable";
 import { WorkflowTask } from "../workflow/define-workflow-task.ts";
-import { StepAttemptTask } from "../workflow/define-step-attempt-task.ts";
+import { executeWorkflowProcess } from "../run/execute-workflow-process.ts";
+import { createStepAttemptTask } from "../workflow/define-step-attempt-task.ts";
 import { WorkflowTickTask } from "../schedule/tick-workflows.ts";
 import { createWorkshopExtension, type WorkshopServiceRequest } from "./create-workshop-extension.ts";
 import type { OrchestratorModel } from "./create-orchestrator-runtime.ts";
@@ -23,7 +24,7 @@ export async function openWorkshopHarness(
   const registry = createRegistry();
   registry.install(defineExtension({
     name: "workshop-workflows",
-    tasks: [WorkflowTask, StepAttemptTask, WorkflowTickTask],
+    tasks: [WorkflowTask, createStepAttemptTask(executeWorkflowProcess), WorkflowTickTask],
   }));
   const workshop = options === undefined ? undefined : createWorkshopExtension(options);
   if (workshop) registry.install(workshop);

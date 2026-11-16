@@ -8,7 +8,7 @@ import { StepAttemptTask } from "./define-step-attempt-task.ts";
 import { loadWorkflowStep } from "./load-workflow-step.ts";
 import type { WorkflowAttemptRequest, WorkflowAttemptResult, WorkflowDecisionRequest, WorkflowInterpretation } from "./interpret-workflow.ts";
 import type { AttemptHistoryEntry, OrchestratorDecision, Workflow, WorkflowDecision, WorkflowStep, WorkflowStepResult } from "./types.ts";
-import { appendRecent, workshopStateDocument } from "../run/workshop-state.ts";
+import { appendRecent, workshopStateDocument } from "./define-workshop-state.ts";
 
 export const WORKFLOW_TASK_NAME = "workshop.workflow";
 

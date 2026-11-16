@@ -157,16 +157,16 @@ workflow/                                 workflow loading and durable execution
   compute-retry-profiles.ts                allowed retry profiles
   define-step-attempt-task.ts              durable step-attempt task
   define-workflow-task.ts                  durable workflow task
+  define-workshop-state.ts                durable workshop state and history
   interpret-workflow.ts                    command, agent, and check behavior
   list-workflow-status.ts                  workflow status for orchestrator tools
   load-workflow-step.ts                    step and check files at step start
   load-workflows.ts                        folder validation and workflow loading
   parse-workflow-decision.ts               decision validation
   types.ts                                 workflow and step shapes
-run/                                      admission, state, and process execution
+run/                                      admission and process execution
   execute-workflow-process.ts              command and profile process groups
   start-workflow.ts                        workflow admission and task creation
-  workshop-state.ts                        bounded history, pause state, counters
 schedule/                                 cron-slot selection and durable ticks
   decide-workflow-slot.ts                  slot and `max_runs` decisions
   tick-workflows.ts                        one-minute durable schedule tick

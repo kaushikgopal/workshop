@@ -48,21 +48,21 @@ function createSourceTree(): string {
   return root;
 }
 
-function serviceDependencyChains(root = projectRoot): string[] {
+function dependencyChains(root: string, sourceDirectory: string, targetDirectory: string): string[] {
   const files = sourceDirectories.flatMap((directory) => sourceFiles(resolve(root, directory)));
   const knownFiles = new Set(files);
-  const workflowFiles = files.filter((file) => relative(root, file).startsWith(`workflow${sep}`));
-  const serviceFiles = new Set(files.filter((file) => relative(root, file).startsWith(`service${sep}`)));
+  const sourceFilesInDirectory = files.filter((file) => relative(root, file).startsWith(`${sourceDirectory}${sep}`));
+  const targetFiles = new Set(files.filter((file) => relative(root, file).startsWith(`${targetDirectory}${sep}`)));
   const violations: string[] = [];
 
-  for (const start of workflowFiles) {
+  for (const start of sourceFilesInDirectory) {
     const pending: Array<{ file: string; chain: string[] }> = [{ file: start, chain: [relative(root, start)] }];
     const visited = new Set<string>();
     while (pending.length > 0) {
       const current = pending.shift();
       if (!current || visited.has(current.file)) continue;
       visited.add(current.file);
-      if (serviceFiles.has(current.file)) {
+      if (targetFiles.has(current.file)) {
         violations.push(current.chain.join(" -> "));
         continue;
       }
@@ -79,8 +79,20 @@ function serviceDependencyChains(root = projectRoot): string[] {
   return violations;
 }
 
+function serviceDependencyChains(root = projectRoot): string[] {
+  return dependencyChains(root, "workflow", "service");
+}
+
+function runDependencyChains(root = projectRoot): string[] {
+  return dependencyChains(root, "workflow", "run");
+}
+
 test("workflow modules do not depend on the service API", () => {
   assert.deepEqual(serviceDependencyChains(), []);
+});
+
+test("workflow modules do not depend on run modules", () => {
+  assert.deepEqual(runDependencyChains(), []);
 });
 
 test("reports a transitive workflow dependency on the service API", () => {
@@ -91,6 +103,17 @@ test("reports a transitive workflow dependency on the service API", () => {
     assert.deepEqual(serviceDependencyChains(root), [
       "workflow/entry.ts -> run/entry.ts -> service/types.ts",
     ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("reports a direct workflow dependency on run modules", () => {
+  const root = createSourceTree();
+  try {
+    writeFileSync(resolve(root, "workflow/entry.ts"), 'import "../run/entry.ts";\n');
+    writeFileSync(resolve(root, "run/entry.ts"), "export const run = true;\n");
+    assert.deepEqual(runDependencyChains(root), ["workflow/entry.ts -> run/entry.ts"]);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

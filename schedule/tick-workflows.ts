@@ -4,7 +4,7 @@ import { defineTask, type Cursor, type Harness, type TaskRecord, type TaskRuntim
 import type { JsonValue } from "@earendil-works/chord/json";
 import { checkProfileCommands, readConfig } from "../config/read-workshop-config.ts";
 import { startWorkflow, type WorkflowStartPort } from "../run/start-workflow.ts";
-import { workshopStateDocument, type WorkshopState } from "../run/workshop-state.ts";
+import { workshopStateDocument, type WorkshopState } from "../workflow/define-workshop-state.ts";
 import { decideWorkflowSlot } from "./decide-workflow-slot.ts";
 import { loadWorkflows } from "../workflow/load-workflows.ts";
 

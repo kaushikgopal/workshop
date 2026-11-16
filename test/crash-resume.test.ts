@@ -10,7 +10,8 @@ import { createRegistry, Harness, type TaskRecord } from "@earendil-works/pi-dur
 import type { JsonValue } from "@earendil-works/chord/json";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { test } from "node:test";
-import { StepAttemptTask, STEP_ATTEMPT_TASK_NAME } from "../workflow/define-step-attempt-task.ts";
+import { executeWorkflowProcess } from "../run/execute-workflow-process.ts";
+import { createStepAttemptTask, STEP_ATTEMPT_TASK_NAME } from "../workflow/define-step-attempt-task.ts";
 import { WorkflowTask, WORKFLOW_TASK_NAME } from "../workflow/define-workflow-task.ts";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -19,7 +20,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function createHarness(storage: Awaited<ReturnType<typeof openNodeSqliteStorage>>) {
   const registry = createRegistry();
-  registry.install({ name: "workshop", tasks: [WorkflowTask, StepAttemptTask] });
+  registry.install({ name: "workshop", tasks: [WorkflowTask, createStepAttemptTask(executeWorkflowProcess)] });
   return Harness.open(storage, { models: createModels(), registry }, BACKGROUND_CONTEXT);
 }
 
@@ -66,8 +67,10 @@ async function startHarnessProcess(projectRoot: string, startWorkflow: boolean):
     `import { createRegistry, Harness } from "@earendil-works/pi-durable";`,
     `import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";`,
     `import { startWorkflow, createWorkflowStartPort } from ${JSON.stringify(new URL("../run/start-workflow.ts", import.meta.url).href)};`,
+    `import { executeWorkflowProcess } from ${JSON.stringify(new URL("../run/execute-workflow-process.ts", import.meta.url).href)};`,
     `import { WorkflowTask } from ${JSON.stringify(new URL("../workflow/define-workflow-task.ts", import.meta.url).href)};`,
-    `import { StepAttemptTask } from ${JSON.stringify(new URL("../workflow/define-step-attempt-task.ts", import.meta.url).href)};`,
+    `import { createStepAttemptTask } from ${JSON.stringify(new URL("../workflow/define-step-attempt-task.ts", import.meta.url).href)};`,
+    `const StepAttemptTask = createStepAttemptTask(executeWorkflowProcess);`,
     `const root = ${JSON.stringify(projectRoot)};`,
     `const storage = await openNodeSqliteStorage(root + "/state/workshop.sqlite");`,
     `const registry = createRegistry(); registry.install({ name: "workshop", tasks: [WorkflowTask, StepAttemptTask] });`,
@@ -218,8 +221,10 @@ test("a completed step attempt is reused when the parent checkpoint lags", { ski
       `import { createRegistry, Harness } from "@earendil-works/pi-durable";`,
       `import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";`,
       `import { startWorkflow, createWorkflowStartPort } from ${JSON.stringify(new URL("../run/start-workflow.ts", import.meta.url).href)};`,
+      `import { executeWorkflowProcess } from ${JSON.stringify(new URL("../run/execute-workflow-process.ts", import.meta.url).href)};`,
       `import { WorkflowTask } from ${JSON.stringify(new URL("../workflow/define-workflow-task.ts", import.meta.url).href)};`,
-      `import { StepAttemptTask } from ${JSON.stringify(new URL("../workflow/define-step-attempt-task.ts", import.meta.url).href)};`,
+      `import { createStepAttemptTask } from ${JSON.stringify(new URL("../workflow/define-step-attempt-task.ts", import.meta.url).href)};`,
+      `const StepAttemptTask = createStepAttemptTask(executeWorkflowProcess);`,
       `const root = ${JSON.stringify(projectRoot)};`,
       `const checkpointFile = ${JSON.stringify(checkpointFile)};`,
       `const storage = await openNodeSqliteStorage(root + "/state/workshop.sqlite");`,

@@ -5,7 +5,7 @@ import type { JsonValue } from "@earendil-works/chord/json";
 import type { WorkshopServiceInvocation } from "./create-workshop-extension.ts";
 import { checkProfileCommands, readConfig } from "../config/read-workshop-config.ts";
 import { createWorkflowStartPort, startWorkflow, type StartWorkflowOutcome } from "../run/start-workflow.ts";
-import { appendRecent, workshopStateDocument, workflowRunReferenceDocument, type WorkshopAction, type WorkshopState } from "../run/workshop-state.ts";
+import { appendRecent, workshopStateDocument, workflowRunReferenceDocument, type WorkshopAction, type WorkshopState } from "../workflow/define-workshop-state.ts";
 import { parseServiceRequest, type ServiceRequest, type ServiceResponse } from "./types.ts";
 import { WORKFLOW_TASK_NAME, workflowDecisionDocument, type WorkflowTaskCheckpoint } from "../workflow/define-workflow-task.ts";
 import { listWorkflowStatus } from "../workflow/list-workflow-status.ts";

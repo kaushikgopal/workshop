@@ -1,7 +1,7 @@
 import type { JsonValue } from "@earendil-works/chord/json";
 import { defineDoc, defineDocFamily, type TaskId } from "@earendil-works/pi-durable";
-import type { OrchestratorDecision, WorkflowDecision } from "../workflow/types.ts";
-import { parseWorkflowDecision } from "../workflow/parse-workflow-decision.ts";
+import type { OrchestratorDecision, WorkflowDecision } from "./types.ts";
+import { parseWorkflowDecision } from "./parse-workflow-decision.ts";
 
 export type WorkflowAdmission = {
   workflow: string;

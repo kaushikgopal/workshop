@@ -9,7 +9,7 @@ import type { WorkshopConfig } from "../config/read-workshop-config.ts";
 import { loadWorkflows } from "../workflow/load-workflows.ts";
 import type { Workflow } from "../workflow/types.ts";
 import { WorkflowTask, WORKFLOW_TASK_NAME, type WorkflowTaskInput, workflowDecisionDocument } from "../workflow/define-workflow-task.ts";
-import { appendRecent, workshopStateDocument, workflowRunReferenceDocument, type WorkshopAction, type WorkflowRunReference, type WorkshopState } from "./workshop-state.ts";
+import { appendRecent, workshopStateDocument, workflowRunReferenceDocument, type WorkshopAction, type WorkflowRunReference, type WorkshopState } from "../workflow/define-workshop-state.ts";
 
 export type StartWorkflowOutcome =
   | { kind: "started"; workflow: string; run_id: string; slot: string | null; task_id: string }
