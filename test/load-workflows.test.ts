@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { loadWorkflows } from "../workflow/load-workflows.ts";
 
 const profiles = new Set(["writer", "judge"]);
+const aliasLimitFixture = new URL("./fixtures/trigger-alias-limit.md", import.meta.url);
 
 function withRoot(check: (root: string) => void): void {
   const root = mkdtempSync(join(tmpdir(), "workshop-workflow-test-"));
@@ -214,6 +215,19 @@ test("requires valid workflow frontmatter, known keys, and a parseable cron", ()
     assert.match(errorReasons(result, "non-mapping/workflow.md").join(" "), /frontmatter must be a mapping/);
     assert.match(errorReasons(result, "missing-cron/workflow.md").join(" "), /cron: Invalid input/);
     assert.ok(unknownKey && invalidCron && malformedYaml && duplicateKeys && nonMapping && missingCron);
+  });
+});
+
+test("reports frontmatter alias expansion that exceeds the YAML library limit", () => {
+  withRoot((root) => {
+    const directory = createWorkflow(root);
+    writeStep(directory, "10-step.sh");
+    writeFileSync(join(directory, "workflow.md"), readFileSync(aliasLimitFixture, "utf8"));
+    const result = loadWorkflows(root, profiles);
+    assert.deepEqual(result.errors, [{
+      file: "clock/workflow.md",
+      reason: "invalid YAML frontmatter: Excessive alias count indicates a resource exhaustion attack",
+    }]);
   });
 });
 
