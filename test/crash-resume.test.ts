@@ -271,26 +271,30 @@ test("a completed step attempt is reused when the parent checkpoint lags", { ski
     harness = await createHarness(storage);
     const beforeRestart = (await storage.scanTasks({ kind: WORKFLOW_TASK_NAME }, 100, undefined, BACKGROUND_CONTEXT)).items.find((record) => isRecord(record.input) && record.input.runId === runId);
     assert.ok(beforeRestart, "SQLite retains the parent task");
-    if (!beforeRestart || beforeRestart.state.status !== "waiting" || !isRecord(beforeRestart.state.checkpoint)) return;
+    if (!beforeRestart) throw new Error("SQLite retains the parent task");
+    assert.equal(beforeRestart.state.status, "pending", "the reopened parent is eligible to resume");
+    if (beforeRestart.state.status !== "pending") throw new Error("The reopened parent is not pending");
+    assert.ok(isRecord(beforeRestart.state.checkpoint), "the parent retains its attempt checkpoint");
+    if (!isRecord(beforeRestart.state.checkpoint)) throw new Error("The parent has no attempt checkpoint");
+    assert.equal(beforeRestart.state.checkpoint.phase, "attempt");
     const active = beforeRestart.state.checkpoint.activeAttempt;
-    assert.ok(isRecord(active) && (typeof active.taskId === "string" || typeof active.taskId === "number"));
-    if (!isRecord(active) || (typeof active.taskId !== "string" && typeof active.taskId !== "number")) return;
+    assert.ok(isRecord(active) && typeof active.taskId === "number", "the attempt checkpoint retains its child task ID");
+    if (!isRecord(active) || typeof active.taskId !== "number") throw new Error("The attempt checkpoint has no child task ID");
     const completedAttempt = await taskById(storage, active.taskId);
     assert.equal(completedAttempt.kind, STEP_ATTEMPT_TASK_NAME);
     assert.equal(completedAttempt.state.status, "terminal");
-    if (completedAttempt.state.status === "terminal") assert.equal(completedAttempt.state.outcome.status, "completed");
+    if (completedAttempt.state.status !== "terminal") throw new Error("The child attempt is not terminal");
+    assert.equal(completedAttempt.state.outcome.status, "completed");
 
     harness.resume();
     const settled = await harness.waitForTask(beforeRestart.id, BACKGROUND_CONTEXT);
     assert.equal(settled.state.status, "terminal");
-    if (settled.state.status === "terminal") {
-      assert.equal(settled.state.outcome.status, "completed");
-      if (settled.state.outcome.status === "completed") {
-        const result = settled.state.outcome.result;
-        assert.ok(isRecord(result));
-        if (isRecord(result)) assert.equal(result.output, "finished output");
-      }
-    }
+    if (settled.state.status !== "terminal") throw new Error("The workflow did not complete after recovery");
+    assert.equal(settled.state.outcome.status, "completed");
+    if (settled.state.outcome.status !== "completed") throw new Error("The recovered workflow did not complete");
+    assert.ok(isRecord(settled.state.outcome.result));
+    if (!isRecord(settled.state.outcome.result)) throw new Error("The recovered workflow has no result");
+    assert.equal(settled.state.outcome.result.output, "finished output");
     assert.equal(readFileSync(invocationFile, "utf8").trim().split(/\r?\n/).length, 1);
   } finally {
     if (child && child.exitCode === null) {
