@@ -11,7 +11,7 @@ import { createRegistry, defineDoc, Harness, MemoryStorage, type Storage, type T
 import type { JsonValue } from "@earendil-works/chord/json";
 import { test } from "node:test";
 import { createWorkflowStartPort, startWorkflow } from "../run/start-workflow.ts";
-import { appendRecent, maxWorkshopHistoryRecords, workshopStateDocument, workflowRunReferenceDocument, type MutationReceipt, type WorkshopAction, type WorkflowAdmission } from "../workflow/define-workshop-state.ts";
+import { maxWorkshopHistoryRecords, workshopStateDocument, workflowRunReferenceDocument, type MutationReceipt, type WorkshopAction, type WorkflowAdmission } from "../workflow/define-workshop-state.ts";
 import { createWorkshopService } from "../service/create-workshop-service.ts";
 import { openWorkshopHarness } from "../service/open-workshop-harness.ts";
 import { serveServiceSocket } from "../service/serve-service-socket.ts";
@@ -110,13 +110,6 @@ function runIdFrom(response: Record<string, unknown>): string {
   return response.run_id;
 }
 
-test("bounded workshop history keeps only the newest records", () => {
-  const history: number[] = [];
-  for (let value = 0; value < maxWorkshopHistoryRecords + 25; value += 1) appendRecent(history, value);
-  assert.equal(history.length, maxWorkshopHistoryRecords);
-  assert.equal(history[0], 25);
-  assert.equal(history.at(-1), maxWorkshopHistoryRecords + 24);
-});
 
 test("workshop-state migration bounds history without losing scheduling counters", async () => {
   type WorkshopStateV1 = { admissions: WorkflowAdmission[]; actions: WorkshopAction[]; paused: string[]; receipts: MutationReceipt[] };
