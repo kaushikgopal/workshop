@@ -306,6 +306,16 @@ test("timeouts become workflow failures with the configured limit", async () => 
   assert.equal(requests[0]?.timeoutMs, 2_000);
 });
 
+test("rejects a persisted workflow timeout beyond the Node timer limit", async () => {
+  const workflow = makeWorkflow([
+    { kind: "command", file: "10-slow.sh", number: 10, name: "slow" },
+  ], { timeout: "999999h" });
+  await assert.rejects(
+    interpretWorkflow(makeInput(workflow, async () => successful("unused"))),
+    /Workflow timeout is too large for Node timers: 999999h/,
+  );
+});
+
 test("fake profile commands receive stdin and Workshop environment without a shell", async () => {
   await withRoot(async (root) => {
     const result = await executeWorkflowProcess({

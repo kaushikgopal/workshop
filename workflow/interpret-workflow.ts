@@ -88,6 +88,7 @@ function timeoutMilliseconds(value: string | undefined): number | undefined {
   const amount = Number(match[1]);
   const factor = match[2] === "s" ? 1_000 : match[2] === "m" ? 60_000 : 3_600_000;
   const milliseconds = amount * factor;
+  // Persisted workflow inputs can resume without passing through loader validation.
   if (!Number.isSafeInteger(milliseconds) || milliseconds > 2_147_483_647) {
     throw new Error(`Workflow timeout is too large for Node timers: ${value}`);
   }
