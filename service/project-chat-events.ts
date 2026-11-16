@@ -5,7 +5,8 @@ type ChatEvent = { ok: true; type: string; chat_request_id?: string; [key: strin
 type ProjectedTool = { status: string; resultSent: boolean };
 type ProjectingTurn = {
   phase: "projecting";
-  runId: string;
+  turnId: string;
+  submissionId?: string;
   chatRequestId?: string;
   generationAttempt?: number;
   partialText: string;
@@ -13,9 +14,10 @@ type ProjectingTurn = {
   nestedTools: ReadonlyMap<string, ProjectedTool>;
 };
 export type ChatProjectorState =
-  | { phase: "idle"; lastRunId?: string }
+  | { phase: "idle"; lastTurnId?: string }
   | ProjectingTurn;
-export type ChatObservation = { view: ChatView; chatRequestId?: string };
+export type ChatSettlement = { submissionId: string; status: "done" | "unanswered"; reason?: string; detail?: string };
+export type ChatObservation = { view: ChatView; chatRequestId?: string; settledSubmissions?: readonly ChatSettlement[] };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -83,10 +85,20 @@ export function initialChatProjectorState(): ChatProjectorState {
   return { phase: "idle" };
 }
 
-function startTurn(runId: string, chatRequestId?: string): ProjectingTurn {
+function turnIdentity(run: Record<string, unknown>): { turnId: string; submissionId?: string } {
+  const input = Array.isArray(run.inputs) ? run.inputs.find((value) => typeof value === "string" || typeof value === "number") : undefined;
+  if (input !== undefined) {
+    const submissionId = String(input);
+    return { turnId: `submission:${submissionId}`, submissionId };
+  }
+  return { turnId: `task:${String(run.taskId)}` };
+}
+
+function startTurn(turnId: string, submissionId?: string, chatRequestId?: string): ProjectingTurn {
   return {
     phase: "projecting",
-    runId,
+    turnId,
+    ...(submissionId === undefined ? {} : { submissionId }),
     ...(chatRequestId === undefined ? {} : { chatRequestId }),
     partialText: "",
     tools: new Map(),
@@ -94,16 +106,21 @@ function startTurn(runId: string, chatRequestId?: string): ProjectingTurn {
   };
 }
 
-function runEnd(turn: ProjectingTurn, live: Record<string, unknown>): ChatEvent[] {
+function settlementFor(turn: ProjectingTurn, settlements: readonly ChatSettlement[]): ChatSettlement | undefined {
+  if (turn.submissionId === undefined) return undefined;
+  return settlements.find((settlement) => settlement.submissionId === turn.submissionId);
+}
+
+function runEnd(turn: ProjectingTurn, live: Record<string, unknown>, settlement: ChatSettlement): ChatEvent[] {
   if (turn.chatRequestId === undefined) return [];
   const failure = isRecord(live.runFailure) ? live.runFailure : undefined;
   return [{
     ok: true,
     type: "run.end",
     chat_request_id: turn.chatRequestId,
-    status: failure === undefined ? "done" : "error",
-    ...(typeof failure?.reason === "string" ? { reason: failure.reason } : {}),
-    ...(typeof failure?.detail === "string" ? { detail: failure.detail } : {}),
+    status: settlement.status === "done" ? "done" : "error",
+    ...(typeof settlement.reason === "string" ? { reason: settlement.reason } : typeof failure?.reason === "string" ? { reason: failure.reason } : {}),
+    ...(typeof settlement.detail === "string" ? { detail: settlement.detail } : typeof failure?.detail === "string" ? { detail: failure.detail } : {}),
   }];
 }
 
@@ -181,27 +198,40 @@ function projectTurn(turn: ProjectingTurn, view: ChatView): { state: ProjectingT
 export function projectChatEvents(
   previous: ChatProjectorState,
   observation: ChatObservation,
-): { state: ChatProjectorState; events: ChatEvent[] } {
+ ): { state: ChatProjectorState; events: ChatEvent[] } {
   const live = liveState(observation.view);
   const run = isRecord(live.run) ? live.run : undefined;
-  const runId = run === undefined ? undefined : String(run.taskId);
-  if (runId === undefined) {
+  const settlements = observation.settledSubmissions ?? [];
+  if (run === undefined) {
     if (previous.phase === "idle") return { state: previous, events: [] };
-    return { state: { phase: "idle", lastRunId: previous.runId }, events: runEnd(previous, live) };
+    const settlement = settlementFor(previous, settlements);
+    if (settlement === undefined) return { state: previous, events: [] };
+    return {
+      state: { phase: "idle", lastTurnId: previous.turnId },
+      events: runEnd(previous, live, settlement),
+    };
   }
 
+  const identity = turnIdentity(run);
   let turn: ProjectingTurn;
   let events: ChatEvent[] = [];
   if (previous.phase === "idle") {
-    if (previous.lastRunId === runId) return { state: previous, events: [] };
-    turn = startTurn(runId, observation.chatRequestId);
-  } else if (previous.runId !== runId) {
-    events = runEnd(previous, live);
-    turn = startTurn(runId, observation.chatRequestId);
+    if (previous.lastTurnId === identity.turnId) return { state: previous, events: [] };
+    turn = startTurn(identity.turnId, identity.submissionId, observation.chatRequestId);
+  } else if (previous.turnId !== identity.turnId) {
+    const settlement = settlementFor(previous, settlements);
+    if (previous.chatRequestId !== undefined && settlement === undefined) return { state: previous, events: [] };
+    if (settlement !== undefined) events = runEnd(previous, live, settlement);
+    turn = startTurn(identity.turnId, identity.submissionId, observation.chatRequestId);
   } else {
     const attempt = generationAttempt(live);
     if (attempt !== undefined && previous.generationAttempt !== undefined && attempt < previous.generationAttempt) {
-      return { state: previous, events: [] };
+      const settlement = settlementFor(previous, settlements);
+      if (settlement === undefined) return { state: previous, events: [] };
+      return {
+        state: { phase: "idle", lastTurnId: previous.turnId },
+        events: runEnd(previous, live, settlement),
+      };
     }
     const newGeneration = attempt !== previous.generationAttempt;
     turn = {
@@ -211,9 +241,16 @@ export function projectChatEvents(
     };
   }
 
-  if (previous.phase === "idle" || (previous.phase === "projecting" && previous.runId !== runId)) {
+  if (previous.phase === "idle" || (previous.phase === "projecting" && previous.turnId !== identity.turnId)) {
     turn = { ...turn, generationAttempt: generationAttempt(live) };
   }
   const projected = projectTurn(turn, observation.view);
+  const settlement = settlementFor(turn, settlements);
+  if (settlement !== undefined) {
+    return {
+      state: { phase: "idle", lastTurnId: turn.turnId },
+      events: [...events, ...projected.events, ...runEnd(turn, live, settlement)],
+    };
+  }
   return { state: projected.state, events: [...events, ...projected.events] };
 }

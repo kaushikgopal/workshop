@@ -64,33 +64,54 @@ test("projector emits nested tool completion when a later observation adds its s
   ]);
 });
 
-test("projector ends the prior turn on identity replacement and ignores older generations", () => {
+test("projector keeps one submission turn across generation tasks and ends it once settled", () => {
   const first = projectChatEvents(initialChatProjectorState(), {
     view: view({
-      run: { taskId: "turn-1", inputs: ["submission-1"] },
+      run: { taskId: "generation-1", inputs: ["submission-1"] },
       generation: { attempt: 1, message: { content: [{ type: "text", text: "first" }] } },
     }),
     chatRequestId: "chat-first",
   });
-  const replacement = projectChatEvents(first.state, {
+  const handoff = projectChatEvents(first.state, {
     view: view({
-      run: { taskId: "turn-2", inputs: ["submission-2"] },
+      run: { taskId: "generation-2", inputs: ["submission-1"] },
       generation: { attempt: 2, message: { content: [{ type: "text", text: "second" }] } },
     }),
-    chatRequestId: "chat-second",
+    chatRequestId: "chat-first",
   });
-  assert.deepEqual(replacement.events.map(({ type, chat_request_id, status }) => ({ type, chat_request_id, status })), [
-    { type: "run.end", chat_request_id: "chat-first", status: "done" },
-    { type: "assistant.delta", chat_request_id: "chat-second", status: undefined },
+  assert.deepEqual(handoff.events.map(({ type, chat_request_id }) => ({ type, chat_request_id })), [
+    { type: "assistant.delta", chat_request_id: "chat-first" },
   ]);
 
-  const stale = projectChatEvents(replacement.state, {
+  const stale = projectChatEvents(handoff.state, {
     view: view({
-      run: { taskId: "turn-2", inputs: ["submission-2"] },
+      run: { taskId: "generation-2", inputs: ["submission-1"] },
       generation: { attempt: 1, message: { content: [{ type: "text", text: "stale" }] } },
     }),
-    chatRequestId: "chat-second",
+    chatRequestId: "chat-first",
   });
   assert.deepEqual(stale.events, []);
-  assert.deepEqual(stale.state, replacement.state);
+  assert.deepEqual(stale.state, handoff.state);
+
+  const settled = projectChatEvents(handoff.state, {
+    view: view({
+      run: { taskId: "generation-2", inputs: ["submission-1"] },
+      generation: { attempt: 2, message: { content: [{ type: "text", text: "second" }] } },
+    }),
+    chatRequestId: "chat-first",
+    settledSubmissions: [{ submissionId: "submission-1", status: "done" }],
+  });
+  assert.deepEqual(settled.events.map(({ type, chat_request_id, status }) => ({ type, chat_request_id, status })), [
+    { type: "run.end", chat_request_id: "chat-first", status: "done" },
+  ]);
+  const repeated = projectChatEvents(settled.state, {
+    view: view({
+      run: { taskId: "generation-2", inputs: ["submission-1"] },
+      generation: { attempt: 2, message: { content: [{ type: "text", text: "second" }] } },
+    }),
+    chatRequestId: "chat-first",
+    settledSubmissions: [{ submissionId: "submission-1", status: "done" }],
+  });
+  assert.deepEqual(repeated.events, []);
+  assert.deepEqual(repeated.state, settled.state);
 });

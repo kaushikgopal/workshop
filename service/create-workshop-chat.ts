@@ -1,7 +1,7 @@
 import { AssistantEntry, type ConversationView, type Harness, type SubmissionId, type SubmissionRecord } from "@earendil-works/pi-durable";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { ServiceRequest, ServiceResponse } from "./types.ts";
-import { initialChatProjectorState, projectChatEvents, type ChatProjectorState } from "./project-chat-events.ts";
+import { initialChatProjectorState, projectChatEvents, type ChatProjectorState, type ChatSettlement } from "./project-chat-events.ts";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -92,7 +92,7 @@ export function createWorkshopChat(input: { harness: Harness }): {
     let projectorState: ChatProjectorState = initialChatProjectorState();
     const knownSubmissions = new Map<SubmissionId, SubmissionRecord>();
     const trackedSubmissions = new Map<SubmissionId, { id: SubmissionId; chatRequestId: string }>();
-    const settledSubmissions = new Set<SubmissionId>();
+    const settledSubmissionIds = new Set<SubmissionId>();
     let publishChain = Promise.resolve();
     let closed = false;
     const sendEvent = (event: ServiceResponse) => send({ request_id: requestId, ...event });
@@ -104,17 +104,18 @@ export function createWorkshopChat(input: { harness: Harness }): {
         const record = knownSubmissions.get(id);
         const chatId = record === undefined ? undefined : chatRequestId(record);
         const terminal = record?.status === "done" || record?.status === "unanswered";
-        if (record?.type === "input" && chatId !== undefined && (record.status === "placed" || (terminal && !settledSubmissions.has(id)))) {
+        if (record?.type === "input" && chatId !== undefined && (record.status === "placed" || (terminal && !settledSubmissionIds.has(id)))) {
           trackedSubmissions.set(id, { id: record.id, chatRequestId: chatId });
         }
       }
+      const settledSubmissions: ChatSettlement[] = [];
       for (const [key, tracked] of trackedSubmissions) {
         const submission = await input.harness.submission(tracked.id, BACKGROUND_CONTEXT);
         const record = await submission?.status(BACKGROUND_CONTEXT);
         if (!record) continue;
         knownSubmissions.set(key, record);
         if (record.status === "queued" || record.status === "placed") continue;
-        if (record.status === "done" && record.type === "input") {
+        if (record.type === "input" && record.status === "done") {
           const entry = await input.harness.commit((tx) => tx.entry(AssistantEntry, record.answer), BACKGROUND_CONTEXT);
           sendEvent({
             ok: true,
@@ -123,8 +124,16 @@ export function createWorkshopChat(input: { harness: Harness }): {
             conversation_id: root.id,
             answer: assistantText(entry),
           });
+          settledSubmissions.push({ submissionId: String(key), status: "done" });
+        } else if (record.type === "input" && record.status === "unanswered") {
+          settledSubmissions.push({
+            submissionId: String(key),
+            status: "unanswered",
+            reason: record.reason,
+            ...(typeof record.detail === "string" ? { detail: record.detail } : {}),
+          });
         }
-        settledSubmissions.add(key);
+        settledSubmissionIds.add(key);
         trackedSubmissions.delete(key);
       }
 
@@ -133,7 +142,7 @@ export function createWorkshopChat(input: { harness: Harness }): {
         const chatId = record === undefined ? undefined : chatRequestId(record);
         return chatId === undefined ? [] : [chatId];
       })[0];
-      const projection = projectChatEvents(projectorState, { view, chatRequestId: correlatedRequestId });
+      const projection = projectChatEvents(projectorState, { view, chatRequestId: correlatedRequestId, settledSubmissions });
       projectorState = projection.state;
       for (const event of projection.events) sendEvent(event);
     };

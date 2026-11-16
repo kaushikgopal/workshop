@@ -1294,6 +1294,14 @@ test("the chat socket streams fake-model text and tool events to multiple watche
       const finalIndex = watcher.events.findIndex((event) => event.type === "assistant.final" && event.answer === response.answer);
       const deltaIndex = watcher.events.findIndex((event) => event.type === "assistant.delta");
       assert.ok(deltaIndex >= 0 && finalIndex > deltaIndex, "text deltas arrive before the full answer event");
+      await watcher.waitFor((event) => {
+        if (event.type !== "run.end" || event.chat_request_id !== "chat-stream") return false;
+        const answerIndex = watcher.events.findIndex((item) => item.type === "assistant.final" && item.answer === response.answer);
+        return answerIndex >= 0 && watcher.events.indexOf(event) > answerIndex;
+      });
+      const terminal = watcher.events.filter((event) => event.type === "run.end" && event.chat_request_id === "chat-stream");
+      assert.equal(terminal.length, 1, "one terminal event follows the settled answer");
+      assert.equal(terminal[0]?.status, "done");
     }
   } finally {
     for (const client of clients) client.destroy();
