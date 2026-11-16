@@ -57,6 +57,64 @@ test("config loads .env.local without overwriting the environment and substitute
   }
 });
 
+test("config failures do not apply values staged from .env.local", () => {
+  const directory = createDirectory();
+  const configName = "WORKSHOP_CONFIG";
+  const dotenvName = "WORKSHOP_CONFIG_TEST_STAGED_DOTENV";
+  const yamlParseName = "WORKSHOP_CONFIG_TEST_STAGED_YAML_PARSE";
+  const yamlInterpolationName = "WORKSHOP_CONFIG_TEST_STAGED_YAML_INTERPOLATION";
+  const missingInterpolationName = "WORKSHOP_CONFIG_TEST_MISSING_STAGED_YAML_INTERPOLATION";
+  const yamlSchemaName = "WORKSHOP_CONFIG_TEST_STAGED_YAML_SCHEMA";
+  const variables = [dotenvName, yamlParseName, yamlInterpolationName, yamlSchemaName, missingInterpolationName];
+  const originals = new Map(variables.map((name) => [name, process.env[name]]));
+  const previousConfig = process.env[configName];
+  try {
+    for (const name of variables) delete process.env[name];
+    const failures = [
+      {
+        key: dotenvName,
+        env: `${dotenvName}=staged-value\nBROKEN="unterminated\n`,
+        config: basicConfig(`[node, "\${${dotenvName}}"]`),
+        message: /unterminated quoted value/,
+      },
+      {
+        key: yamlParseName,
+        env: `${yamlParseName}=staged-value\n`,
+        config: "agent_profiles:\n  writer:\n    command: [node\norchestrator: {}\n",
+        message: /invalid YAML/,
+      },
+      {
+        key: yamlInterpolationName,
+        env: `${yamlInterpolationName}=staged-value\n`,
+        config: basicConfig(`[node, "\${${missingInterpolationName}}"]`),
+        message: new RegExp(missingInterpolationName),
+      },
+      {
+        key: yamlSchemaName,
+        env: `${yamlSchemaName}=staged-value\n`,
+        config: `agent_profiles:\n  writer:\n    command: [node, "\${${yamlSchemaName}}"]\n    context_window: 0\norchestrator: {}\n`,
+        message: /context_window: Too small/,
+      },
+    ];
+    for (const [index, failure] of failures.entries()) {
+      writeFileSync(join(directory, ".env.local"), failure.env);
+      const file = writeConfig(directory, failure.config);
+      process.env[configName] = file;
+      assert.throws(() => readConfig(), failure.message, `invalid input ${index}`);
+      assert.equal(process.env[failure.key], undefined, `failed read applied ${failure.key}`);
+    }
+  } finally {
+    for (const name of variables) {
+      const original = originals.get(name);
+      if (original === undefined) delete process.env[name];
+      else process.env[name] = original;
+    }
+    if (previousConfig === undefined) delete process.env[configName];
+    else process.env[configName] = previousConfig;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("config errors name an unset interpolation variable", () => {
   const directory = createDirectory();
   const envName = "WORKSHOP_CONFIG_TEST_MISSING";

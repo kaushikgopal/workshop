@@ -74,13 +74,14 @@ function parseEnvValue(raw: string): string {
   return value.replace(/\s+#.*$/, "").trim();
 }
 
-function loadEnvLocal(configDirectory: string): void {
+function loadEnvLocal(configDirectory: string): Map<string, string> {
+  const stagedEnvironment = new Map<string, string>();
   const envFile = resolve(configDirectory, ".env.local");
   let contents: string;
   try {
     contents = readFileSync(envFile, "utf8");
   } catch (error) {
-    if (isMissingFile(error)) return;
+    if (isMissingFile(error)) return stagedEnvironment;
     throw makeIssue(".env.local", `could not read file: ${errorMessage(error)}`);
   }
 
@@ -91,13 +92,14 @@ function loadEnvLocal(configDirectory: string): void {
     if (!match) throw makeIssue(".env.local", `line ${index + 1} must use KEY=value syntax`);
     const key = match[1];
     if (key === undefined) throw makeIssue(".env.local", `line ${index + 1} has no variable name`);
-    if (process.env[key] !== undefined) continue;
     try {
-      process.env[key] = parseEnvValue(match[2] ?? "");
+      const value = parseEnvValue(match[2] ?? "");
+      if (process.env[key] === undefined && !stagedEnvironment.has(key)) stagedEnvironment.set(key, value);
     } catch (error) {
       throw makeIssue(".env.local", `line ${index + 1}: ${errorMessage(error)}`);
     }
   }
+  return stagedEnvironment;
 }
 
 function isMissingFile(error: unknown): boolean {
@@ -108,17 +110,17 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function interpolateEnvironment(value: unknown, file: string): unknown {
+function interpolateEnvironment(value: unknown, file: string, stagedEnvironment: ReadonlyMap<string, string>): unknown {
   if (typeof value === "string") {
     return value.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_match, name: string) => {
-      const replacement = process.env[name];
+      const replacement = process.env[name] ?? stagedEnvironment.get(name);
       if (replacement === undefined) throw makeIssue(file, `environment variable ${name} is not set`);
       return replacement;
     });
   }
-  if (Array.isArray(value)) return value.map((item) => interpolateEnvironment(item, file));
+  if (Array.isArray(value)) return value.map((item) => interpolateEnvironment(item, file, stagedEnvironment));
   if (typeof value === "object" && value !== null) {
-    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, interpolateEnvironment(item, file)]));
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, interpolateEnvironment(item, file, stagedEnvironment)]));
   }
   return value;
 }
@@ -133,7 +135,7 @@ function describeSchemaIssues(file: string, issues: z.ZodIssue[]): ConfigIssue[]
 export function readConfig(configFile?: string): WorkshopConfig {
   const configuredFile = configFile ?? process.env.WORKSHOP_CONFIG ?? "workshop.yaml";
   const absoluteFile = isAbsolute(configuredFile) ? configuredFile : resolve(process.cwd(), configuredFile);
-  loadEnvLocal(dirname(absoluteFile));
+  const stagedEnvironment = loadEnvLocal(dirname(absoluteFile));
 
   let source: string;
   try {
@@ -153,7 +155,7 @@ export function readConfig(configFile?: string): WorkshopConfig {
   } catch (error) {
     throw makeIssue(configuredFile, `invalid YAML: ${errorMessage(error)}`);
   }
-  const expanded = interpolateEnvironment(parsed, configuredFile);
+  const expanded = interpolateEnvironment(parsed, configuredFile, stagedEnvironment);
   const result = configSchema.safeParse(expanded);
   if (!result.success) throw new ConfigReadError(describeSchemaIssues(configuredFile, result.error.issues));
   const configDirectory = dirname(absoluteFile);
@@ -166,6 +168,9 @@ export function readConfig(configFile?: string): WorkshopConfig {
       return [name, { ...profile, command }];
     }),
   );
+  for (const [name, value] of stagedEnvironment) {
+    if (process.env[name] === undefined) process.env[name] = value;
+  }
   return { ...result.data, agent_profiles };
 }
 
