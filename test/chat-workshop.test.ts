@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createModels } from "@earendil-works/pi-ai/models";
-import { fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai/providers/faux";
+import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { MemoryStorage } from "@earendil-works/pi-durable";
 import { test } from "node:test";
@@ -125,6 +125,85 @@ test("interactive and --print modes receive the streamed answer", { timeout: 30_
     assert.ok(interactive.stdout.includes("workshop> The interactive client received this streamed reply."));
     assert.equal(interactive.stderr, "");
   } finally {
+    if (socketServer) await socketServer.close();
+    if (harness) await harness.close(BACKGROUND_CONTEXT);
+    rmSync(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("--print ignores text from an earlier chat submission", { timeout: 30_000 }, async () => {
+  const projectRoot = createProject();
+  const storage = new MemoryStorage();
+  const faux = fauxProvider({ tokensPerSecond: 20, tokenSize: { min: 1, max: 1 } });
+  const models = createModels();
+  models.setProvider(faux.provider);
+  const model = faux.getModel();
+  assert.ok(model);
+  let markFirstStarted = () => {};
+  let releaseFirst = () => {};
+  const firstStarted = new Promise<void>((resolve) => { markFirstStarted = resolve; });
+  const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+  faux.setResponses([
+    async () => {
+      markFirstStarted();
+      await firstGate;
+      return fauxAssistantMessage("Skipped 10-fail after the earlier command failed.");
+    },
+    fauxAssistantMessage(fauxToolCall("list_workflows", {}), { stopReason: "toolUse" }),
+    fauxAssistantMessage("The slow workflow started."),
+  ]);
+  const configuredModel = {
+    model: { provider: model.provider, modelId: model.id },
+    thinkingLevel: "medium" as const,
+  };
+  let service: ReturnType<typeof createWorkshopService> | undefined;
+  let harness: Awaited<ReturnType<typeof openWorkshopHarness>> | undefined;
+  let socketServer: Awaited<ReturnType<typeof serveServiceSocket>> | undefined;
+  let markWatchAttached = () => {};
+  let markPrintSubmitted = () => {};
+  const watchAttached = new Promise<void>((resolve) => { markWatchAttached = resolve; });
+  const printSubmitted = new Promise<void>((resolve) => { markPrintSubmitted = resolve; });
+  let printed: Promise<{ code: number | null; stdout: string; stderr: string }> | undefined;
+  try {
+    harness = await openWorkshopHarness(storage, undefined, {
+      projectRoot,
+      models,
+      model: configuredModel,
+      escalationModel: configuredModel,
+      request: async (request) => {
+        if (!service) throw new Error("Workshop service is not ready");
+        return await service.handleRequest(request);
+      },
+    });
+    service = createWorkshopService({ projectRoot, harness });
+    harness.resume();
+    const stateDirectory = join(projectRoot, "state");
+    mkdirSync(stateDirectory, { recursive: true });
+    socketServer = await serveServiceSocket(join(stateDirectory, "service.sock"), async (value, send) => {
+      if (!service) throw new Error("Workshop service is not ready");
+      const request = parseServiceRequest(value);
+      if (request.type === "watch_chat") {
+        const watch = await service.watchChat(request.request_id, send);
+        markWatchAttached();
+        return watch;
+      }
+      if (request.type === "submit_chat" && request.request_id !== "earlier-chat") markPrintSubmitted();
+      send(await service.handleRequest(request));
+    });
+    const earlier = service.handleRequest({ request_id: "earlier-chat", type: "submit_chat", content: "Handle the earlier failure." });
+    await firstStarted;
+    printed = executeChat(["--print", "Start slow"], projectRoot);
+    await Promise.all([watchAttached, printSubmitted]);
+    releaseFirst();
+    const [result, previous] = await Promise.all([printed, earlier]);
+    assert.equal(previous.ok, true);
+    assert.equal(previous.answer, "Skipped 10-fail after the earlier command failed.");
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(result.stdout, "The slow workflow started.\n");
+    assert.equal(result.stderr, "  list_workflows {}\n  list_workflows ok\n");
+  } finally {
+    releaseFirst();
+    await printed?.catch(() => undefined);
     if (socketServer) await socketServer.close();
     if (harness) await harness.close(BACKGROUND_CONTEXT);
     rmSync(projectRoot, { recursive: true, force: true });

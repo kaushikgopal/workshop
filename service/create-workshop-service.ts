@@ -46,14 +46,6 @@ function partialAssistantText(live: Record<string, unknown>): string {
   return textContent(live.generation.message.content);
 }
 
-function latestAssistantText(view: ConversationView): string {
-  for (let index = view.entries.length - 1; index >= 0; index -= 1) {
-    const text = assistantText(view.entries[index]);
-    if (text.length > 0) return text;
-  }
-  return "";
-}
-
 function sanitizeArguments(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(sanitizeArguments);
   if (!isRecord(value)) return value;
@@ -298,7 +290,12 @@ function liveStatus(record: WorkflowTaskRecord): boolean {
 export function createWorkshopService(input: { projectRoot: string; harness: Harness }): WorkshopService {
   const projectRoot = resolve(input.projectRoot);
   const workflowDirectory = resolve(projectRoot, "workflows");
-  const chatWatchers = new Set<(event: ServiceResponse) => void>();
+  type ChatWatcher = { send(event: ServiceResponse): void; refresh(): void };
+  const chatWatchers = new Set<ChatWatcher>();
+  const chatSubmissions = new Map<string, string>();
+  const refreshChatWatchers = () => {
+    for (const watcher of chatWatchers) watcher.refresh();
+  };
 
   async function decideBlockedRun(request: Extract<ServiceRequest, { type: "decide_blocked_run" }>): Promise<ServiceResponse> {
     const decision = parseWorkflowDecision(request.decision);
@@ -362,7 +359,7 @@ export function createWorkshopService(input: { projectRoot: string; harness: Har
         decision: { action },
         note: paused ? "Workflow paused from chat." : "Workflow resumed from chat.",
       });
-      const response = { request_id: request.request_id, ok: true, workflow: request.workflow, paused, paused_workflows: state.paused };
+      const response = { request_id: request.request_id, ok: true, workflow: request.workflow, paused, paused_workflows: [...state.paused] };
       saveReceipt(state, request, response);
       return response;
     }, BACKGROUND_CONTEXT);
@@ -376,68 +373,85 @@ export function createWorkshopService(input: { projectRoot: string; harness: Har
       requestId: `chat:${request.request_id}`,
       whenBusy: "followUp",
     }, BACKGROUND_CONTEXT);
-    const settled = await submission.wait(BACKGROUND_CONTEXT);
-    if (settled.status !== "done" || settled.type !== "input") {
+    const submissionId = String(submission.id);
+    chatSubmissions.set(submissionId, request.request_id);
+    refreshChatWatchers();
+    try {
+      const settled = await submission.wait(BACKGROUND_CONTEXT);
+      if (settled.status !== "done" || settled.type !== "input") {
+        return {
+          request_id: request.request_id,
+          ok: false,
+          error: "chat_unanswered",
+          conversation_id: root.id,
+          submission_id: submission.id,
+          reason: settled.status === "unanswered" ? settled.reason : "Unexpected submission type",
+        };
+      }
+      const entry = await input.harness.commit((tx) => tx.entry(AssistantEntry, settled.answer), BACKGROUND_CONTEXT);
+      const answer = assistantText(entry);
+      for (const watcher of chatWatchers) watcher.send({
+        ok: true,
+        type: "assistant.final",
+        chat_request_id: request.request_id,
+        conversation_id: root.id,
+        answer,
+      });
       return {
         request_id: request.request_id,
-        ok: false,
-        error: "chat_unanswered",
+        ok: true,
         conversation_id: root.id,
         submission_id: submission.id,
-        reason: settled.status === "unanswered" ? settled.reason : "Unexpected submission type",
+        answer,
       };
+    } finally {
+      chatSubmissions.delete(submissionId);
+      refreshChatWatchers();
     }
-    const entry = await input.harness.commit((tx) => tx.entry(AssistantEntry, settled.answer), BACKGROUND_CONTEXT);
-    const answer = assistantText(entry);
-    for (const watcher of chatWatchers) watcher({
-      ok: true,
-      type: "assistant.final",
-      chat_request_id: request.request_id,
-      conversation_id: root.id,
-      answer,
-    });
-    return {
-      request_id: request.request_id,
-      ok: true,
-      conversation_id: root.id,
-      submission_id: submission.id,
-      answer,
-    };
   }
 
   async function watchChat(requestId: string, send: (event: ServiceResponse) => void): Promise<{ close(): Promise<void> }> {
     const root = await input.harness.root(BACKGROUND_CONTEXT);
     const watch = await root.watch(BACKGROUND_CONTEXT);
     let currentRun: string | undefined;
+    let currentChatRequestId: string | undefined;
     let currentGeneration: string | undefined;
     let partialText = "";
     const sentCalls = new Set<string>();
     const callStatuses = new Map<string, string>();
     const sentNestedCalls = new Set<string>();
-    const watcher = (event: ServiceResponse) => send({ request_id: requestId, ...event });
-    chatWatchers.add(watcher);
-    const emit = (type: string, fields: Record<string, unknown> = {}) => {
-      watcher({ ok: true, type, ...fields });
+    const watcher: ChatWatcher = {
+      send: (event) => send({ request_id: requestId, ...event }),
+      refresh: () => publish(watch.value),
+    };
+    const emit = (chatRequestId: string | undefined, type: string, fields: Record<string, unknown> = {}) => {
+      if (chatRequestId === undefined) return;
+      watcher.send({ ok: true, type, chat_request_id: chatRequestId, ...fields });
+    };
+    const requestForView = (view: ConversationView): string | undefined => {
+      const run = liveState(view).run;
+      if (!isRecord(run) || !Array.isArray(run.inputs)) return undefined;
+      for (const submissionId of run.inputs) {
+        const chatRequestId = chatSubmissions.get(String(submissionId));
+        if (chatRequestId !== undefined) return chatRequestId;
+      }
+      return undefined;
     };
     const publish = (view: ConversationView) => {
       const live = liveState(view);
       const run = isRecord(live.run) ? live.run : undefined;
       const runId = run === undefined ? undefined : String(run.taskId);
-      if (currentRun !== undefined && runId !== currentRun) {
+      const chatRequestId = requestForView(view);
+      if (currentRun !== undefined && runId === undefined && currentChatRequestId !== undefined) {
         const failure = isRecord(live.runFailure) ? live.runFailure : undefined;
-        const answer = failure === undefined ? latestAssistantText(view) : "";
-        if (answer.length > 0 && answer !== partialText) {
-          const delta = answer.startsWith(partialText) ? answer.slice(partialText.length) : answer;
-          emit("assistant.delta", { text: delta, ...(answer.startsWith(partialText) ? {} : { replace: true }) });
-          partialText = answer;
-        }
-        emit("run.end", {
+        emit(currentChatRequestId, "run.end", {
           status: failure === undefined ? "done" : "error",
           ...(typeof failure?.reason === "string" ? { reason: failure.reason } : {}),
           ...(typeof failure?.detail === "string" ? { detail: failure.detail } : {}),
         });
       }
       if (runId !== currentRun) {
+        currentChatRequestId = undefined;
         currentGeneration = undefined;
         partialText = "";
         sentCalls.clear();
@@ -452,12 +466,13 @@ export function createWorkshopService(input: { projectRoot: string; harness: Har
         : `${runId}:${String(generation.attempt)}`;
       if (generationKey !== currentGeneration) {
         currentGeneration = generationKey;
-        partialText = "";
+        currentChatRequestId = chatRequestId;
+        partialText = partialAssistantText(live);
       }
       const text = partialAssistantText(live);
       if (text !== partialText) {
         const delta = text.startsWith(partialText) ? text.slice(partialText.length) : text;
-        if (delta.length > 0) emit("assistant.delta", { text: delta, ...(text.startsWith(partialText) ? {} : { replace: true }) });
+        if (delta.length > 0) emit(currentChatRequestId, "assistant.delta", { text: delta, ...(text.startsWith(partialText) ? {} : { replace: true }) });
         partialText = text;
       }
 
@@ -469,14 +484,14 @@ export function createWorkshopService(input: { projectRoot: string; harness: Har
         if (!sentCalls.has(callId)) {
           sentCalls.add(callId);
           const argumentsSummary = summarizedArguments(toolArguments(view, callId));
-          emit("tool.call", {
+          emit(currentChatRequestId, "tool.call", {
             call_id: callId,
             name: item.name,
             ...(argumentsSummary === undefined ? {} : { arguments: argumentsSummary }),
           });
         }
         if (status === "done" && callStatuses.get(callId) !== "done") {
-          emit("tool.result", { call_id: callId, name: item.name, ...toolResult(view, callId) });
+          emit(currentChatRequestId, "tool.result", { call_id: callId, name: item.name, ...toolResult(view, callId) });
         }
         callStatuses.set(callId, status);
       }
@@ -486,14 +501,14 @@ export function createWorkshopService(input: { projectRoot: string; harness: Har
         if (!isRecord(item) || typeof item.callId !== "string" || typeof item.name !== "string" || sentNestedCalls.has(item.callId)) continue;
         sentNestedCalls.add(item.callId);
         const argumentsSummary = summarizedArguments(item.arguments);
-        emit("tool.call", {
+        emit(currentChatRequestId, "tool.call", {
           call_id: item.callId,
           name: item.name,
           nested: true,
           ...(argumentsSummary === undefined ? {} : { arguments: argumentsSummary }),
         });
         if (isRecord(item.summary)) {
-          emit("tool.result", {
+          emit(currentChatRequestId, "tool.result", {
             call_id: item.callId,
             name: item.name,
             status: item.summary.isError === true ? "error" : "ok",
@@ -502,7 +517,8 @@ export function createWorkshopService(input: { projectRoot: string; harness: Har
       }
     };
 
-    emit("chat.attached", { conversation_id: root.id, busy: isRecord(liveState(watch.value).run) });
+    chatWatchers.add(watcher);
+    watcher.send({ ok: true, type: "chat.attached", conversation_id: root.id, busy: isRecord(liveState(watch.value).run) });
     publish(watch.value);
     watch.start(async (call) => {
       if (call.kind === "value") publish(call.value);

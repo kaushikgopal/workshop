@@ -107,14 +107,14 @@ async function printMessage(message: string): Promise<void> {
   let socket: Socket | undefined;
   try {
     socket = await connectChat((event) => {
-      if (event.type === "assistant.delta" && typeof event.text === "string") {
+      if (event.type === "assistant.delta" && event.chat_request_id === id && typeof event.text === "string") {
         streamed += event.text;
         stdout.write(event.text);
       } else if (event.type === "assistant.final" && event.chat_request_id === id && typeof event.answer === "string") {
         if (event.answer.startsWith(streamed)) stdout.write(event.answer.slice(streamed.length));
         else stdout.write(`\n${event.answer}`);
         streamed = event.answer;
-      } else if (event.type === "tool.call" || event.type === "tool.result") {
+      } else if ((event.type === "tool.call" || event.type === "tool.result") && event.chat_request_id === id) {
         outputTool(event, stderr);
       }
       if (event.request_id !== id) return;
@@ -152,16 +152,15 @@ async function startChat(): Promise<void> {
   };
   try {
     socket = await connectChat((event) => {
-      if (event.type === "assistant.delta" && typeof event.text === "string") {
+      if (event.type === "assistant.delta" && typeof event.chat_request_id === "string" && pendingText.has(event.chat_request_id) && typeof event.text === "string") {
         if (promptVisible) {
           stdout.write("\n");
           promptVisible = false;
         }
         stdout.write(event.text);
-        const first = pendingText.keys().next().value;
-        if (first !== undefined) pendingText.set(first, (pendingText.get(first) ?? "") + event.text);
+        pendingText.set(event.chat_request_id, (pendingText.get(event.chat_request_id) ?? "") + event.text);
         responseHasText = true;
-      } else if (event.type === "tool.call" || event.type === "tool.result") {
+      } else if ((event.type === "tool.call" || event.type === "tool.result") && typeof event.chat_request_id === "string" && pendingText.has(event.chat_request_id)) {
         if (promptVisible) {
           stdout.write("\n");
           promptVisible = false;
@@ -184,7 +183,7 @@ async function startChat(): Promise<void> {
             prompt();
           }
         }
-      } else if (event.type === "run.end" && pending === 0) {
+      } else if (event.type === "run.end" && typeof event.chat_request_id === "string" && pendingText.has(event.chat_request_id) && pending === 0) {
         if (responseHasText) stdout.write("\n");
         prompt();
       }

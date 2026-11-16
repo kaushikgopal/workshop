@@ -528,6 +528,59 @@ test("submit_chat reuses the configured root conversation through the service", 
   }
 });
 
+test("chat pause and resume tools return successful results", async () => {
+  const project = createProject("printf 'unused'\n");
+  const storage = new MemoryStorage();
+  const faux = fauxProvider();
+  const models = createModels();
+  models.setProvider(faux.provider);
+  const model = faux.getModel();
+  assert.ok(model);
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("pause_workflow", { workflow: "clock" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage("Paused the workflow."),
+    fauxAssistantMessage(fauxToolCall("resume_workflow", { workflow: "clock" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage("Resumed the workflow."),
+  ]);
+  const configuredModel = {
+    model: { provider: model.provider, modelId: model.id },
+    thinkingLevel: "medium" as const,
+  };
+  let service: ReturnType<typeof createWorkshopService> | undefined;
+  let harness: Awaited<ReturnType<typeof openWorkshopHarness>> | undefined;
+  try {
+    harness = await openWorkshopHarness(storage, undefined, {
+      projectRoot: project.root,
+      models,
+      model: configuredModel,
+      escalationModel: configuredModel,
+      request: async (request) => {
+        if (!service) throw new Error("Workshop service is not ready");
+        return await service.handleRequest(request);
+      },
+    });
+    service = createWorkshopService({ projectRoot: project.root, harness });
+    harness.resume();
+    const paused = await service.handleRequest({ request_id: "pause-chat", type: "submit_chat", content: "Pause clock." });
+    assert.equal(paused.ok, true);
+    assert.equal(paused.answer, "Paused the workflow.");
+    const resumed = await service.handleRequest({ request_id: "resume-chat", type: "submit_chat", content: "Resume clock." });
+    assert.equal(resumed.ok, true);
+    assert.equal(resumed.answer, "Resumed the workflow.");
+    const root = await harness.root(BACKGROUND_CONTEXT);
+    const context = await root.context(BACKGROUND_CONTEXT);
+    const toolResults = context.messages.filter((message) => message.role === "toolResult");
+    assert.equal(toolResults.length, 2);
+    assert.ok(toolResults.every((message) => message.isError !== true));
+    const state = await harness.snapshot(workshopStateDocument, BACKGROUND_CONTEXT);
+    assert.deepEqual(state?.paused, []);
+    assert.deepEqual(state?.actions.map((action) => action.decision.action), ["pause", "resume"]);
+  } finally {
+    if (harness) await harness.close(BACKGROUND_CONTEXT);
+    rmSync(project.root, { recursive: true, force: true });
+  }
+});
+
 test("submit_chat keeps the root transcript after reopening SQLite storage", { timeout: 30_000 }, async () => {
   const project = createProject("printf 'unused'\n");
   const stateDirectory = join(project.root, "state");
