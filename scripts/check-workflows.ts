@@ -1,5 +1,5 @@
 import { join } from "node:path";
-import { ConfigReadError, readConfig } from "../agent/lib/read-config.ts";
+import { ConfigReadError, readConfig } from "../config/read-workshop-config.ts";
 import { loadWorkflows } from "../workflow/load-workflows.ts";
 
 function printErrors(label: string, errors: { file: string; reason: string }[]): void {

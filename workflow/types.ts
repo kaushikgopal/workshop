@@ -24,16 +24,6 @@ export type WorkflowStepResult = {
   attempts: AttemptHistoryEntry[];
 };
 
-export type WorkflowSnapshot = {
-  workflow: Workflow;
-  runDirectory: string;
-  documents: Record<string, string>;
-  files: Record<string, string>;
-  contents: Record<string, string>;
-  profileCommands: Record<string, string[]>;
-  dataDirectory: string;
-  stateDirectory: string;
-};
 
 export type WorkflowCheck = {
   kind: WorkflowStepKind;

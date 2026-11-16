@@ -7,13 +7,7 @@
   <key>ProgramArguments</key>
   <array>
     <string>{{NODE_PATH}}</string>
-    <string>{{NPX_PATH}}</string>
-    <string>eve</string>
-    <string>start</string>
-    <string>--host</string>
-    <string>127.0.0.1</string>
-    <string>--port</string>
-    <string>{{PORT}}</string>
+    <string>service/start-service.ts</string>
   </array>
   <key>WorkingDirectory</key>
   <string>{{REPO_PATH}}</string>
@@ -21,8 +15,6 @@
   <dict>
     <key>PATH</key>
     <string>{{PATH}}</string>
-    <key>WORKSHOP_LOCAL_EVE_AUTH</key>
-    <string>1</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>

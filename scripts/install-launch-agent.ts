@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
+import { delimiter, dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 
 function requireValue(value: string | undefined, name: string): string {
@@ -31,12 +31,6 @@ function install(): void {
 
   const label = validateLabel(requireValue(process.argv[2], "LABEL"));
   const repository = resolve(requireValue(process.argv[3], "repository path"));
-  const npxPath = requireValue(process.argv[4], "npx path");
-  const portText = requireValue(process.argv[5], "PORT");
-  if (!isAbsolute(npxPath)) throw new Error("npx path must be absolute");
-  if (!/^\d+$/.test(portText) || Number(portText) < 1 || Number(portText) > 65_535) {
-    throw new Error("PORT must be an integer from 1 to 65535");
-  }
   if (!existsSync(join(repository, "workshop.yaml"))) throw new Error("workshop.yaml is required; run make setup first");
 
   const uid = process.getuid?.();
@@ -52,7 +46,6 @@ function install(): void {
   const nodePath = process.execPath;
   const servicePath = [...new Set([
     dirname(nodePath),
-    dirname(npxPath),
     ...(process.env.PATH ?? "").split(delimiter).filter(Boolean),
   ])].join(delimiter);
   const logPath = join(repository, "state", "service.log");
@@ -60,8 +53,6 @@ function install(): void {
   const values: Record<string, string> = {
     LABEL: label,
     NODE_PATH: nodePath,
-    NPX_PATH: npxPath,
-    PORT: portText,
     REPO_PATH: repository,
     PATH: servicePath,
     LOG_PATH: logPath,

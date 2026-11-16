@@ -1,0 +1,190 @@
+import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { createModels } from "@earendil-works/pi-ai/models";
+import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import { createRegistry, Harness, type TaskRecord } from "@earendil-works/pi-durable";
+import type { JsonValue } from "@earendil-works/chord/json";
+import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
+import { test } from "node:test";
+import { StepAttemptTask, STEP_ATTEMPT_TASK_NAME } from "../workflow/define-step-attempt-task.ts";
+import { WorkflowTask, WORKFLOW_TASK_NAME } from "../workflow/define-workflow-task.ts";
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function createHarness(storage: Awaited<ReturnType<typeof openNodeSqliteStorage>>) {
+  const registry = createRegistry();
+  registry.install({ name: "workshop", tasks: [WorkflowTask, StepAttemptTask] });
+  return Harness.open(storage, { models: createModels(), registry }, BACKGROUND_CONTEXT);
+}
+
+async function waitForInvocationCount(file: string, expected: number, timeoutMs = 10_000): Promise<number[]> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (existsSync(file)) {
+      const pids = readFileSync(file, "utf8").trim().split(/\s+/).filter(Boolean).map(Number);
+      if (pids.length >= expected) return pids;
+    }
+    await new Promise((resolveWait) => setTimeout(resolveWait, 20));
+  }
+  throw new Error(`Timed out waiting for ${expected} workflow command invocations`);
+}
+
+async function taskById(storage: Awaited<ReturnType<typeof openNodeSqliteStorage>>, id: string | number): Promise<TaskRecord<JsonValue, JsonValue, JsonValue>> {
+  const page = await storage.scanTasks({}, 1_000, undefined, BACKGROUND_CONTEXT);
+  const task = page.items.find((record) => String(record.id) === String(id));
+  if (!task) throw new Error(`Durable task ${id} was not found`);
+  return task;
+}
+
+function activeAttemptId(task: TaskRecord<JsonValue, JsonValue, JsonValue>): string | number {
+  if (task.state.status !== "running" || !isRecord(task.state.checkpoint)) throw new Error(`Workflow task has no running checkpoint: ${JSON.stringify(task.state)}`);
+  const activeAttempt = task.state.checkpoint.activeAttempt;
+  if (!isRecord(activeAttempt) || (typeof activeAttempt.taskId !== "string" && typeof activeAttempt.taskId !== "number")) throw new Error(`Workflow task has no child attempt ID: ${JSON.stringify(task.state.checkpoint)}`);
+  return activeAttempt.taskId;
+}
+
+function killProcessGroups(pids: readonly number[]): void {
+  for (const pid of pids) {
+    try {
+      process.kill(-pid, "SIGKILL");
+    } catch (error) {
+      if (!isRecord(error) || error.code !== "ESRCH") throw error;
+    }
+  }
+}
+
+async function startHarnessProcess(projectRoot: string, startWorkflow: boolean): Promise<ReturnType<typeof spawn>> {
+  const script = [
+    `import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";`,
+    `import { createModels } from "@earendil-works/pi-ai/models";`,
+    `import { createRegistry, Harness } from "@earendil-works/pi-durable";`,
+    `import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";`,
+    `import { startWorkflow, createWorkflowStartPort } from ${JSON.stringify(new URL("../run/start-workflow.ts", import.meta.url).href)};`,
+    `import { WorkflowTask } from ${JSON.stringify(new URL("../workflow/define-workflow-task.ts", import.meta.url).href)};`,
+    `import { StepAttemptTask } from ${JSON.stringify(new URL("../workflow/define-step-attempt-task.ts", import.meta.url).href)};`,
+    `const root = ${JSON.stringify(projectRoot)};`,
+    `const storage = await openNodeSqliteStorage(root + "/state/workshop.sqlite");`,
+    `const registry = createRegistry(); registry.install({ name: "workshop", tasks: [WorkflowTask, StepAttemptTask] });`,
+    `const harness = await Harness.open(storage, { models: createModels(), registry }, BACKGROUND_CONTEXT);`,
+    `harness.resume();`,
+    ...(startWorkflow ? [
+      `const port = await createWorkflowStartPort(harness);`,
+      `const started = await startWorkflow({ workflowName: "clock", projectRoot: root, port });`,
+      `process.stdout.write(JSON.stringify(started) + "\\n");`,
+    ] : []),
+    `setInterval(() => {}, 1000);`,
+  ].join("\n");
+  const child = spawn(process.execPath, ["--input-type=module", "-e", script], {
+    cwd: resolve("."),
+    env: { ...process.env, WORKSHOP_CONFIG: join(projectRoot, "workshop.yaml") },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  return child;
+}
+
+async function startedRun(child: ReturnType<typeof spawn>): Promise<string> {
+  return await new Promise((resolveStarted, rejectStarted) => {
+    let stdout = "";
+    child.stdout?.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString();
+      const newline = stdout.indexOf("\n");
+      if (newline < 0) return;
+      try {
+        const result: unknown = JSON.parse(stdout.slice(0, newline));
+        if (!isRecord(result) || result.kind !== "started" || typeof result.run_id !== "string") throw new Error("Workflow did not start");
+        resolveStarted(result.run_id);
+      } catch (error) {
+        rejectStarted(error);
+      }
+    });
+    child.once("error", rejectStarted);
+    child.once("exit", (code, signal) => rejectStarted(new Error(`Harness exited before starting (${code ?? signal})`)));
+  });
+}
+
+test("a killed service resumes the same parent and child tasks from SQLite", { skip: process.platform === "win32" }, async () => {
+  const projectRoot = mkdtempSync(join(tmpdir(), "workshop-crash-resume-test-"));
+  const workflowDirectory = join(projectRoot, "workflows", "clock");
+  const stateDirectory = join(projectRoot, "state");
+  const invocationFile = join(projectRoot, "invocations");
+  const releaseFile = join(projectRoot, "release");
+  mkdirSync(workflowDirectory, { recursive: true });
+  writeFileSync(join(projectRoot, "workshop.yaml"), [
+    "agent_profiles:",
+    `  writer:\n    command: ["${process.execPath}"]`,
+    "orchestrator:",
+    "  profile: writer",
+    "  escalation_profile: writer",
+    "",
+  ].join("\n"));
+  writeFileSync(join(workflowDirectory, "workflow.md"), "---\ncron: '* * * * *'\nretries: 0\n---\nCrash-resume fixture.\n");
+  writeFileSync(join(workflowDirectory, "10-gated.sh"), [
+    `printf '%s\\n' "$$" >> "$WORKSHOP_PROJECT_ROOT/invocations"`,
+    `while [ ! -f "$WORKSHOP_PROJECT_ROOT/release" ]; do sleep 0.02; done`,
+    `printf 'resumed output'`,
+    "",
+  ].join("\n"));
+
+  let child: ReturnType<typeof spawn> | undefined;
+  let harness: Awaited<ReturnType<typeof createHarness>> | undefined;
+  let storage: Awaited<ReturnType<typeof openNodeSqliteStorage>> | undefined;
+  let pids: number[] = [];
+  try {
+    child = await startHarnessProcess(projectRoot, true);
+    const runId = await startedRun(child);
+    pids = await waitForInvocationCount(invocationFile, 1);
+    const beforeStorage = await openNodeSqliteStorage(join(stateDirectory, "workshop.sqlite"));
+    const beforeRun = (await beforeStorage.scanTasks({ kind: WORKFLOW_TASK_NAME }, 100, undefined, BACKGROUND_CONTEXT)).items.find((record) => isRecord(record.input) && record.input.runId === runId);
+    assert.ok(beforeRun, "SQLite contains the workflow task before the crash");
+    const attemptId = activeAttemptId(beforeRun);
+    const beforeAttempt = await taskById(beforeStorage, attemptId);
+    assert.equal(beforeAttempt.kind, STEP_ATTEMPT_TASK_NAME);
+    const runRestartCount = beforeRun.restarts ?? 0;
+    const attemptRestartCount = beforeAttempt.restarts ?? 0;
+    await beforeStorage.close(BACKGROUND_CONTEXT);
+
+    child.kill("SIGKILL");
+    await once(child, "exit");
+    child = undefined;
+
+    storage = await openNodeSqliteStorage(join(stateDirectory, "workshop.sqlite"));
+    harness = await createHarness(storage);
+    const reopenedRun = await taskById(storage, beforeRun.id);
+    const reopenedAttempt = await taskById(storage, attemptId);
+    assert.equal(reopenedRun.id, beforeRun.id);
+    assert.equal(reopenedAttempt.id, beforeAttempt.id);
+    assert.ok((reopenedRun.restarts ?? 0) > runRestartCount);
+    assert.ok((reopenedAttempt.restarts ?? 0) > attemptRestartCount);
+    harness.resume();
+
+    pids = await waitForInvocationCount(invocationFile, 2);
+    writeFileSync(releaseFile, "release\n");
+    const settled = await harness.waitForTask(beforeRun.id, BACKGROUND_CONTEXT);
+    assert.equal(settled.state.status, "terminal");
+    if (settled.state.status === "terminal") {
+      assert.equal(settled.state.outcome.status, "completed");
+      if (settled.state.outcome.status === "completed") {
+        const result = settled.state.outcome.result;
+        assert.ok(isRecord(result));
+        assert.equal(result.output, "resumed output");
+      }
+    }
+    assert.equal((await waitForInvocationCount(invocationFile, 2)).length, 2);
+  } finally {
+    writeFileSync(releaseFile, "release\n");
+    if (child && child.exitCode === null) {
+      child.kill("SIGKILL");
+      await once(child, "exit");
+    }
+    killProcessGroups(pids);
+    if (harness) await harness.close(BACKGROUND_CONTEXT);
+    else if (storage) await storage.close(BACKGROUND_CONTEXT);
+    rmSync(projectRoot, { recursive: true, force: true });
+  }
+});

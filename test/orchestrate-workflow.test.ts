@@ -3,25 +3,15 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
-import { decideBlockedRun } from "../agent/tools/decide_blocked_run.ts";
-import { startWorkflowForChat } from "../agent/tools/start_workflow.ts";
-import { executeWorkflowProcess } from "../agent/lib/execute-workflow-process.ts";
+import { executeWorkflowProcess } from "../run/execute-workflow-process.ts";
 import { advanceOrchestratorRound } from "../workflow/advance-orchestrator-round.ts";
 import { applyWorkflowDecision } from "../workflow/apply-workflow-decision.ts";
 import { buildOrchestratorBrief } from "../workflow/build-orchestrator-brief.ts";
-import { changeWorkflowPause } from "../workflow/change-workflow-pause.ts";
 import { computeRetryProfiles } from "../workflow/compute-retry-profiles.ts";
 import { listWorkflowStatus } from "../workflow/list-workflow-status.ts";
-import { readPausedWorkflows } from "../workflow/read-paused-workflows.ts";
 import { parseOrchestratorDecision } from "../workflow/parse-orchestrator-decision.ts";
-import { cancelWorkflowRun } from "../run/cancel-workflow-run.ts";
-import { recordActionLog } from "../run/record-action-log.ts";
-import { listWorkflowRuns } from "../run/list-workflow-runs.ts";
-import { readActionLog } from "../run/read-action-log.ts";
-import { readWorkflowRun } from "../run/read-workflow-run.ts";
 import { interpretWorkflow, type ProcessExecutionRequest, type ProcessExecutionResult, type WorkflowInterpreterInput } from "../workflow/interpret-workflow.ts";
 import type { AttemptHistoryEntry, Workflow, WorkflowStep } from "../workflow/types.ts";
-import type { BlockedWorkflowStep, RunIndexEntry } from "../run/types.ts";
 
 const profileFixture = resolve("test/fixtures/orchestrator-profile.mjs");
 
@@ -57,7 +47,7 @@ function orchestratedInput(
   return {
     workflow: commandWorkflow(),
     documents: {},
-    files: { "10-check.sh": "/snapshot/test-loop/10-check.sh" },
+    files: { "10-check.sh": "/workflows/test-loop/10-check.sh" },
     contents: { "10-check.sh": "test command source" },
     workflowRunId: "wrun_orchestrator_test",
     profileCommands: {
@@ -75,30 +65,11 @@ async function executeFakeOrchestrator(request: ProcessExecutionRequest, root: s
     ...request,
     workflow: "test-loop",
     runId: "wrun_orchestrator_test",
+    projectRoot: root,
     dataDirectory: root,
     stateDirectory: root,
     cwd: root,
   });
-}
-
-function blockedStep(overrides: Partial<BlockedWorkflowStep> = {}): BlockedWorkflowStep {
-  return {
-    workflow: "clock",
-    run_id: "wrun_1",
-    step: "10-write",
-    step_kind: "agent",
-    retry_profiles: ["pi-fast"],
-    last_error: "profile failed",
-    last_output: "partial",
-    attempt_history: [{ attempt: 1, profile: "pi-local", output: "partial", error: "profile failed" }],
-    token: "hook-token",
-    at: "2026-11-14T12:00:00.000Z",
-    ...overrides,
-  };
-}
-
-function runEntry(runId: string, workflow = "clock"): RunIndexEntry {
-  return { workflow, slot: "2026-11-14T12:00:00.000Z", run_id: runId, outcome: "started", at: "2026-11-14T12:00:01.000Z" };
 }
 
 test("computes allowed retry profiles from the step executable only", () => {
@@ -240,28 +211,6 @@ test("two automatic give_up decisions leave the run waiting for the user", async
     assert.equal((await pending).steps[0]?.status, "skipped");
   });
 });
-test("automatic fail decisions end the run and are written to the action log", async () => {
-  await withRoot(async (root) => {
-    const actionFile = join(root, "state", "actions.jsonl");
-    const input = orchestratedInput(async (request) => {
-      if (request.kind === "orchestrator") return executeFakeOrchestrator(request, root);
-      return failed("partial", "step still fails");
-    }, async ({ workflow, runId, step, round, decision, note }) => {
-      recordActionLog(actionFile, {
-        workflow,
-        run_id: runId,
-        step,
-        source: round === 1 ? "round-1" : "round-2",
-        decision,
-        note,
-      });
-    }, { first: "fail", escalation: "skip" });
-
-    await assert.rejects(interpretWorkflow(input), /10-check failed after 1 attempts: 10-check failed with exit code 7: step still fails/);
-    assert.deepEqual(readActionLog(actionFile).map(({ source, decision }) => [source, decision.action]), [["round-1", "fail"]]);
-  });
-});
-
 
 test("a failed round-one retry counts as the round failure and escalates without replaying it", async () => {
   await withRoot(async (root) => {
@@ -292,67 +241,6 @@ test("applies user retry decisions through the same profile and feedback rules",
   assert.deepEqual(applied, { action: "retry", profile: "pi-fast", feedback: "check rejected it\n\nHint: shorten it", after: "30s" });
 });
 
-test("action log appends validated JSON lines and reads the newest entries", async () => {
-  await withRoot((root) => {
-    const file = join(root, "state", "actions.jsonl");
-    recordActionLog(file, {
-      at: "2026-11-14T12:00:00.000Z", workflow: "clock", run_id: "wrun_1", step: "10-write",
-      source: "round-1", decision: { action: "retry", hint: "try once", note: "safe" }, note: "retry succeeded",
-    });
-    recordActionLog(file, {
-      at: "2026-11-14T12:00:00.000Z", workflow: "clock", run_id: "wrun_1", step: "10-write",
-      source: "round-1", decision: { action: "retry", hint: "try once", note: "safe" }, note: "retry succeeded",
-    });
-    recordActionLog(file, {
-      at: "2026-11-14T12:01:00.000Z", workflow: "clock", run_id: "wrun_1", step: "10-write",
-      source: "chat", decision: { action: "skip" }, note: "step skipped",
-    });
-    assert.equal(readActionLog(file, 1)[0]?.source, "chat");
-    assert.equal(readActionLog(file, 2)[1]?.decision.action, "retry");
-    assert.deepEqual(readActionLog(file, 0), []);
-    assert.equal(readActionLog(file, 10).filter(({ source }) => source === "round-1").length, 1);
-  });
-});
-
-
-test("pause and resume update the state file and record chat actions", async () => {
-  await withRoot((root) => {
-    const pauseFile = join(root, "state", "paused.json");
-    const actionFile = join(root, "state", "actions.jsonl");
-    const paused = changeWorkflowPause({ workflow: "clock", paused: true, pauseFile, actionFile, at: "2026-11-14T12:00:00.000Z" });
-    assert.deepEqual(paused.pausedWorkflows, ["clock"]);
-    assert.equal(readPausedWorkflows(pauseFile).has("clock"), true);
-    const resumed = changeWorkflowPause({ workflow: "clock", paused: false, pauseFile, actionFile, at: "2026-11-14T12:01:00.000Z" });
-    assert.deepEqual(resumed.pausedWorkflows, []);
-    assert.equal(readPausedWorkflows(pauseFile).has("clock"), false);
-    assert.deepEqual(readActionLog(actionFile).map(({ decision }) => decision.action), ["resume", "pause"]);
-  });
-});
-
-test("manual starts refuse paused or disabled workflows and log successful starts", async () => {
-  let starts = 0;
-  const startsLogged: string[] = [];
-  await assert.rejects(startWorkflowForChat("clock", {
-    isPaused: () => true,
-    isEnabled: () => true,
-    start: async () => { starts += 1; return "wrun_never"; },
-  }), /paused; resume it before starting manually/);
-  await assert.rejects(startWorkflowForChat("clock", {
-    isPaused: () => false,
-    isEnabled: () => false,
-    start: async () => { starts += 1; return "wrun_never"; },
-  }), /disabled; enable it before starting manually/);
-  assert.equal(starts, 0);
-  const started = await startWorkflowForChat("clock", {
-    isPaused: () => false,
-    isEnabled: () => true,
-    start: async () => "wrun_started",
-    recordStart: (name, runId) => { startsLogged.push(`${name}:${runId}`); },
-  });
-  assert.deepEqual(started, { status: "started", workflow: "clock", runId: "wrun_started" });
-  assert.deepEqual(startsLogged, ["clock:wrun_started"]);
-});
-
 test("workflow listing reports enabled, paused, and broken workflows", () => {
   const result = listWorkflowStatus({
     workflows: [
@@ -365,82 +253,4 @@ test("workflow listing reports enabled, paused, and broken workflows", () => {
     ["clock", true, true], ["disabled", false, false],
   ]);
   assert.deepEqual(result.broken_workflows, [{ name: "broken", errors: [{ file: "broken/workflow.md", reason: "missing cron" }] }]);
-});
-
-test("run listing uses fake Eve status and blocked-step readers", async () => {
-  const entries: RunIndexEntry[] = [runEntry("wrun_1"), { ...runEntry("wrun_skip"), run_id: null, outcome: "skipped", reason: "max runs" }];
-  const result = await listWorkflowRuns(entries, { limit: 10 }, {
-    getStatus: async (id) => id === "wrun_1" ? "running" : "failed",
-    readBlocked: (id) => id === "wrun_1" ? blockedStep() : undefined,
-  });
-  assert.deepEqual(result.map(({ status }) => status), ["running", "skipped"]);
-  assert.equal(result[0]?.blocked_step, "10-write");
-  assert.equal(result[0]?.last_error, "profile failed");
-});
-test("run listing keeps an older blocked run visible beyond the recent-history limit", async () => {
-  const entries: RunIndexEntry[] = [runEntry("wrun_old")];
-  for (let index = 0; index < 25; index += 1) {
-    entries.push({ ...runEntry(`wrun_skip_${index}`), run_id: null, outcome: "skipped", reason: "workflow lock held" });
-  }
-  const result = await listWorkflowRuns(entries, { limit: 2 }, {
-    getStatus: async () => "running",
-    readBlocked: (id) => id === "wrun_old" ? blockedStep({ run_id: id }) : undefined,
-  });
-  assert.equal(result.length, 3);
-  assert.equal(result[0]?.run_id, "wrun_old");
-  assert.equal(result[0]?.blocked_step, "10-write");
-});
-
-
-test("run reading returns Eve-exposed step output and blocked attempts", async () => {
-  const entries = [runEntry("wrun_1")];
-  const completed = await readWorkflowRun("wrun_1", entries, {
-    inspect: async () => ({ status: "completed", returnValue: { output: "done", steps: [{ step: "10-save", output: "done" }] } }),
-    readBlocked: () => undefined,
-  });
-  assert.equal(completed.output, "done");
-  assert.deepEqual(completed.steps, [{ step: "10-save", output: "done" }]);
-  const blocked = await readWorkflowRun("wrun_1", entries, {
-    inspect: async () => ({ status: "running" }),
-    readBlocked: () => blockedStep(),
-  });
-  assert.equal(blocked.status, "running");
-  assert.equal(blocked.blocked_step?.last_error, "profile failed");
-  assert.equal(blocked.blocked_step?.attempt_history?.[0]?.output, "partial");
-  await assert.rejects(readWorkflowRun("missing", entries, { inspect: async () => ({ status: "failed" }), readBlocked: () => undefined }), /not in the run index/);
-});
-
-test("chat decision tool applies a checked user action through its injected sender", async () => {
-  let sent: { runId: string; action: string } | undefined;
-  const result = await decideBlockedRun("wrun_1", { action: "skip" }, async (runId, decision) => {
-    sent = { runId, action: decision.action };
-  });
-  assert.deepEqual(sent, { runId: "wrun_1", action: "skip" });
-  assert.deepEqual(result, { run_id: "wrun_1", decision: { action: "skip" } });
-});
-
-test("cancel tool cancels active runs and stops their processes", async () => {
-  const entries = [runEntry("wrun_active"), runEntry("wrun_done")];
-  const cancelled: string[] = [];
-  const stopped: string[] = [];
-  const actions: string[] = [];
-  const events: string[] = [];
-  const active = await cancelWorkflowRun("wrun_active", entries, {
-    getStatus: async () => "running",
-    cancel: async (id) => { events.push("cancel"); cancelled.push(id); },
-    stopProcesses: async (id) => { events.push("stop"); stopped.push(id); },
-    recordAction: ({ workflow, runId }) => { actions.push(`${workflow}:${runId}`); },
-  });
-  const completed = await cancelWorkflowRun("wrun_done", entries, {
-    getStatus: async () => "completed",
-    cancel: async () => { assert.fail("terminal run must not be cancelled"); },
-    stopProcesses: async () => { assert.fail("terminal run processes must not be stopped"); },
-    recordAction: () => { assert.fail("terminal run must not be logged as cancelled"); },
-  });
-  assert.deepEqual(active, { run_id: "wrun_active", workflow: "clock", status: "cancellation-requested", cancelled: true });
-  assert.deepEqual(completed, { run_id: "wrun_done", workflow: "clock", status: "completed", cancelled: false });
-  assert.deepEqual(cancelled, ["wrun_active"]);
-  assert.deepEqual(stopped, ["wrun_active"]);
-  assert.deepEqual(events, ["cancel", "stop"]);
-  assert.deepEqual(actions, ["clock:wrun_active"]);
 });

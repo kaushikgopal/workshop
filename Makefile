@@ -1,5 +1,3 @@
-PORT ?= 3000
-DEV_PORT ?= 2000
 LABEL ?= dev.workshop.service
 
 .PHONY: setup check dev start chat service-install service-uninstall copy
@@ -25,22 +23,18 @@ check:
 	@npm test
 
 dev:
-	@npm run dev -- --host 127.0.0.1 --port $(DEV_PORT)
+	@npm run dev
 
 start:
-	@npx eve build && WORKSHOP_LOCAL_EVE_AUTH=1 npx eve start --host 127.0.0.1 --port $(PORT)
+	@npm start
 
 chat:
-	@port="$(PORT)"; \
-	if ! nc -z 127.0.0.1 "$$port" >/dev/null 2>&1; then port="$(DEV_PORT)"; fi; \
-	if ! nc -z 127.0.0.1 "$$port" >/dev/null 2>&1; then echo "No Workshop service is listening; run make start (or make dev)." >&2; exit 1; fi; \
-	npx eve remote connect --url "http://127.0.0.1:$$port"
+	@node scripts/chat-workshop.ts
 
 service-install:
 	@test -f workshop.yaml || { echo "workshop.yaml is required; run make setup and edit the config first." >&2; exit 1; }
 	@$(MAKE) check
-	@npx eve build
-	@node scripts/install-launch-agent.ts "$(LABEL)" "$(CURDIR)" "$$(command -v npx)" "$(PORT)"
+	@node scripts/install-launch-agent.ts "$(LABEL)" "$(CURDIR)"
 
 service-uninstall:
 	@node scripts/uninstall-launch-agent.ts "$(LABEL)"

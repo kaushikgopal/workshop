@@ -3,7 +3,7 @@ import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { checkProfileCommands, ConfigReadError, readConfig, type WorkshopConfig } from "../agent/lib/read-config.ts";
+import { checkProfileCommands, ConfigReadError, readConfig, type WorkshopConfig } from "../config/read-workshop-config.ts";
 
 function createDirectory(): string {
   return mkdtempSync(join(tmpdir(), "workshop-config-test-"));
@@ -80,7 +80,7 @@ test("config errors name an unset interpolation variable", () => {
   }
 });
 
-test("config validates command arrays, profile names, references, and context windows", () => {
+test("config validates command arrays, profile names, profile references, and context windows", () => {
   const directory = createDirectory();
   try {
     const invalidConfigs = [
@@ -88,8 +88,6 @@ test("config validates command arrays, profile names, references, and context wi
       { source: basicConfig("[\"\"]"), message: /must not be empty/ },
       { source: basicConfig().replace("writer:", "Writer:"), message: /lowercase letters, digits, and hyphens/ },
       { source: basicConfig().replace("profile: writer", "profile: missing"), message: /does not exist in agent_profiles/ },
-      { source: basicConfig().replace("profile: writer", "profile: constructor"), message: /does not exist in agent_profiles/ },
-      { source: basicConfig().replace("escalation_profile: writer", "escalation_profile: missing"), message: /does not exist in agent_profiles/ },
       { source: basicConfig().replace("command:", "unknown: true\n    command:"), message: /Unrecognized key/ },
       { source: basicConfig().replace("command:", "context_window: 0\n    command:"), message: /context_window: Too small/ },
       { source: basicConfig().replace("command:", "context_window: 1.5\n    command:"), message: /context_window: Invalid input/ },

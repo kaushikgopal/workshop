@@ -1,5 +1,4 @@
-# Eve build output and Workflow World state
-/.eve/
+# Local runtime state and generated output
 /.output/
 /data/
 /state/

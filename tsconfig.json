@@ -12,6 +12,6 @@
     "skipLibCheck": true,
     "noEmit": true
   },
-  "include": ["agent/**/*.ts", "scripts/**/*.ts", "test/**/*.ts"],
+  "include": ["agent/**/*.ts", "config/**/*.ts", "run/**/*.ts", "schedule/**/*.ts", "service/**/*.ts", "workflow/**/*.ts", "scripts/**/*.ts", "test/**/*.ts"],
   "exclude": ["spike", "node_modules"]
 }

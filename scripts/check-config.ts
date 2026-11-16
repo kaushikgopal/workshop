@@ -1,4 +1,4 @@
-import { checkProfileCommands, ConfigReadError, readConfig } from "../agent/lib/read-config.ts";
+import { checkProfileCommands, ConfigReadError, readConfig } from "../config/read-workshop-config.ts";
 
 try {
   const config = readConfig();

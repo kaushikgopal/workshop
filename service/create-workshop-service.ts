@@ -1,0 +1,396 @@
+import { resolve } from "node:path";
+import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import type { Harness, TaskRecord } from "@earendil-works/pi-durable";
+import type { JsonValue } from "@earendil-works/chord/json";
+import { checkProfileCommands, readConfig } from "../config/read-workshop-config.ts";
+import { createWorkflowStartPort, startWorkflow } from "../run/start-workflow.ts";
+import { appendRecent, workshopStateDocument, workflowRunReferenceDocument, type WorkshopAction, type WorkshopState } from "../run/workshop-state.ts";
+import { parseServiceRequest, type ServiceRequest, type ServiceResponse } from "./types.ts";
+import { WORKFLOW_TASK_NAME, workflowDecisionDocument, type WorkflowTaskCheckpoint } from "../workflow/define-workflow-task.ts";
+import { listWorkflowStatus } from "../workflow/list-workflow-status.ts";
+import { loadWorkflows } from "../workflow/load-workflows.ts";
+import { parseWorkflowDecision } from "../workflow/parse-workflow-decision.ts";
+import type { WorkflowDecision } from "../workflow/types.ts";
+
+export type WorkshopService = {
+  handleRequest(value: unknown): Promise<ServiceResponse>;
+};
+
+type WorkflowTaskRecord = TaskRecord<JsonValue, JsonValue, unknown>;
+type RunInput = { runId: string; workflow: string; slot: string | null; startedAt: string };
+
+type WorkflowTaskState = WorkflowTaskCheckpoint;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isWorkflowTaskCheckpoint(value: unknown): value is WorkflowTaskCheckpoint {
+  if (!isRecord(value) || !["step", "attempt", "blocked", "decision"].includes(String(value.phase))) return false;
+  if (!Number.isSafeInteger(value.stepIndex) || typeof value.pipeInput !== "string" || !Array.isArray(value.results) || !Array.isArray(value.attemptHistory)) return false;
+  if (typeof value.localRetriesLeft !== "number" || typeof value.feedback !== "string" || typeof value.decisionNumber !== "number" || typeof value.automaticRoundUsed !== "boolean") return false;
+  if (value.profile !== undefined && typeof value.profile !== "string") return false;
+  if (value.waitUntil !== undefined && typeof value.waitUntil !== "number") return false;
+  if (value.phase === "attempt" && (!isRecord(value.activeAttempt) || (typeof value.activeAttempt.taskId !== "string" && typeof value.activeAttempt.taskId !== "number") || !isRecord(value.activeAttempt.request))) return false;
+  if (value.phase === "blocked" || value.phase === "decision") {
+    if (!isRecord(value.failure) || typeof value.failure.step !== "string" || typeof value.failure.lastError !== "string" || typeof value.failure.lastOutput !== "string" || !Array.isArray(value.failure.retryProfiles) || !Array.isArray(value.failure.attemptHistory)) return false;
+  }
+  if (value.phase === "decision" && (!isRecord(value.decision) || !["retry", "skip", "accept", "fail"].includes(String(value.decision.action)))) return false;
+  return true;
+}
+
+function runInputOf(record: WorkflowTaskRecord): RunInput | undefined {
+  if (!isRecord(record.input)) return undefined;
+  const { runId, workflowName, slot, startedAt } = record.input;
+  if (typeof runId !== "string" || typeof workflowName !== "string" || typeof startedAt !== "string") return undefined;
+  return { runId, workflow: workflowName, slot: typeof slot === "string" ? slot : null, startedAt };
+}
+
+function checkpointOf(record: WorkflowTaskRecord): WorkflowTaskState | undefined {
+  const state = record.state;
+  if (state.status !== "pending" && state.status !== "running" && state.status !== "waiting" && state.status !== "sleeping") return undefined;
+  return isWorkflowTaskCheckpoint(state.checkpoint) ? state.checkpoint : undefined;
+}
+
+function checkpointPhase(record: WorkflowTaskRecord): string | undefined {
+  return checkpointOf(record)?.phase;
+}
+
+function statusOf(record: WorkflowTaskRecord): string {
+  const phase = checkpointPhase(record);
+  const state = record.state;
+  if (state.status === "pending" || state.status === "running" || state.status === "waiting" || state.status === "sleeping") {
+    return phase === "blocked" || phase === "decision" ? "blocked" : state.status;
+  }
+  if (state.status === "completing" || state.status === "terminal") {
+    if (state.outcome.status === "completed") {
+      const result = state.outcome.result;
+      return isRecord(result) && result.status === "nothing-to-do" ? "nothing-to-do" : "completed";
+    }
+    if (state.outcome.status === "aborted") return "cancelled";
+    return state.outcome.status;
+  }
+  return "unavailable";
+}
+
+function outputTail(value: string, limit: number): string {
+  if (value.length <= limit) return value;
+  return `[truncated; showing last ${limit} characters]\n${value.slice(-limit)}`;
+}
+
+function readConfiguration(projectRoot: string) {
+  const configFile = process.env.WORKSHOP_CONFIG ?? resolve(projectRoot, "workshop.yaml");
+  const config = readConfig(configFile);
+  const issues = checkProfileCommands(config, process.env.PATH, configFile);
+  if (issues.length > 0) throw new Error(issues.map(({ file, reason }) => `${file}: ${reason}`).join("\n"));
+  return config;
+}
+
+async function scanLiveWorkflowTasks(harness: Harness): Promise<WorkflowTaskRecord[]> {
+  const inspection = await harness.inspect(BACKGROUND_CONTEXT);
+  return inspection.tasks
+    .map(({ record }) => record)
+    .filter((record) => record.kind === WORKFLOW_TASK_NAME);
+}
+
+async function taskForRun(harness: Harness, runId: string): Promise<WorkflowTaskRecord | undefined> {
+  const reference = await harness.snapshot(workflowRunReferenceDocument, runId, BACKGROUND_CONTEXT);
+  if (!reference || reference.run_id !== runId) return undefined;
+  const record = await harness.getTask(reference.task_id, BACKGROUND_CONTEXT);
+  if (!record || record.kind !== WORKFLOW_TASK_NAME || runInputOf(record)?.runId !== runId) return undefined;
+  return record;
+}
+
+function actionNote(decision: WorkflowDecision): string {
+  if (decision.action === "retry") return [decision.hint, decision.after === undefined ? undefined : `retry after ${decision.after}`].filter(Boolean).join("; ");
+  if (decision.action === "skip") return "Step skipped by chat decision.";
+  if (decision.action === "accept") return "Last output accepted by chat decision.";
+  return "Run failed by chat decision.";
+}
+
+function actionForDecision(workflow: string, runId: string, step: string, decision: WorkflowDecision, at: string): WorkshopAction {
+  return { at, workflow, run_id: runId, step, source: "chat", decision, note: actionNote(decision) };
+}
+
+function statusResult(record: WorkflowTaskRecord): { returnValue?: Record<string, unknown>; error?: string } {
+  const state = record.state;
+  if (state.status !== "completing" && state.status !== "terminal") return {};
+  if (state.outcome.status === "completed") return { returnValue: isRecord(state.outcome.result) ? state.outcome.result : undefined };
+  if (state.outcome.status === "failed") return { error: state.outcome.error.message };
+  if (state.outcome.status === "aborted") return { error: state.outcome.reason ?? "cancelled" };
+  return { error: state.outcome.reason };
+}
+
+function resultSteps(record: WorkflowTaskRecord): unknown[] | undefined {
+  const result = statusResult(record).returnValue;
+  if (Array.isArray(result?.steps)) return result.steps;
+  const checkpoint = checkpointOf(record);
+  if (checkpoint && Array.isArray(checkpoint.results)) return checkpoint.results;
+  return undefined;
+}
+
+function blockedStep(record: WorkflowTaskRecord): Record<string, unknown> | undefined {
+  const checkpoint = checkpointOf(record);
+  if (!checkpoint || (checkpoint.phase !== "blocked" && checkpoint.phase !== "decision")) return undefined;
+  const failure = checkpoint.failure;
+  return {
+    step: failure.step,
+    decision_number: failure.decisionNumber,
+    last_error: failure.lastError,
+    last_output: outputTail(failure.lastOutput, 4_000),
+    attempt_history: failure.attemptHistory.map((attempt) => ({
+      ...attempt,
+      output: outputTail(attempt.output, 2_000),
+      ...(attempt.error === undefined ? {} : { error: outputTail(attempt.error, 2_000) }),
+    })),
+  };
+}
+
+function runDetails(record: WorkflowTaskRecord) {
+  const input = runInputOf(record);
+  if (!input) throw new Error("Durable workflow task has invalid run metadata");
+  const outcome = statusResult(record);
+  const checkpoint = checkpointOf(record);
+  const current = checkpoint && isRecord(checkpoint) && typeof checkpoint.pipeInput === "string" ? checkpoint.pipeInput : undefined;
+  return {
+    run_id: input.runId,
+    workflow: input.workflow,
+    slot: input.slot,
+    started_at: input.startedAt,
+    status: statusOf(record),
+    ...(resultSteps(record) === undefined ? {} : { steps: resultSteps(record) }),
+    ...(outcome.returnValue && Object.hasOwn(outcome.returnValue, "output") ? { output: outcome.returnValue.output } : current === undefined ? {} : { output: current }),
+    ...(outcome.error === undefined ? {} : { error: outcome.error }),
+    ...(blockedStep(record) === undefined ? {} : { blocked_step: blockedStep(record) }),
+  };
+}
+
+function runSummary(record: WorkflowTaskRecord) {
+  const input = runInputOf(record);
+  if (!input) return undefined;
+  const blocked = blockedStep(record);
+  return {
+    run_id: input.runId,
+    workflow: input.workflow,
+    slot: input.slot,
+    started_at: input.startedAt,
+    status: statusOf(record),
+    ...(blocked === undefined ? {} : { blocked_step: blocked.step, last_error: blocked.last_error }),
+  };
+}
+
+function fingerprint(request: ServiceRequest): string {
+  const { request_id: _requestId, ...payload } = request;
+  const normalize = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(normalize);
+    if (!isRecord(value)) return value;
+    return Object.fromEntries(Object.keys(value).sort().map((key) => [key, normalize(value[key])]));
+  };
+  return JSON.stringify(normalize(payload));
+}
+
+function responseFromReceipt(value: JsonValue): ServiceResponse {
+  if (!isRecord(value) || typeof value.ok !== "boolean") throw new Error("Stored service receipt is invalid");
+  if (value.request_id !== undefined && typeof value.request_id !== "string") throw new Error("Stored service receipt has an invalid request ID");
+  return {
+    ...value,
+    ok: value.ok,
+    ...(typeof value.request_id === "string" ? { request_id: value.request_id } : {}),
+  };
+}
+
+function receiptFor(state: WorkshopState, request: ServiceRequest): ServiceResponse | undefined {
+  const receipt = state.receipts.find((entry) => entry.request_id === request.request_id);
+  if (!receipt) return undefined;
+  if (receipt.fingerprint !== fingerprint(request)) throw new Error("Request ID was already used for a different request");
+  return responseFromReceipt(receipt.response);
+}
+
+function saveReceipt(state: WorkshopState, request: ServiceRequest, response: ServiceResponse): void {
+  const serialized = JSON.stringify(response);
+  if (serialized === undefined) throw new Error("Service response could not be saved");
+  const responseValue = JSON.parse(serialized);
+  appendRecent(state.receipts, { request_id: request.request_id, fingerprint: fingerprint(request), response: responseValue });
+}
+
+function liveStatus(record: WorkflowTaskRecord): boolean {
+  return ["pending", "running", "waiting", "sleeping", "completing"].includes(record.state.status);
+}
+
+export function createWorkshopService(input: { projectRoot: string; harness: Harness }): WorkshopService {
+  const projectRoot = resolve(input.projectRoot);
+  const workflowDirectory = resolve(projectRoot, "workflows");
+
+  async function decideBlockedRun(request: Extract<ServiceRequest, { type: "decide_blocked_run" }>): Promise<ServiceResponse> {
+    const decision = parseWorkflowDecision(request.decision);
+    const previousState = await input.harness.snapshot(workshopStateDocument, BACKGROUND_CONTEXT);
+    const prior = previousState === undefined ? undefined : receiptFor(previousState, request);
+    if (prior) return prior;
+    const record = await taskForRun(input.harness, request.run_id);
+    if (!record || checkpointPhase(record) !== "blocked") throw new Error(`Workflow run ${request.run_id} is not waiting on a decision`);
+
+    return await input.harness.commit(async (tx) => {
+      const state = await tx.doc(workshopStateDocument);
+      const prior = receiptFor(state, request);
+      if (prior) return prior;
+      const current = await tx.task(record.id);
+      if (!current || current.kind !== WORKFLOW_TASK_NAME || checkpointPhase(current) !== "blocked") {
+        throw new Error(`Workflow run ${request.run_id} is no longer waiting on a decision`);
+      }
+      const currentCheckpoint = checkpointOf(current);
+      if (!currentCheckpoint || (currentCheckpoint.phase !== "blocked" && currentCheckpoint.phase !== "decision")) {
+        throw new Error(`Workflow run ${request.run_id} is no longer waiting on a decision`);
+      }
+      const failure = currentCheckpoint.failure;
+      if (failure.decisionNumber !== request.decision_number) {
+        throw new Error(`Blocked decision ${request.decision_number} is stale; current decision is ${failure.decisionNumber}`);
+      }
+      if (decision.action === "accept" && failure.lastOutput.trim().length === 0) {
+        throw new Error("Cannot accept a blocked step with empty output");
+      }
+      if (decision.action === "retry" && decision.profile !== undefined && !failure.retryProfiles.includes(decision.profile)) {
+        throw new Error(`Profile "${decision.profile}" cannot retry ${failure.stepKind} step ${failure.step}`);
+      }
+      const document = await tx.doc(workflowDecisionDocument, record.id);
+      if (document.choice !== null) throw new Error("A decision was already accepted for this blocked step");
+      document.choice = { requestId: request.request_id, decisionNumber: request.decision_number, decision };
+      const response: ServiceResponse = { request_id: request.request_id, ok: true, run_id: request.run_id, decision };
+      appendRecent(state.actions, actionForDecision(failure.workflow, request.run_id, failure.step, decision, new Date().toISOString()));
+      saveReceipt(state, request, response);
+      return response;
+    }, BACKGROUND_CONTEXT);
+  }
+
+  async function pauseWorkflow(request: Extract<ServiceRequest, { type: "pause_workflow" | "resume_workflow" }>): Promise<ServiceResponse> {
+    const paused = request.type === "pause_workflow";
+    return await input.harness.commit(async (tx) => {
+      const state = await tx.doc(workshopStateDocument);
+      if (paused && !state.paused.includes(request.workflow)) state.paused.push(request.workflow);
+      if (!paused) state.paused = state.paused.filter((workflow) => workflow !== request.workflow);
+      state.paused.sort();
+      const action = paused ? "pause" as const : "resume" as const;
+      appendRecent(state.actions, {
+        at: new Date().toISOString(),
+        workflow: request.workflow,
+        run_id: null,
+        step: null,
+        source: "chat",
+        decision: { action },
+        note: paused ? "Workflow paused from chat." : "Workflow resumed from chat.",
+      });
+      return { request_id: request.request_id, ok: true, workflow: request.workflow, paused, paused_workflows: state.paused };
+    }, BACKGROUND_CONTEXT);
+  }
+
+  async function handleRequest(value: unknown): Promise<ServiceResponse> {
+    const request = parseServiceRequest(value);
+    switch (request.type) {
+      case "list_workflows": {
+        const config = readConfiguration(projectRoot);
+        const loaded = loadWorkflows(workflowDirectory, new Set(Object.keys(config.agent_profiles)));
+        const state = await input.harness.snapshot(workshopStateDocument, BACKGROUND_CONTEXT);
+        return { request_id: request.request_id, ok: true, ...listWorkflowStatus(loaded, new Set(state?.paused ?? [])) };
+      }
+      case "list_runs": {
+        const limit = request.limit ?? 20;
+        if (limit === 0) return { request_id: request.request_id, ok: true, runs: [] };
+        const [tasks, state] = await Promise.all([
+          scanLiveWorkflowTasks(input.harness),
+          input.harness.snapshot(workshopStateDocument, BACKGROUND_CONTEXT),
+        ]);
+        const live = tasks.flatMap((task) => {
+          const run = runSummary(task);
+          return run !== undefined && (request.workflow === undefined || run.workflow === request.workflow) ? [run] : [];
+        });
+        const liveById = new Map(live.map((run) => [run.run_id, run]));
+        const admissions = (state?.admissions ?? []).filter((admission) => request.workflow === undefined || admission.workflow === request.workflow).slice(-limit);
+        const recent = await Promise.all(admissions.map(async (admission) => {
+          if (admission.outcome === "skipped") return {
+            run_id: null,
+            workflow: admission.workflow,
+            slot: admission.slot,
+            started_at: admission.at,
+            status: "skipped",
+            reason: admission.reason,
+          };
+          if (admission.run_id === null) return undefined;
+          const current = liveById.get(admission.run_id);
+          if (current) return current;
+          const task = await taskForRun(input.harness, admission.run_id);
+          const run = task === undefined ? undefined : runSummary(task);
+          return run ?? {
+            run_id: admission.run_id,
+            workflow: admission.workflow,
+            slot: admission.slot,
+            started_at: admission.at,
+            status: "unavailable",
+            reason: "Durable workflow task was not found",
+          };
+        }));
+        const rows = [...live, ...recent.filter((row): row is NonNullable<typeof row> => row !== undefined)];
+        const seen = new Set<string>();
+        const unique = rows.filter((row) => {
+          const key = row.run_id === null ? `${row.workflow}:${row.slot}:${row.status}` : row.run_id;
+          if (seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        });
+        unique.sort((left, right) => Number(right.status === "blocked") - Number(left.status === "blocked") || right.started_at.localeCompare(left.started_at));
+        return { request_id: request.request_id, ok: true, runs: unique.slice(0, limit) };
+      }
+      case "read_run": {
+        const record = await taskForRun(input.harness, request.run_id);
+        if (!record) throw new Error(`Workflow run ${request.run_id} was not found`);
+        return { request_id: request.request_id, ok: true, run: runDetails(record) };
+      }
+      case "start_workflow": {
+        const port = await createWorkflowStartPort(input.harness);
+        const result = await startWorkflow({
+          workflowName: request.workflow,
+          projectRoot,
+          port,
+          source: "chat",
+        });
+        if (result.kind === "skipped" || result.kind === "locked") return { request_id: request.request_id, ok: false, error: result.reason };
+        if (result.kind === "already-indexed") return { request_id: request.request_id, ok: false, error: `Workflow slot ${result.slot} was already indexed` };
+        return { request_id: request.request_id, ok: true, workflow: result.workflow, run_id: result.run_id };
+      }
+      case "decide_blocked_run":
+        return await decideBlockedRun(request);
+      case "cancel_run": {
+        const record = await taskForRun(input.harness, request.run_id);
+        if (!record) throw new Error(`Workflow run ${request.run_id} was not found`);
+        const run = runInputOf(record);
+        if (!run) throw new Error("Durable workflow task has invalid run metadata");
+        const status = statusOf(record);
+        if (!liveStatus(record)) return { request_id: request.request_id, ok: true, run_id: request.run_id, workflow: run.workflow, status, cancelled: false };
+        await input.harness.abortTask(record.id, BACKGROUND_CONTEXT);
+        await input.harness.commit(async (tx) => {
+          const state = await tx.doc(workshopStateDocument);
+          if (!state.actions.some((action) => action.run_id === request.run_id && action.source === "chat" && action.decision.action === "cancel")) {
+            appendRecent(state.actions, {
+              at: new Date().toISOString(),
+              workflow: run.workflow,
+              run_id: request.run_id,
+              step: null,
+              source: "chat",
+              decision: { action: "cancel" },
+              note: "Workflow run cancelled from chat.",
+            });
+          }
+        }, BACKGROUND_CONTEXT);
+        return { request_id: request.request_id, ok: true, run_id: request.run_id, workflow: run.workflow, status: "cancellation-requested", cancelled: true };
+      }
+      case "pause_workflow":
+      case "resume_workflow":
+        return await pauseWorkflow(request);
+      case "list_actions": {
+        const state = await input.harness.snapshot(workshopStateDocument, BACKGROUND_CONTEXT);
+        const all = [...(state?.actions ?? [])].reverse().filter((action) => request.workflow === undefined || action.workflow === request.workflow);
+        return { request_id: request.request_id, ok: true, actions: all.slice(0, request.limit ?? 20) };
+      }
+    }
+  }
+
+  return { handleRequest };
+}

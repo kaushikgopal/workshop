@@ -1,13 +1,11 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
-import { cancelWorkflowProcesses } from "../agent/lib/cancel-workflow-process.ts";
-import { executeWorkflowProcess } from "../agent/lib/execute-workflow-process.ts";
-import { createWorkflowSnapshot } from "../workflow/create-workflow-snapshot.ts";
-import { interpretWorkflow, parseMarkdownVerdict, type ProcessExecutionRequest, type ProcessExecutionResult, type WorkflowInterpreterInput } from "../workflow/interpret-workflow.ts";
+import { executeWorkflowProcess } from "../run/execute-workflow-process.ts";
+import { interpretWorkflow, parseMarkdownVerdict, type ProcessExecutionRequest, type ProcessExecutionResult, type WorkflowInterpreterInput, type WorkflowInterpreterResume } from "../workflow/interpret-workflow.ts";
 import type { Workflow, WorkflowDecision, WorkflowStep } from "../workflow/types.ts";
 
 const fixture = resolve("test/fixtures/profile-command.mjs");
@@ -28,11 +26,13 @@ function makeInput(
   executeProcess: WorkflowInterpreterInput["executeProcess"],
   waitForDecision: WorkflowInterpreterInput["waitForDecision"] = async () => ({ action: "fail" }),
   extra: Partial<WorkflowInterpreterInput> = {},
-): WorkflowInterpreterInput {
+ ): WorkflowInterpreterInput {
+  const files = workflow.steps.flatMap((step) => [step.file, ...(step.check ? [step.check.file] : [])]);
   return {
     workflow,
     documents: {},
-    files: Object.fromEntries(workflow.steps.flatMap((step) => [step.file, ...(step.check ? [step.check.file] : [])].map((file) => [file, join("/snapshot/clock", file)] as const))),
+    files: Object.fromEntries(files.map((file) => [file, join("/workflows/clock", file)] as const)),
+    contents: Object.fromEntries(files.map((file) => [file, `fixture source for ${file}\n`] as const)),
     workflowRunId: "wrun_test_1",
     profileCommands: { writer: ["fake-writer"], judge: ["fake-judge"], fast: ["fake-writer", "--fast"] },
     executeProcess,
@@ -161,6 +161,11 @@ test("command checks accept on exit zero and feed a rejection back into the retr
     }
     if (request.kind === "command-check") return successful("");
     return successful(`candidate ${request.attempt}`);
+  }, undefined, {
+    contents: {
+      "10-checkable.sh": "printf 'captured step'\n",
+      "10-checkable.check.sh": "printf 'captured check'\n",
+    },
   }));
 
   assert.equal(result.output, "candidate 2");
@@ -170,9 +175,14 @@ test("command checks accept on exit zero and feed a rejection back into the retr
     ["command", ""],
     ["command-check", "candidate 2"],
   ]);
+  assert.deepEqual(calls.map(({ source }) => source?.content), [
+    "printf 'captured step'\n",
+    "printf 'captured check'\n",
+    "printf 'captured step'\n",
+    "printf 'captured check'\n",
+  ]);
   assert.equal(calls[2]?.feedback, "wrong output\nexpected a line");
 });
-
 test("Markdown checks use only their first line", () => {
   assert.deepEqual(parseMarkdownVerdict("ACCEPT - original\nREJECT"), { accepted: true, reason: "original" });
   assert.deepEqual(parseMarkdownVerdict("explanation\nACCEPT"), {
@@ -290,54 +300,6 @@ test("retry, skip, accept, and fail decisions have distinct effects", async (t) 
   });
 });
 
-test("snapshot copies prompts and scripts so later workflow edits do not affect the active run", async () => {
-  await withRoot(async (root) => {
-    const workflowRoot = join(root, "workflows");
-    const workflowDirectory = join(workflowRoot, "clock");
-    const stateRoot = join(root, "state");
-    mkdirSync(workflowDirectory, { recursive: true });
-    writeFileSync(join(workflowDirectory, "workflow.md"), "---\ncron: '* * * * *'\n---\n\nTest snapshot.\n");
-    writeFileSync(join(workflowDirectory, "10-first.sh"), "first version\n");
-    writeFileSync(join(workflowDirectory, "20-second.sh"), "old second version\n");
-    writeFileSync(join(workflowDirectory, "30-write.md"), "---\nprofile: writer\n---\n\nOld prompt.\n");
-
-    const snapshot = createWorkflowSnapshot({
-      workflowName: "clock",
-      runId: "wrun_snapshot_1",
-      workflowRoot,
-      stateRoot,
-      dataDirectory: join(root, "data", "clock"),
-      profileCommands: { writer: ["fake-writer"] },
-    });
-    const seenScripts: string[] = [];
-    const seenPrompts: string[] = [];
-    await interpretWorkflow({
-      workflow: snapshot.workflow,
-      documents: snapshot.documents,
-      files: snapshot.files,
-      workflowRunId: "wrun_snapshot_1",
-      profileCommands: snapshot.profileCommands,
-      executeProcess: async (request) => {
-        if (request.kind === "agent") {
-          seenPrompts.push(request.input);
-          return successful("agent output");
-        }
-        const script = request.command[1];
-        if (!script) throw new Error("command fixture path is missing");
-        seenScripts.push(readFileSync(script, "utf8"));
-        if (request.step === "10-first") {
-          writeFileSync(join(workflowDirectory, "20-second.sh"), "new second version\n");
-          writeFileSync(join(workflowDirectory, "30-write.md"), "---\nprofile: writer\n---\n\nNew prompt.\n");
-        }
-        return successful(request.step);
-      },
-      waitForDecision: async () => ({ action: "fail" }),
-    });
-    assert.deepEqual(seenScripts, ["first version\n", "old second version\n"]);
-    assert.ok(seenPrompts[0]?.startsWith("Old prompt."));
-    assert.doesNotMatch(seenPrompts[0] ?? "", /New prompt/);
-  });
-});
 
 test("timeouts become workflow failures with the configured limit", async () => {
   const requests: ProcessExecutionRequest[] = [];
@@ -363,6 +325,7 @@ test("fake profile commands receive stdin and Workshop environment without a she
       timeoutMs: 2_000,
       workflow: "clock",
       runId: "wrun_process_1",
+      projectRoot: root,
       dataDirectory: "/data/clock",
       stateDirectory: root,
       cwd: process.cwd(),
@@ -379,6 +342,34 @@ test("fake profile commands receive stdin and Workshop environment without a she
     });
   });
 });
+
+test("command steps execute captured shell source with path and stdin semantics", async () => {
+  await withRoot(async (root) => {
+    const file = join(root, "10-step with spaces.sh");
+    writeFileSync(file, "printf 'live source'\n");
+    const content = `IFS= read -r line\nprintf 'captured:%s:%s' "$line" "$0"\n`;
+    const result = await executeWorkflowProcess({
+      kind: "command",
+      command: ["sh", file],
+      source: { path: file, content, kind: "shell" },
+      input: "pipe content\n",
+      step: "10-step",
+      feedback: "",
+      attempt: 1,
+      workflow: "clock",
+      runId: "wrun_captured_shell",
+      projectRoot: root,
+      dataDirectory: root,
+      stateDirectory: root,
+      cwd: root,
+    });
+
+    assert.equal(result.exitCode, 0);
+    assert.equal(result.stdout, `captured:pipe content:${file}`);
+  });
+});
+
+
 
 async function waitForProcessId(file: string): Promise<number> {
   const deadline = Date.now() + 5_000;
@@ -405,7 +396,7 @@ async function assertProcessStopped(pid: number): Promise<void> {
   assert.fail(`grandchild ${pid} is still running`);
 }
 
-function grandchildProcessInput(root: string, pidFile: string, timeoutMs?: number) {
+function grandchildProcessInput(root: string, pidFile: string, timeoutMs?: number, signal?: AbortSignal) {
   return executeWorkflowProcess({
     kind: "agent",
     command: [process.execPath, fixture, "spawn-grandchild", pidFile],
@@ -416,9 +407,11 @@ function grandchildProcessInput(root: string, pidFile: string, timeoutMs?: numbe
     ...(timeoutMs === undefined ? {} : { timeoutMs }),
     workflow: "clock",
     runId: "wrun_grandchild_1",
+    projectRoot: root,
     dataDirectory: root,
     stateDirectory: root,
     cwd: root,
+    ...(signal === undefined ? {} : { signal }),
   });
 }
 
@@ -433,18 +426,62 @@ test("step timeout kills the process tree", { skip: process.platform === "win32"
   });
 });
 
-test("run cancellation kills the active process tree", { skip: process.platform === "win32" }, async () => {
+test("aborting the step task signal kills the active process tree", { skip: process.platform === "win32" }, async () => {
   await withRoot(async (root) => {
     const pidFile = join(root, "grandchild.pid");
-    const processRecord = join(root, "processes", "wrun_grandchild_1.json");
-    const pending = grandchildProcessInput(root, pidFile);
+    const controller = new AbortController();
+    const pending = grandchildProcessInput(root, pidFile, undefined, controller.signal);
     const pid = await waitForProcessId(pidFile);
-    assert.equal(existsSync(processRecord), true);
-    await cancelWorkflowProcesses("wrun_grandchild_1", root);
+    controller.abort();
     const result = await pending;
     assert.equal(result.timedOut, false);
     assert.equal(result.signal, "SIGTERM");
     await assertProcessStopped(pid);
-    assert.equal(existsSync(processRecord), false);
   });
+});
+
+test("automatic retry delay returns a durable resume checkpoint before rerunning the step", async () => {
+  let attempts = 0;
+  let retryResume: WorkflowInterpreterResume | undefined;
+  const workflow = makeWorkflow([{ kind: "command", file: "10-run.sh", number: 10, name: "run", retries: 0 }]);
+  const input = makeInput(workflow, async (request) => {
+    if (request.kind === "orchestrator") {
+      return successful(JSON.stringify({ action: "retry", after: "30s", note: "Wait before the next attempt." }));
+    }
+    attempts += 1;
+    return failed("partial", "first attempt failed");
+  }, undefined, {
+    orchestrator: {
+      profile: "writer",
+      escalationProfile: "writer",
+      recordDecision: async () => {},
+    },
+  });
+  input.waitBeforeRetry = async (duration, resume) => {
+    assert.equal(duration, "30s");
+    retryResume = resume;
+    return true;
+  };
+
+  const waiting = await interpretWorkflow(input);
+  assert.equal(waiting.status, "waiting");
+  assert.equal(attempts, 1);
+  assert.ok(retryResume);
+  assert.equal(retryResume.automaticRound, 2);
+  assert.equal(retryResume.localRetriesLeft, 0);
+  assert.equal(retryResume.attemptHistory.length, 1);
+  assert.match(retryResume.feedback, /first attempt failed/);
+
+  const resumed = await interpretWorkflow({
+    ...input,
+    resume: retryResume,
+    waitBeforeRetry: undefined,
+    executeProcess: async (request) => {
+      assert.equal(request.kind, "command");
+      assert.equal(request.attempt, 2);
+      return successful("completed after wait");
+    },
+  });
+  assert.equal(resumed.status, "completed");
+  assert.equal(resumed.output, "completed after wait");
 });

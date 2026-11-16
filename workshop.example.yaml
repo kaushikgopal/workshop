@@ -3,15 +3,13 @@ agent_profiles:
     command: [pi, -p, --no-session, --model, "<provider>/<model>"]
   claude:
     command: [claude, -p, --model, "<model>"]
-  claude-orchestrator:
-    command: [claude, -p, --tools, "", --model, "<model>"]
   codex:
     command: [codex, exec, "-"]
-  writer:
-    command: [pi, -p, --no-session, --model, "<provider>/<model>"]
   orchestrator:
     command: [pi, -p, --no-session, --no-tools, --no-extensions, --no-skills, --model, "<provider>/<model>"]
     context_window: 32000
+  writer:
+    command: [pi, -p, --no-session, --model, "<provider>/<model>"]
 orchestrator:
   profile: orchestrator
-  escalation_profile: claude-orchestrator
+  escalation_profile: writer

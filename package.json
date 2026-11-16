@@ -7,17 +7,16 @@
     "node": ">=24"
   },
   "scripts": {
-    "build": "eve build",
-    "dev": "eve dev",
-    "start": "eve start",
+    "dev": "node --watch service/start-service.ts",
+    "start": "node service/start-service.ts",
     "typecheck": "tsc --noEmit",
     "test": "node --test test"
   },
   "dependencies": {
-    "@ai-sdk/provider": "4.0.38",
-    "ai": "7.0.172",
+    "@earendil-works/chord": "1.5.2",
+    "@earendil-works/pi-ai": "1.5.2",
+    "@earendil-works/pi-durable": "1.5.2",
     "cron-parser": "5.4.0",
-    "eve": "1.0.0-rc.18",
     "yaml": "2.8.3",
     "zod": "4.6.7"
   },
