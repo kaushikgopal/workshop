@@ -180,6 +180,7 @@ scripts/                                  checks and user-facing commands
   uninstall-launch-agent.ts                macOS LaunchAgent remover
 test/                                     unit and integration tests
   chat-workshop.test.ts                    interactive and single-reply chat
+  check-architecture-boundaries.test.ts    dependency direction
   check-workflows.test.ts                  workflow validation
   crash-resume.test.ts                     SQLite task recovery
   interpret-workflow.test.ts               command, agent, and check behavior
