@@ -19,7 +19,7 @@ import { serveServiceSocket } from "../service/serve-service-socket.ts";
 import { parseServiceRequest } from "../service/types.ts";
 import { tickWorkflows } from "../schedule/tick-workflows.ts";
 import { executeWorkflowProcess } from "../run/execute-workflow-process.ts";
-import { createStepAttemptTask, STEP_ATTEMPT_TASK_NAME } from "../workflow/define-step-attempt-task.ts";
+import { createStepAttemptTask, STEP_ATTEMPT_TASK_NAME, type StepAttemptTaskInput } from "../workflow/define-step-attempt-task.ts";
 import * as workflowStepLoader from "../workflow/load-workflow-step.ts";
 import { WorkflowTask, WORKFLOW_TASK_NAME, workflowDecisionDocument, type WorkflowTaskCheckpoint, type WorkflowTaskInput } from "../workflow/define-workflow-task.ts";
 
@@ -42,11 +42,13 @@ function createProject(command: string, extraFrontmatter = ""): { root: string }
 
 function createHarness(
   storage: Storage,
-  options: { now?: () => number; onWake?: (wake: Wake) => void } = {},
+  options: { now?: () => number; onWake?: (wake: Wake) => void; includeStepAttemptTask?: boolean } = {},
 ) {
+  const { includeStepAttemptTask = true, ...harnessOptions } = options;
   const registry = createRegistry();
-  registry.install({ name: "workshop", tasks: [WorkflowTask, createStepAttemptTask(executeWorkflowProcess)] });
-  return Harness.open(storage, { models: createModels(), registry, ...options }, BACKGROUND_CONTEXT);
+  const tasks = includeStepAttemptTask ? [WorkflowTask, createStepAttemptTask(executeWorkflowProcess)] : [WorkflowTask];
+  registry.install({ name: "workshop", tasks });
+  return Harness.open(storage, { models: createModels(), registry, ...harnessOptions }, BACKGROUND_CONTEXT);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -86,6 +88,19 @@ async function waitForTask(storage: Storage, runId: string): Promise<TaskRecord<
   throw new Error(`Workflow task for ${runId} was not created`);
 }
 
+async function waitForChildAttempt(
+  storage: Storage,
+  parentId: TaskRecord<JsonValue, JsonValue, JsonValue>["id"],
+): Promise<TaskRecord<JsonValue, JsonValue, JsonValue>> {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    const page = await storage.scanTasks({ kind: STEP_ATTEMPT_TASK_NAME }, 100, undefined, BACKGROUND_CONTEXT);
+    const found = page.items.find((record) => String(record.owner) === String(parentId));
+    if (found) return found;
+    await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+  }
+  throw new Error(`Step-attempt child for ${parentId} was not created`);
+}
+
 async function waitForFile(file: string, timeoutMs = 5_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -106,6 +121,26 @@ async function waitForRunStatus(service: ReturnType<typeof createWorkshopService
   const page = await storage.scanTasks({ kind: WORKFLOW_TASK_NAME }, 100, undefined, BACKGROUND_CONTEXT);
   const task = page.items.find((record) => isRecord(record.input) && record.input.runId === runId);
   throw new Error(`Workflow run ${runId} did not reach ${expected}: ${JSON.stringify(lastRun)} task=${JSON.stringify(task?.state)}`);
+}
+
+async function waitForFailureEvidence(
+  storage: Storage,
+  harness: Awaited<ReturnType<typeof createHarness>>,
+  runId: string,
+  attempt = 1,
+): Promise<string> {
+  const root = await harness.root(BACKGROUND_CONTEXT);
+  const requestId = `round:${runId}:10-task:${attempt}`;
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    const page = await storage.scanSubmissions({ conversationId: root.id }, 100, undefined, BACKGROUND_CONTEXT);
+    if (page.items.some((submission) => submission.requestId === requestId)) {
+      const context = await root.context(BACKGROUND_CONTEXT);
+      const transcript = transcriptText(context.messages);
+      if (transcript.includes("## Attempt history")) return transcript;
+    }
+    await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+  }
+  throw new Error(`Failure evidence for ${requestId} was not submitted`);
 }
 
 function runIdFrom(response: Record<string, unknown>): string {
@@ -2234,6 +2269,207 @@ test("a chat retry after the failure round does not submit another automatic rou
     const settled = await harness.waitForTask(task.id, BACKGROUND_CONTEXT);
     assert.equal(settled.state.status, "terminal");
     assert.equal(faux.state.callCount, 1);
+  } finally {
+    if (harness) await harness.close(BACKGROUND_CONTEXT);
+    rmSync(project.root, { recursive: true, force: true });
+  }
+});
+
+test("a saved faulted step-attempt child is consumed after SQLite reopen", { timeout: 60_000 }, async () => {
+  const project = createProject("printf 'unused'\n", "retries: 0\n");
+  const stateDirectory = join(project.root, "state");
+  mkdirSync(stateDirectory, { recursive: true });
+  const databasePath = join(stateDirectory, "workshop.sqlite");
+  const reason = "faulted child detail";
+  let storage: Storage | undefined;
+  let harness: Awaited<ReturnType<typeof createHarness>> | undefined;
+  try {
+    const seedStorage = await openNodeSqliteStorage(databasePath);
+    storage = seedStorage;
+    const seedHarness = await createHarness(seedStorage);
+    harness = seedHarness;
+    const service = createWorkshopService({ projectRoot: project.root, harness: seedHarness });
+    const runId = runIdFrom(await service.handleRequest({
+      request_id: "start-faulted-child", type: "start_workflow", workflow: "clock",
+    }));
+    const parentPage = await seedStorage.scanTasks({ kind: WORKFLOW_TASK_NAME }, 100, undefined, BACKGROUND_CONTEXT);
+    const parent = parentPage.items.find((record) => isRecord(record.input) && record.input.runId === runId);
+    assert.ok(parent, "SQLite contains the workflow parent");
+    if (!parent) throw new Error("Workflow parent was not saved");
+    const workflow: WorkflowTaskInput["workflow"] = {
+      name: "clock", directory: "clock", cron: "* * * * *", description: "A service test workflow.", retries: 0,
+      steps: [{ kind: "command", file: "10-task.sh", number: 10, name: "task" }],
+    };
+    const step = workflow.steps[0];
+    if (!step) throw new Error("Test workflow has no step");
+    const request = { step, pipeInput: "", feedback: "", attempt: 1 };
+    const childInput: StepAttemptTaskInput = {
+      projectRoot: project.root, workflow, step, documents: {}, files: {},
+      profileCommands: { writer: [process.execPath] }, runId,
+      dataDirectory: join(project.root, "data", "clock"), stateDirectory, request,
+    };
+    const childId = await seedHarness.commit(
+      (tx) => tx.createTask(createStepAttemptTask(executeWorkflowProcess), childInput, {
+        ownership: { kind: "task", taskId: parent.id },
+      }),
+      BACKGROUND_CONTEXT,
+    );
+    const [parentRecord, childRecord] = await Promise.all([
+      seedStorage.task(parent.id, BACKGROUND_CONTEXT), seedStorage.task(childId, BACKGROUND_CONTEXT),
+    ]);
+    assert.ok(parentRecord);
+    assert.ok(childRecord);
+    if (!parentRecord || !childRecord) throw new Error("Seed parent or child task is missing");
+    const checkpoint: WorkflowTaskCheckpoint = {
+      phase: "attempt", stepIndex: 0, pipeInput: "", results: [], attemptHistory: [],
+      localRetriesLeft: 0, feedback: "", decisionNumber: 0, automaticRoundUsed: false,
+      activeAttempt: { taskId: childId, request },
+    };
+    const { memos: _memos, ...childWithoutMemos } = childRecord;
+    const seeded = await seedStorage.commit(
+      [[
+        { type: "task", value: { ...parentRecord, startedAt: 1_000, state: { status: "running", checkpoint } } },
+        { type: "task", value: {
+          ...childWithoutMemos, startedAt: 1_000, endedAt: 2_000,
+          state: { status: "terminal", outcome: { status: "faulted", error: { message: reason } } },
+        } },
+      ]],
+      () => {},
+      BACKGROUND_CONTEXT,
+    );
+    assert.equal(seeded.stored, 1);
+    assert.equal(seeded.refused, undefined);
+    await seedHarness.close(BACKGROUND_CONTEXT);
+    harness = undefined;
+    storage = undefined;
+
+    const reopenedStorage = await openNodeSqliteStorage(databasePath);
+    storage = reopenedStorage;
+    const resumedHarness = await createHarness(reopenedStorage);
+    harness = resumedHarness;
+    resumedHarness.resume();
+    const resumedService = createWorkshopService({ projectRoot: project.root, harness: resumedHarness });
+    const blocked = await waitForRunStatus(resumedService, reopenedStorage, runId, "blocked");
+    assert.ok(isRecord(blocked.blocked_step));
+    if (!isRecord(blocked.blocked_step)) throw new Error("Faulted child did not block its parent");
+    assert.equal(blocked.blocked_step.last_error, reason);
+    assert.ok(Array.isArray(blocked.blocked_step.attempt_history));
+    if (!Array.isArray(blocked.blocked_step.attempt_history)) throw new Error("Blocked step has no attempt history");
+    assert.ok(isRecord(blocked.blocked_step.attempt_history[0]));
+    if (!isRecord(blocked.blocked_step.attempt_history[0])) throw new Error("Blocked step has no first attempt record");
+    assert.equal(blocked.blocked_step.attempt_history[0].error, reason);
+    assert.ok((await waitForFailureEvidence(reopenedStorage, resumedHarness, runId)).includes(reason));
+    const savedChild = await reopenedStorage.task(childId, BACKGROUND_CONTEXT);
+    assert.ok(savedChild);
+    if (!savedChild) throw new Error("Recovered child disappeared");
+    assert.equal(savedChild.state.status, "terminal");
+    if (savedChild.state.status !== "terminal") throw new Error("Recovered child is not terminal");
+    assert.equal(savedChild.state.outcome.status, "faulted");
+  } finally {
+    if (harness) await harness.close(BACKGROUND_CONTEXT);
+    else if (storage) await storage.close(BACKGROUND_CONTEXT);
+    rmSync(project.root, { recursive: true, force: true });
+  }
+});
+
+test("an orphaned step-attempt child preserves its reason after SQLite reopen", { timeout: 60_000 }, async () => {
+  const project = createProject("printf 'unused'\n", "retries: 0\n");
+  const stateDirectory = join(project.root, "state");
+  mkdirSync(stateDirectory, { recursive: true });
+  const databasePath = join(stateDirectory, "workshop.sqlite");
+  let storage: Storage | undefined;
+  let firstHarness: Awaited<ReturnType<typeof createHarness>> | undefined;
+  let harness: Awaited<ReturnType<typeof createHarness>> | undefined;
+  try {
+    storage = await openNodeSqliteStorage(databasePath);
+    firstHarness = await createHarness(storage, { includeStepAttemptTask: false });
+    firstHarness.resume();
+    const firstService = createWorkshopService({ projectRoot: project.root, harness: firstHarness });
+    const runId = runIdFrom(await firstService.handleRequest({
+      request_id: "start-orphaned-child", type: "start_workflow", workflow: "clock",
+    }));
+    const parent = await waitForTask(storage, runId);
+    const child = await waitForChildAttempt(storage, parent.id);
+    await firstHarness.close(BACKGROUND_CONTEXT);
+    firstHarness = undefined;
+    storage = undefined;
+
+    storage = await openNodeSqliteStorage(databasePath);
+    harness = await createHarness(storage, { includeStepAttemptTask: false });
+    assert.equal(await harness.abortTask(child.id, BACKGROUND_CONTEXT), "marked");
+    const orphaned = await storage.task(child.id, BACKGROUND_CONTEXT);
+    assert.ok(orphaned);
+    if (!orphaned) throw new Error("Orphaned child task was not saved");
+    assert.equal(orphaned.state.status, "terminal");
+    if (orphaned.state.status !== "terminal") throw new Error("Step-attempt child did not settle");
+    assert.equal(orphaned.state.outcome.status, "orphaned");
+    if (orphaned.state.outcome.status !== "orphaned") throw new Error("Step-attempt child was not orphaned");
+    const reason = orphaned.state.outcome.reason;
+    assert.ok(reason.length > 0);
+
+    harness.resume();
+    const service = createWorkshopService({ projectRoot: project.root, harness });
+    const blocked = await waitForRunStatus(service, storage, runId, "blocked");
+    assert.ok(isRecord(blocked.blocked_step));
+    if (!isRecord(blocked.blocked_step)) throw new Error("Orphaned child did not block its parent");
+    assert.equal(blocked.blocked_step.last_error, reason);
+    assert.ok(Array.isArray(blocked.blocked_step.attempt_history));
+    if (!Array.isArray(blocked.blocked_step.attempt_history)) throw new Error("Blocked step has no attempt history");
+    assert.ok(isRecord(blocked.blocked_step.attempt_history[0]));
+    if (!isRecord(blocked.blocked_step.attempt_history[0])) throw new Error("Blocked step has no first attempt record");
+    assert.equal(blocked.blocked_step.attempt_history[0].error, reason);
+    assert.ok((await waitForFailureEvidence(storage, harness, runId)).includes(reason));
+  } finally {
+    if (firstHarness) await firstHarness.close(BACKGROUND_CONTEXT);
+    if (harness) await harness.close(BACKGROUND_CONTEXT);
+    else if (storage) await storage.close(BACKGROUND_CONTEXT);
+    rmSync(project.root, { recursive: true, force: true });
+  }
+});
+
+test("aborting an owned step-attempt child blocks the run with its reason", { timeout: 60_000 }, async () => {
+  const project = createProject([
+    `${JSON.stringify(process.execPath)} -e ${JSON.stringify([
+      `require("node:fs").writeFileSync(process.env.WORKSHOP_PROJECT_ROOT + "/child-started", "started");`,
+      `require("node:net").createServer().listen(0, "127.0.0.1");`,
+    ].join(" "))}`,
+    "",
+  ].join("\n"), "retries: 0\n");
+  const storage = new MemoryStorage();
+  let harness: Awaited<ReturnType<typeof createHarness>> | undefined;
+  try {
+    harness = await createHarness(storage);
+    harness.resume();
+    const service = createWorkshopService({ projectRoot: project.root, harness });
+    const runId = runIdFrom(await service.handleRequest({
+      request_id: "start-aborted-owned-child", type: "start_workflow", workflow: "clock",
+    }));
+    const parent = await waitForTask(storage, runId);
+    const child = await waitForChildAttempt(storage, parent.id);
+    await waitForFile(join(project.root, "child-started"));
+    assert.equal(await harness.abortTask(child.id, BACKGROUND_CONTEXT), "marked");
+    await harness.waitForTask(child.id, BACKGROUND_CONTEXT);
+    const abortedChild = await storage.task(child.id, BACKGROUND_CONTEXT);
+    assert.ok(abortedChild);
+    if (!abortedChild) throw new Error("Aborted child task was not saved");
+    assert.equal(abortedChild.state.status, "terminal");
+    if (abortedChild.state.status !== "terminal") throw new Error("Aborted child task did not settle");
+    assert.equal(abortedChild.state.outcome.status, "aborted");
+    if (abortedChild.state.outcome.status !== "aborted") throw new Error("Step-attempt child was not aborted");
+    const reason = abortedChild.state.outcome.reason ?? "Step attempt was aborted";
+    assert.equal(reason, "cancelled");
+
+    const blocked = await waitForRunStatus(service, storage, runId, "blocked");
+    assert.ok(isRecord(blocked.blocked_step));
+    if (!isRecord(blocked.blocked_step)) throw new Error("Aborted child did not block its parent");
+    assert.equal(blocked.status, "blocked", "aborting the child does not cancel its parent run");
+    assert.equal(blocked.blocked_step.last_error, reason);
+    assert.ok(Array.isArray(blocked.blocked_step.attempt_history));
+    if (!Array.isArray(blocked.blocked_step.attempt_history)) throw new Error("Blocked step has no attempt history");
+    assert.ok(isRecord(blocked.blocked_step.attempt_history[0]));
+    if (!isRecord(blocked.blocked_step.attempt_history[0])) throw new Error("Blocked step has no first attempt record");
+    assert.equal(blocked.blocked_step.attempt_history[0].error, reason);
+    assert.ok((await waitForFailureEvidence(storage, harness, runId)).includes(reason));
   } finally {
     if (harness) await harness.close(BACKGROUND_CONTEXT);
     rmSync(project.root, { recursive: true, force: true });
