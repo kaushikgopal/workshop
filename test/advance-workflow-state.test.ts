@@ -180,6 +180,32 @@ test("attempt failures consume local retry budget before blocking", () => {
   });
 });
 
+test("command attempt history omits a resumed profile", () => {
+  const context = makeContext(makeWorkflow(1, 0));
+  const step = context.workflow.steps[0];
+  assert.ok(step);
+  const decoded = decodeWorkflowTaskCheckpoint({
+    ...stepCheckpoint(0),
+    phase: "attempt",
+    profile: "writer",
+    activeAttempt: {
+      taskId: 7,
+      request: { step, profile: "writer", pipeInput: "", feedback: "", attempt: 1 },
+    },
+  }, context);
+  assert.equal(decoded.phase, "attempt");
+  if (decoded.phase !== "attempt") throw new Error("Expected an active attempt");
+
+  const blocked = accepted(advanceWorkflowState(decoded, {
+    kind: "attempt-settled", attempt: 1, result: { kind: "failed", output: "partial", reason: "exit 7" },
+  }, context));
+  assert.equal(blocked.state.phase, "blocked");
+  if (blocked.state.phase !== "blocked") throw new Error("Expected a blocked workflow");
+  const expectedHistory = [{ attempt: 1, output: "partial", error: "exit 7" }];
+  assert.deepEqual(blocked.state.attemptHistory, expectedHistory);
+  assert.deepEqual(blocked.state.failure.attemptHistory, expectedHistory);
+});
+
 test("retry counts resolve step, check, then workflow with explicit zero", () => {
   const cases = [
     { name: "step overrides check and workflow", workflowRetries: 0, stepRetries: 2, checkRetries: 1, expected: 2 },
