@@ -284,6 +284,20 @@ test("validates agent-step retries and timeouts and preserves them in the result
   });
 });
 
+test("a Markdown check does not inherit its agent step profile", () => {
+  withRoot((root) => {
+    const directory = createWorkflow(root, "checks", 'cron: "*/5 * * * *"');
+    writeStep(directory, "10-agent.md", agentMarkdown("judge", "Do the work."));
+    writeStep(directory, "10-agent.check.md", "---\n---\nJudge the result.\n");
+    const result = loadWorkflows(root, profiles);
+
+    assert.equal(result.workflows.length, 0);
+    assert.deepEqual(errorReasons(result, "checks/10-agent.check.md"), [
+      "agent profile must be set here or in workflow.md",
+    ]);
+  });
+});
+
 test("resolves Markdown checks through explicit or workflow-default profiles", () => {
   withRoot((root) => {
     const directory = createWorkflow(root, "checks", 'cron: "*/5 * * * *"\nprofile: writer');
