@@ -40,8 +40,8 @@ brings me in only when something truly needs me.
   is paused are skipped for good; resuming never replays them. After downtime,
   only the latest missed slot runs.
 - **Optional checks per step.** A step can name a command or a judge agent
-  to check its output. Rejected checks and expected step or check load errors
-  use local retries before the orchestrator steps in.
+  to check its output. A rejected result retries the step with the reason as
+  feedback. The orchestrator steps in only when retries run out.
 - **Shared working folder.** Steps pass data through files, not through a
   data contract between steps.
 - **Cancellation stops active processes.** Cancelling a run stops its active
