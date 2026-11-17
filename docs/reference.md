@@ -23,6 +23,8 @@ Every profile's first command argument must resolve to an executable on `PATH`. 
 
 Workshop reads `WORKSHOP_CONFIG` when set. Otherwise it reads `workshop.yaml` from the current directory. Make targets expect the project root. `make setup` copies `workshop.example.yaml` and `.env.example` only when the destination files do not exist. Upstream ignores `workshop.yaml` and `.env.local`.
 
+`WORKSHOP_NOTHING_TO_DO` is a built-in agent-step output convention, not a `workshop.yaml` key or Markdown frontmatter field.
+
 Workshop reads `.env.local` from the config file's directory. Existing process environment variables take precedence. Workshop parses and stages values from `.env.local`, expands `${NAME}` in YAML string values, and applies staged values to `process.env` only after YAML parsing, interpolation, and config-schema validation succeed. A failure in those checks leaves staged values unapplied. An unset variable is an error. Expansion does not apply to YAML keys, workflow files, or command output. Keep secrets in `.env.local`, not in tracked config.
 
 ## Orchestrator conversation
@@ -110,13 +112,15 @@ Every child process inherits the service environment and receives these variable
 
 Command processes receive workflow input through stdin. Agent processes receive the step prompt, then optional `## Input` and `## Feedback` sections. A check receives the worker's output as its input; its result does not replace the worker's output.
 
-A command step that exits with code `99` ends the run successfully with status `nothing-to-do`; its check does not run. Exit `99` from an agent or check has no special meaning. Each command or profile process starts in its own process group. A step timeout or run cancellation sends `SIGTERM`, then `SIGKILL` after 250 ms if the process group remains. This also stops descendants while the service is alive. Only a deadline expiration sets `timedOut`; an abort never becomes a timeout. If timeout and cancellation overlap, the first stop cause wins and later signals do not relabel the process.
+A command step that exits with code `99` ends the run successfully with status `nothing-to-do`; its check does not run. An agent worker step also ends the run this way only after a clean process success: exit code `0`, no timeout, launch or I/O error, signal, or cancellation. Its stdout's last nonblank line must match `WORKSHOP_NOTHING_TO_DO`: Workshop splits on LF or CRLF, drops trailing whitespace-only lines, trims the last remaining line, and compares it case-sensitively. It ignores stderr, earlier lines, quoted or fenced tokens, and text after the token. It does not strip ANSI codes or parse Markdown or JSON. Workshop keeps the original stdout, including the token. Later steps do not run. Exit `99` from an agent or check has no special meaning. Each command or profile process starts in its own process group. A step timeout or run cancellation sends `SIGTERM`, then `SIGKILL` after 250 ms if the process group remains. This also stops descendants while the service is alive. Only a deadline expiration sets `timedOut`; an abort never becomes a timeout. If timeout and cancellation overlap, the first stop cause wins and later signals do not relabel the process.
 
 Pi-durable resumes unfinished tasks from their last checkpoint. It cannot reattach to an operating-system process after a hard service crash. An unfinished command may start again, and the original child process may still be running. If a step-attempt task completed before its parent checkpoint, the parent reuses that durable result after restart. Make external side effects safe to repeat for unfinished commands. Workshop does not provide exactly-once effects. A normal service shutdown aborts active task signals so Workshop can stop their process groups. An invalid saved checkpoint fails with a `Workflow checkpoint integrity error` that names the bad field; Workshop does not interpret it as successful completion.
 
 ## Checks, retries, and blocked runs
 
 Command checks receive the step's output on stdin. Exit code `0` accepts it. Any other exit, timeout, or launch error rejects the attempt. Stdout and stderr help explain a nonzero result. A Markdown check runs as an agent. Its first output line must start with `ACCEPT` or `REJECT`, case-insensitively, followed by an optional separator and reason. `ACCEPTED` is not a valid verdict. Other output is not the verdict.
+
+An agent worker step that matches `WORKSHOP_NOTHING_TO_DO` ends the workflow successfully instead of entering check or retry handling; its check, later steps, local retries, and failure round do not run. The token is not a Markdown verdict: a judge still has to start with `ACCEPT` or `REJECT`, and a command check still follows its exit-code rules.
 
 A check rejection retries the whole step, then checks the new output. `retries` means extra attempts: `retries: 2` permits up to three total attempts. The retry count resolves as `step.retries`, then `check.retries`, then `workflow.retries`, then zero. A check's `retries` is a fallback count for the step, not a separate check-only loop. A failure, timeout, rejected result, or expected step/check load error consumes one attempt. Missing or unreadable files, incomplete Markdown frontmatter, and empty Markdown bodies follow the normal retry and blocking rules. Unexpected loader or programming errors still fault the task.
 
@@ -196,6 +200,8 @@ input and checkpoint.
 A `workshop.step-attempt` task can store an expected step or check load error
 as its input. Builds before that change cannot read this input. Upgrading
 keeps open runs resumable, but finish open runs before you downgrade.
+
+An older build rejects an agent `nothing-to-do` result saved mid-run; finish open runs before downgrading.
 
 The `workshop.state` document is version 2 and migrates version 1. The
 `workshop.workflow-decision` and `workshop.run-reference` documents are version

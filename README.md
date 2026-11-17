@@ -104,6 +104,12 @@ workflows/hemingway-clock/
 
 `workflow.md` holds schedule settings and defaults. A numbered `.md` file is an agent step; `.sh` and `.ts` files are command steps. A matching `.check.md`, `.check.sh`, or `.check.ts` checks a step's output.
 
+### Ending a run early
+
+A command step that exits with code `99` ends the run early. An agent step can do the same when its stdout ends with `WORKSHOP_NOTHING_TO_DO` as the last nonblank line. See [the reference](docs/reference.md) for matching and check rules.
+
+If there is nothing to do, finish your response with WORKSHOP_NOTHING_TO_DO alone on its own line, without quotes or a code fence. Emit nothing after it.
+
 Workshop stores runs and orchestrator state in `state/workshop.sqlite`. It
 reads each step and check file when that step starts. Workshop rereads the main
 step file when it builds a failure brief. Edits made after a failed attempt can
