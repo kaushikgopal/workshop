@@ -8,7 +8,7 @@ import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
-import { createRegistry, defineDoc, Harness, MemoryStorage, type Storage, type TaskRecord } from "@earendil-works/pi-durable";
+import { createRegistry, defineDoc, Harness, MemoryStorage, type Storage, type TaskRecord, type Wake } from "@earendil-works/pi-durable";
 import type { JsonValue } from "@earendil-works/chord/json";
 import { test } from "node:test";
 import { createWorkflowStartPort, startWorkflow } from "../run/start-workflow.ts";
@@ -40,10 +40,13 @@ function createProject(command: string, extraFrontmatter = ""): { root: string }
   return { root };
 }
 
-function createHarness(storage: Storage) {
+function createHarness(
+  storage: Storage,
+  options: { now?: () => number; onWake?: (wake: Wake) => void } = {},
+) {
   const registry = createRegistry();
   registry.install({ name: "workshop", tasks: [WorkflowTask, createStepAttemptTask(executeWorkflowProcess)] });
-  return Harness.open(storage, { models: createModels(), registry }, BACKGROUND_CONTEXT);
+  return Harness.open(storage, { models: createModels(), registry, ...options }, BACKGROUND_CONTEXT);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -1432,6 +1435,100 @@ test("durable explicit-zero retry budgets override workflow defaults", { timeout
     ]);
   } finally {
     if (harness) await harness.close(BACKGROUND_CONTEXT);
+    rmSync(project.root, { recursive: true, force: true });
+  }
+});
+
+test("a delayed retry survives SQLite reopen before its deadline", { timeout: 30_000 }, async () => {
+  const command = [
+    `printf 'attempt\\n' >> "$WORKSHOP_PROJECT_ROOT/invocations"`,
+    'if [ ! -e "$WORKSHOP_PROJECT_ROOT/first-attempt" ]; then',
+    '  touch "$WORKSHOP_PROJECT_ROOT/first-attempt"',
+    "  printf 'first failure'",
+    "  exit 7",
+    "fi",
+    'printf "%s" "$WORKSHOP_FEEDBACK" > "$WORKSHOP_PROJECT_ROOT/retry-feedback"',
+    "printf 'retry succeeded'",
+    "",
+  ].join("\n");
+  const project = createProject(command, "retries: 0\n");
+  const stateDirectory = join(project.root, "state");
+  mkdirSync(stateDirectory, { recursive: true });
+  const databasePath = join(stateDirectory, "workshop.sqlite");
+  const invocationFile = join(project.root, "invocations");
+  const retryFeedbackFile = join(project.root, "retry-feedback");
+  const initialTime = Date.now();
+  const deadline = initialTime + 60_000;
+  let now = initialTime;
+  let storage: Awaited<ReturnType<typeof openNodeSqliteStorage>> | undefined;
+  let harness: Awaited<ReturnType<typeof createHarness>> | undefined;
+  let service: ReturnType<typeof createWorkshopService> | undefined;
+  try {
+    storage = await openNodeSqliteStorage(databasePath);
+    harness = await createHarness(storage, { now: () => now, onWake: () => {} });
+    harness.resume();
+    service = createWorkshopService({ projectRoot: project.root, harness });
+    const started = await service.handleRequest({ request_id: "start-delayed-retry", type: "start_workflow", workflow: "clock" });
+    const runId = runIdFrom(started);
+    const task = await waitForTask(storage, runId);
+    const blocked = await waitForRunStatus(service, storage, runId, "blocked");
+    if (!isRecord(blocked.blocked_step) || typeof blocked.blocked_step.decision_number !== "number") {
+      throw new Error("Blocked run has no decision number");
+    }
+    const decision = await service.handleRequest({
+      request_id: "retry-after-one-minute",
+      type: "decide_blocked_run",
+      run_id: runId,
+      decision_number: blocked.blocked_step.decision_number,
+      decision: { action: "retry", after: "1m", hint: "Continue after the saved delay." },
+    });
+    assert.equal(decision.ok, true);
+    await waitForRunStatus(service, storage, runId, "sleeping");
+    const sleeping = await storage.task(task.id, BACKGROUND_CONTEXT);
+    assert.ok(sleeping);
+    if (!sleeping || sleeping.state.status !== "sleeping") throw new Error("Retry did not enter durable sleep");
+    assert.equal(sleeping.state.until, deadline);
+    assert.equal(harness.wake().at, deadline);
+    assert.equal(readFileSync(invocationFile, "utf8"), "attempt\n");
+    assert.equal(existsSync(retryFeedbackFile), false);
+
+    await harness.close(BACKGROUND_CONTEXT);
+    harness = undefined;
+    await storage.close(BACKGROUND_CONTEXT);
+    storage = undefined;
+    now = deadline - 1;
+    storage = await openNodeSqliteStorage(databasePath);
+    harness = await createHarness(storage, { now: () => now, onWake: () => {} });
+    harness.resume();
+    service = createWorkshopService({ projectRoot: project.root, harness });
+    await waitForRunStatus(service, storage, runId, "sleeping");
+    assert.equal(harness.wake().at, deadline);
+    assert.equal(readFileSync(invocationFile, "utf8"), "attempt\n");
+    assert.equal(existsSync(retryFeedbackFile), false);
+
+    now = deadline;
+    harness.resume();
+    const settled = await harness.waitForTask(task.id, BACKGROUND_CONTEXT);
+    if (settled.state.status !== "terminal" || settled.state.outcome.status !== "completed") {
+      throw new Error("Due retry did not complete");
+    }
+    assert.equal(readFileSync(invocationFile, "utf8"), "attempt\nattempt\n");
+    const retryFeedback = readFileSync(retryFeedbackFile, "utf8");
+    assert.match(retryFeedback, /first failure/);
+    assert.match(retryFeedback, /Hint: Continue after the saved delay\./);
+    const result: unknown = settled.state.outcome.result;
+    assert.ok(isRecord(result));
+    const steps = recordsFrom(result.steps);
+    assert.ok(steps[0]);
+    const attempts = recordsFrom(steps[0].attempts);
+    assert.deepEqual(attempts.map(({ attempt, output }) => [attempt, output]), [
+      [1, "first failure"],
+      [2, "retry succeeded"],
+    ]);
+    assert.match(String(attempts[0]?.error), /exit code 7/);
+  } finally {
+    if (harness) await harness.close(BACKGROUND_CONTEXT);
+    if (storage) await storage.close(BACKGROUND_CONTEXT);
     rmSync(project.root, { recursive: true, force: true });
   }
 });
