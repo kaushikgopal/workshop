@@ -2,8 +2,8 @@ import { applyWorkflowDecision } from "./apply-workflow-decision.ts";
 import { computeRetryProfiles } from "./compute-retry-profiles.ts";
 import { parseWorkflowDuration } from "./parse-workflow-duration.ts";
 import type { TaskId } from "@earendil-works/pi-durable";
-import type { WorkflowAttemptRequest, WorkflowAttemptResult, WorkflowDecisionRequest } from "./interpret-workflow.ts";
-import type { AttemptHistoryEntry, Workflow, WorkflowDecision, WorkflowStep, WorkflowStepResult } from "./types.ts";
+import type { WorkflowAttemptRequest, WorkflowAttemptResult } from "./execute-workflow-attempt.ts";
+import type { AttemptHistoryEntry, Workflow, WorkflowDecision, WorkflowDecisionRequest, WorkflowStep, WorkflowStepResult } from "./types.ts";
 
 export type ActiveWorkflowAttempt = {
   taskId: TaskId<WorkflowAttemptResult>;

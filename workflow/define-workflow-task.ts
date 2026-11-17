@@ -14,7 +14,7 @@ import {
 import { buildOrchestratorBrief } from "./build-orchestrator-brief.ts";
 import { StepAttemptTask, type StepAttemptSource } from "./define-step-attempt-task.ts";
 import { loadWorkflowStep, WorkflowStepLoadError } from "./load-workflow-step.ts";
-import type { WorkflowAttemptRequest, WorkflowAttemptResult, WorkflowDecisionRequest } from "./interpret-workflow.ts";
+import type { WorkflowAttemptRequest, WorkflowAttemptResult } from "./execute-workflow-attempt.ts";
 import type { OrchestratorDecision, Workflow, WorkflowDecision } from "./types.ts";
 import { appendRecent, workshopStateDocument } from "./define-workshop-state.ts";
 

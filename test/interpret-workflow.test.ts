@@ -6,7 +6,7 @@ import { join, resolve } from "node:path";
 import { test } from "node:test";
 import { ZodError } from "zod";
 import { createWorkflowProcessState, executeWorkflowProcess, transitionWorkflowProcess } from "../run/execute-workflow-process.ts";
-import { executeWorkflowAttempt, parseMarkdownVerdict, transitionWorkflowAttempt, type ProcessExecutionRequest, type ProcessExecutionResult, type WorkflowAttemptEnvironment, type WorkflowAttemptResult } from "../workflow/interpret-workflow.ts";
+import { executeWorkflowAttempt, parseMarkdownVerdict, transitionWorkflowAttempt, type ProcessExecutionRequest, type ProcessExecutionResult, type WorkflowAttemptEnvironment, type WorkflowAttemptResult } from "../workflow/execute-workflow-attempt.ts";
 import { parseWorkflowDecision } from "../workflow/parse-workflow-decision.ts";
 import type { Workflow, WorkflowStep } from "../workflow/types.ts";
 

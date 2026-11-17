@@ -17,6 +17,19 @@ export type AttemptHistoryEntry = {
   error?: string;
 };
 
+export type WorkflowDecisionRequest = {
+  workflow: string;
+  runId: string;
+  step: string;
+  stepKind: WorkflowStepKind;
+  retryProfiles: string[];
+  lastError: string;
+  lastOutput: string;
+  attemptHistory: AttemptHistoryEntry[];
+  decisionNumber: number;
+};
+
+
 export type WorkflowStepResult = {
   step: string;
   status: "completed" | "skipped" | "nothing-to-do";

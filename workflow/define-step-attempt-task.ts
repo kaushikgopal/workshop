@@ -1,5 +1,5 @@
 import { defineTask, type TaskRuntime } from "@earendil-works/pi-durable";
-import { executeWorkflowAttempt, type ProcessExecutionRequest, type ProcessExecutionResult, type WorkflowAttemptEnvironment, type WorkflowAttemptRequest, type WorkflowAttemptResult } from "./interpret-workflow.ts";
+import { executeWorkflowAttempt, type ProcessExecutionRequest, type ProcessExecutionResult, type WorkflowAttemptEnvironment, type WorkflowAttemptRequest, type WorkflowAttemptResult } from "./execute-workflow-attempt.ts";
 import type { Workflow, WorkflowStep } from "./types.ts";
 
 

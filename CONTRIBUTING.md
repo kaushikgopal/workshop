@@ -12,7 +12,7 @@ A reader should know what a file does from its path alone, before opening it.
 
 - **Folders** name the domain things the code is about: `config/`, `workflow/`, `run/`, `schedule/`, and `service/`. Use the same nouns as the data model and user-facing terms.
 - **Files** lead with a verb that says what they do: `workflow/load-workflows.ts`,
-  `workflow/interpret-workflow.ts`, `service/serve-service-socket.ts`. A noun
+  `workflow/execute-workflow-attempt.ts`, `service/serve-service-socket.ts`. A noun
   alone, such as `workflow/types.ts`, says what a file is about, not what it does.
 - **Exception: pure shape.** A file that only declares types or a schema keeps a noun name, such as `workflow/types.ts` or `service/types.ts`.
 
@@ -170,13 +170,13 @@ workflow/                                 workflow loading and durable execution
   define-step-attempt-task.ts              durable step-attempt task
   define-workflow-task.ts                  durable workflow task
   define-workshop-state.ts                 durable workshop state and history
-  interpret-workflow.ts                    single-attempt execution and process types
+  execute-workflow-attempt.ts              step and check attempt execution
   list-workflow-status.ts                  workflow status for orchestrator tools
   load-workflow-step.ts                    step and check files at step start
   load-workflows.ts                        folder validation and workflow loading
   parse-workflow-decision.ts               decision validation
   parse-workflow-duration.ts               duration grammar and timer limits
-  types.ts                                 workflow and step shapes
+  types.ts                                 workflow, step, and decision request shapes
 run/                                      admission and process execution
   decide-workflow-admission.ts             start receipt and admission decisions
   execute-workflow-process.ts              command and profile process groups

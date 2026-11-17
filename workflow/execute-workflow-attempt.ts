@@ -1,5 +1,5 @@
 import { parseWorkflowDuration } from "./parse-workflow-duration.ts";
-import type { AttemptHistoryEntry, Workflow, WorkflowStep } from "./types.ts";
+import type { Workflow, WorkflowStep } from "./types.ts";
 
 export type ProcessExecutionKind = "command" | "agent" | "command-check" | "agent-check";
 
@@ -23,17 +23,6 @@ export type ProcessExecutionResult = {
   error?: string;
 };
 
-export type WorkflowDecisionRequest = {
-  workflow: string;
-  runId: string;
-  step: string;
-  stepKind: WorkflowStep["kind"];
-  retryProfiles: string[];
-  lastError: string;
-  lastOutput: string;
-  attemptHistory: AttemptHistoryEntry[];
-  decisionNumber: number;
-};
 
 export type WorkflowAttemptRequest = {
   step: WorkflowStep;

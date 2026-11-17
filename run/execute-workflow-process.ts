@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import type { ProcessExecutionRequest, ProcessExecutionResult } from "../workflow/interpret-workflow.ts";
+import type { ProcessExecutionRequest, ProcessExecutionResult } from "../workflow/execute-workflow-attempt.ts";
 
 type ExecuteWorkflowProcessInput = ProcessExecutionRequest & {
   workflow: string;

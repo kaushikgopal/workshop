@@ -1148,7 +1148,7 @@ test("agent prompt and failure brief share one raw step-file read", () => {
     `syncBuiltinESMExports();`,
     `try {`,
     `const { loadWorkflowStep } = await import(${JSON.stringify(new URL("../workflow/load-workflow-step.ts", import.meta.url).href)});`,
-    `const { executeWorkflowAttempt } = await import(${JSON.stringify(new URL("../workflow/interpret-workflow.ts", import.meta.url).href)});`,
+    `const { executeWorkflowAttempt } = await import(${JSON.stringify(new URL("../workflow/execute-workflow-attempt.ts", import.meta.url).href)});`,
     `const { buildOrchestratorBrief } = await import(${JSON.stringify(new URL("../workflow/build-orchestrator-brief.ts", import.meta.url).href)});`,
     `const workflow = { name: "clock", directory: "clock", cron: "* * * * *", description: "Test.", steps: [] };`,
     `const step = { kind: "agent", file: "20-next.md", number: 20, name: "next", profile: "writer" };`,
