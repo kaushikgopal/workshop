@@ -13,7 +13,7 @@ import {
 } from "./advance-workflow-state.ts";
 import { buildOrchestratorBrief } from "./build-orchestrator-brief.ts";
 import { StepAttemptTask, type StepAttemptSource } from "./define-step-attempt-task.ts";
-import { loadWorkflowStep, WorkflowStepLoadError } from "./load-workflow-step.ts";
+import { loadWorkflowStep, loadWorkflowStepSource, WorkflowStepLoadError } from "./load-workflow-step.ts";
 import type { WorkflowAttemptRequest, WorkflowAttemptResult } from "./execute-workflow-attempt.ts";
 import type { OrchestratorDecision, Workflow, WorkflowDecision } from "./types.ts";
 import { appendRecent, workshopStateDocument } from "./define-workshop-state.ts";
@@ -153,8 +153,7 @@ async function submitFailureRound(
   if (!step) throw new WorkflowCheckpointIntegrityError("checkpoint.stepIndex", "does not identify a workflow step");
   let stepContent = "";
   try {
-    const loaded = loadWorkflowStep(join(input.projectRoot, "workflows"), input.workflow, step);
-    stepContent = loaded.stepContent;
+    stepContent = loadWorkflowStepSource(join(input.projectRoot, "workflows"), input.workflow, step);
   } catch (error) {
     if (!(error instanceof WorkflowStepLoadError)) throw error;
   }

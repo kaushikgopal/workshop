@@ -88,9 +88,7 @@ that attempt.
 
 Workshop reloads the main step file when it builds a failure brief. If you edit
 the file after an attempt fails, the brief uses the newer contents, which may
-differ from what the failed attempt saw. The brief loads the step and its check
-together, so if the check file is missing, the brief omits the step source even
-when the step file is readable.
+differ from what the failed attempt saw.
 
 Steps execute in order. The first step receives empty input. A command step runs as `sh <file>` for `.sh` or `node <file>` for `.ts`, with its working directory set to `data/<workflow>/`. Node.js applies built-in type stripping to supported TypeScript syntax. An agent step runs the selected profile command with its prompt on stdin. Workshop does not invoke a shell to start profile commands.
 

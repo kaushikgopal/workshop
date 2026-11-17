@@ -1215,6 +1215,32 @@ test("agent prompt and failure brief agree within one loaded step", () => {
     rmSync(project.root, { recursive: true, force: true });
   }
 });
+test("failure brief includes a readable step when its check file is missing", { timeout: 10_000 }, async () => {
+  const stepSource = [
+    `rm "$WORKSHOP_PROJECT_ROOT/workflows/clock/10-task.check.sh"`,
+    `printf 'broken output'; exit 7`,
+    "",
+  ].join("\n");
+  const project = createProject(stepSource, "retries: 0\n");
+  const checkFile = join(project.root, "workflows", "clock", "10-task.check.sh");
+  writeFileSync(checkFile, "printf 'ACCEPT'\n");
+  const storage = new MemoryStorage();
+  let harness: Awaited<ReturnType<typeof createHarness>> | undefined;
+  try {
+    harness = await createHarness(storage);
+    harness.resume();
+    const service = createWorkshopService({ projectRoot: project.root, harness });
+    const started = await service.handleRequest({ request_id: "start-missing-check", type: "start_workflow", workflow: "clock" });
+    const runId = runIdFrom(started);
+    const brief = await waitForFailureEvidence(storage, harness, runId);
+    assert.equal(existsSync(checkFile), false);
+    assert.ok(brief.includes(stepSource));
+  } finally {
+    if (harness) await harness.close(BACKGROUND_CONTEXT);
+    rmSync(project.root, { recursive: true, force: true });
+  }
+});
+
 
 test("admitted missing step retries and blocks with saved input", { timeout: 10_000 }, async () => {
   const firstStep = [

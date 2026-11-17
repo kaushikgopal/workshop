@@ -30,12 +30,17 @@ function readMarkdownBody(file: string, source: string): string {
   if (body.length === 0) throw new WorkflowStepLoadError(`${file}: step content must not be empty`);
   return body;
 }
+export function loadWorkflowStepSource(workflowRoot: string, workflow: Workflow, step: WorkflowStep): string {
+  const directory = resolve(workflowRoot, workflow.directory);
+  return readSource(join(directory, step.file));
+}
+
 export function loadWorkflowStep(workflowRoot: string, workflow: Workflow, step: WorkflowStep): WorkflowStepFiles {
   const directory = resolve(workflowRoot, workflow.directory);
   const documents: Record<string, string> = {};
   const files: Record<string, string> = {};
   const stepFiles = [step, ...(step.check === undefined ? [] : [step.check])];
-  const stepContent = readSource(join(directory, step.file));
+  const stepContent = loadWorkflowStepSource(workflowRoot, workflow, step);
 
   for (const [index, item] of stepFiles.entries()) {
     const file = join(directory, item.file);
