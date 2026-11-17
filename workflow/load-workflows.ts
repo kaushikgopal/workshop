@@ -41,16 +41,7 @@ const stepMetadataSchema = z.object({
 type WorkflowMetadata = z.infer<typeof workflowMetadataSchema>;
 type StepMetadata = z.infer<typeof stepMetadataSchema>;
 type MarkdownDocument = { metadata: unknown; body: string };
-type StepFile = {
-  number: number;
-  name: string;
-  file: string;
-  kind: WorkflowStepKind;
-  profile?: string;
-  retries?: number;
-  timeout?: string;
-};
-type CheckFile = {
+type NumberedFile = {
   number: number;
   name: string;
   file: string;
@@ -177,7 +168,8 @@ function parseCheckName(file: string): { number: number; name: string; extension
   return { number, name, extension };
 }
 
-function readStepFile(
+
+function readNumberedFile(
   root: string,
   directory: string,
   file: string,
@@ -186,51 +178,24 @@ function readStepFile(
   extension: string,
   defaultProfile: string | undefined,
   availableProfiles: ReadonlySet<string>,
+  emptyBodyLabel: "agent" | "judge",
   errors: WorkflowIssue[],
-): StepFile {
+): NumberedFile {
   const kind: WorkflowStepKind = extension === "md" ? "agent" : "command";
-  const step: StepFile = { number, name, file, kind };
-  if (kind === "command") return step;
+  const numberedFile: NumberedFile = { number, name, file, kind };
+  if (kind === "command") return numberedFile;
 
   const relativeFile = join(directory, file);
   const markdown = readMarkdown(join(root, directory, file), relativeFile, errors);
-  if (!markdown) return step;
-  if (markdown.body.length === 0) issue(errors, relativeFile, "agent prompt body must not be empty");
+  if (!markdown) return numberedFile;
+  if (markdown.body.length === 0) issue(errors, relativeFile, `${emptyBodyLabel} prompt body must not be empty`);
   const metadata = parseStepMetadata(markdown, relativeFile, errors);
-  if (!metadata) return step;
+  if (!metadata) return numberedFile;
   const profile = resolveProfile(metadata.profile, defaultProfile, availableProfiles, relativeFile, errors);
-  if (profile !== undefined) step.profile = profile;
-  if (metadata.retries !== undefined) step.retries = metadata.retries;
-  if (metadata.timeout !== undefined) step.timeout = metadata.timeout;
-  return step;
-}
-
-function readCheckFile(
-  root: string,
-  directory: string,
-  file: string,
-  number: number,
-  name: string,
-  extension: string,
-  defaultProfile: string | undefined,
-  availableProfiles: ReadonlySet<string>,
-  errors: WorkflowIssue[],
-): CheckFile {
-  const kind: WorkflowStepKind = extension === "md" ? "agent" : "command";
-  const check: CheckFile = { number, name, file, kind };
-  if (kind === "command") return check;
-
-  const relativeFile = join(directory, file);
-  const markdown = readMarkdown(join(root, directory, file), relativeFile, errors);
-  if (!markdown) return check;
-  if (markdown.body.length === 0) issue(errors, relativeFile, "judge prompt body must not be empty");
-  const metadata = parseStepMetadata(markdown, relativeFile, errors);
-  if (!metadata) return check;
-  const profile = resolveProfile(metadata.profile, defaultProfile, availableProfiles, relativeFile, errors);
-  if (profile !== undefined) check.profile = profile;
-  if (metadata.retries !== undefined) check.retries = metadata.retries;
-  if (metadata.timeout !== undefined) check.timeout = metadata.timeout;
-  return check;
+  if (profile !== undefined) numberedFile.profile = profile;
+  if (metadata.retries !== undefined) numberedFile.retries = metadata.retries;
+  if (metadata.timeout !== undefined) numberedFile.timeout = metadata.timeout;
+  return numberedFile;
 }
 
 function readWorkflow(
@@ -258,8 +223,8 @@ function readWorkflow(
     issue(errors, join(directory, "workflow.md"), `profile "${metadata.profile}" does not exist in agent_profiles`);
   }
 
-  const stepFiles: StepFile[] = [];
-  const checkFiles: CheckFile[] = [];
+  const stepFiles: NumberedFile[] = [];
+  const checkFiles: NumberedFile[] = [];
   for (const entry of contents) {
     if (entry.name === "workflow.md") continue;
     const relativeFile = join(directory, entry.name);
@@ -269,7 +234,18 @@ function readWorkflow(
     }
     const checkName = parseCheckName(entry.name);
     if (checkName) {
-      checkFiles.push(readCheckFile(root, directory, entry.name, checkName.number, checkName.name, checkName.extension, metadata?.profile, availableProfiles, errors));
+      checkFiles.push(readNumberedFile(
+        root,
+        directory,
+        entry.name,
+        checkName.number,
+        checkName.name,
+        checkName.extension,
+        metadata?.profile,
+        availableProfiles,
+        "judge",
+        errors,
+      ));
       continue;
     }
     const stepName = parseStepName(entry.name);
@@ -277,12 +253,23 @@ function readWorkflow(
       issue(errors, relativeFile, "unknown file; expected N-name.md, N-name.sh, N-name.ts, or a matching check");
       continue;
     }
-    stepFiles.push(readStepFile(root, directory, entry.name, stepName.number, stepName.name, stepName.extension, metadata?.profile, availableProfiles, errors));
+    stepFiles.push(readNumberedFile(
+      root,
+      directory,
+      entry.name,
+      stepName.number,
+      stepName.name,
+      stepName.extension,
+      metadata?.profile,
+      availableProfiles,
+      "agent",
+      errors,
+    ));
   }
 
   if (stepFiles.length === 0) issue(errors, join(directory, "workflow.md"), "workflow must contain at least one step");
   stepFiles.sort((left, right) => left.number - right.number || left.file.localeCompare(right.file));
-  const stepsByNumber = new Map<number, StepFile>();
+  const stepsByNumber = new Map<number, NumberedFile>();
   for (const step of stepFiles) {
     const previous = stepsByNumber.get(step.number);
     if (previous) {
@@ -292,7 +279,7 @@ function readWorkflow(
     }
   }
 
-  const checksByNumber = new Map<number, CheckFile>();
+  const checksByNumber = new Map<number, NumberedFile>();
   for (const check of checkFiles) {
     const matching = stepsByNumber.get(check.number);
     if (!matching || matching.name !== check.name) {
