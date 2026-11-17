@@ -280,7 +280,7 @@ async function executeAttempt(
     return attemptResult(transition({ kind: "check-rejected", feedback: reason }).state);
   }
 
-  const checkProfile = step.check.profile ?? profile ?? step.profile;
+  const checkProfile = step.check.profile;
   const command = input.profileCommands[checkProfile ?? ""];
   if (!command) throw new Error(`${checkId} selects an unknown profile "${checkProfile ?? ""}"`);
   const prompt = input.documents[step.check.file];

@@ -179,6 +179,47 @@ test("command-check diagnostics report signals and retain stdout-first fallback 
   }
 });
 
+test("Markdown judges use their resolved profile and reject unresolved profiles", async (t) => {
+  await t.test("uses the resolved judge profile instead of the worker override", async () => {
+    const calls: ProcessExecutionRequest[] = [];
+    const step: WorkflowStep = {
+      kind: "agent", file: "10-write.md", number: 10, name: "write", profile: "writer",
+      check: { kind: "agent", file: "10-write.check.md", profile: "judge" },
+    };
+    const input = makeInput(makeWorkflow([step]), async (request) => {
+      calls.push(request);
+      return successful(request.kind === "agent-check" ? "ACCEPT" : "draft");
+    }, { documents: { "10-write.md": "Write.", "10-write.check.md": "Judge." } });
+    const result = await executeWorkflowAttempt(input, { step, profile: "fast", pipeInput: "", feedback: "", attempt: 1 });
+
+    assert.deepEqual(result, { kind: "accepted", output: "draft" });
+    assert.deepEqual(calls.map(({ kind, command }) => [kind, command]), [
+      ["agent", ["fake-writer", "--fast"]],
+      ["agent-check", ["fake-judge"]],
+    ]);
+  });
+
+  for (const workerProfile of ["fast", undefined] as const) {
+    await t.test(`fails when the judge profile is unresolved and worker profile is ${workerProfile ?? "configured"}`, async () => {
+      const calls: ProcessExecutionRequest[] = [];
+      const step: WorkflowStep = {
+        kind: "agent", file: "10-write.md", number: 10, name: "write", profile: "writer",
+        check: { kind: "agent", file: "10-write.check.md" },
+      };
+      const input = makeInput(makeWorkflow([step]), async (request) => {
+        calls.push(request);
+        return successful("draft");
+      }, { documents: { "10-write.md": "Write.", "10-write.check.md": "Judge." } });
+
+      await assert.rejects(executeWorkflowAttempt(input, {
+        step, ...(workerProfile === undefined ? {} : { profile: workerProfile }),
+        pipeInput: "", feedback: "", attempt: 1,
+      }), /10-write\.check selects an unknown profile ""/);
+      assert.deepEqual(calls.map(({ kind }) => kind), ["agent"]);
+    });
+  }
+});
+
 test("Markdown judges receive worker retry feedback without changing their input", async () => {
   const calls: ProcessExecutionRequest[] = [];
   const retryFeedback = "repeats a previous sentence";
