@@ -51,6 +51,26 @@ test("builds a single native-tool failure round with bounded evidence", () => {
   assert.doesNotMatch(brief.prompt, /Return exactly one strict JSON/);
 });
 
+test("brief distinguishes the configured profile from the last attempted profile", () => {
+  const step: WorkflowStep = { kind: "agent", file: "10-write.md", number: 10, name: "write", profile: "writer" };
+  const brief = buildOrchestratorBrief({
+    workflow: { ...commandWorkflow(), steps: [step] },
+    step,
+    stepId: "10-write",
+    runId: "run-1",
+    decisionNumber: 2,
+    stepContent: "Write a line.",
+    lastOutput: "draft",
+    lastError: "rejected",
+    attemptHistory: [{ attempt: 1, profile: "fast", output: "draft", error: "rejected" }],
+    allowedRetryProfiles: ["writer", "fast"],
+  });
+
+  assert.match(brief.prompt, /Configured step profile: writer/);
+  assert.match(brief.prompt, /Attempt history[\s\S]*"profile": "fast"/);
+  assert.doesNotMatch(brief.prompt, /Current profile:/);
+});
+
 test("automatic retry rules reject a different executable", () => {
   const step: WorkflowStep = { kind: "agent", file: "10-write.md", number: 10, name: "write", profile: "pi-local" };
   assert.throws(() => applyWorkflowDecision({

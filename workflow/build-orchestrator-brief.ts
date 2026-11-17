@@ -48,7 +48,7 @@ export function buildOrchestratorBrief(input: OrchestratorBriefInput): Orchestra
     `## Run ${input.runId}; decision ${input.decisionNumber}`,
     `### Step ${input.stepId} (${input.step.kind})`,
     `File: ${input.step.file}`,
-    `Current profile: ${input.step.profile ?? "none"}`,
+    `Configured step profile: ${input.step.profile ?? "none"}`,
     "Step file content:",
     input.stepContent || "(empty)",
     "",
