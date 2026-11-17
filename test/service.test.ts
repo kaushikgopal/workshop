@@ -1609,8 +1609,11 @@ test("a delayed retry survives SQLite reopen before its deadline", { timeout: 30
   }
 });
 
-test("durable command exit 99 completes without checking or starting later steps", { timeout: 10_000 }, async () => {
-  const project = createProject("printf 'no work'; exit 99\n", "retries: 2\n");
+test("durable command exit 99 skips the rest of its run and leaves the next run free", { timeout: 10_000 }, async () => {
+  const project = createProject(
+    'if [ ! -f "$WORKSHOP_DATA_DIR/ready" ]; then printf \'no work\'; exit 99; fi\nprintf \'work\'\n',
+    "retries: 2\n",
+  );
   const workflowDirectory = join(project.root, "workflows", "clock");
   const dataDirectory = join(project.root, "data", "clock");
   const stateDirectory = join(project.root, "state");
@@ -1644,6 +1647,22 @@ test("durable command exit 99 completes without checking or starting later steps
     });
     assert.equal(existsSync(join(dataDirectory, "check-marker")), false);
     assert.equal(existsSync(join(dataDirectory, "later-marker")), false);
+
+    writeFileSync(join(dataDirectory, "ready"), "");
+    const next = await startWorkflow({
+      projectRoot: project.root,
+      workflowName: "clock",
+      port,
+      at: new Date("2026-11-16T12:05:00.000Z"),
+    });
+    assert.equal(next.kind, "started");
+    if (next.kind !== "started") throw new Error("Next workflow run did not start");
+    const nextTask = await waitForTask(storage, next.run_id);
+    const nextSettled = await harness.waitForTask(nextTask.id, BACKGROUND_CONTEXT);
+    assert.ok(nextSettled.state.status === "terminal" && nextSettled.state.outcome.status === "completed");
+    assert.equal((nextSettled.state.outcome.result as { status: string }).status, "completed");
+    assert.equal(existsSync(join(dataDirectory, "check-marker")), true);
+    assert.equal(existsSync(join(dataDirectory, "later-marker")), true);
   } finally {
     if (harness) await harness.close(BACKGROUND_CONTEXT);
     else if (storage) await storage.close(BACKGROUND_CONTEXT);
