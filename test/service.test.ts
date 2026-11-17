@@ -1381,6 +1381,48 @@ test("durable retries send check feedback to the worker and keep the accepted wo
   }
 });
 
+test("durable command exit 99 completes without checking or starting later steps", { timeout: 10_000 }, async () => {
+  const project = createProject("printf 'no work'; exit 99\n", "retries: 2\n");
+  const workflowDirectory = join(project.root, "workflows", "clock");
+  const dataDirectory = join(project.root, "data", "clock");
+  const stateDirectory = join(project.root, "state");
+  mkdirSync(dataDirectory, { recursive: true });
+  mkdirSync(stateDirectory, { recursive: true });
+  writeFileSync(join(workflowDirectory, "10-task.check.sh"), 'touch "$WORKSHOP_DATA_DIR/check-marker"\n');
+  writeFileSync(join(workflowDirectory, "20-later.sh"), 'touch "$WORKSHOP_DATA_DIR/later-marker"\n');
+  let storage: Awaited<ReturnType<typeof openNodeSqliteStorage>> | undefined;
+  let harness: Awaited<ReturnType<typeof createHarness>> | undefined;
+  try {
+    storage = await openNodeSqliteStorage(join(stateDirectory, "workshop.sqlite"));
+    harness = await createHarness(storage);
+    harness.resume();
+    const port = await createWorkflowStartPort(harness);
+    const started = await startWorkflow({
+      projectRoot: project.root,
+      workflowName: "clock",
+      port,
+      at: new Date("2026-11-16T12:00:00.000Z"),
+    });
+    assert.equal(started.kind, "started");
+    if (started.kind !== "started") throw new Error("Workflow did not start");
+    const task = await waitForTask(storage, started.run_id);
+    const settled = await harness.waitForTask(task.id, BACKGROUND_CONTEXT);
+    assert.ok(settled.state.status === "terminal" && settled.state.outcome.status === "completed");
+    assert.deepEqual(settled.state.outcome.result, {
+      status: "nothing-to-do",
+      output: "no work",
+      completedSteps: 0,
+      steps: [{ step: "10-task", status: "nothing-to-do", output: "no work", attempts: [{ attempt: 1, output: "no work" }] }],
+    });
+    assert.equal(existsSync(join(dataDirectory, "check-marker")), false);
+    assert.equal(existsSync(join(dataDirectory, "later-marker")), false);
+  } finally {
+    if (harness) await harness.close(BACKGROUND_CONTEXT);
+    else if (storage) await storage.close(BACKGROUND_CONTEXT);
+    rmSync(project.root, { recursive: true, force: true });
+  }
+});
+
 test("submit_chat reuses the configured root conversation through the service", async () => {
   const project = createProject("printf 'unused'\n");
   const storage = new MemoryStorage();
