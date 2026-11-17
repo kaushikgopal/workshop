@@ -21,7 +21,7 @@ import { tickWorkflows } from "../schedule/tick-workflows.ts";
 import { executeWorkflowProcess } from "../run/execute-workflow-process.ts";
 import { createStepAttemptTask } from "../workflow/define-step-attempt-task.ts";
 import * as workflowStepLoader from "../workflow/load-workflow-step.ts";
-import { WorkflowTask, WORKFLOW_TASK_NAME, workflowDecisionDocument } from "../workflow/define-workflow-task.ts";
+import { WorkflowTask, WORKFLOW_TASK_NAME, workflowDecisionDocument, type WorkflowTaskCheckpoint, type WorkflowTaskInput } from "../workflow/define-workflow-task.ts";
 
 function createProject(command: string, extraFrontmatter = ""): { root: string } {
   const root = mkdtempSync(join(tmpdir(), "workshop-service-test-"));
@@ -588,6 +588,180 @@ test("a blocked run accepts a chat decision after reopening SQLite", { timeout: 
   }
 });
 
+
+test("saved workflow decisions reject stale and missing numbers and empty accepts", { timeout: 30_000 }, async (t) => {
+  for (const fixture of [
+    { name: "stale number", decisionNumber: 0, useCurrentNumber: false, decision: { action: "skip" as const }, error: /Decision changed or became stale/ },
+    { name: "missing number", decisionNumber: undefined, useCurrentNumber: false, decision: { action: "skip" as const }, error: /Decision changed or became stale/ },
+    { name: "empty accept", decisionNumber: undefined, useCurrentNumber: true, decision: { action: "accept" as const }, error: /Cannot accept a blocked step with empty output/ },
+  ]) {
+    await t.test(fixture.name, async () => {
+      const project = createProject("exit 7\n", "retries: 0\n");
+      const storage = new MemoryStorage();
+      let harness: Awaited<ReturnType<typeof createHarness>> | undefined;
+      try {
+        harness = await createHarness(storage);
+        harness.resume();
+        const service = createWorkshopService({ projectRoot: project.root, harness });
+        const started = await service.handleRequest({ request_id: `start-${fixture.name}`, type: "start_workflow", workflow: "clock" });
+        const runId = runIdFrom(started);
+        const task = await waitForTask(storage, runId);
+        const blocked = await waitForRunStatus(service, storage, runId, "blocked");
+        assert.ok(isRecord(blocked.blocked_step));
+        assert.equal(typeof blocked.blocked_step.decision_number, "number");
+        if (typeof blocked.blocked_step.decision_number !== "number") throw new Error("Blocked run has no decision number");
+        const savedNumber = fixture.useCurrentNumber ? blocked.blocked_step.decision_number : fixture.decisionNumber;
+        await harness.commit(async (tx) => {
+          const document = await tx.doc(workflowDecisionDocument, task.id);
+          document.choice = {
+            requestId: `saved-${fixture.name}`,
+            ...(savedNumber === undefined ? {} : { decisionNumber: savedNumber }),
+            decision: fixture.decision,
+            source: "chat",
+          };
+          return true;
+        }, BACKGROUND_CONTEXT);
+        const settled = await harness.waitForTask(task.id, BACKGROUND_CONTEXT);
+        if (settled.state.status !== "terminal") throw new Error("Saved decision did not settle the workflow task");
+        assert.equal(settled.state.outcome.status, "faulted");
+        if (settled.state.outcome.status !== "faulted") throw new Error("Invalid saved decision did not fault the workflow task");
+        assert.match(settled.state.outcome.error.message, fixture.error);
+      } finally {
+        if (harness) await harness.close(BACKGROUND_CONTEXT);
+        rmSync(project.root, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("source-less retry resumes a numbered old SQLite checkpoint without replaying a failure round", { timeout: 30_000 }, async () => {
+  const project = createProject("exit 7\n", "retries: 0\n");
+  const stateDirectory = join(project.root, "state");
+  const dataDirectory = join(project.root, "data", "clock");
+  mkdirSync(stateDirectory, { recursive: true });
+  mkdirSync(dataDirectory, { recursive: true });
+  writeFileSync(join(project.root, "workflows", "clock", "10-task.sh"), `printf x >> "$WORKSHOP_PROJECT_ROOT/attempts"\nprintf 'retry failed'; exit 7\n`);
+  const databasePath = join(stateDirectory, "workshop.sqlite");
+  const attemptFile = join(project.root, "attempts");
+  const firstAttempt = { attempt: 1, output: "first failure", error: "10-task failed with exit code 7: first failure" };
+  const history = [firstAttempt];
+  const workflow = {
+    name: "clock",
+    directory: "clock",
+    cron: "* * * * *",
+    description: "Historical blocked workflow fixture.",
+    retries: 0,
+    steps: [{ kind: "command" as const, file: "10-task.sh", number: 10, name: "task" }],
+  };
+  const input: WorkflowTaskInput = {
+    runId: "legacy-run",
+    workflowName: "clock",
+    startedAt: new Date(0).toISOString(),
+    slot: null,
+    projectRoot: project.root,
+    dataDirectory,
+    stateDirectory,
+    workflow,
+    profileCommands: { writer: [process.execPath] },
+  };
+  const failure = {
+    workflow: "clock",
+    runId: input.runId,
+    step: "10-task",
+    stepKind: "command" as const,
+    retryProfiles: [],
+    lastError: firstAttempt.error,
+    lastOutput: firstAttempt.output,
+    attemptHistory: history,
+    decisionNumber: 1,
+  };
+  const checkpoint: WorkflowTaskCheckpoint = {
+    phase: "blocked",
+    stepIndex: 0,
+    pipeInput: "",
+    results: [],
+    attemptHistory: history,
+    localRetriesLeft: 0,
+    feedback: "",
+    decisionNumber: 1,
+    automaticRoundUsed: true,
+    failure,
+  };
+  assert.equal("roundStatus" in checkpoint, false);
+  let firstStorage: Storage | undefined;
+  let secondStorage: Storage | undefined;
+  let firstHarness: Awaited<ReturnType<typeof createHarness>> | undefined;
+  let secondHarness: Awaited<ReturnType<typeof createHarness>> | undefined;
+  try {
+    firstStorage = await openNodeSqliteStorage(databasePath);
+    firstHarness = await createHarness(firstStorage);
+    const root = await firstHarness.root(BACKGROUND_CONTEXT);
+    const taskId = await firstHarness.commit(async (tx) => {
+      const created = await tx.createTask(WorkflowTask, input, { ownership: { kind: "conversation" }, conversationId: root.id });
+      const decision = await tx.doc(workflowDecisionDocument, created);
+      decision.choice = { requestId: "legacy-retry", decisionNumber: 1, decision: { action: "retry", hint: "Retry the saved failure." } };
+      return created;
+    }, BACKGROUND_CONTEXT);
+    const createdTask = await firstStorage.task(taskId, BACKGROUND_CONTEXT);
+    assert.ok(createdTask);
+    if (!createdTask) throw new Error("Historical workflow task was not saved");
+    const saved = await firstStorage.commit(
+      [[{ type: "task", value: { ...createdTask, state: { status: "pending", checkpoint } } }]],
+      () => {},
+      BACKGROUND_CONTEXT,
+    );
+    assert.equal(saved.stored, 1);
+    assert.equal(saved.refused, undefined);
+    const oldTask = await firstStorage.task(taskId, BACKGROUND_CONTEXT);
+    assert.ok(oldTask);
+    if (!oldTask) throw new Error("Historical workflow checkpoint was not saved");
+    assert.equal(oldTask.version, 3);
+    assert.ok(isRecord(oldTask.state));
+    assert.ok(isRecord(oldTask.state.checkpoint));
+    assert.equal(oldTask.state.checkpoint.phase, "blocked");
+    assert.equal("roundStatus" in oldTask.state.checkpoint, false);
+    await firstHarness.close(BACKGROUND_CONTEXT);
+    firstHarness = undefined;
+    firstStorage = undefined;
+
+    secondStorage = await openNodeSqliteStorage(databasePath);
+    secondHarness = await createHarness(secondStorage);
+    secondHarness.resume();
+    let resumedTask: TaskRecord<JsonValue, JsonValue, JsonValue> | undefined;
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      const current = await secondStorage.task(taskId, BACKGROUND_CONTEXT);
+      assert.ok(current);
+      if (!current) throw new Error("Historical workflow task disappeared");
+      resumedTask = current;
+      const currentCheckpoint = current.state.checkpoint;
+      if (current.state.status === "running" && isRecord(currentCheckpoint) && currentCheckpoint.phase === "blocked" && currentCheckpoint.decisionNumber === 2) break;
+      await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+    }
+    assert.ok(resumedTask);
+    assert.equal(resumedTask.state.status, "running");
+    if (resumedTask.state.status !== "running") throw new Error("Retry did not return to a running checkpoint");
+    const resumedCheckpoint = resumedTask.state.checkpoint;
+    assert.ok(isRecord(resumedCheckpoint));
+    if (!isRecord(resumedCheckpoint)) throw new Error("Retry checkpoint is invalid");
+    assert.equal(resumedCheckpoint.phase, "blocked");
+    if (resumedCheckpoint.phase !== "blocked") throw new Error("Retry did not block after attempt 2");
+    assert.ok(isRecord(resumedCheckpoint.failure));
+    if (!isRecord(resumedCheckpoint.failure)) throw new Error("Blocked failure is invalid");
+    assert.equal(resumedCheckpoint.failure.decisionNumber, 2);
+    assert.ok(Array.isArray(resumedCheckpoint.attemptHistory));
+    if (!Array.isArray(resumedCheckpoint.attemptHistory)) throw new Error("Attempt history is invalid");
+    assert.deepEqual(resumedCheckpoint.attemptHistory.map((entry) => isRecord(entry) ? entry.attempt : null), [1, 2]);
+    assert.equal(readFileSync(attemptFile, "utf8"), "x");
+    const submissions = await secondStorage.scanSubmissions({ conversationId: root.id }, 100, undefined, BACKGROUND_CONTEXT);
+    assert.deepEqual(submissions.items.map((submission) => submission.requestId), []);
+  } finally {
+    if (secondHarness) await secondHarness.close(BACKGROUND_CONTEXT);
+    else if (secondStorage) await secondStorage.close(BACKGROUND_CONTEXT);
+    if (firstHarness) await firstHarness.close(BACKGROUND_CONTEXT);
+    else if (firstStorage) await firstStorage.close(BACKGROUND_CONTEXT);
+    rmSync(project.root, { recursive: true, force: true });
+  }
+});
 
 test("service rejects accepting an empty blocked result", async () => {
   const project = createProject("exit 7\n", "retries: 0\n");

@@ -240,11 +240,10 @@ async function waitForDecision(
         });
       });
     }
-    const acceptedDecisionNumber = accepted.decisionNumber ?? checkpoint.decisionNumber;
     await runtime.commit(async (tx) => {
       const document = await tx.doc(workflowDecisionDocument, runtime.taskId);
       const current = document.choice;
-      if (current === null || current.requestId !== accepted.requestId || acceptedDecisionNumber !== checkpoint.decisionNumber || (current.decisionNumber !== undefined && current.decisionNumber !== checkpoint.decisionNumber)) {
+      if (current === null || current.requestId !== accepted.requestId || accepted.decisionNumber !== checkpoint.decisionNumber || current.decisionNumber !== checkpoint.decisionNumber) {
         throw new Error("Decision changed or became stale before the workflow task accepted it");
       }
       if (accepted.decision.action === "accept" && checkpoint.failure.lastOutput.trim().length === 0) {
@@ -253,7 +252,7 @@ async function waitForDecision(
       document.choice = null;
       const next = requireAccepted(advanceWorkflowState(checkpoint, {
         kind: "decision-recorded",
-        decisionNumber: acceptedDecisionNumber,
+        decisionNumber: checkpoint.decisionNumber,
         decision: accepted.decision,
         source: accepted.source ?? "chat",
       }, stateContext(input)));
