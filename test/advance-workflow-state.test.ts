@@ -3,11 +3,12 @@ import { test } from "node:test";
 import {
   advanceWorkflowState,
   decodeWorkflowTaskCheckpoint,
+  retryLimit,
   WorkflowCheckpointIntegrityError,
   type WorkflowStateContext,
   type WorkflowStateTransition,
 } from "../workflow/advance-workflow-state.ts";
-import { decodeStepAttemptOutcome, WorkflowTask } from "../workflow/define-workflow-task.ts";
+import { decodeStepAttemptOutcome } from "../workflow/define-workflow-task.ts";
 import type { Workflow } from "../workflow/types.ts";
 
 function makeWorkflow(stepCount = 2, retries = 1): Workflow {
@@ -206,82 +207,21 @@ test("command attempt history omits a resumed profile", () => {
   assert.deepEqual(blocked.state.failure.attemptHistory, expectedHistory);
 });
 
-test("retry counts resolve step, check, then workflow with explicit zero", () => {
-  const cases = [
-    { name: "step overrides check and workflow", workflowRetries: 0, stepRetries: 2, checkRetries: 1, expected: 2 },
-    { name: "check overrides workflow", workflowRetries: 0, checkRetries: 2, expected: 2 },
-    { name: "workflow supplies the fallback", workflowRetries: 2, expected: 2 },
-    { name: "step zero overrides positive defaults", workflowRetries: 2, stepRetries: 0, checkRetries: 2, expected: 0 },
-  ];
+test("retry limits prefer step, check, then workflow, including explicit zero", () => {
+  const workflow = makeWorkflow(1, 3);
+  const step = workflow.steps[0];
+  assert.ok(step);
+  const check = { kind: "command" as const, file: "10-step.check.sh" };
 
-  for (const item of cases) {
-    const base = makeWorkflow(2, item.workflowRetries);
-    const first = base.steps[0];
-    const second = base.steps[1];
-    assert.ok(first && second);
-    const context = makeContext({
-      ...base,
-      steps: [first, {
-        ...second,
-        ...(item.stepRetries === undefined ? {} : { retries: item.stepRetries }),
-        check: {
-          kind: "command",
-          file: "20-step-2.check.sh",
-          ...(item.checkRetries === undefined ? {} : { retries: item.checkRetries }),
-        },
-      }],
-    });
-    const next = accepted(advanceWorkflowState(attemptCheckpoint(context, 0), {
-      kind: "attempt-settled", attempt: 1, result: { kind: "accepted", output: "first step" },
-    }, context));
+  assert.equal(retryLimit({ ...step, retries: 2, check: { ...check, retries: 1 } }, workflow), 2);
+  assert.equal(retryLimit({ ...step, check: { ...check, retries: 1 } }, workflow), 1);
+  assert.equal(retryLimit(step, workflow), 3);
+  assert.equal(retryLimit({ ...step, retries: 0, check: { ...check, retries: 1 } }, workflow), 0);
+  assert.equal(retryLimit({ ...step, check: { ...check, retries: 0 } }, workflow), 0);
 
-    assert.equal(next.state.phase, "step", item.name);
-    if (next.state.phase !== "step") throw new Error("Expected the next step");
-    assert.equal(next.state.stepIndex, 1, item.name);
-    assert.equal(next.state.localRetriesLeft, item.expected, item.name);
-  }
-});
-
-test("workflow task initial retry budgets use step, check, and workflow precedence", () => {
-  const cases = [
-    { workflowRetries: 0, stepRetries: 2, checkRetries: 1, expected: 2 },
-    { workflowRetries: 0, checkRetries: 2, expected: 2 },
-    { workflowRetries: 2, expected: 2 },
-    { workflowRetries: 2, stepRetries: 0, checkRetries: 2, expected: 0 },
-  ];
-
-  for (const item of cases) {
-    const base = makeWorkflow(1, item.workflowRetries);
-    const first = base.steps[0];
-    assert.ok(first);
-    const workflow: Workflow = {
-      ...base,
-      steps: [{
-        ...first,
-        ...(item.stepRetries === undefined ? {} : { retries: item.stepRetries }),
-        check: {
-          kind: "command",
-          file: "10-step-1.check.sh",
-          ...(item.checkRetries === undefined ? {} : { retries: item.checkRetries }),
-        },
-      }],
-    };
-    const checkpoint = WorkflowTask.definition.initial({
-      runId: "run-1",
-      workflowName: workflow.name,
-      startedAt: "2026-11-16T12:00:00.000Z",
-      slot: null,
-      projectRoot: "/project",
-      dataDirectory: "/data",
-      stateDirectory: "/state",
-      workflow,
-      profileCommands: {},
-    });
-
-    assert.equal(checkpoint.phase, "step");
-    if (checkpoint.phase !== "step") throw new Error("Expected the initial step");
-    assert.equal(checkpoint.localRetriesLeft, item.expected);
-  }
+  const withoutWorkflowRetries = { ...workflow };
+  delete withoutWorkflowRetries.retries;
+  assert.equal(retryLimit(step, withoutWorkflowRetries), 0);
 });
 
 test("checkpoint decoding rejects invalid step bounds and counters with field context", () => {
