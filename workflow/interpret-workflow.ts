@@ -271,9 +271,12 @@ async function executeAttempt(
     if (result.exitCode === 0 && !result.timedOut && result.error === undefined) {
       return attemptResult(transition({ kind: "check-accepted" }).state);
     }
+    const details = [result.stdout.trim(), result.stderr.trim()].filter(Boolean).join("\n");
     const reason = result.timedOut || result.error !== undefined
       ? processFailure(checkId, result, checkTimeout)
-      : [result.stdout.trim(), result.stderr.trim()].filter(Boolean).join("\n") || `${checkId} exited ${result.exitCode}`;
+      : result.exitCode === null && Boolean(result.signal)
+        ? `${checkId} failed with signal ${result.signal}${details ? `: ${details}` : ""}`
+        : details || `${checkId} exited ${result.exitCode}`;
     return attemptResult(transition({ kind: "check-rejected", feedback: reason }).state);
   }
 

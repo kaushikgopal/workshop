@@ -131,6 +131,54 @@ test("a failed command check rejects the attempt with its output and reason", as
   assert.deepEqual(result, { kind: "failed", output: "candidate", reason: "wrong output\nexpected a line" });
 });
 
+test("command-check diagnostics report signals and retain stdout-first fallback text", async (t) => {
+  const step: WorkflowStep = {
+    kind: "command", file: "10-work.sh", number: 10, name: "work",
+    check: { kind: "command", file: "10-work.check.sh" },
+  };
+  const request = { step, pipeInput: "", feedback: "", attempt: 1 };
+
+  await t.test("real nonempty signal", async () => {
+    await withRoot(async (root) => {
+      const workerFile = join(root, "10-work.sh");
+      const checkFile = join(root, "10-work.check.sh");
+      writeFileSync(workerFile, ["printf '  worker\\n'", ""].join("\n"));
+      writeFileSync(checkFile, [
+        "cat >/dev/null",
+        "printf ' explanation\\n'",
+        "printf ' diagnostic\\n' >&2",
+        "kill -TERM $$",
+        "",
+      ].join("\n"));
+      const input = makeInput(makeWorkflow([step]), (processRequest) => executeWorkflowProcess({
+        ...processRequest,
+        workflow: "clock", runId: "wrun_test_1", projectRoot: root,
+        dataDirectory: root, stateDirectory: root, cwd: root,
+      }), { files: { "10-work.sh": workerFile, "10-work.check.sh": checkFile } });
+
+      assert.deepEqual(await executeWorkflowAttempt(input, request), {
+        kind: "failed", output: "  worker\n",
+        reason: "10-work.check failed with signal SIGTERM: explanation\ndiagnostic",
+      });
+    });
+  });
+
+  const noSignalResults: { name: string; result: ProcessExecutionResult }[] = [
+    { name: "absent signal", result: { exitCode: null, stdout: " explanation\n", stderr: " diagnostic\n", timedOut: false } },
+    { name: "null signal", result: { exitCode: null, stdout: " explanation\n", stderr: " diagnostic\n", timedOut: false, signal: null } },
+    { name: "empty signal", result: { exitCode: null, stdout: " explanation\n", stderr: " diagnostic\n", timedOut: false, signal: "" } },
+  ];
+  for (const { name, result } of noSignalResults) {
+    await t.test(name, async () => {
+      const input = makeInput(makeWorkflow([step]), async (processRequest) =>
+        processRequest.kind === "command-check" ? result : successful("  worker\n"));
+      assert.deepEqual(await executeWorkflowAttempt(input, request), {
+        kind: "failed", output: "  worker\n", reason: "explanation\ndiagnostic",
+      });
+    });
+  }
+});
+
 test("Markdown judges receive worker retry feedback without changing their input", async () => {
   const calls: ProcessExecutionRequest[] = [];
   const retryFeedback = "repeats a previous sentence";
