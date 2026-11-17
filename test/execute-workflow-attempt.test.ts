@@ -322,40 +322,13 @@ test("attempt timeouts and invalid saved workflow timeouts keep their limits", a
   }), /Workflow timeout is too large for Node timers: 999999h/);
 });
 
-test("attempt timeouts convert minutes and reject zero before process execution", async () => {
-  const requests: ProcessExecutionRequest[] = [];
-  const step: WorkflowStep = { kind: "command", file: "10-work.sh", number: 10, name: "work", timeout: "3m" };
-  await executeWorkflowAttempt(makeInput(makeWorkflow([step]), async (request) => {
-    requests.push(request);
-    return successful("worked");
-  }), { step, pipeInput: "", feedback: "", attempt: 1 });
-  assert.deepEqual(requests.map(({ timeoutMs }) => timeoutMs), [180_000]);
-
-  const invalidStep: WorkflowStep = { ...step, timeout: "0s" };
-  let calls = 0;
-  await assert.rejects(
-    executeWorkflowAttempt(makeInput(makeWorkflow([invalidStep]), async () => {
-      calls += 1;
-      return successful("unreachable");
-    }), { step: invalidStep, pipeInput: "", feedback: "", attempt: 1 }),
-    { message: "Invalid workflow timeout: 0s" },
-  );
-  assert.equal(calls, 0);
-});
-
-test("retry delays preserve the timer boundary and public validation wording", () => {
-  assert.deepEqual(parseWorkflowDecision({ action: "retry", after: "2147483s" }), {
-    action: "retry", after: "2147483s",
+test("retry decision validation preserves its public duration message", () => {
+  assert.throws(() => parseWorkflowDecision({ action: "retry", after: "0s" }), (error: unknown) => {
+    if (!(error instanceof ZodError)) return false;
+    assert.deepEqual(error.issues[0]?.path, ["after"]);
+    assert.equal(error.issues[0]?.message, "must be a positive duration supported by Node timers");
+    return true;
   });
-
-  for (const after of ["0s", "2147484s"]) {
-    assert.throws(() => parseWorkflowDecision({ action: "retry", after }), (error: unknown) => {
-      if (!(error instanceof ZodError)) return false;
-      assert.deepEqual(error.issues[0]?.path, ["after"]);
-      assert.equal(error.issues[0]?.message, "must be a positive duration supported by Node timers");
-      return true;
-    });
-  }
 });
 
 test("fake profile commands receive stdin and Workshop environment without a shell", async () => {

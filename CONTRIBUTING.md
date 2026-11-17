@@ -207,6 +207,7 @@ test/                                     unit and integration tests
   load-workflows.test.ts                   workflow folder loading
   open-workshop-harness.test.ts             service resource lifecycle
   orchestrate-workflow.test.ts             step attempts and decisions
+  parse-workflow-duration.test.ts          duration grammar and timer limits
   project-chat-events.test.ts               ordered chat event projection
   project-workshop-status.test.ts           run status and capability projection
   read-config.test.ts                      config and profile checks
