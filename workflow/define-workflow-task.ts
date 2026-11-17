@@ -37,7 +37,7 @@ export type WorkflowTaskInput = {
 type WorkflowTaskRuntime = TaskRuntime<WorkflowTaskInput, WorkflowTaskCheckpoint, WorkflowTaskResult, object>;
 
 type DecisionDocument = {
-  choice: { requestId: string; decisionNumber?: number; decision: WorkflowDecision; source?: "chat" | "round" } | null;
+  choice: { requestId: string; decisionNumber: number; decision: WorkflowDecision; source?: "chat" | "round" } | null;
 };
 
 export const workflowDecisionDocument = defineDoc<DecisionDocument>({

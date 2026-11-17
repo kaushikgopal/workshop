@@ -627,11 +627,10 @@ test("a blocked run accepts a chat decision after reopening SQLite", { timeout: 
 });
 
 
-test("saved workflow decisions reject stale and missing numbers and empty accepts", { timeout: 30_000 }, async (t) => {
+test("saved workflow decisions reject stale numbers and empty accepts", { timeout: 30_000 }, async (t) => {
   for (const fixture of [
-    { name: "stale number", decisionNumber: 0, useCurrentNumber: false, decision: { action: "skip" as const }, error: /Decision changed or became stale/ },
-    { name: "missing number", decisionNumber: undefined, useCurrentNumber: false, decision: { action: "skip" as const }, error: /Decision changed or became stale/ },
-    { name: "empty accept", decisionNumber: undefined, useCurrentNumber: true, decision: { action: "accept" as const }, error: /Cannot accept a blocked step with empty output/ },
+    { name: "stale number", decisionNumber: 0, decision: { action: "skip" as const }, error: /Decision changed or became stale/ },
+    { name: "empty accept", decisionNumber: "current" as const, decision: { action: "accept" as const }, error: /Cannot accept a blocked step with empty output/ },
   ]) {
     await t.test(fixture.name, async () => {
       const project = createProject("exit 7\n", "retries: 0\n");
@@ -646,14 +645,15 @@ test("saved workflow decisions reject stale and missing numbers and empty accept
         const task = await waitForTask(storage, runId);
         const blocked = await waitForRunStatus(service, storage, runId, "blocked");
         assert.ok(isRecord(blocked.blocked_step));
-        assert.equal(typeof blocked.blocked_step.decision_number, "number");
-        if (typeof blocked.blocked_step.decision_number !== "number") throw new Error("Blocked run has no decision number");
-        const savedNumber = fixture.useCurrentNumber ? blocked.blocked_step.decision_number : fixture.decisionNumber;
+        const currentNumber = blocked.blocked_step.decision_number;
+        assert.equal(typeof currentNumber, "number");
+        if (typeof currentNumber !== "number") throw new Error("Blocked run has no decision number");
+        const decisionNumber = fixture.decisionNumber === "current" ? currentNumber : fixture.decisionNumber;
         await harness.commit(async (tx) => {
           const document = await tx.doc(workflowDecisionDocument, task.id);
           document.choice = {
             requestId: `saved-${fixture.name}`,
-            ...(savedNumber === undefined ? {} : { decisionNumber: savedNumber }),
+            decisionNumber,
             decision: fixture.decision,
             source: "chat",
           };
