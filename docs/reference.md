@@ -85,6 +85,10 @@ durable task. It loads each step file and its check when that step starts,
 including when a retry starts. Command steps run from their file paths rather than
 from durable source snapshots, so a file edit before a process starts can affect
 that attempt.
+
+Workshop reloads the main step file when it builds a failure brief. If you edit
+the file after an attempt fails, the brief uses the newer contents, which may
+differ from what the failed attempt saw.
 Steps execute in order. The first step receives empty input. A command step runs as `sh <file>` for `.sh` or `node <file>` for `.ts`, with its working directory set to `data/<workflow>/`. Node.js applies built-in type stripping to supported TypeScript syntax. An agent step runs the selected profile command with its prompt on stdin. Workshop does not invoke a shell to start profile commands.
 
 The durable `workshop.workflow` task owns the whole workflow lifecycle. The former `interpretWorkflow` whole-workflow coordinator is retired; `executeWorkflowAttempt` handles one step and its check.
@@ -178,15 +182,14 @@ task definitions are:
 | `workshop.schedule-tick` | 1 | None |
 
 A task at the same version resumes from its saved checkpoint. The current task
-definitions have no migration functions. An open `workshop.workflow` task
-stored below version 3 cannot resume under the current version 3 definition.
-When a newer definition replaces an older version without a migration,
-pi-durable blocks the task and reports `migration_failed`. If the installed
-definition is older than the stored task, it reports `task_too_old`; if the
-task kind is no longer registered, it reports `missing_task`. Add migrations
-for supported older versions before changing a task's version. A compatible
-code change can keep the existing version only if it can still read the saved
-input and checkpoint.
+definitions have no migration functions. The per-step loader runs under
+`workshop.workflow` version 3. Finish open workflow tasks saved below version 3
+before upgrading; otherwise, pi-durable blocks them with `migration_failed`
+instead of resuming them. If the installed definition is older than the stored
+task, it reports `task_too_old`; if the task kind is no longer registered, it
+reports `missing_task`. Add migrations for supported older versions before
+changing a task's version. A compatible code change can keep the existing
+version only if it can still read the saved input and checkpoint.
 
 The `workshop.state` document is version 2 and migrates version 1. The
 `workshop.workflow-decision` and `workshop.run-reference` documents are version
