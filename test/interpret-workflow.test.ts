@@ -131,6 +131,35 @@ test("a failed command check rejects the attempt with its output and reason", as
   assert.deepEqual(result, { kind: "failed", output: "candidate", reason: "wrong output\nexpected a line" });
 });
 
+test("Markdown judges receive worker retry feedback without changing their input", async () => {
+  const calls: ProcessExecutionRequest[] = [];
+  const retryFeedback = "repeats a previous sentence";
+  const workflow = makeWorkflow([{
+    kind: "agent", file: "10-write.md", number: 10, name: "write", profile: "writer",
+    check: { kind: "agent", file: "10-write.check.md", profile: "judge" },
+  }]);
+  const input = makeInput(workflow, async (request) => {
+    calls.push(request);
+    if (request.kind === "agent-check") {
+      return request.attempt === 1 ? successful(`REJECT - ${retryFeedback}`) : successful("ACCEPT");
+    }
+    return successful(request.attempt === 1 ? "first candidate\n" : "second candidate\n");
+  }, { documents: { "10-write.md": "Write the sentence.", "10-write.check.md": "Judge the sentence." } });
+
+  const first = await executeWorkflowAttempt(input, {
+    step: firstStep(workflow), profile: "writer", pipeInput: "", feedback: "", attempt: 1,
+  });
+  const second = await executeWorkflowAttempt(input, {
+    step: firstStep(workflow), profile: "writer", pipeInput: "", feedback: retryFeedback, attempt: 2,
+  });
+
+  assert.deepEqual(first, { kind: "failed", output: "first candidate\n", reason: retryFeedback });
+  assert.deepEqual(second, { kind: "accepted", output: "second candidate\n" });
+  assert.equal(calls[1]?.feedback, "");
+  assert.equal(calls[3]?.feedback, retryFeedback);
+  assert.equal(calls[3]?.input, "Judge the sentence.\n\n## Input\n\nsecond candidate\n");
+});
+
 test("Markdown checks use only their first line and failed check processes cannot accept", async () => {
   assert.deepEqual(parseMarkdownVerdict("ACCEPT - original\nREJECT"), { accepted: true, reason: "original" });
   assert.deepEqual(parseMarkdownVerdict("explanation\nACCEPT"), {

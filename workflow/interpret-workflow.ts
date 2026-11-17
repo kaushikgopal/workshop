@@ -287,7 +287,7 @@ async function executeAttempt(
     command,
     input: renderAgentPrompt(prompt, workerOutput, ""),
     step: checkId,
-    feedback: "",
+    feedback,
     timeoutMs: checkTimeout,
     attempt,
     profile: checkProfile,
