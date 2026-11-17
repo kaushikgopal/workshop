@@ -11,8 +11,8 @@ import {
   type WorkflowTaskResult,
 } from "./advance-workflow-state.ts";
 import { buildOrchestratorBrief } from "./build-orchestrator-brief.ts";
-import { StepAttemptTask } from "./define-step-attempt-task.ts";
-import { loadWorkflowStep } from "./load-workflow-step.ts";
+import { StepAttemptTask, type StepAttemptSource } from "./define-step-attempt-task.ts";
+import { loadWorkflowStep, WorkflowStepLoadError } from "./load-workflow-step.ts";
 import type { WorkflowAttemptRequest, WorkflowAttemptResult, WorkflowDecisionRequest } from "./interpret-workflow.ts";
 import type { OrchestratorDecision, Workflow, WorkflowDecision, WorkflowStep } from "./types.ts";
 import { appendRecent, workshopStateDocument } from "./define-workshop-state.ts";
@@ -153,14 +153,20 @@ async function submitFailureRound(
 ): Promise<void> {
   const step = input.workflow.steps[checkpoint.stepIndex];
   if (!step) throw new WorkflowCheckpointIntegrityError("checkpoint.stepIndex", "does not identify a workflow step");
-  const loaded = loadWorkflowStep(join(input.projectRoot, "workflows"), input.workflow, step);
+  let stepContent = "";
+  try {
+    const loaded = loadWorkflowStep(join(input.projectRoot, "workflows"), input.workflow, step);
+    stepContent = loaded.contents[step.file] ?? loaded.documents[step.file] ?? "";
+  } catch (error) {
+    if (!(error instanceof WorkflowStepLoadError)) throw error;
+  }
   const brief = buildOrchestratorBrief({
     workflow: input.workflow,
     step,
     stepId: checkpoint.failure.step,
     runId: input.runId,
     decisionNumber: checkpoint.failure.decisionNumber,
-    stepContent: loaded.contents[step.file] ?? loaded.documents[step.file] ?? "",
+    stepContent,
     lastOutput: checkpoint.failure.lastOutput,
     lastError: checkpoint.failure.lastError,
     attemptHistory: checkpoint.failure.attemptHistory,
@@ -271,7 +277,15 @@ async function startStepAttempt(
   }
   const step = input.workflow.steps[checkpoint.stepIndex];
   if (!step) throw new WorkflowCheckpointIntegrityError("checkpoint.stepIndex", "does not identify a workflow step");
-  const loaded = loadWorkflowStep(join(input.projectRoot, "workflows"), input.workflow, step);
+  let source: StepAttemptSource;
+  try {
+    const { documents, files } = loadWorkflowStep(join(input.projectRoot, "workflows"), input.workflow, step);
+    source = { documents, files };
+  } catch (error) {
+    if (!(error instanceof WorkflowStepLoadError)) throw error;
+    // Save expected load failures as attempts so retries and blocked decisions still apply.
+    source = { loadError: error.message };
+  }
   const request: WorkflowAttemptRequest = {
     step,
     ...(checkpoint.profile === undefined ? {} : { profile: checkpoint.profile }),
@@ -283,8 +297,7 @@ async function startStepAttempt(
     projectRoot: input.projectRoot,
     workflow: input.workflow,
     step,
-    documents: loaded.documents,
-    files: loaded.files,
+    ...source,
     profileCommands: input.profileCommands,
     runId: input.runId,
     dataDirectory: input.dataDirectory,

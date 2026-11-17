@@ -19,6 +19,7 @@ import { parseServiceRequest } from "../service/types.ts";
 import { tickWorkflows } from "../schedule/tick-workflows.ts";
 import { executeWorkflowProcess } from "../run/execute-workflow-process.ts";
 import { createStepAttemptTask } from "../workflow/define-step-attempt-task.ts";
+import * as workflowStepLoader from "../workflow/load-workflow-step.ts";
 import { WorkflowTask, WORKFLOW_TASK_NAME, workflowDecisionDocument } from "../workflow/define-workflow-task.ts";
 
 function createProject(command: string, extraFrontmatter = ""): { root: string } {
@@ -914,6 +915,169 @@ test("later step files are loaded when each step starts", async () => {
     }
   } finally {
     if (harness) await harness.close(BACKGROUND_CONTEXT);
+    rmSync(project.root, { recursive: true, force: true });
+  }
+});
+
+test("step loader classifies expected failures and preserves path defects", () => {
+  const project = createProject("");
+  const root = join(project.root, "workflows");
+  const workflow = { name: "clock", directory: "clock", cron: "* * * * *", description: "Test.", steps: [] };
+  const load = (file: string, kind: "command" | "agent") =>
+    workflowStepLoader.loadWorkflowStep(root, workflow, { kind, file, number: 20, name: "next" });
+
+  try {
+    const expectedFailures = [
+      ["20-missing.sh", "command", null, "ENOENT"],
+      ["20-incomplete.md", "agent", "---\nprofile: writer\nprompt without closing delimiter", "missing or incomplete YAML frontmatter"],
+      ["20-empty.md", "agent", "---\nprofile: writer\n---\n  \n", "step content must not be empty"],
+    ] as const;
+    for (const [file, kind, contents, message] of expectedFailures) {
+      if (contents !== null) writeFileSync(join(root, "clock", file), contents);
+      assert.throws(() => load(file, kind), (error: unknown) =>
+        error instanceof workflowStepLoader.WorkflowStepLoadError && error.message.includes(message), file);
+    }
+    const pathFailure = new TypeError("invalid workflow path");
+    const invalidWorkflow = { ...workflow, get directory(): string { throw pathFailure; } };
+    assert.throws(() => workflowStepLoader.loadWorkflowStep(root, invalidWorkflow, {
+      kind: "command", file: "20-next.sh", number: 20, name: "next",
+    }), (error: unknown) => error === pathFailure);
+  } finally {
+    rmSync(project.root, { recursive: true, force: true });
+  }
+});
+
+test("admitted missing step retries and blocks with saved input", { timeout: 10_000 }, async () => {
+  const firstStep = [
+    `mv "$WORKSHOP_PROJECT_ROOT/workflows/clock/20-next.sh" "$WORKSHOP_DATA_DIR/20-next.sh"`,
+    "printf 'first output'",
+    "",
+  ].join("\n");
+  const project = createProject(firstStep, "retries: 1\n");
+  writeFileSync(join(project.root, "workflows", "clock", "20-next.sh"), "printf 'unreachable output'\n");
+  const storage = new MemoryStorage();
+  let harness: Awaited<ReturnType<typeof createHarness>> | undefined;
+  try {
+    harness = await createHarness(storage);
+    harness.resume();
+    const service = createWorkshopService({ projectRoot: project.root, harness });
+    const started = await service.handleRequest({ request_id: "start-missing-step", type: "start_workflow", workflow: "clock" });
+    const runId = runIdFrom(started);
+    const task = await waitForTask(storage, runId);
+    let settled = task;
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      const current = await storage.task(task.id, BACKGROUND_CONTEXT);
+      assert.ok(current);
+      settled = current;
+      const checkpoint = current.state.checkpoint;
+      if (current.state.status === "terminal" ||
+        (isRecord(checkpoint) && checkpoint.phase === "blocked" && checkpoint.roundStatus === "settled")) break;
+      await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+    }
+    assert.equal(settled.state.status, "running", JSON.stringify(settled.state));
+    const checkpoint = settled.state.checkpoint;
+    assert.ok(isRecord(checkpoint));
+    assert.equal(checkpoint.phase, "blocked");
+    assert.equal(checkpoint.roundStatus, "settled");
+    assert.equal(checkpoint.localRetriesLeft, 0);
+    assert.equal(checkpoint.pipeInput, "first output");
+    assert.ok(Array.isArray(checkpoint.attemptHistory));
+    const history = checkpoint.attemptHistory;
+    assert.deepEqual(history.map((entry) => isRecord(entry) ? [entry.attempt, entry.output] : null), [[1, ""], [2, ""]]);
+    assert.ok(history.every((entry) => isRecord(entry) && typeof entry.error === "string" && entry.error.includes("ENOENT")));
+
+    const rootConversation = await harness.root(BACKGROUND_CONTEXT);
+    const submissions = await storage.scanSubmissions({ conversationId: rootConversation.id }, 100, undefined, BACKGROUND_CONTEXT);
+    assert.deepEqual(submissions.items.map(({ requestId }) => requestId), [`round:${runId}:20-next:2`]);
+    const state = await harness.snapshot(workshopStateDocument, BACKGROUND_CONTEXT);
+    assert.ok(state?.actions.some((action) => action.run_id === runId && action.step === "20-next" &&
+      action.source === "round" && action.decision.action === "give_up"));
+  } finally {
+    if (harness) await harness.close(BACKGROUND_CONTEXT);
+    rmSync(project.root, { recursive: true, force: true });
+  }
+});
+
+test("unexpected step load errors during failure-brief building still fault the task", { timeout: 30_000 }, async () => {
+  const project = createProject("printf 'failed'; exit 7\n", "retries: 0\n");
+  const stateDirectory = join(project.root, "state");
+  mkdirSync(stateDirectory, { recursive: true });
+  const databasePath = join(stateDirectory, "workshop.sqlite");
+  let seedStorage: Storage | undefined;
+  let seedHarness: Awaited<ReturnType<typeof createHarness>> | undefined;
+  let harness: Awaited<ReturnType<typeof createHarness>> | undefined;
+  try {
+    seedStorage = await openNodeSqliteStorage(databasePath);
+    seedHarness = await createHarness(seedStorage);
+    const port = await createWorkflowStartPort(seedHarness);
+    const started = await startWorkflow({
+      projectRoot: project.root,
+      workflowName: "clock",
+      port,
+      at: new Date("2026-11-16T12:00:00.000Z"),
+    });
+    assert.equal(started.kind, "started");
+    if (started.kind !== "started") throw new Error("Workflow did not start");
+    const task = await waitForTask(seedStorage, started.run_id);
+    const input = structuredClone(task.input);
+    assert.ok(isRecord(input));
+    assert.ok(isRecord(input.workflow));
+    assert.ok(Array.isArray(input.workflow.steps));
+    const step = input.workflow.steps[0];
+    assert.ok(isRecord(step));
+    step.file = 42;
+    const attemptHistory = [{ attempt: 1, output: "failed", error: "command exited with status 7" }];
+    const checkpoint: JsonValue = {
+      phase: "blocked",
+      stepIndex: 0,
+      pipeInput: "",
+      results: [],
+      attemptHistory,
+      localRetriesLeft: 0,
+      feedback: "",
+      decisionNumber: 1,
+      automaticRoundUsed: true,
+      failure: {
+        workflow: "clock",
+        runId: started.run_id,
+        step: "10-task",
+        stepKind: "command",
+        retryProfiles: [],
+        lastError: "command exited with status 7",
+        lastOutput: "failed",
+        attemptHistory,
+        decisionNumber: 1,
+      },
+      roundStatus: "pending",
+    };
+    const seededTask: TaskRecord<JsonValue, JsonValue, JsonValue> = {
+      ...task,
+      input,
+      state: { status: "pending", checkpoint },
+    };
+    const stored = await seedStorage.commit(
+      [[{ type: "task", value: seededTask }]],
+      () => {},
+      BACKGROUND_CONTEXT,
+    );
+    assert.equal(stored.stored, 1);
+    assert.equal(stored.refused, undefined);
+
+    await seedHarness.close(BACKGROUND_CONTEXT);
+    seedHarness = undefined;
+    seedStorage = undefined;
+    harness = await createHarness(await openNodeSqliteStorage(databasePath));
+    harness.resume();
+    const settled = await harness.waitForTask(task.id, BACKGROUND_CONTEXT);
+    assert.equal(settled.state.status, "terminal");
+    if (settled.state.status !== "terminal") throw new Error("Blocked workflow task did not settle");
+    assert.equal(settled.state.outcome.status, "faulted");
+    if (settled.state.outcome.status !== "faulted") throw new Error("Unexpected failure-brief error did not fault the task");
+    assert.match(settled.state.outcome.error.message, /invalid argument|must be of type|path/i);
+  } finally {
+    if (harness) await harness.close(BACKGROUND_CONTEXT);
+    if (seedHarness) await seedHarness.close(BACKGROUND_CONTEXT);
+    else if (seedStorage) await seedStorage.close(BACKGROUND_CONTEXT);
     rmSync(project.root, { recursive: true, force: true });
   }
 });

@@ -5,12 +5,14 @@ import type { Workflow, WorkflowStep } from "./types.ts";
 
 export const STEP_ATTEMPT_TASK_NAME = "workshop.step-attempt";
 
-export type StepAttemptTaskInput = {
+export type StepAttemptSource =
+  | { documents: Record<string, string>; files: Record<string, string> }
+  | { loadError: string };
+
+export type StepAttemptTaskInput = StepAttemptSource & {
   projectRoot: string;
   workflow: Workflow;
   step: WorkflowStep;
-  documents: Record<string, string>;
-  files: Record<string, string>;
   profileCommands: Record<string, string[]>;
   runId: string;
   dataDirectory: string;
@@ -44,6 +46,8 @@ async function executeAttemptTask(
   runtime: StepAttemptRuntime,
   executeProcess: StepAttemptProcessExecutor,
 ): Promise<WorkflowAttemptResult> {
+  if ("loadError" in input) return { kind: "failed", output: "", reason: input.loadError };
+
   const attemptEnvironment: WorkflowAttemptEnvironment = {
     workflow: input.workflow,
     documents: input.documents,
