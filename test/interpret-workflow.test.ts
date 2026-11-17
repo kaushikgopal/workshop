@@ -6,7 +6,7 @@ import { join, resolve } from "node:path";
 import { test } from "node:test";
 import { ZodError } from "zod";
 import { createWorkflowProcessState, executeWorkflowProcess, transitionWorkflowProcess } from "../run/execute-workflow-process.ts";
-import { executeWorkflowAttempt, parseMarkdownVerdict, transitionWorkflowAttempt, type ProcessExecutionRequest, type ProcessExecutionResult, type WorkflowAttemptEnvironment } from "../workflow/interpret-workflow.ts";
+import { executeWorkflowAttempt, parseMarkdownVerdict, transitionWorkflowAttempt, type ProcessExecutionRequest, type ProcessExecutionResult, type WorkflowAttemptEnvironment, type WorkflowAttemptResult } from "../workflow/interpret-workflow.ts";
 import { parseWorkflowDecision } from "../workflow/parse-workflow-decision.ts";
 import type { Workflow, WorkflowStep } from "../workflow/types.ts";
 
@@ -273,6 +273,36 @@ test("Markdown checks use only their first line and failed check processes canno
 
   assert.deepEqual(calls.map(({ kind }) => kind), ["agent", "agent-check"]);
   assert.deepEqual(result, { kind: "failed", output: "draft", reason: "10-write.check failed with exit code 7: judge crashed\nACCEPT" });
+});
+
+test("Markdown judge attempts require complete verdict tokens and preserve supported forms", async () => {
+  const step: WorkflowStep = {
+    kind: "agent", file: "10-write.md", number: 10, name: "write", profile: "writer",
+    check: { kind: "agent", file: "10-write.check.md", profile: "judge" },
+  };
+  const cases: Array<[string, WorkflowAttemptResult]> = [
+    ["ACCEPTED", { kind: "failed", output: "draft", reason: 'check must start with ACCEPT or REJECT; received "ACCEPTED"' }],
+    ["REJECTED", { kind: "failed", output: "draft", reason: 'check must start with ACCEPT or REJECT; received "REJECTED"' }],
+    ["accept", { kind: "accepted", output: "draft" }],
+    ["reject", { kind: "failed", output: "draft", reason: "check rejected the output" }],
+    ["ACCEPT\r\nignored", { kind: "accepted", output: "draft" }],
+    ["REJECT\r\nignored", { kind: "failed", output: "draft", reason: "check rejected the output" }],
+    ["ACCEPT: approved", { kind: "accepted", output: "draft" }],
+    ["REJECT - needs work", { kind: "failed", output: "draft", reason: "needs work" }],
+    ["ACCEPT with a reason", { kind: "accepted", output: "draft" }],
+    ["", { kind: "failed", output: "draft", reason: 'check must start with ACCEPT or REJECT; received ""' }],
+    ["   ", { kind: "failed", output: "draft", reason: 'check must start with ACCEPT or REJECT; received ""' }],
+  ];
+
+  for (const [verdict, expected] of cases) {
+    const input = makeInput(makeWorkflow([step]), async ({ kind }) =>
+      successful(kind === "agent-check" ? verdict : "draft"), {
+        documents: { "10-write.md": "Write.", "10-write.check.md": "Judge." },
+      });
+    assert.deepEqual(await executeWorkflowAttempt(input, {
+      step, profile: "writer", pipeInput: "", feedback: "", attempt: 1,
+    }), expected, verdict);
+  }
 });
 
 test("attempt timeouts and invalid saved workflow timeouts keep their limits", async () => {
