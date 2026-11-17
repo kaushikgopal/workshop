@@ -180,6 +180,42 @@ test("attempt failures consume local retry budget before blocking", () => {
   });
 });
 
+test("retry counts resolve step, check, then workflow with explicit zero", () => {
+  const cases = [
+    { name: "step overrides check and workflow", workflowRetries: 0, stepRetries: 2, checkRetries: 1, expected: 2 },
+    { name: "check overrides workflow", workflowRetries: 0, checkRetries: 2, expected: 2 },
+    { name: "workflow supplies the fallback", workflowRetries: 2, expected: 2 },
+    { name: "step zero overrides positive defaults", workflowRetries: 2, stepRetries: 0, checkRetries: 2, expected: 0 },
+  ];
+
+  for (const item of cases) {
+    const base = makeWorkflow(2, item.workflowRetries);
+    const first = base.steps[0];
+    const second = base.steps[1];
+    assert.ok(first && second);
+    const context = makeContext({
+      ...base,
+      steps: [first, {
+        ...second,
+        ...(item.stepRetries === undefined ? {} : { retries: item.stepRetries }),
+        check: {
+          kind: "command",
+          file: "20-step-2.check.sh",
+          ...(item.checkRetries === undefined ? {} : { retries: item.checkRetries }),
+        },
+      }],
+    });
+    const next = accepted(advanceWorkflowState(attemptCheckpoint(context, 0), {
+      kind: "attempt-settled", attempt: 1, result: { kind: "accepted", output: "first step" },
+    }, context));
+
+    assert.equal(next.state.phase, "step", item.name);
+    if (next.state.phase !== "step") throw new Error("Expected the next step");
+    assert.equal(next.state.stepIndex, 1, item.name);
+    assert.equal(next.state.localRetriesLeft, item.expected, item.name);
+  }
+});
+
 test("checkpoint decoding rejects invalid step bounds and counters with field context", () => {
   const context = makeContext();
   for (const [checkpoint, field] of [

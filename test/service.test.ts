@@ -19,7 +19,7 @@ import { serveServiceSocket } from "../service/serve-service-socket.ts";
 import { parseServiceRequest } from "../service/types.ts";
 import { tickWorkflows } from "../schedule/tick-workflows.ts";
 import { executeWorkflowProcess } from "../run/execute-workflow-process.ts";
-import { createStepAttemptTask } from "../workflow/define-step-attempt-task.ts";
+import { createStepAttemptTask, STEP_ATTEMPT_TASK_NAME } from "../workflow/define-step-attempt-task.ts";
 import * as workflowStepLoader from "../workflow/load-workflow-step.ts";
 import { WorkflowTask, WORKFLOW_TASK_NAME, workflowDecisionDocument, type WorkflowTaskCheckpoint, type WorkflowTaskInput } from "../workflow/define-workflow-task.ts";
 
@@ -1374,6 +1374,61 @@ test("durable retries send check feedback to the worker and keep the accepted wo
       "check:first",
       "worker:second feedback=expected a revision",
       "check:second",
+    ]);
+  } finally {
+    if (harness) await harness.close(BACKGROUND_CONTEXT);
+    rmSync(project.root, { recursive: true, force: true });
+  }
+});
+
+test("durable explicit-zero retry budgets override workflow defaults", { timeout: 10_000 }, async () => {
+  const project = createProject("printf 'first step output'\n", "retries: 2\n");
+  const workflowDirectory = join(project.root, "workflows", "clock");
+  writeFileSync(join(project.root, "workshop.yaml"), [
+    "agent_profiles:",
+    `  writer:\n    command: ${JSON.stringify([process.execPath, join(process.cwd(), "test/fixtures/profile-command.mjs"), "fail"])}`,
+    "orchestrator: {}",
+    "",
+  ].join("\n"));
+  writeFileSync(join(workflowDirectory, "20-agent.md"), "---\nprofile: writer\nretries: 0\n---\n\nFail this attempt.\n");
+  const storage = new MemoryStorage();
+  let harness: Awaited<ReturnType<typeof createHarness>> | undefined;
+  try {
+    harness = await createHarness(storage);
+    harness.resume();
+    const service = createWorkshopService({ projectRoot: project.root, harness });
+    const started = await service.handleRequest({ request_id: "retry-budget", type: "start_workflow", workflow: "clock" });
+    const runId = runIdFrom(started);
+    const task = await waitForTask(storage, runId);
+    await waitForRunStatus(service, storage, runId, "blocked");
+    const settled = await storage.task(task.id, BACKGROUND_CONTEXT);
+    assert.ok(settled);
+    assert.equal(settled.state.status, "running");
+    const checkpoint = settled.state.checkpoint;
+    assert.ok(isRecord(checkpoint));
+    assert.equal(checkpoint.phase, "blocked");
+    assert.equal(checkpoint.stepIndex, 1);
+    assert.equal(checkpoint.localRetriesLeft, 0);
+    assert.ok(Array.isArray(checkpoint.attemptHistory));
+    assert.equal(checkpoint.attemptHistory.length, 1);
+    const attempt = checkpoint.attemptHistory[0];
+    assert.ok(isRecord(attempt));
+    assert.equal(attempt.profile, "writer");
+    assert.match(String(attempt.error), /fixture profile failure/);
+
+    const childTasks = await storage.scanTasks({ kind: STEP_ATTEMPT_TASK_NAME }, 100, undefined, BACKGROUND_CONTEXT);
+    const childRequests = childTasks.items
+      .filter((child) => String(child.owner) === String(task.id))
+      .map((child) => {
+        assert.ok(isRecord(child.input));
+        assert.ok(isRecord(child.input.request));
+        assert.ok(isRecord(child.input.request.step));
+        return [child.input.request.step.file, child.input.request.attempt, child.input.request.profile];
+      })
+      .sort((left, right) => String(left[0]).localeCompare(String(right[0])) || Number(left[1]) - Number(right[1]));
+    assert.deepEqual(childRequests, [
+      ["10-task.sh", 1, undefined],
+      ["20-agent.md", 1, "writer"],
     ]);
   } finally {
     if (harness) await harness.close(BACKGROUND_CONTEXT);
