@@ -106,9 +106,13 @@ workflows/hemingway-clock/
 
 ### Ending a run early
 
-A command step that exits with code `99` ends the run early. An agent step can do the same when its stdout ends with `WORKSHOP_NOTHING_TO_DO` as the last nonblank line. See [the reference](docs/reference.md) for matching and check rules.
+A command step that exits with code `99` ends the run early as `nothing-to-do`: its check and later steps do not run, and the next scheduled run starts as usual. An agent step does the same when the last nonblank line of its output is `WORKSHOP_NOTHING_TO_DO`. To use it, add a line like this to the agent step's prompt:
 
+```text
 If there is nothing to do, finish your response with WORKSHOP_NOTHING_TO_DO alone on its own line, without quotes or a code fence. Emit nothing after it.
+```
+
+See [the reference](docs/reference.md) for the exact matching rules.
 
 Workshop stores runs and orchestrator state in `state/workshop.sqlite`. It
 reads each step and check file when that step starts. Workshop rereads the main
