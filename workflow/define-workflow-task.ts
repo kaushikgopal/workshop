@@ -48,7 +48,6 @@ export const workflowDecisionDocument = defineDoc<DecisionDocument>({
   checkpointWhen: () => true,
 });
 
-
 function stateContext(input: WorkflowTaskInput): WorkflowStateContext {
   return {
     workflow: input.workflow,

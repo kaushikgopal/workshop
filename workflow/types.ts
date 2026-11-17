@@ -29,14 +29,12 @@ export type WorkflowDecisionRequest = {
   decisionNumber: number;
 };
 
-
 export type WorkflowStepResult = {
   step: string;
   status: "completed" | "skipped" | "nothing-to-do";
   output: string;
   attempts: AttemptHistoryEntry[];
 };
-
 
 export type WorkflowCheck = {
   kind: WorkflowStepKind;

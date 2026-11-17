@@ -203,7 +203,7 @@ test/                                     unit and integration tests
   check-workflows.test.ts                  workflow validation
   crash-resume.test.ts                     SQLite task recovery
   decide-workflow-admission.test.ts        start receipt and admission outcomes
-  interpret-workflow.test.ts               command, agent, and check behavior
+  execute-workflow-attempt.test.ts         command, agent, and check behavior
   load-workflows.test.ts                   workflow folder loading
   open-workshop-harness.test.ts             service resource lifecycle
   orchestrate-workflow.test.ts             step attempts and decisions
