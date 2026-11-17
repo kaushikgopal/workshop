@@ -1670,6 +1670,85 @@ test("durable command exit 99 skips the rest of its run and leaves the next run 
   }
 });
 
+test("durable agent nothing-to-do skips its check and later steps, then leaves the next run free", { timeout: 10_000 }, async () => {
+  const project = createProject(":", "retries: 2\n");
+  const workflowDirectory = join(project.root, "workflows", "clock");
+  const dataDirectory = join(project.root, "data", "clock");
+  const stateDirectory = join(project.root, "state");
+  rmSync(join(workflowDirectory, "10-task.sh"));
+  mkdirSync(dataDirectory, { recursive: true });
+  mkdirSync(stateDirectory, { recursive: true });
+  writeFileSync(join(workflowDirectory, "10-task.md"), "---\nprofile: writer\n---\n\nWrite the summary.\n");
+  writeFileSync(join(workflowDirectory, "10-task.check.sh"), 'touch "$WORKSHOP_DATA_DIR/check-marker"\n');
+  writeFileSync(join(workflowDirectory, "20-later.sh"), 'touch "$WORKSHOP_DATA_DIR/later-marker"\n');
+  const fakeWriter = join(project.root, "fake-writer.mjs");
+  writeFileSync(fakeWriter, [
+    "import { existsSync, writeFileSync } from 'node:fs';",
+    "for await (const chunk of process.stdin) void chunk;",
+    "const marker = `${process.env.WORKSHOP_DATA_DIR}/ready`;",
+    "if (existsSync(marker)) process.stdout.write('work\\n');",
+    "else { writeFileSync(marker, ''); process.stdout.write('no work\\nWORKSHOP_NOTHING_TO_DO\\n'); }",
+    "",
+  ].join("\n"));
+  writeFileSync(join(project.root, "workshop.yaml"), [
+    "agent_profiles:",
+    `  writer:\n    command: ${JSON.stringify([process.execPath, fakeWriter])}`,
+    "orchestrator: {}",
+    "",
+  ].join("\n"));
+  let storage: Awaited<ReturnType<typeof openNodeSqliteStorage>> | undefined;
+  let harness: Awaited<ReturnType<typeof createHarness>> | undefined;
+  try {
+    storage = await openNodeSqliteStorage(join(stateDirectory, "workshop.sqlite"));
+    harness = await createHarness(storage);
+    harness.resume();
+    const port = await createWorkflowStartPort(harness);
+    const started = await startWorkflow({
+      projectRoot: project.root,
+      workflowName: "clock",
+      port,
+      at: new Date("2026-11-16T12:00:00.000Z"),
+    });
+    assert.equal(started.kind, "started");
+    if (started.kind !== "started") throw new Error("Workflow did not start");
+    const task = await waitForTask(storage, started.run_id);
+    const settled = await harness.waitForTask(task.id, BACKGROUND_CONTEXT);
+    assert.ok(settled.state.status === "terminal" && settled.state.outcome.status === "completed");
+    assert.deepEqual(settled.state.outcome.result, {
+      status: "nothing-to-do",
+      output: "no work\nWORKSHOP_NOTHING_TO_DO\n",
+      completedSteps: 0,
+      steps: [{ step: "10-task", status: "nothing-to-do", output: "no work\nWORKSHOP_NOTHING_TO_DO\n", attempts: [{ attempt: 1, profile: "writer", output: "no work\nWORKSHOP_NOTHING_TO_DO\n" }] }],
+    });
+    assert.equal(existsSync(join(dataDirectory, "check-marker")), false);
+    assert.equal(existsSync(join(dataDirectory, "later-marker")), false);
+    const status = await createWorkshopService({ projectRoot: project.root, harness }).handleRequest({
+      request_id: "agent-no-work-read", type: "read_run", run_id: started.run_id,
+    });
+    assert.ok(isRecord(status.run));
+    assert.equal(status.run.status, "nothing-to-do");
+
+    const next = await startWorkflow({
+      projectRoot: project.root,
+      workflowName: "clock",
+      port,
+      at: new Date("2026-11-16T12:05:00.000Z"),
+    });
+    assert.equal(next.kind, "started");
+    if (next.kind !== "started") throw new Error("Next workflow run did not start");
+    const nextTask = await waitForTask(storage, next.run_id);
+    const nextSettled = await harness.waitForTask(nextTask.id, BACKGROUND_CONTEXT);
+    assert.ok(nextSettled.state.status === "terminal" && nextSettled.state.outcome.status === "completed");
+    assert.equal((nextSettled.state.outcome.result as { status: string }).status, "completed");
+    assert.equal(existsSync(join(dataDirectory, "check-marker")), true);
+    assert.equal(existsSync(join(dataDirectory, "later-marker")), true);
+  } finally {
+    if (harness) await harness.close(BACKGROUND_CONTEXT);
+    else if (storage) await storage.close(BACKGROUND_CONTEXT);
+    rmSync(project.root, { recursive: true, force: true });
+  }
+});
+
 test("submit_chat reuses the configured root conversation through the service", async () => {
   const project = createProject("printf 'unused'\n");
   const storage = new MemoryStorage();

@@ -11,7 +11,7 @@ import {
 import { decodeStepAttemptOutcome } from "../workflow/define-workflow-task.ts";
 import type { Workflow } from "../workflow/types.ts";
 
-function makeWorkflow(stepCount = 2, retries = 1): Workflow {
+function makeWorkflow(stepCount = 2, retries = 1, stepKind: "command" | "agent" = "command"): Workflow {
   return {
     name: "clock",
     directory: "clock",
@@ -19,8 +19,8 @@ function makeWorkflow(stepCount = 2, retries = 1): Workflow {
     description: "Transition fixture.",
     retries,
     steps: Array.from({ length: stepCount }, (_, index) => ({
-      kind: "command" as const,
-      file: `${(index + 1) * 10}-step.sh`,
+      kind: stepKind,
+      file: `${(index + 1) * 10}-step.${stepKind === "agent" ? "md" : "sh"}`,
       number: (index + 1) * 10,
       name: `step-${index + 1}`,
     })),
@@ -267,9 +267,9 @@ test("child task faults and orphan reasons remain visible in the attempt result"
   });
 });
 
-test("nothing-to-do finishes a command workflow instead of advancing", () => {
-  const context = makeContext(makeWorkflow(2, 0));
-  const attempt = attemptCheckpoint(context, 0);
+test("nothing-to-do finishes an agent workflow instead of advancing", () => {
+  const context = makeContext(makeWorkflow(2, 2, "agent"));
+  const attempt = attemptCheckpoint(context, 2);
   const finished = accepted(advanceWorkflowState(attempt, {
     kind: "attempt-settled", attempt: 1, result: { kind: "nothing-to-do", output: "already done" },
   }, context));

@@ -397,7 +397,6 @@ export function advanceWorkflowState(
       if (event.attempt !== state.activeAttempt.request.attempt) return rejected("stale-attempt", "Attempt result does not match the active attempt");
       const step = context.workflow.steps[state.stepIndex];
       if (!step) return rejected("invalid-event", "Current workflow step is missing");
-      if (event.result.kind === "nothing-to-do" && step.kind !== "command") return rejected("invalid-event", "Only command steps can finish as nothing-to-do");
       const history = [...state.attemptHistory, attemptRecord(state.activeAttempt.request, event.result)];
       const position: CheckpointPosition = { ...state, attemptHistory: history };
       if (event.result.kind === "nothing-to-do") {

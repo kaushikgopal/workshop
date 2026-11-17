@@ -106,6 +106,75 @@ test("only a clean command exit 99 means nothing-to-do", async () => {
   if (errored.kind === "failed") assert.match(errored.reason, /pipe failed/);
 });
 
+type AgentNothingToDoCase = {
+  name: string;
+  stdout: string;
+  expected: "accepted" | "failed" | "nothing-to-do";
+  stepKind?: WorkflowStep["kind"];
+  stderr?: string;
+  process?: Partial<ProcessExecutionResult>;
+  check?: boolean;
+  checkOutput?: string;
+  expectedCalls?: ProcessExecutionRequest["kind"][];
+};
+
+test("agent nothing-to-do matches only a clean worker's last nonblank stdout line", async () => {
+  const token = "WORKSHOP_NOTHING_TO_DO";
+  const cases: AgentNothingToDoCase[] = [
+    { name: "bare token", stdout: token, expected: "nothing-to-do", check: true },
+    { name: "text before token", stdout: `Report ready.\n${token}\n`, expected: "nothing-to-do" },
+    { name: "CRLF", stdout: `Report ready.\r\n${token}\r\n`, expected: "nothing-to-do" },
+    { name: "surrounding whitespace and trailing blank lines", stdout: ` \t${token} \t\r\n \t\n\r\n`, expected: "nothing-to-do" },
+    { name: "prefix", stdout: `text ${token}`, expected: "accepted" },
+    { name: "suffix", stdout: `${token}_LATER`, expected: "accepted" },
+    { name: "wrong case", stdout: token.toLowerCase(), expected: "accepted" },
+    { name: "ANSI escape codes", stdout: `\u001b[32m${token}\u001b[0m`, expected: "accepted" },
+    { name: "JSON text", stdout: JSON.stringify({ result: token }), expected: "accepted" },
+    { name: "backticks", stdout: `\`${token}\``, expected: "accepted" },
+    { name: "quotes", stdout: `\"${token}\"`, expected: "accepted" },
+    { name: "closed fence", stdout: `\`\`\`\n${token}\n\`\`\``, expected: "accepted" },
+    { name: "text after token", stdout: `${token}\nMore text`, expected: "accepted" },
+    { name: "stderr only", stdout: "ordinary output", stderr: token, expected: "accepted" },
+    { name: "command output token", stdout: token, expected: "accepted", stepKind: "command", expectedCalls: ["command"] },
+    { name: "nonzero exit", stdout: token, process: { exitCode: 7 }, expected: "failed" },
+    { name: "agent exit 99", stdout: token, process: { exitCode: 99 }, expected: "failed" },
+    { name: "timeout", stdout: token, process: { exitCode: null, timedOut: true, signal: "SIGTERM" }, expected: "failed" },
+    { name: "launch or I/O error", stdout: token, process: { error: "stdin failed" }, expected: "failed" },
+    { name: "cancelled process", stdout: token, process: { exitCode: null, signal: "SIGTERM" }, expected: "failed" },
+    {
+      name: "judge token is not a verdict", stdout: "draft", check: true, checkOutput: token,
+      expected: "failed", expectedCalls: ["agent", "agent-check"],
+    },
+  ];
+  for (const entry of cases) {
+    const stepKind = entry.stepKind ?? "agent";
+    const step: WorkflowStep = {
+      kind: stepKind, file: stepKind === "command" ? "10-step.sh" : "10-step.md", number: 10, name: "step", profile: "writer",
+      ...(entry.check ? { check: { kind: "agent", file: "10-step.check.md", profile: "judge" } } : {}),
+    };
+    const workflow = makeWorkflow([step]);
+    const calls: ProcessExecutionRequest[] = [];
+    const result = await executeWorkflowAttempt(makeInput(workflow, async (request) => {
+      calls.push(request);
+      if (request.kind === "agent-check") return successful(entry.checkOutput ?? "ACCEPT");
+      return { exitCode: 0, stdout: entry.stdout, stderr: entry.stderr ?? "", timedOut: false, ...entry.process };
+    }, { documents: { "10-step.md": "Write the report.", "10-step.check.md": "Judge the report." } }), {
+      step, profile: "writer", pipeInput: "", feedback: "", attempt: 1,
+    });
+    assert.equal(result.kind, entry.expected, entry.name);
+    if (entry.expected === "nothing-to-do" || entry.expected === "accepted") {
+      assert.equal(result.output, entry.stdout, `${entry.name} keeps the original output`);
+    }
+    if (entry.name === "judge token is not a verdict") {
+      assert.deepEqual(result, {
+        kind: "failed", output: "draft",
+        reason: 'check must start with ACCEPT or REJECT; received "WORKSHOP_NOTHING_TO_DO"',
+      });
+    }
+    assert.deepEqual(calls.map(({ kind }) => kind), entry.expectedCalls ?? ["agent"], entry.name);
+  }
+});
+
 test("command checks accept exit zero and keep the worker output", async () => {
   const calls: ProcessExecutionRequest[] = [];
   const workflow = makeWorkflow([{

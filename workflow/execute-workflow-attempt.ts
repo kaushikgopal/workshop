@@ -142,6 +142,12 @@ function processFailure(label: string, result: ProcessExecutionResult, timeoutMs
   return `${label} failed with ${status}${details ? `: ${details}` : ""}`;
 }
 
+function isNothingToDoOutput(output: string): boolean {
+  const lines = output.split(/\r?\n/);
+  while (lines.length > 0 && lines.at(-1)?.trim() === "") lines.pop();
+  return lines.at(-1)?.trim() === "WORKSHOP_NOTHING_TO_DO";
+}
+
 export function parseMarkdownVerdict(output: string): { accepted: boolean; reason: string } {
   const firstLine = output.split(/\r?\n/, 1)[0]?.trim() ?? "";
   const match = /^(ACCEPT|REJECT)(?=$|\s|:|-)(?:\s*[:-]?\s*(.*))?$/i.exec(firstLine);
@@ -226,6 +232,13 @@ export async function executeWorkflowAttempt(
       return attemptResult(transition({
         kind: "worker-failed", output: workerOutput, reason: processFailure(`${id} profile`, result, stepTimeout),
       }).state);
+    }
+    if (
+      (result.signal === undefined || result.signal === null)
+      && !input.signal?.aborted
+      && isNothingToDoOutput(workerOutput)
+    ) {
+      return attemptResult(transition({ kind: "worker-nothing-to-do", output: workerOutput }).state);
     }
   }
 
