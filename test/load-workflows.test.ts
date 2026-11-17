@@ -306,6 +306,7 @@ test("rejects orphaned, mismatched, and duplicate checks and validates Markdown 
     writeStep(directory, "10-agent.check.md", "---\nprofile: writer\n---\n  \n");
     writeStep(directory, "10-agent.check.sh", "exit 0\n");
     writeStep(directory, "20-orphan.check.ts", "process.exit(0);\n");
+    writeStep(directory, "30-other.sh");
     writeStep(directory, "30-mismatch.check.sh", "exit 0\n");
     const result = loadWorkflows(root, profiles);
     assert.equal(result.workflows.length, 0);
