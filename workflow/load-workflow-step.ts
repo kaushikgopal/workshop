@@ -5,8 +5,9 @@ import type { Workflow, WorkflowStep } from "./types.ts";
 export type WorkflowStepFiles = {
   documents: Record<string, string>;
   files: Record<string, string>;
-  contents: Record<string, string>;
+  stepContent: string;
 };
+
 export class WorkflowStepLoadError extends Error {}
 
 function readSource(file: string): string {
@@ -20,8 +21,8 @@ function readSource(file: string): string {
   }
 }
 
-function readMarkdownBody(file: string): string {
-  const contents = readSource(file).replace(/^\uFEFF/, "");
+function readMarkdownBody(file: string, source: string): string {
+  const contents = source.replace(/^\uFEFF/, "");
   const lines = contents.split(/\r?\n/);
   const closingLine = lines.findIndex((line, index) => index > 0 && (line.trim() === "---" || line.trim() === "..."));
   if (lines[0]?.trim() !== "---" || closingLine < 0) throw new WorkflowStepLoadError(`${file}: missing or incomplete YAML frontmatter`);
@@ -33,16 +34,15 @@ export function loadWorkflowStep(workflowRoot: string, workflow: Workflow, step:
   const directory = resolve(workflowRoot, workflow.directory);
   const documents: Record<string, string> = {};
   const files: Record<string, string> = {};
-  const contents: Record<string, string> = {};
   const stepFiles = [step, ...(step.check === undefined ? [] : [step.check])];
+  const stepContent = readSource(join(directory, step.file));
 
-  for (const item of stepFiles) {
+  for (const [index, item] of stepFiles.entries()) {
     const file = join(directory, item.file);
-    const source = readSource(file);
+    const source = index === 0 ? stepContent : readSource(file);
     files[item.file] = file;
-    contents[item.file] = source;
-    if (item.kind === "agent") documents[item.file] = readMarkdownBody(file);
+    if (item.kind === "agent") documents[item.file] = readMarkdownBody(file, source);
   }
 
-  return { documents, files, contents };
+  return { documents, files, stepContent };
 }

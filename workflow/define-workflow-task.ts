@@ -156,7 +156,7 @@ async function submitFailureRound(
   let stepContent = "";
   try {
     const loaded = loadWorkflowStep(join(input.projectRoot, "workflows"), input.workflow, step);
-    stepContent = loaded.contents[step.file] ?? loaded.documents[step.file] ?? "";
+    stepContent = loaded.stepContent;
   } catch (error) {
     if (!(error instanceof WorkflowStepLoadError)) throw error;
   }
