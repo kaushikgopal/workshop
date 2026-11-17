@@ -233,11 +233,7 @@ export async function executeWorkflowAttempt(
         kind: "worker-failed", output: workerOutput, reason: processFailure(`${id} profile`, result, stepTimeout),
       }).state);
     }
-    if (
-      (result.signal === undefined || result.signal === null)
-      && !input.signal?.aborted
-      && isNothingToDoOutput(workerOutput)
-    ) {
+    if (isNothingToDoOutput(workerOutput)) {
       return attemptResult(transition({ kind: "worker-nothing-to-do", output: workerOutput }).state);
     }
   }
