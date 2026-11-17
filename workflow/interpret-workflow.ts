@@ -187,10 +187,10 @@ function attemptResult(state: WorkflowAttemptState): WorkflowAttemptResult {
   }
 }
 
-async function executeAttempt(
+export async function executeWorkflowAttempt(
   input: WorkflowAttemptEnvironment,
   request: WorkflowAttemptRequest,
- ): Promise<WorkflowAttemptResult> {
+): Promise<WorkflowAttemptResult> {
   const { step, profile, pipeInput, feedback, attempt } = request;
   const id = stepId(step);
   const stepTimeout = timeoutMilliseconds(step.timeout ?? input.workflow.timeout);
@@ -304,11 +304,4 @@ async function executeAttempt(
   return attemptResult(transition(verdict.accepted
     ? { kind: "check-accepted" }
     : { kind: "check-rejected", feedback: verdict.reason }).state);
-}
-
-export async function executeWorkflowAttempt(
-  input: WorkflowAttemptEnvironment,
-  request: WorkflowAttemptRequest,
-): Promise<WorkflowAttemptResult> {
-  return await executeAttempt(input, request);
 }
