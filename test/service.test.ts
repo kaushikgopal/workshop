@@ -1160,7 +1160,7 @@ test("step loader classifies expected failures and preserves path defects", () =
   }
 });
 
-test("agent prompt and failure brief share one raw step-file read", () => {
+test("agent prompt and failure brief agree within one loaded step", () => {
   const project = createProject("");
   const stepFile = join(project.root, "workflows", "clock", "20-next.md");
   const original = "\uFEFF---\r\nprofile: writer\r\n...\r\nOriginal agent prompt.\r\n";
