@@ -175,6 +175,7 @@ workflow/                                 workflow loading and durable execution
   load-workflow-step.ts                    step and check files at step start
   load-workflows.ts                        folder validation and workflow loading
   parse-workflow-decision.ts               decision validation
+  parse-workflow-duration.ts               duration grammar and timer limits
   types.ts                                 workflow and step shapes
 run/                                      admission and process execution
   decide-workflow-admission.ts             start receipt and admission decisions

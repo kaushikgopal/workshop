@@ -3,19 +3,15 @@ import { join, resolve } from "node:path";
 import { CronExpressionParser } from "cron-parser";
 import { parseDocument } from "yaml";
 import { z } from "zod";
+import { parseWorkflowDuration } from "./parse-workflow-duration.ts";
 import type { Workflow, WorkflowCheck, WorkflowIssue, WorkflowLoadOptions, WorkflowLoadResult, WorkflowStep, WorkflowStepKind } from "./types.ts";
 
 const namePattern = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const profileName = z.string().regex(namePattern, "must use lowercase letters, digits, and hyphens");
-const maxTimeoutMs = 2_147_483_647;
-const durationFactors = { s: 1_000, m: 60_000, h: 3_600_000 };
-const duration = z.string().refine((value) => {
-  const match = /^([1-9][0-9]*)(s|m|h)$/.exec(value);
-  if (!match) return false;
-  const amount = Number(match[1]);
-  const factor = durationFactors[match[2] as keyof typeof durationFactors];
-  return Number.isSafeInteger(amount) && amount * factor <= maxTimeoutMs;
-}, "must be a positive duration supported by Node timers, such as 30s, 10m, or 2h");
+const duration = z.string().refine(
+  (value) => parseWorkflowDuration(value).kind === "valid",
+  "must be a positive duration supported by Node timers, such as 30s, 10m, or 2h",
+);
 const retryCount = z.number().int().nonnegative().refine(Number.isSafeInteger, "must be a safe integer");
 const workflowMetadataSchema = z.object({
   cron: z.string().min(1).refine((value) => {

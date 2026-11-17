@@ -1,5 +1,6 @@
 import { applyWorkflowDecision } from "./apply-workflow-decision.ts";
 import { computeRetryProfiles } from "./compute-retry-profiles.ts";
+import { parseWorkflowDuration } from "./parse-workflow-duration.ts";
 import type { TaskId } from "@earendil-works/pi-durable";
 import type { WorkflowAttemptRequest, WorkflowAttemptResult, WorkflowDecisionRequest } from "./interpret-workflow.ts";
 import type { AttemptHistoryEntry, Workflow, WorkflowDecision, WorkflowStep, WorkflowStepResult } from "./types.ts";
@@ -360,13 +361,10 @@ function advanceStep(
 }
 
 function retryDelay(value: string): number {
-  const match = /^([1-9][0-9]*)(s|m|h)$/.exec(value);
-  if (!match) throw new Error(`Invalid retry delay: ${value}`);
-  const amount = Number(match[1]);
-  const factor = match[2] === "s" ? 1_000 : match[2] === "m" ? 60_000 : 3_600_000;
-  const milliseconds = amount * factor;
-  if (!Number.isSafeInteger(milliseconds) || milliseconds > 2_147_483_647) throw new Error(`Retry delay is too large: ${value}`);
-  return milliseconds;
+  const duration = parseWorkflowDuration(value);
+  if (duration.kind === "invalid") throw new Error(`Invalid retry delay: ${value}`);
+  if (duration.kind === "too-large") throw new Error(`Retry delay is too large: ${value}`);
+  return duration.milliseconds;
 }
 
 function accepted(state: WorkflowExecutionState): WorkflowStateTransition {

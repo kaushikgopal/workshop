@@ -1,13 +1,11 @@
 import { z } from "zod";
+import { parseWorkflowDuration } from "./parse-workflow-duration.ts";
 import type { WorkflowDecision } from "./types.ts";
 
-const duration = z.string().refine((value) => {
-  const match = /^([1-9][0-9]*)(s|m|h)$/.exec(value);
-  if (!match) return false;
-  const amount = Number(match[1]);
-  const factor = match[2] === "s" ? 1_000 : match[2] === "m" ? 60_000 : 3_600_000;
-  return Number.isSafeInteger(amount) && amount * factor <= 2_147_483_647;
-}, "must be a positive duration supported by Node timers");
+const duration = z.string().refine(
+  (value) => parseWorkflowDuration(value).kind === "valid",
+  "must be a positive duration supported by Node timers",
+);
 
 const decisionSchema = z.discriminatedUnion("action", [
   z.object({

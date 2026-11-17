@@ -1,3 +1,4 @@
+import { parseWorkflowDuration } from "./parse-workflow-duration.ts";
 import type { AttemptHistoryEntry, Workflow, WorkflowStep } from "./types.ts";
 
 export type ProcessExecutionKind = "command" | "agent" | "command-check" | "agent-check";
@@ -126,16 +127,11 @@ export type WorkflowAttemptEnvironment = {
 
 function timeoutMilliseconds(value: string | undefined): number | undefined {
   if (value === undefined) return undefined;
-  const match = /^([1-9][0-9]*)(s|m|h)$/.exec(value);
-  if (!match) throw new Error(`Invalid workflow timeout: ${value}`);
-  const amount = Number(match[1]);
-  const factor = match[2] === "s" ? 1_000 : match[2] === "m" ? 60_000 : 3_600_000;
-  const milliseconds = amount * factor;
   // Persisted workflow inputs can resume without passing through loader validation.
-  if (!Number.isSafeInteger(milliseconds) || milliseconds > 2_147_483_647) {
-    throw new Error(`Workflow timeout is too large for Node timers: ${value}`);
-  }
-  return milliseconds;
+  const duration = parseWorkflowDuration(value);
+  if (duration.kind === "invalid") throw new Error(`Invalid workflow timeout: ${value}`);
+  if (duration.kind === "too-large") throw new Error(`Workflow timeout is too large for Node timers: ${value}`);
+  return duration.milliseconds;
 }
 
 function stepId(step: WorkflowStep): string {
