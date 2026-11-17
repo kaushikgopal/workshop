@@ -114,7 +114,7 @@ function stepId(step: WorkflowStep): string {
   return `${step.number}-${step.name}`;
 }
 
-function retryLimit(step: WorkflowStep, workflow: Workflow): number {
+export function retryLimit(step: WorkflowStep, workflow: Workflow): number {
   return step.retries ?? step.check?.retries ?? workflow.retries ?? 0;
 }
 

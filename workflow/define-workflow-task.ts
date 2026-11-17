@@ -4,6 +4,7 @@ import { defineDoc, defineTask, type TaskOutcome, type TaskRuntime } from "@eare
 import {
   advanceWorkflowState,
   decodeWorkflowTaskCheckpoint,
+  retryLimit,
   WorkflowCheckpointIntegrityError,
   type WorkflowExecutionState,
   type WorkflowStateContext,
@@ -14,7 +15,7 @@ import { buildOrchestratorBrief } from "./build-orchestrator-brief.ts";
 import { StepAttemptTask, type StepAttemptSource } from "./define-step-attempt-task.ts";
 import { loadWorkflowStep, WorkflowStepLoadError } from "./load-workflow-step.ts";
 import type { WorkflowAttemptRequest, WorkflowAttemptResult, WorkflowDecisionRequest } from "./interpret-workflow.ts";
-import type { OrchestratorDecision, Workflow, WorkflowDecision, WorkflowStep } from "./types.ts";
+import type { OrchestratorDecision, Workflow, WorkflowDecision } from "./types.ts";
 import { appendRecent, workshopStateDocument } from "./define-workshop-state.ts";
 
 export type { WorkflowTaskCheckpoint, WorkflowTaskResult } from "./advance-workflow-state.ts";
@@ -47,9 +48,6 @@ export const workflowDecisionDocument = defineDoc<DecisionDocument>({
   checkpointWhen: () => true,
 });
 
-function retryLimit(step: WorkflowStep, workflow: Workflow): number {
-  return step.retries ?? step.check?.retries ?? workflow.retries ?? 0;
-}
 
 function stateContext(input: WorkflowTaskInput): WorkflowStateContext {
   return {
