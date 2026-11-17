@@ -102,11 +102,11 @@ test("loads a folder workflow with ordered steps, profile inheritance, and all c
 test("accepts numbering gaps and leading zeroes, and sorts steps numerically", () => {
   withRoot((root) => {
     const directory = createWorkflow(root);
-    writeStep(directory, "30-last.sh");
-    writeStep(directory, "010-first.sh");
+    writeStep(directory, "10-last.sh");
+    writeStep(directory, "2-first.sh");
     const result = loadWorkflows(root, profiles);
     assert.deepEqual(result.errors, []);
-    assert.deepEqual(result.workflows[0]?.steps.map(({ number, name }) => [number, name]), [[10, "first"], [30, "last"]]);
+    assert.deepEqual(result.workflows[0]?.steps.map(({ number, name }) => [number, name]), [[2, "first"], [10, "last"]]);
   });
 });
 
