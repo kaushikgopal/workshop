@@ -24,16 +24,19 @@ function createHarness(storage: Awaited<ReturnType<typeof openNodeSqliteStorage>
   return Harness.open(storage, { models: createModels(), registry }, BACKGROUND_CONTEXT);
 }
 
-async function waitForInvocationCount(file: string, expected: number, timeoutMs = 10_000): Promise<number[]> {
+function readRecords(file: string): string[] {
+  if (!existsSync(file)) return [];
+  return readFileSync(file, "utf8").trim().split(/\r?\n/).filter(Boolean);
+}
+
+async function waitForRecords(file: string, expected: number, description: string, timeoutMs = 10_000): Promise<string[]> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (existsSync(file)) {
-      const pids = readFileSync(file, "utf8").trim().split(/\s+/).filter(Boolean).map(Number);
-      if (pids.length >= expected) return pids;
-    }
+    const records = readRecords(file);
+    if (records.length >= expected) return records;
     await new Promise((resolveWait) => setTimeout(resolveWait, 20));
   }
-  throw new Error(`Timed out waiting for ${expected} workflow command invocations`);
+  throw new Error(`Timed out waiting for ${expected} ${description}`);
 }
 
 async function taskById(storage: Awaited<ReturnType<typeof openNodeSqliteStorage>>, id: string | number): Promise<TaskRecord<JsonValue, JsonValue, JsonValue>> {
@@ -48,16 +51,6 @@ function activeAttemptId(task: TaskRecord<JsonValue, JsonValue, JsonValue>): str
   const activeAttempt = task.state.checkpoint.activeAttempt;
   if (!isRecord(activeAttempt) || (typeof activeAttempt.taskId !== "string" && typeof activeAttempt.taskId !== "number")) throw new Error(`Workflow task has no child attempt ID: ${JSON.stringify(task.state.checkpoint)}`);
   return activeAttempt.taskId;
-}
-
-function killProcessGroups(pids: readonly number[]): void {
-  for (const pid of pids) {
-    try {
-      process.kill(-pid, "SIGKILL");
-    } catch (error) {
-      if (!isRecord(error) || error.code !== "ESRCH") throw error;
-    }
-  }
 }
 
 async function startHarnessProcess(projectRoot: string, startWorkflow: boolean): Promise<ReturnType<typeof spawn>> {
@@ -116,6 +109,7 @@ test("a killed service resumes the same parent and child tasks from SQLite", { s
   const workflowDirectory = join(projectRoot, "workflows", "clock");
   const stateDirectory = join(projectRoot, "state");
   const invocationFile = join(projectRoot, "invocations");
+  const completionFile = join(projectRoot, "completions");
   const releaseFile = join(projectRoot, "release");
   mkdirSync(workflowDirectory, { recursive: true });
   writeFileSync(join(projectRoot, "workshop.yaml"), [
@@ -126,8 +120,9 @@ test("a killed service resumes the same parent and child tasks from SQLite", { s
   ].join("\n"));
   writeFileSync(join(workflowDirectory, "workflow.md"), "---\ncron: '* * * * *'\nretries: 0\n---\nCrash-resume fixture.\n");
   writeFileSync(join(workflowDirectory, "10-gated.sh"), [
-    `printf '%s\\n' "$$" >> "$WORKSHOP_PROJECT_ROOT/invocations"`,
-    `while [ ! -f "$WORKSHOP_PROJECT_ROOT/release" ]; do sleep 0.02; done`,
+    `printf '%s\\n' "$$" >> "$WORKSHOP_PROJECT_ROOT/invocations" || exit 1`,
+    `while [ ! -f "$WORKSHOP_PROJECT_ROOT/release" ]; do [ -d "$WORKSHOP_PROJECT_ROOT" ] || exit 1; sleep 0.02; done`,
+    `printf '%s\\n' "$$" >> "$WORKSHOP_PROJECT_ROOT/completions"`,
     `printf 'resumed output'`,
     "",
   ].join("\n"));
@@ -135,11 +130,10 @@ test("a killed service resumes the same parent and child tasks from SQLite", { s
   let child: ReturnType<typeof spawn> | undefined;
   let harness: Awaited<ReturnType<typeof createHarness>> | undefined;
   let storage: Awaited<ReturnType<typeof openNodeSqliteStorage>> | undefined;
-  let pids: number[] = [];
   try {
     child = await startHarnessProcess(projectRoot, true);
     const runId = await startedRun(child);
-    pids = await waitForInvocationCount(invocationFile, 1);
+    await waitForRecords(invocationFile, 1, "workflow command invocations");
     const beforeStorage = await openNodeSqliteStorage(join(stateDirectory, "workshop.sqlite"));
     const beforeRun = (await beforeStorage.scanTasks({ kind: WORKFLOW_TASK_NAME }, 100, undefined, BACKGROUND_CONTEXT)).items.find((record) => isRecord(record.input) && record.input.runId === runId);
     assert.ok(beforeRun, "SQLite contains the workflow task before the crash");
@@ -164,7 +158,8 @@ test("a killed service resumes the same parent and child tasks from SQLite", { s
     assert.ok((reopenedAttempt.restarts ?? 0) > attemptRestartCount);
     harness.resume();
 
-    pids = await waitForInvocationCount(invocationFile, 2);
+    const invocations = await waitForRecords(invocationFile, 2, "workflow command invocations");
+    assert.equal(invocations.length, 2);
     writeFileSync(releaseFile, "release\n");
     const settled = await harness.waitForTask(beforeRun.id, BACKGROUND_CONTEXT);
     assert.equal(settled.state.status, "terminal");
@@ -176,17 +171,27 @@ test("a killed service resumes the same parent and child tasks from SQLite", { s
         assert.equal(result.output, "resumed output");
       }
     }
-    assert.equal((await waitForInvocationCount(invocationFile, 2)).length, 2);
   } finally {
     writeFileSync(releaseFile, "release\n");
-    if (child && child.exitCode === null) {
-      child.kill("SIGKILL");
-      await once(child, "exit");
+    try {
+      if (child?.exitCode === null && child.signalCode === null) {
+        const exited = once(child, "exit");
+        child.kill("SIGKILL");
+        await exited;
+      }
+      // The detached command can outlive the crashed harness. Let each command
+      // finish using the fixture directory rather than signaling a saved group ID.
+      const invocations = readRecords(invocationFile);
+      const completions = await waitForRecords(completionFile, invocations.length, "workflow command completions");
+      assert.deepEqual(completions.toSorted(), invocations.toSorted());
+    } finally {
+      try {
+        if (harness) await harness.close(BACKGROUND_CONTEXT);
+        else if (storage) await storage.close(BACKGROUND_CONTEXT);
+      } finally {
+        rmSync(projectRoot, { recursive: true, force: true });
+      }
     }
-    killProcessGroups(pids);
-    if (harness) await harness.close(BACKGROUND_CONTEXT);
-    else if (storage) await storage.close(BACKGROUND_CONTEXT);
-    rmSync(projectRoot, { recursive: true, force: true });
   }
 });
 
