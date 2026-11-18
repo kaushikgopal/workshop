@@ -10,10 +10,10 @@ function validateLabel(value: string | undefined): string {
   return value;
 }
 
-function executeLaunchctl(args: string[]): { status: number | null; output: string } {
+function executeLaunchctl(args: string[]): { status: number | null; signal: NodeJS.Signals | null; output: string } {
   const result = spawnSync("/bin/launchctl", args, { encoding: "utf8" });
   if (result.error) throw result.error;
-  return { status: result.status, output: `${result.stdout}${result.stderr}` };
+  return { status: result.status, signal: result.signal, output: `${result.stdout}${result.stderr}` };
 }
 
 function uninstall(): void {
@@ -25,6 +25,11 @@ function uninstall(): void {
   const domain = `gui/${uid}`;
   const plistPath = join(homedir(), "Library", "LaunchAgents", `${label}.plist`);
   const loaded = executeLaunchctl(["print", `${domain}/${label}`]);
+  if (loaded.status === null) {
+    const detail = loaded.signal === null ? "without an exit status" : `terminated by ${loaded.signal}`;
+    const output = loaded.output.trim();
+    throw new Error(`launchctl print failed: ${detail}${output ? ` (${output})` : ""}`);
+  }
   if (loaded.status === 0) {
     const target = existsSync(plistPath) ? plistPath : `${domain}/${label}`;
     const removed = executeLaunchctl(["bootout", domain, target]);

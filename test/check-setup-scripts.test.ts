@@ -9,6 +9,7 @@ import { test } from "node:test";
 const root = fileURLToPath(new URL("..", import.meta.url));
 const copyScript = join(root, "scripts", "copy-workshop.ts");
 const installScript = join(root, "scripts", "install-launch-agent.ts");
+const uninstallScript = join(root, "scripts", "uninstall-launch-agent.ts");
 
 function createDirectory(prefix: string): string {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -183,6 +184,65 @@ syncBuiltinESMExports();
     rmSync(fixture, { recursive: true, force: true });
   }
 });
+test("uninstall keeps the plist when launchctl print is interrupted and accepts a completed not-loaded result", () => {
+  for (const scenario of [
+    { mode: "interrupted", status: 1, keepsPlist: true, message: /launchctl print.*SIGTERM/ },
+    { mode: "not-loaded", status: 0, keepsPlist: false, message: undefined },
+  ]) {
+    const fixture = createDirectory("workshop-uninstall-launch-agent-test-");
+    const home = join(fixture, "home");
+    const fakeLaunchctl = join(fixture, "fake-launchctl");
+    const shim = join(fixture, "fake-launchctl-import.mjs");
+    const launchctlLog = join(fixture, "launchctl.log");
+    const label = "com.example.workshop-test";
+    const plistPath = join(home, "Library", "LaunchAgents", `${label}.plist`);
+    mkdirSync(join(home, "Library", "LaunchAgents"), { recursive: true });
+    writeFileSync(plistPath, "fixture plist\n");
+    writeExecutable(fakeLaunchctl, `#!/bin/sh
+printf '%s\n' "$*" >> "$LAUNCHCTL_LOG"
+if [ "$1" = print ]; then
+  if [ "$FAKE_PRINT_MODE" = interrupted ]; then kill -TERM "$$"; fi
+  printf '%s\n' 'not loaded' >&2
+  exit 113
+fi
+exit 0
+`);
+    writeFileSync(shim, `import childProcess from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
+const originalSpawnSync = childProcess.spawnSync;
+Object.defineProperty(process, "platform", { value: "darwin" });
+childProcess.spawnSync = (command, args, options) => {
+  if (command !== "/bin/launchctl") throw new Error("Unexpected executable: " + command);
+  return originalSpawnSync(process.env.FAKE_LAUNCHCTL, args, options);
+};
+syncBuiltinESMExports();
+`);
+    try {
+      const result = spawnSync(process.execPath, ["--import", shim, uninstallScript, label], {
+        cwd: root,
+        encoding: "utf8",
+        timeout: 10_000,
+        env: {
+          PATH: process.env.PATH ?? "",
+          HOME: home,
+          FAKE_LAUNCHCTL: fakeLaunchctl,
+          FAKE_PRINT_MODE: scenario.mode,
+          LAUNCHCTL_LOG: launchctlLog,
+        },
+      });
+      assert.equal(result.error, undefined, result.error?.message);
+      assert.equal(result.status, scenario.status, result.stderr || result.stdout);
+      if (scenario.message) assert.match(result.stderr, scenario.message);
+      else assert.equal(result.stdout, `Removed launch agent ${label}.\n`);
+      assert.equal(existsSync(plistPath), scenario.keepsPlist);
+      const uid = process.getuid?.();
+      assert.equal(readFileSync(launchctlLog, "utf8"), `print gui/${uid}/${label}\n`);
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  }
+});
+
 
 function executeMake(args: string[], options: { directoryName?: string; config?: boolean; commandStatus?: number } = {}) {
   const fixture = createDirectory("workshop-make-arguments-test-");

@@ -153,7 +153,7 @@ Omit either orchestrator field to use Pi's configured default model. Put provide
 | `make start` | Start the durable service in the foreground. |
 | `make chat` | Attach to the persistent orchestrator conversation; `make chat print="message"` sends one message and exits. |
 | `make service-install` | Install the macOS launch agent for the durable service. |
-| `make service-uninstall` | Remove the macOS launch agent. |
+| `make service-uninstall` | Remove the macOS launch agent. An interrupted status check leaves the agent's plist in place. |
 
 Quote message assignments for your shell. Make requires `$$` for each literal dollar sign; see [the argument rules](docs/reference.md#make-targets).
 
