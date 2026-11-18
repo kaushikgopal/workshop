@@ -2347,6 +2347,48 @@ test("a replacement service watch recovers chat correlation and completion when 
 });
 
 
+for (const status of ["done", "unanswered"] as const) {
+  test(`chat watcher ignores repeated stale ${status} submission observations`, async () => {
+    const chatRequestId = `chat-${status}`;
+    const record = status === "done"
+      ? { type: "input", id: 42, conversationId: "conversation", requestId: `chat:${chatRequestId}`, status, answer: 84 }
+      : { type: "input", id: 42, conversationId: "conversation", requestId: `chat:${chatRequestId}`, status, reason: "No answer was produced." };
+    const view = {
+      entries: [],
+      docs: { "pi.live": { run: { taskId: "task-1", inputs: [42] } } },
+    };
+    let repeat: (() => Promise<void>) | undefined;
+    const watch = {
+      value: view,
+      start(listener: (call: { kind: "value"; value: typeof view }) => Promise<void>) {
+        repeat = () => listener({ kind: "value", value: view });
+      },
+      stop: async () => {},
+    };
+    const harness = {
+      root: async () => ({ id: "conversation", watch: async () => watch }),
+      submission: async () => ({ status: async () => record }),
+      commit: async () => ({ model: [{ role: "assistant", content: [{ type: "text", text: "Recovered answer" }] }] }),
+    } as unknown as Parameters<typeof createWorkshopChat>[0]["harness"];
+    const events: Record<string, unknown>[] = [];
+    const watcher = await createWorkshopChat({ harness }).watchChat(`watch-${status}`, (event) => events.push(event));
+    try {
+      assert.ok(repeat);
+      await repeat();
+      await repeat();
+      const finals = events.filter((event) => event.type === "assistant.final");
+      assert.equal(finals.length, status === "done" ? 1 : 0);
+      if (status === "done") assert.equal(finals[0]?.chat_request_id, chatRequestId);
+      const ends = events.filter((event) => event.type === "run.end");
+      assert.equal(ends.length, 1);
+      assert.equal(ends[0]?.status, status === "done" ? "done" : "error");
+      if (status === "unanswered") assert.equal(ends[0]?.reason, "No answer was produced.");
+    } finally {
+      await watcher.close();
+    }
+  });
+}
+
 test("the durable failure round records its keyed tool decision once", async () => {
   const project = createProject("printf 'broken'; exit 7\n", "retries: 0\n");
   const storage = new MemoryStorage();
