@@ -157,7 +157,7 @@ service/                                  durable service and local API
   launch-service.plist.template            macOS service launch settings
   open-workshop-harness.ts                 durable task and conversation registry
   project-chat-events.ts                   chat event state projection
-  project-workshop-status.ts               run status and capability projection
+  project-workflow-run-status.ts          run status and capability projection
   read-workshop-status.ts                  workflow and run reads
   record-service-receipt.ts                mutation receipt replay and storage
   request-service.ts                       local API client
@@ -214,7 +214,7 @@ test/                                     unit and integration tests
   orchestrate-workflow.test.ts             step attempts and decisions
   parse-workflow-duration.test.ts          duration grammar and timer limits
   project-chat-events.test.ts               ordered chat event projection
-  project-workshop-status.test.ts           run status and capability projection
+  project-workshop-status.test.ts          run status and capability projection
   read-config.test.ts                      config and profile checks
   check-service-socket.test.ts             socket behavior
   check-workshop-service.test.ts          service operations and chat
