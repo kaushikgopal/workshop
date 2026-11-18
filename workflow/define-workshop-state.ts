@@ -147,12 +147,25 @@ export const workflowRunReferenceDocument = defineDocFamily<WorkflowRunReference
   checkpointWhen: () => true,
 });
 
+type WorkshopStateV2 = Omit<WorkshopState, "actions"> & {
+  actions: (Omit<WorkshopAction, "source"> & { source: "chat" | "round" | "round-1" })[];
+};
+
 export const workshopStateDocument = defineDoc<WorkshopState>({
   kind: "workshop.state",
-  version: 2,
+  version: 3,
   scope: "session",
   initial: () => ({ admissions: [], actions: [], paused: [], receipts: [], startedCounts: {}, lastSlots: {} }),
   migrate(value, fromVersion) {
+    if (fromVersion === 2) {
+      // Version 2 already stores this shape, except for the old round label.
+      // Preserve its counters and history verbatim rather than rebuilding them.
+      const previous = value as WorkshopStateV2;
+      return {
+        ...previous,
+        actions: previous.actions.map((action) => ({ ...action, source: action.source === "round-1" ? "round" : action.source })),
+      };
+    }
     if (fromVersion !== 1) throw new Error(`Cannot migrate workshop state from version ${fromVersion}`);
     if (!Array.isArray(value.paused) || !value.paused.every((entry) => typeof entry === "string")) {
       throw new Error("Stored workshop pause state is invalid");

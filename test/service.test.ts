@@ -213,6 +213,88 @@ test("workshop-state migration bounds history without losing scheduling counters
   }
 });
 
+test("version-2 automatic action history uses the current round source", async () => {
+  const previousDocument = defineDoc<Record<string, JsonValue>>({
+    kind: "workshop.state",
+    version: 2,
+    scope: "session",
+    initial: (): Record<string, JsonValue> => ({
+      admissions: [],
+      actions: [{
+        at: "2026-11-15T20:00:00.000Z", workflow: "clock", run_id: "old-run", step: "10-task",
+        source: "round-1", decision: { action: "give_up", note: "Automatic decisions unavailable" },
+        note: "Automatic decisions unavailable",
+      }],
+      paused: [], receipts: [],
+      startedCounts: {}, lastSlots: {},
+    }),
+    checkpointWhen: () => true,
+  });
+  const harness = await createHarness(new MemoryStorage());
+  try {
+    await harness.commit(async (tx) => {
+      await tx.doc(previousDocument);
+      return { stored: true };
+    }, BACKGROUND_CONTEXT);
+    const service = createWorkshopService({ projectRoot: ".", harness });
+    const response = await service.handleRequest({ request_id: "legacy-actions", type: "list_actions" });
+    assert.deepEqual(response, {
+      request_id: "legacy-actions", ok: true, actions: [{
+        at: "2026-11-15T20:00:00.000Z", workflow: "clock", run_id: "old-run", step: "10-task",
+        source: "round",
+        decision: { action: "give_up", note: "Automatic decisions unavailable" },
+        note: "Automatic decisions unavailable",
+      }],
+    });
+  } finally {
+    await harness.close(BACKGROUND_CONTEXT);
+  }
+});
+
+test("version-2 action migration preserves current actions and scheduling state", async () => {
+  const previousDocument = defineDoc<Record<string, JsonValue>>({
+    kind: "workshop.state",
+    version: 2,
+    scope: "session",
+    initial: (): Record<string, JsonValue> => ({
+      admissions: [{ workflow: "clock", slot: null, run_id: "recent-run", outcome: "started", at: "2026-11-15T20:00:00.000Z" }],
+      actions: [
+        { at: "2026-11-15T20:00:00.000Z", workflow: "clock", run_id: "old-run", step: "10-task", source: "chat", decision: { action: "retry", profile: "writer", after: "30s", hint: "Try again" }, note: "Chat retry" },
+        { at: "2026-11-15T20:01:00.000Z", workflow: "clock", run_id: "recent-run", step: "10-task", source: "round", decision: { action: "skip", note: "Skip failed step" }, note: "Skip failed step" },
+      ],
+      paused: ["clock", "archived"],
+      receipts: [{ request_id: "saved", fingerprint: "saved-fingerprint", response: { ok: true, decision_number: 3 } }],
+      startedCounts: { clock: 1200, archived: 42 },
+      lastSlots: { clock: "2026-11-15T19:59:00.000Z", archived: "2026-11-14T12:00:00.000Z" },
+    }),
+    checkpointWhen: () => true,
+  });
+  const harness = await createHarness(new MemoryStorage());
+  try {
+    await harness.commit(async (tx) => {
+      await tx.doc(previousDocument);
+      return { stored: true };
+    }, BACKGROUND_CONTEXT);
+    await harness.commit(async (tx) => {
+      const state = await tx.doc(workshopStateDocument);
+      assert.deepEqual(state, {
+        admissions: [{ workflow: "clock", slot: null, run_id: "recent-run", outcome: "started", at: "2026-11-15T20:00:00.000Z" }],
+        actions: [
+          { at: "2026-11-15T20:00:00.000Z", workflow: "clock", run_id: "old-run", step: "10-task", source: "chat", decision: { action: "retry", profile: "writer", after: "30s", hint: "Try again" }, note: "Chat retry" },
+          { at: "2026-11-15T20:01:00.000Z", workflow: "clock", run_id: "recent-run", step: "10-task", source: "round", decision: { action: "skip", note: "Skip failed step" }, note: "Skip failed step" },
+        ],
+        paused: ["clock", "archived"],
+        receipts: [{ request_id: "saved", fingerprint: "saved-fingerprint", response: { ok: true, decision_number: 3 } }],
+        startedCounts: { clock: 1200, archived: 42 },
+        lastSlots: { clock: "2026-11-15T19:59:00.000Z", archived: "2026-11-14T12:00:00.000Z" },
+      });
+      return { migrated: true };
+    }, BACKGROUND_CONTEXT);
+  } finally {
+    await harness.close(BACKGROUND_CONTEXT);
+  }
+});
+
 test("fatal durable storage errors are reported to the service owner", async () => {
   const storage = new MemoryStorage();
   const originalCommit = storage.commit.bind(storage);

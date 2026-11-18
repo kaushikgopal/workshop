@@ -114,8 +114,9 @@ If there is nothing to do, finish your response with WORKSHOP_NOTHING_TO_DO alon
 
 See [the reference](docs/reference.md) for the exact matching rules.
 
-Workshop stores runs and orchestrator state in `state/workshop.sqlite`. It
-reads each step and check file when that step starts. Workshop rereads the main
+Workshop stores runs and orchestrator state in `state/workshop.sqlite`. State
+upgrades migrate to version 3; see [downgrade limits](docs/reference.md#upgrading-with-open-runs).
+Workshop reads each step and check file when that step starts. It rereads the main
 step file when it builds a failure brief. Edits made after a failed attempt can
 change what the orchestrator sees. Steps share `data/<workflow>/`. See [the
 reference](docs/reference.md) for validation and execution rules.

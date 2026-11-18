@@ -203,7 +203,10 @@ keeps open runs resumable, but finish open runs before you downgrade.
 
 An older build rejects an agent `nothing-to-do` result saved mid-run; finish open runs before downgrading.
 
-The `workshop.state` document is version 2 and migrates version 1. The
+The `workshop.state` document is version 3 and migrates versions 1 and 2.
+The version-2 migration normalizes historical action source `round-1` to
+`round`, preserving scheduling counters and all other saved state. Once saved
+at version 3, the document cannot be read by an older build. The
 `workshop.workflow-decision` and `workshop.run-reference` documents are version
 1. Keep document migrations in step with their stored shapes.
 
