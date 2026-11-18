@@ -35,19 +35,16 @@ export async function openWorkshopHarness(
     }));
     const workshop = options === undefined ? undefined : createWorkshopExtension(options);
     if (workshop) registry.install(workshop);
-    const harnessOptions = {
+    initialization = { kind: "opening" };
+    const harness = await Harness.open(storage, {
       models: options?.models ?? createModels(),
       registry,
-      onReport: (report: Report) => {
+      onReport: (report) => {
         const message = report.error instanceof Error ? report.error.message : String(report.error);
         console.error(`[workshop] durable ${report.kind}: ${message}`);
         if (report.kind === "storage_failed") onStorageFailure?.(report);
       },
-    };
-    const preparing = initialization;
-    if (preparing.kind !== "preparing") throw new Error("Workshop harness is not preparing");
-    initialization = { kind: "opening" };
-    const harness = await Harness.open(preparing.storage, harnessOptions, BACKGROUND_CONTEXT);
+    }, BACKGROUND_CONTEXT);
     initialization = { kind: "opened", harness };
     if (workshop && options) {
       const tools = workshop.tools ?? [];
