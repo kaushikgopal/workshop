@@ -261,4 +261,14 @@ The daily-summary activity step uses this API to read recent runs and actions. `
 | `make service-install` | Runs checks, then installs a per-user macOS LaunchAgent that starts `node service/start-service.ts` from the project root. The agent writes stdout and stderr to `state/service.log`. On failure the installer reports the stage and a recovery command; it leaves partial files in place for inspection. |
 | `make service-uninstall` | Removes the macOS LaunchAgent and plist. It leaves runtime state and workflow data in place. |
 
+Make expands `print`, `LABEL`, and `to` as usual, then passes each expanded value as one literal argument. Quotes, backticks, dollar signs, backslashes, and newlines in that value are not evaluated again by the recipe shell. The installer receives the current project directory in the same way. Label validation still applies in the launch-agent scripts.
+
+Quote assignments for your calling shell and double literal dollar signs for Make. For example:
+
+```fish
+make chat 'print=Explain `git status` and $$PATH'
+```
+
+This sends ``Explain `git status` and $PATH`` without executing `git status` or expanding `$PATH`. An absent, empty, or whitespace-only `print` still selects interactive chat.
+
 The foreground `make start` and `make dev` commands write output to the terminal.

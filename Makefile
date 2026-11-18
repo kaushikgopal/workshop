@@ -28,16 +28,21 @@ dev:
 start:
 	@npm start
 
+# Carry expanded Make values in the environment, not executable shell source.
+chat: export workshop_print = $(print)
 chat:
-	@node scripts/chat-workshop.ts $(if $(strip $(print)),--print "$(print)")
+	@node scripts/chat-workshop.ts $(if $(strip $(print)),--print "$$workshop_print")
 
+service-install service-uninstall: export workshop_label = $(LABEL)
+service-install: export workshop_directory = $(CURDIR)
 service-install:
 	@test -f workshop.yaml || { echo "workshop.yaml is required; run make setup and edit the config first." >&2; exit 1; }
 	@$(MAKE) check
-	@node scripts/install-launch-agent.ts "$(LABEL)" "$(CURDIR)"
+	@node scripts/install-launch-agent.ts "$$workshop_label" "$$workshop_directory"
 
 service-uninstall:
-	@node scripts/uninstall-launch-agent.ts "$(LABEL)"
+	@node scripts/uninstall-launch-agent.ts "$$workshop_label"
 
+copy: export workshop_destination = $(to)
 copy:
-	@node scripts/copy-workshop.ts "$(to)"
+	@node scripts/copy-workshop.ts "$$workshop_destination"

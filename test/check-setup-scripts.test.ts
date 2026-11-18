@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { delimiter, join } from "node:path";
 import { tmpdir } from "node:os";
@@ -182,4 +182,116 @@ syncBuiltinESMExports();
   } finally {
     rmSync(fixture, { recursive: true, force: true });
   }
+});
+
+function executeMake(args: string[], options: { directoryName?: string; config?: boolean; commandStatus?: number } = {}) {
+  const fixture = createDirectory("workshop-make-arguments-test-");
+  const project = join(fixture, options.directoryName ?? "project");
+  const bin = join(fixture, "bin");
+  mkdirSync(project);
+  mkdirSync(bin);
+  copyFileSync(join(root, "Makefile"), join(project, "Makefile"));
+  if (options.config !== false) writeFileSync(join(project, "workshop.yaml"), "");
+  const recorder = 'console.log(JSON.stringify(process.argv.slice(1))); process.exit(Number(process.env.MAKE_RECIPE_STATUS ?? 0));';
+  for (const command of ["node", "npm"]) {
+    writeExecutable(join(bin, command), `#!/bin/sh\nexec ${quoteShellArgument(process.execPath)} -e ${quoteShellArgument(recorder)} ${command} "$@"\n`);
+  }
+  try {
+    const result = spawnSync("make", ["--no-print-directory", ...args], {
+      cwd: project,
+      encoding: "utf8",
+      timeout: 10_000,
+      env: {
+        ...process.env,
+        PATH: [bin, process.env.PATH ?? ""].join(delimiter),
+        MAKEFLAGS: "",
+        MFLAGS: "",
+        MAKEOVERRIDES: "",
+        WORKSHOP_MAKE_PROBE: "expanded-dollar",
+        MAKE_RECIPE_STATUS: String(options.commandStatus ?? 0),
+      },
+    });
+    assert.equal(result.error, undefined);
+    return {
+      status: result.status,
+      stdout: result.stdout,
+      stderr: result.stderr,
+      project: realpathSync(project),
+      calls: result.stdout.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line)),
+    };
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
+}
+
+const makeChecks = [
+  ["node", "scripts/check-config.ts"],
+  ["node", "scripts/check-workflows.ts"],
+  ["npm", "run", "typecheck"],
+  ["npm", "test"],
+];
+
+test("make recipes preserve ordinary arguments and control flow", () => {
+  const cases = [
+    { args: ["chat"], calls: [["node", "scripts/chat-workshop.ts"]] },
+    { args: ["chat", "print="], calls: [["node", "scripts/chat-workshop.ts"]] },
+    { args: ["chat", "print= \t "], calls: [["node", "scripts/chat-workshop.ts"]] },
+    { args: ["chat", "print=  What is running?  "], calls: [["node", "scripts/chat-workshop.ts", "--print", "What is running?  "]] },
+    { args: ["chat", "print=Using $(LABEL)", "LABEL=custom.label"], calls: [["node", "scripts/chat-workshop.ts", "--print", "Using custom.label"]] },
+    { args: ["copy"], calls: [["node", "scripts/copy-workshop.ts", ""]] },
+    { args: ["copy", "to="], calls: [["node", "scripts/copy-workshop.ts", ""]] },
+    { args: ["copy", "to=private copy"], calls: [["node", "scripts/copy-workshop.ts", "private copy"]] },
+    { args: ["service-uninstall"], calls: [["node", "scripts/uninstall-launch-agent.ts", "dev.workshop.service"]] },
+    { args: ["service-uninstall", "LABEL=custom.label"], calls: [["node", "scripts/uninstall-launch-agent.ts", "custom.label"]] },
+  ];
+  for (const { args, calls } of cases) {
+    const result = executeMake(args);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stderr, "");
+    assert.deepEqual(result.calls, calls, JSON.stringify(args));
+  }
+  for (const label of [undefined, "", "custom.label"]) {
+    const result = executeMake(["service-install", ...(label !== undefined ? [`LABEL=${label}`] : [])]);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stderr, "");
+    assert.deepEqual(result.calls, [...makeChecks, ["node", "scripts/install-launch-agent.ts", label ?? "dev.workshop.service", result.project]]);
+  }
+  const missing = executeMake(["service-install"], { config: false });
+  assert.equal(missing.status, 2);
+  assert.equal(missing.stdout, "");
+  assert.match(missing.stderr, /^workshop.yaml is required; run make setup and edit the config first\.\n/);
+  const failedCheck = executeMake(["service-install"], { commandStatus: 7 });
+  assert.equal(failedCheck.status, 2);
+  assert.deepEqual(failedCheck.calls, [["node", "scripts/check-config.ts"]]);
+  const failedChat = executeMake(["chat", "print=Hello"], { commandStatus: 7 });
+  assert.equal(failedChat.status, 2);
+  assert.deepEqual(failedChat.calls, [["node", "scripts/chat-workshop.ts", "--print", "Hello"]]);
+});
+
+test("make recipes pass shell characters literally in operator arguments", () => {
+  const input = '  Explain "two words", \'single\'; \\path $$WORKSHOP_MAKE_PROBE $${WORKSHOP_MAKE_PROBE} $$(printf dollar-probe) `printf boundary-probe`  ';
+  const literal = 'Explain "two words", \'single\'; \\path $WORKSHOP_MAKE_PROBE ${WORKSHOP_MAKE_PROBE} $(printf dollar-probe) `printf boundary-probe`  ';
+  const cases = [
+    { target: "chat", variable: "print", script: "scripts/chat-workshop.ts", before: ["--print"] },
+    { target: "copy", variable: "to", script: "scripts/copy-workshop.ts", before: [] },
+    { target: "service-uninstall", variable: "LABEL", script: "scripts/uninstall-launch-agent.ts", before: [] },
+    { target: "service-install", variable: "LABEL", script: "scripts/install-launch-agent.ts", before: [] },
+  ];
+  for (const { target, variable, script, before } of cases) {
+    const result = executeMake([target, `${variable}=${input}`]);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stderr, "");
+    assert.deepEqual(result.calls, [
+      ...(target === "service-install" ? makeChecks : []),
+      ["node", script, ...before, literal, ...(target === "service-install" ? [result.project] : [])],
+    ], target);
+  }
+  const multiline = executeMake(["chat", "print=first\nsecond"]);
+  assert.equal(multiline.status, 0, multiline.stderr);
+  assert.equal(multiline.stderr, "");
+  assert.deepEqual(multiline.calls, [["node", "scripts/chat-workshop.ts", "--print", "first\nsecond"]]);
+  const directory = executeMake(["service-install"], { directoryName: "project`printf path-probe`" });
+  assert.equal(directory.status, 0, directory.stderr);
+  assert.equal(directory.stderr, "");
+  assert.deepEqual(directory.calls, [...makeChecks, ["node", "scripts/install-launch-agent.ts", "dev.workshop.service", directory.project]]);
 });

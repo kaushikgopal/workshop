@@ -154,6 +154,8 @@ Omit either orchestrator field to use Pi's configured default model. Put provide
 | `make service-install` | Install the macOS launch agent for the durable service. |
 | `make service-uninstall` | Remove the macOS launch agent. |
 
+Quote message assignments for your shell. Make requires `$$` for each literal dollar sign; see [the argument rules](docs/reference.md#make-targets).
+
 The service listens on the private Unix socket `state/service.sock` and does not open a network port. `make chat` attaches to the root conversation, streams assistant text and tool progress, and queues messages behind any current turn. See [the reference](docs/reference.md) for the socket protocol.
 
 ## Contributing
