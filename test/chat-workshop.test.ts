@@ -369,9 +369,15 @@ test("print and interactive clients treat replacement deltas as new text", { tim
     });
     const printed = await executeChat(["--print", "Replace this"], projectRoot);
     assert.equal(printed.code, 0, printed.stderr);
+    assert.match(printed.stdout, /Old partial\nReplacement/);
+    assert.equal(printed.stdout.match(/Replacement/g)?.length ?? 0, 1);
+    assert.equal(printed.stderr, "");
     assert.doesNotMatch(printed.stdout, /Old partialReplacement/);
     const interactive = await executeInteractiveChat(projectRoot, "Replace this too");
     assert.equal(interactive.code, 0, interactive.stderr);
+    assert.match(interactive.stdout, /Old partial\nReplacement/);
+    assert.equal(interactive.stdout.match(/Replacement/g)?.length ?? 0, 1);
+    assert.equal(interactive.stderr, "");
     assert.doesNotMatch(interactive.stdout, /Old partialReplacement/);
   } finally {
     if (socketServer) await socketServer.close();
