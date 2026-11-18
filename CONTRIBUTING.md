@@ -216,7 +216,7 @@ test/                                     unit and integration tests
   project-chat-events.test.ts               ordered chat event projection
   project-workshop-status.test.ts          run status and capability projection
   read-config.test.ts                      config and profile checks
-  service-socket.test.ts                   socket behavior
+  check-service-socket.test.ts             socket behavior
   check-workshop-service.test.ts          service operations and chat
   transition-service-lifecycle.test.ts      startup and shutdown transitions
   transition-workflow-pause.test.ts         idempotent pause and resume outcomes
