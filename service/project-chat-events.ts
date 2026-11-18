@@ -3,6 +3,10 @@ import type { ConversationView } from "@earendil-works/pi-durable";
 type ChatView = Pick<ConversationView, "entries" | "docs">;
 type ChatEvent = { ok: true; type: string; chat_request_id?: string; [key: string]: unknown };
 type ProjectedTool = "call-emitted" | "result-emitted";
+type ProjectedText =
+  | { kind: "current"; text: string }
+  | { kind: "replace-next" };
+
 type ProjectingTurn = {
   phase: "projecting";
   turnId: string;
@@ -10,8 +14,7 @@ type ProjectingTurn = {
   chatRequestId?: string;
   generationTaskId?: string;
   generationAttempt?: number;
-  partialText: string;
-  replacePending: boolean;
+  text: ProjectedText;
   tools: ReadonlyMap<string, ProjectedTool>;
   nestedTools: ReadonlyMap<string, ProjectedTool>;
 };
@@ -102,8 +105,7 @@ function startTurn(turnId: string, submissionId?: string, chatRequestId?: string
     turnId,
     ...(submissionId === undefined ? {} : { submissionId }),
     ...(chatRequestId === undefined ? {} : { chatRequestId }),
-    partialText: "",
-    replacePending: false,
+    text: { kind: "current", text: "" },
     tools: new Map(),
     nestedTools: new Map(),
   };
@@ -132,8 +134,8 @@ function projectTurn(turn: ProjectingTurn, view: ChatView): { state: ProjectingT
   const requestId = turn.chatRequestId;
   if (requestId === undefined) return { state: turn, events: [] };
 
-  let partialText = turn.partialText;
-  let replacePending = turn.replacePending;
+  let textState = turn.text;
+  const partialText = textState.kind === "current" ? textState.text : "";
   const tools = new Map(turn.tools);
   const nestedTools = new Map(turn.nestedTools);
   const events: ChatEvent[] = [];
@@ -146,12 +148,11 @@ function projectTurn(turn: ProjectingTurn, view: ChatView): { state: ProjectingT
     const extendsText = text.startsWith(partialText);
     const delta = extendsText ? text.slice(partialText.length) : text;
     if (delta.length > 0) {
-      emit("assistant.delta", { text: delta, ...(replacePending || !extendsText ? { replace: true } : {}) });
-      replacePending = false;
+      emit("assistant.delta", { text: delta, ...(textState.kind === "replace-next" || !extendsText ? { replace: true } : {}) });
+      textState = { kind: "current", text };
     } else if (partialText.length > 0 && text.length === 0) {
-      replacePending = true;
+      textState = { kind: "replace-next" };
     }
-    partialText = text;
   }
 
   const currentTools = Array.isArray(live.tools) ? live.tools : [];
@@ -201,7 +202,7 @@ function projectTurn(turn: ProjectingTurn, view: ChatView): { state: ProjectingT
     nestedTools.set(callId, completed || previous === "result-emitted" ? "result-emitted" : "call-emitted");
   }
 
-  return { state: { ...turn, partialText, replacePending, tools, nestedTools }, events };
+  return { state: { ...turn, text: textState, tools, nestedTools }, events };
 }
 
 export function projectChatEvents(
@@ -252,8 +253,10 @@ export function projectChatEvents(
       ...(newGeneration ? {
         generationTaskId: taskId,
         generationAttempt: attempt,
-        partialText: "",
-        replacePending: previous.replacePending || previous.partialText.length > 0,
+        text: previous.text.kind === "replace-next"
+          || (previous.text.kind === "current" && previous.text.text.length > 0)
+          ? { kind: "replace-next" }
+          : { kind: "current", text: "" },
         tools: new Map(),
         nestedTools: new Map(),
       } : {}),
