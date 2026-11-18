@@ -150,11 +150,14 @@ async function submitFailureRound(
 ): Promise<void> {
   const step = input.workflow.steps[checkpoint.stepIndex];
   if (!step) throw new WorkflowCheckpointIntegrityError("checkpoint.stepIndex", "does not identify a workflow step");
-  let stepContent = "";
+  let stepSource;
   try {
-    stepContent = loadWorkflowStepSource(join(input.projectRoot, "workflows"), input.workflow, step);
+    stepSource = { content: loadWorkflowStepSource(join(input.projectRoot, "workflows"), input.workflow, step) };
   } catch (error) {
     if (!(error instanceof WorkflowStepLoadError)) throw error;
+    const cause = error.cause;
+    const code = cause instanceof Error && "code" in cause && typeof cause.code === "string" ? cause.code : undefined;
+    stepSource = { unavailable: code };
   }
   const brief = buildOrchestratorBrief({
     workflow: input.workflow,
@@ -162,7 +165,7 @@ async function submitFailureRound(
     stepId: checkpoint.failure.step,
     runId: input.runId,
     decisionNumber: checkpoint.failure.decisionNumber,
-    stepContent,
+    stepSource,
     lastOutput: checkpoint.failure.lastOutput,
     lastError: checkpoint.failure.lastError,
     attemptHistory: checkpoint.failure.attemptHistory,

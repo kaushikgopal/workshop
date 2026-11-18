@@ -1336,6 +1336,27 @@ test("failure brief includes a readable step when its check file is missing", { 
   }
 });
 
+test("a failure brief reports a missing source separately from the failed attempt", { timeout: 10_000 }, async () => {
+  const project = createProject([
+    `mv "$WORKSHOP_PROJECT_ROOT/workflows/clock/10-task.sh" "$WORKSHOP_DATA_DIR/10-task.sh"`,
+    "printf 'failed output'; exit 7",
+  ].join("\n"), "retries: 0\n");
+  const storage = new MemoryStorage();
+  const harness = await createHarness(storage);
+  try {
+    harness.resume();
+    const service = createWorkshopService({ projectRoot: project.root, harness });
+    const started = await service.handleRequest({ request_id: "start-removed-source", type: "start_workflow", workflow: "clock" });
+    const brief = await waitForFailureEvidence(storage, harness, runIdFrom(started));
+    assert.match(brief, /Step file content:\n\(unavailable: ENOENT\)/);
+    assert.match(brief, /## Last error \(tail\)\n10-task failed with exit code 7/);
+    assert.match(brief, /## Attempt history[\s\S]*"output": "failed output"/);
+  } finally {
+    await harness.close(BACKGROUND_CONTEXT);
+    rmSync(project.root, { recursive: true, force: true });
+  }
+});
+
 
 test("admitted missing step retries and blocks with saved input", { timeout: 10_000 }, async () => {
   const firstStep = [

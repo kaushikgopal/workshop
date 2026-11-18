@@ -6,7 +6,7 @@ export type OrchestratorBriefInput = {
   stepId: string;
   runId: string;
   decisionNumber: number;
-  stepContent: string;
+  stepSource: { content: string } | { unavailable: string | undefined };
   lastOutput: string;
   lastError: string;
   attemptHistory: readonly AttemptHistoryEntry[];
@@ -50,7 +50,9 @@ export function buildOrchestratorBrief(input: OrchestratorBriefInput): Orchestra
     `File: ${input.step.file}`,
     `Configured step profile: ${input.step.profile ?? "none"}`,
     "Step file content:",
-    input.stepContent || "(empty)",
+    "content" in input.stepSource
+      ? input.stepSource.content || "(empty)"
+      : input.stepSource.unavailable === undefined ? "(unavailable)" : `(unavailable: ${input.stepSource.unavailable})`,
     "",
     "## Last output",
     tail(input.lastOutput, outputLimit) || "(empty)",
