@@ -3,7 +3,8 @@ import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { checkProfileCommands, ConfigReadError, loadWorkshopConfig, type WorkshopConfig } from "../config/load-workshop-config.ts";
+import { checkProfileCommands } from "../config/check-profile-commands.ts";
+import { ConfigReadError, loadWorkshopConfig, type WorkshopConfig } from "../config/load-workshop-config.ts";
 
 function createDirectory(): string {
   return mkdtempSync(join(tmpdir(), "workshop-config-test-"));
