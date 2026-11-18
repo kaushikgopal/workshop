@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { defineDoc, defineTask, type TaskOutcome, type TaskRuntime } from "@earendil-works/pi-durable";
+import { defineDoc, defineTask, type TaskId, type TaskOutcome, type TaskRuntime } from "@earendil-works/pi-durable";
 import {
   advanceWorkflowState,
   decodeWorkflowTaskCheckpoint,
@@ -318,7 +318,9 @@ async function receiveStepAttempt(
   runtime: WorkflowTaskRuntime,
   context: typeof BACKGROUND_CONTEXT,
 ): Promise<void> {
-  const settled = await runtime.waitForTask(checkpoint.activeAttempt.taskId, context);
+  // The checkpoint decoder validates the persisted numeric value before restoring this SDK task ID.
+  const taskId = checkpoint.activeAttempt.taskId as TaskId<WorkflowAttemptResult>;
+  const settled = await runtime.waitForTask(taskId, context);
   const attemptResult = decodeStepAttemptOutcome(settled.state.outcome);
   const transition = advanceWorkflowState(checkpoint, {
     kind: "attempt-settled",

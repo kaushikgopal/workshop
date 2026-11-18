@@ -1,12 +1,11 @@
 import { applyWorkflowDecision } from "./apply-workflow-decision.ts";
 import { computeRetryProfiles } from "./compute-retry-profiles.ts";
 import { parseWorkflowDuration } from "./parse-workflow-duration.ts";
-import type { TaskId } from "@earendil-works/pi-durable";
 import type { WorkflowAttemptRequest, WorkflowAttemptResult } from "./execute-workflow-attempt.ts";
 import type { AttemptHistoryEntry, Workflow, WorkflowDecision, WorkflowDecisionRequest, WorkflowStep, WorkflowStepResult } from "./types.ts";
 
 export type ActiveWorkflowAttempt = {
-  taskId: TaskId<WorkflowAttemptResult>;
+  taskId: number;
   request: WorkflowAttemptRequest;
 };
 
@@ -252,8 +251,7 @@ export function decodeWorkflowTaskCheckpoint(value: unknown, context: WorkflowSt
   if (phase === "attempt") {
     const active = record(raw.activeAttempt, "checkpoint.activeAttempt");
     const taskIdValue = integer(active.taskId, "checkpoint.activeAttempt.taskId", 1);
-    // pi-durable stores branded task IDs as positive SQLite integer identifiers.
-    const taskId = taskIdValue as TaskId<WorkflowAttemptResult>;
+    const taskId = taskIdValue;
     const request = record(active.request, "checkpoint.activeAttempt.request");
     const requestStep = record(request.step, "checkpoint.activeAttempt.request.step");
     const requestStepKind = requestStep.kind;
