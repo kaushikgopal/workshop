@@ -87,12 +87,20 @@ function runDependencyChains(root = projectRoot): string[] {
   return dependencyChains(root, "workflow", "run");
 }
 
+function scheduleRunDependencyChains(root = projectRoot): string[] {
+  return dependencyChains(root, "schedule", "run");
+}
+
 test("workflow modules do not depend on the service API", () => {
   assert.deepEqual(serviceDependencyChains(), []);
 });
 
 test("workflow modules do not depend on run modules", () => {
   assert.deepEqual(runDependencyChains(), []);
+});
+
+test("schedule modules do not depend on run modules", () => {
+  assert.deepEqual(scheduleRunDependencyChains(), []);
 });
 
 test("reports a transitive workflow dependency on the service API", () => {
