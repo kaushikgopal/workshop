@@ -59,10 +59,25 @@ test("startup failure waits for bootstrap settlement before cleanup", () => {
   assert.equal(transitionServiceLifecycle(state, { type: "stopped" }).kind, "accepted");
 });
 
+test("a failure after readiness enters cleanup with a rejected completion", () => {
+  const ready = transitionServiceLifecycle(createServiceLifecycle(), { type: "ready" });
+  if (ready.kind !== "accepted") throw new Error("Service should become ready");
+  const failure = new Error("runtime service failure");
+  const failed = transitionServiceLifecycle(ready.state, { type: "fail", error: failure });
+  assert.equal(failed.kind, "accepted");
+  if (failed.kind !== "accepted") throw new Error("Ready service failure should begin cleanup");
+  assert.equal(failed.state.kind, "cleaning");
+  if (failed.state.kind !== "cleaning") throw new Error("Ready service should enter cleanup");
+  assert.equal(failed.state.cause, "startup failure");
+  assert.deepEqual(failed.state.completion, { kind: "throw", error: failure });
+  assert.equal(failed.state.result, "success");
+});
+
 test("out-of-order lifecycle events leave the service state unchanged", () => {
   const starting = createServiceLifecycle();
   const rejected = transitionServiceLifecycle(starting, { type: "stopped" });
   assert.deepEqual(rejected, { kind: "rejected", code: "invalid-transition", state: starting });
+  assert.deepEqual(transitionServiceLifecycle(starting, { type: "bootstrap-settled", error: new Error("not stopped") }), { kind: "rejected", code: "invalid-transition", state: starting });
   assert.equal(starting.kind, "starting");
 });
 
@@ -204,6 +219,27 @@ test("a storage failure during cleanup does not change the cleanup result snapsh
   if (stopped.state.kind !== "stopped") throw new Error("Service should be stopped");
   assert.equal(stopped.state.result, "success");
   assert.equal(stopped.state.storageFailure?.error, state.storageFailure?.error);
+});
+
+test("a storage failure after stopped is recorded without reopening cleanup", () => {
+  const ready = transitionServiceLifecycle(createServiceLifecycle(), { type: "ready" });
+  if (ready.kind !== "accepted") throw new Error("Service should become ready");
+  const stopping = transitionServiceLifecycle(ready.state, { type: "stop", signal: "SIGTERM" });
+  if (stopping.kind !== "accepted") throw new Error("Ready service should stop");
+  const stopped = transitionServiceLifecycle(stopping.state, { type: "stopped" });
+  if (stopped.kind !== "accepted") throw new Error("Cleanup should finish");
+  if (stopped.state.kind !== "stopped") throw new Error("Service should be stopped");
+
+  const storageError = new Error("late storage failure");
+  const reported = transitionServiceLifecycle(stopped.state, { type: "storage-failure", error: storageError });
+  assert.equal(reported.kind, "accepted");
+  if (reported.kind !== "accepted") throw new Error("First stopped-state storage failure should be recorded");
+  assert.equal(reported.state.kind, "stopped");
+  if (reported.state.kind !== "stopped") throw new Error("Storage report must not reopen cleanup");
+  assert.equal(reported.state.result, "success");
+  assert.equal(reported.state.storageFailure?.error, storageError);
+  assert.equal(transitionServiceLifecycle(reported.state, { type: "storage-failure", error: new Error("duplicate") }).kind, "ignored");
+  assert.equal(transitionServiceLifecycle(reported.state, { type: "stop", signal: "SIGINT" }).kind, "already-stopped");
 });
 
 test("cleanup failures change the shutdown result without changing completion", () => {
