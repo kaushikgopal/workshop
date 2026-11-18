@@ -173,7 +173,8 @@ async function submitFailureRound(
   });
   const conversation = await runtime.conversation(runtime.conversationId, context);
   if (!conversation) throw new Error("Root orchestrator conversation is unavailable");
-  const attempt = checkpoint.failure.attemptHistory.at(-1)?.attempt ?? 1;
+  // The blocked checkpoint decoder requires contiguous attempt numbers starting at one.
+  const attempt = checkpoint.failure.attemptHistory.length;
   const submission = await conversation.submit({
     type: "input",
     content: brief.prompt,
