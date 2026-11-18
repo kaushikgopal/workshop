@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
+import type { Harness } from "@earendil-works/pi-durable";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { test } from "node:test";
 import { closeServiceStore, createServiceLifecycle, openServiceHarness, serviceCanDispatchRequests, transitionServiceLifecycle } from "../service/start-service.ts";
@@ -53,6 +54,52 @@ test("out-of-order lifecycle events leave the service state unchanged", () => {
   assert.equal(starting.kind, "starting");
 });
 
+for (const store of [{ kind: "not-opened" }, { kind: "closed" }] as const) {
+  test(`service harness rejects ${store.kind} store ownership`, async () => {
+    const lifecycle = createServiceLifecycle({ store });
+    if (lifecycle.kind !== "starting") throw new Error("New service should be starting");
+    const resources = lifecycle.resources;
+    let openCalls = 0;
+    await assert.rejects(openServiceHarness(resources, async () => {
+      openCalls += 1;
+      throw new Error("Harness must not open without storage ownership");
+    }), /Durable storage is not available for harness startup/);
+    assert.equal(openCalls, 0);
+    assert.deepEqual(resources.store, store);
+  });
+}
+
+test("a successful harness handoff transfers store ownership", async () => {
+  const storage = await openNodeSqliteStorage(":memory:");
+  const originalClose = storage.close.bind(storage);
+  let harnessClosed = false;
+  const harness = {
+    close: async () => {
+      harnessClosed = true;
+      await originalClose(BACKGROUND_CONTEXT);
+    },
+  } as unknown as Harness;
+  const lifecycle = createServiceLifecycle();
+  if (lifecycle.kind !== "starting") throw new Error("New service should be starting");
+  const resources = lifecycle.resources;
+  resources.store = { kind: "storage-owned", storage };
+  try {
+    let openedWith: unknown;
+    const ownership = await openServiceHarness(resources, async (ownedStorage) => {
+      openedWith = ownedStorage;
+      return harness;
+    });
+    assert.equal(openedWith, storage);
+    assert.deepEqual(ownership, { kind: "harness-owned", harness });
+    assert.deepEqual(resources.store, ownership);
+    assert.deepEqual(await closeServiceStore(resources), { kind: "closed" });
+    assert.deepEqual(resources.store, { kind: "closed" });
+    assert.equal(harnessClosed, true);
+  } finally {
+    if (!harnessClosed) await originalClose(BACKGROUND_CONTEXT);
+  }
+});
+
 test("a failed harness cleanup retains storage ownership until closure is confirmed", async () => {
   const storage = await openNodeSqliteStorage(":memory:");
   const originalClose = storage.close.bind(storage);
@@ -66,7 +113,7 @@ test("a failed harness cleanup retains storage ownership until closure is confir
   const lifecycle = createServiceLifecycle();
   if (lifecycle.kind !== "starting") throw new Error("New service should be starting");
   const resources = lifecycle.resources;
-  resources.storage = storage;
+  resources.store = { kind: "storage-owned", storage };
   resources.storeLock = { release: async () => { releaseCalls += 1; } };
 
   try {
@@ -81,19 +128,19 @@ test("a failed harness cleanup retains storage ownership until closure is confir
 
     const firstCleanup = await closeServiceStore(resources);
     const ownershipAfterFailure = {
-      storageRetained: resources.storage === storage,
-      markedClosed: resources.storageClosed,
+      storageRetained: resources.store.kind === "storage-owned" && resources.store.storage === storage,
+      storeState: resources.store.kind,
       ownerReleased: releaseCalls > 0,
       closeResult: firstCleanup.kind,
       closeCalls,
     };
     storage.close = originalClose;
     const secondCleanup = await closeServiceStore(resources);
-    storageClosed = ownershipAfterFailure.storageRetained && secondCleanup.kind === "closed";
+    storageClosed = secondCleanup.kind === "closed";
 
     assert.deepEqual(ownershipAfterFailure, {
       storageRetained: true,
-      markedClosed: false,
+      storeState: "storage-owned",
       ownerReleased: false,
       closeResult: "failed",
       closeCalls: 2,
