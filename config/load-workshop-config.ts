@@ -65,7 +65,7 @@ function parseEnvValue(raw: string): string {
   const value = raw.trim();
   const quote = value[0];
   if (quote === "'" || quote === '"' || quote === "`") {
-    if (!value.endsWith(quote)) throw new Error("unterminated quoted value");
+    if (value.length < 2 || !value.endsWith(quote)) throw new Error("unterminated quoted value");
     const inner = value.slice(1, -1);
     return quote === '"'
       ? inner.replace(/\\n/g, "\n").replace(/\\r/g, "\r").replace(/\\\\/g, "\\").replace(/\\\"/g, '"')

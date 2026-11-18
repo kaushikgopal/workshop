@@ -58,6 +58,24 @@ test("config loads .env.local without overwriting the environment and substitute
   }
 });
 
+test("config accepts an empty quoted dotenv value", () => {
+  const directory = createDirectory();
+  const name = "WORKSHOP_CONFIG_TEST_EMPTY_QUOTED";
+  const original = process.env[name];
+  delete process.env[name];
+  try {
+    writeFileSync(join(directory, ".env.local"), `${name}=""\n`);
+    const file = writeConfig(directory, basicConfig(`[node, "\${${name}}"]`));
+    const config = loadWorkshopConfig(file);
+    assert.deepEqual(config.agent_profiles.writer?.command, ["node", ""]);
+    assert.equal(process.env[name], "");
+  } finally {
+    if (original === undefined) delete process.env[name];
+    else process.env[name] = original;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("config failures do not apply values staged from .env.local", () => {
   const directory = createDirectory();
   const configName = "WORKSHOP_CONFIG";
@@ -78,6 +96,12 @@ test("config failures do not apply values staged from .env.local", () => {
         config: basicConfig(`[node, "\${${dotenvName}}"]`),
         message: /unterminated quoted value/,
       },
+      ...["'", '"', "`"].map((quote) => ({
+        key: dotenvName,
+        env: `${dotenvName}=staged-value\nBROKEN=${quote}\n`,
+        config: basicConfig(`[node, "\${${dotenvName}}"]`),
+        message: /unterminated quoted value/,
+      })),
       {
         key: yamlParseName,
         env: `${yamlParseName}=staged-value\n`,

@@ -140,7 +140,7 @@ orchestrator:
   escalation_model: <provider>/<model>
 ```
 
-Omit either orchestrator field to use Pi's configured default model. Put provider credentials in Pi's auth store, not in `workshop.yaml`. Put secrets for workflow commands in `.env.local` and refer to them as `${NAME}` in `workshop.yaml`.
+Omit either orchestrator field to use Pi's configured default model. Put provider credentials in Pi's auth store, not in `workshop.yaml`. Put secrets for workflow commands in `.env.local` and refer to them as `${NAME}` in `workshop.yaml`. See the [configuration reference](docs/reference.md#configuration) for `.env.local` rules.
 
 ## Make targets
 

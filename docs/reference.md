@@ -25,7 +25,7 @@ Workshop reads `WORKSHOP_CONFIG` when set. Otherwise it reads `workshop.yaml` fr
 
 `WORKSHOP_NOTHING_TO_DO` is a built-in agent-step output convention, not a `workshop.yaml` key or Markdown frontmatter field.
 
-Workshop reads `.env.local` from the config file's directory. Existing process environment variables take precedence. Workshop parses and stages values from `.env.local`, expands `${NAME}` in YAML string values, and applies staged values to `process.env` only after YAML parsing, interpolation, and config-schema validation succeed. A failure in those checks leaves staged values unapplied. An unset variable is an error. Expansion does not apply to YAML keys, workflow files, or command output. Keep secrets in `.env.local`, not in tracked config.
+Workshop reads `.env.local` from the config file's directory. Existing process environment variables take precedence. Quoted values need a matching closing quote; a pair of quotes with nothing between them is a valid empty value. Workshop parses and stages values from `.env.local`, expands `${NAME}` in YAML string values, and applies staged values to `process.env` only after YAML parsing, interpolation, and config-schema validation succeed. A failure in those checks leaves staged values unapplied. An unset variable is an error. Expansion does not apply to YAML keys, workflow files, or command output. Keep secrets in `.env.local`, not in tracked config.
 
 ## Orchestrator conversation
 
