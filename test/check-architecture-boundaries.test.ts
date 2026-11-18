@@ -103,9 +103,35 @@ test("schedule modules do not depend on run modules", () => {
   assert.deepEqual(scheduleRunDependencyChains(), []);
 });
 
+function admissionImportsDurableState(root = projectRoot): boolean {
+  const policy = resolve(root, "run/decide-workflow-admission.ts");
+  const durableState = new Set([resolve(root, "workflow/define-workshop-state.ts")]);
+  return importSpecifiers(readFileSync(policy, "utf8")).some((specifier) =>
+    resolveSourceImport(policy, specifier, durableState) !== undefined,
+  );
+}
+
 test("admission policy does not depend on durable workshop state", () => {
-  const source = readFileSync(resolve(projectRoot, "run/decide-workflow-admission.ts"), "utf8");
-  assert.equal(importSpecifiers(source).includes("../workflow/define-workshop-state.ts"), false);
+  assert.equal(admissionImportsDurableState(), false);
+});
+
+test("the admission boundary recognizes equivalent paths to durable workshop state", () => {
+  const root = createSourceTree();
+  const policy = resolve(root, "run/decide-workflow-admission.ts");
+  try {
+    writeFileSync(resolve(root, "workflow/define-workshop-state.ts"), "export type Receipt = string;\n");
+    writeFileSync(resolve(root, "workflow/types.ts"), "export type Receipt = string;\n");
+    for (const [specifier, forbidden] of [
+      ["../workflow/define-workshop-state.ts", true],
+      ["../workflow/./define-workshop-state.ts", true],
+      ["../workflow/types.ts", false],
+    ] as const) {
+      writeFileSync(policy, `import type { Receipt } from "${specifier}";\n`);
+      assert.equal(admissionImportsDurableState(root), forbidden, specifier);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("reports a transitive workflow dependency on the service API", () => {
