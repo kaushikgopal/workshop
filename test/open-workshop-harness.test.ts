@@ -3,10 +3,10 @@ import { createModels } from "@earendil-works/pi-ai/models";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { MemoryStorage } from "@earendil-works/pi-durable";
 import { test } from "node:test";
-import { openWorkshopHarness, type WorkshopHarnessOptions } from "../service/open-workshop-harness.ts";
+import { openWorkshopHarness } from "../service/open-workshop-harness.ts";
 import type { OrchestratorModel } from "../service/create-orchestrator-runtime.ts";
 
-test("closes caller-owned storage when harness option preparation fails", async () => {
+test("does not close storage when Harness.open option preparation fails", async () => {
   const storage = new MemoryStorage();
   const originalClose = storage.close.bind(storage);
   let closeCalls = 0;
@@ -30,7 +30,7 @@ test("closes caller-owned storage when harness option preparation fails", async 
 
   try {
     await assert.rejects(openWorkshopHarness(storage, undefined, options), /injected harness option preparation failure/);
-    assert.equal(closeCalls, 1);
+    assert.equal(closeCalls, 0);
   } finally {
     if (!storageClosed) await originalClose(BACKGROUND_CONTEXT);
   }
