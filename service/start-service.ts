@@ -28,13 +28,19 @@ type ServiceStage =
   | "resume-harness"
   | "runtime";
 
+type ServiceStorage = Awaited<ReturnType<typeof openNodeSqliteStorage>>;
+type HarnessOwnedStore = { kind: "harness-owned"; harness: Harness };
+type ServiceStoreOwnership =
+  | { kind: "not-opened" }
+  | { kind: "storage-owned"; storage: ServiceStorage }
+  | HarnessOwnedStore
+  | { kind: "closed" };
+
 type ServiceResources = {
   storeLock?: Awaited<ReturnType<typeof acquireStoreLock>>;
   socket?: Awaited<ReturnType<typeof serveServiceSocket>>;
-  storage?: Awaited<ReturnType<typeof openNodeSqliteStorage>>;
-  storageClosed: boolean;
+  store: ServiceStoreOwnership;
   orchestratorRuntime?: OrchestratorRuntime;
-  harness?: Harness;
   workshop?: WorkshopService;
 };
 
@@ -58,7 +64,7 @@ export type ServiceLifecycleTransition =
   | { kind: "already-stopped"; state: ServiceLifecycle }
   | { kind: "rejected"; code: "invalid-transition"; state: ServiceLifecycle };
 
-export function createServiceLifecycle(resources: ServiceResources = { storageClosed: false }): ServiceLifecycle {
+export function createServiceLifecycle(resources: ServiceResources = { store: { kind: "not-opened" } }): ServiceLifecycle {
   return { kind: "starting", stage: "validate-project", resources };
 }
 
@@ -109,30 +115,30 @@ export type ServiceStoreCleanup =
 
 export async function openServiceHarness(
   resources: ServiceResources,
-  open: (storage: NonNullable<ServiceResources["storage"]>) => Promise<Harness>,
-): Promise<void> {
-  const storage = resources.storage;
-  if (!storage) throw new Error("Durable storage is not available for harness startup");
-  const harness = await open(storage);
-  resources.harness = harness;
-  resources.storage = undefined;
+  open: (storage: ServiceStorage) => Promise<Harness>,
+): Promise<HarnessOwnedStore> {
+  const store = resources.store;
+  if (store.kind !== "storage-owned") throw new Error("Durable storage is not available for harness startup");
+  const harness = await open(store.storage);
+  const ownership: HarnessOwnedStore = { kind: "harness-owned", harness };
+  resources.store = ownership;
+  return ownership;
 }
 
 export async function closeServiceStore(resources: ServiceResources): Promise<ServiceStoreCleanup> {
-  let storeClosed = resources.storageClosed || (resources.harness === undefined && resources.storage === undefined);
-  if (!storeClosed) {
+  const store = resources.store;
+  if (store.kind === "not-opened") {
+    resources.store = { kind: "closed" };
+  } else if (store.kind === "storage-owned" || store.kind === "harness-owned") {
     try {
-      if (resources.harness) await resources.harness.close(BACKGROUND_CONTEXT);
-      else if (resources.storage) await resources.storage.close(BACKGROUND_CONTEXT);
-      storeClosed = true;
-      resources.storageClosed = true;
-      resources.harness = undefined;
-      resources.storage = undefined;
+      if (store.kind === "storage-owned") await store.storage.close(BACKGROUND_CONTEXT);
+      else await store.harness.close(BACKGROUND_CONTEXT);
+      resources.store = { kind: "closed" };
     } catch (error) {
       return { kind: "failed", stage: "close", error };
     }
   }
-  if (storeClosed && resources.storeLock) {
+  if (resources.store.kind === "closed" && resources.storeLock) {
     try {
       await resources.storeLock.release();
       resources.storeLock = undefined;
@@ -166,7 +172,7 @@ class ServiceStartupInterrupted extends Error {
 }
 
 export async function startService(): Promise<void> {
-  const resources: ServiceResources = { storageClosed: false };
+  const resources: ServiceResources = { store: { kind: "not-opened" } };
   let lifecycle = createServiceLifecycle(resources);
   let storageFailed = false;
   let storageFailure: unknown;
@@ -274,7 +280,7 @@ export async function startService(): Promise<void> {
     assertStartupCanContinue();
 
     setStage("open-storage");
-    resources.storage = await openNodeSqliteStorage(join(stateDirectory, sqliteFile));
+    resources.store = { kind: "storage-owned", storage: await openNodeSqliteStorage(join(stateDirectory, sqliteFile)) };
     assertStartupCanContinue();
 
     setStage("open-model-runtime");
@@ -284,7 +290,7 @@ export async function startService(): Promise<void> {
     setStage("open-harness");
     const orchestratorRuntime = resources.orchestratorRuntime;
     if (!orchestratorRuntime) throw new Error("Orchestrator runtime is not available for harness startup");
-    await openServiceHarness(resources, (storage) => openWorkshopHarness(storage, (report) => {
+    const { harness } = await openServiceHarness(resources, (storage) => openWorkshopHarness(storage, (report) => {
       if (storageFailed) return;
       storageFailed = true;
       storageFailure = report.error;
@@ -310,8 +316,6 @@ export async function startService(): Promise<void> {
     assertStartupCanContinue();
 
     setStage("create-service");
-    const harness = resources.harness;
-    if (!harness) throw new Error("Durable harness is not available");
     resources.workshop = createWorkshopService({ projectRoot, harness });
 
     setStage("ensure-ticker");
