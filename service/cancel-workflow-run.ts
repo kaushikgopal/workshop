@@ -4,7 +4,7 @@ import { appendRecent, workshopStateDocument } from "../workflow/define-workshop
 import { WORKFLOW_TASK_NAME } from "../workflow/define-workflow-task.ts";
 import { runInputOf, statusOf, taskForRun } from "./read-workshop-status.ts";
 import { receiptFor, recordServiceReceipt } from "./record-service-receipt.ts";
-import { ServiceFailure } from "./create-service-failure.ts";
+import { ServiceFailure } from "./read-service-failure-code.ts";
 import type { ServiceRequest, ServiceResponse } from "./types.ts";
 
 type WorkflowTaskRecord = NonNullable<Awaited<ReturnType<typeof taskForRun>>>;

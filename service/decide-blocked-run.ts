@@ -7,7 +7,7 @@ import { parseWorkflowDecision } from "../workflow/parse-workflow-decision.ts";
 import type { WorkflowDecision } from "../workflow/types.ts";
 import { checkpointOf, taskForRun } from "./read-workshop-status.ts";
 import { receiptFor, recordServiceReceipt } from "./record-service-receipt.ts";
-import { ServiceFailure } from "./create-service-failure.ts";
+import { ServiceFailure } from "./read-service-failure-code.ts";
 import type { ServiceRequest, ServiceResponse } from "./types.ts";
 
 function actionNote(decision: WorkflowDecision, source: "chat" | "round"): string {

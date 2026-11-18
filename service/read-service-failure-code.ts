@@ -8,7 +8,7 @@ export class ServiceFailure extends Error {
   }
 }
 
-export function serviceFailureCode(error: unknown): string | undefined {
+export function readServiceFailureCode(error: unknown): string | undefined {
   if (error instanceof ServiceFailure) return error.code;
   if (typeof error === "object" && error !== null && "code" in error && error.code === "request_id_conflict") {
     return "request_id_conflict";

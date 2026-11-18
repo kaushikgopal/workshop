@@ -1,7 +1,7 @@
 import type { JsonValue } from "@earendil-works/chord/json";
 import { appendRecent, type WorkshopState } from "../workflow/define-workshop-state.ts";
 import type { StartWorkflowOutcome } from "../run/start-workflow.ts";
-import { ServiceFailure } from "./create-service-failure.ts";
+import { ServiceFailure } from "./read-service-failure-code.ts";
 import type { ServiceRequest, ServiceResponse } from "./types.ts";
 
 function isRecord(value: unknown): value is Record<string, unknown> {

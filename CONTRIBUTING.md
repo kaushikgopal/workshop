@@ -145,7 +145,7 @@ service/                                  durable service and local API
   acquire-store-lock.ts                   single-owner SQLite lock
   cancel-workflow-run.ts                   run cancellation and recovery
   create-orchestrator-runtime.ts           Pi model registry and auth
-  create-service-failure.ts                stable mutation failure codes
+  read-service-failure-code.ts           stable mutation failure codes
   create-workshop-chat.ts                  root conversation chat lifecycle
   create-workshop-extension.ts             root tools, status, and consult
   create-workshop-service.ts               request routing and receipt gate

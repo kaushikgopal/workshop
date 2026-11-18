@@ -12,7 +12,7 @@ import { cancelWorkflowRun } from "./cancel-workflow-run.ts";
 import { setWorkflowPause } from "./set-workflow-pause.ts";
 import { createWorkshopChat } from "./create-workshop-chat.ts";
 import { fingerprint, responseFromReceipt, startResponse } from "./record-service-receipt.ts";
-import { serviceFailureCode } from "./create-service-failure.ts";
+import { readServiceFailureCode } from "./read-service-failure-code.ts";
 export type WorkshopService = {
   handleRequest(value: unknown, invocation?: WorkshopServiceInvocation): Promise<ServiceResponse>;
   watchChat(requestId: string, send: (event: ServiceResponse) => void): Promise<{ close(): Promise<void> }>;
@@ -103,7 +103,7 @@ export function createWorkshopService(input: { projectRoot: string; harness: Har
           request_id: request.request_id,
           ok: false,
           error: error instanceof Error ? error.message : "Service mutation failed",
-          error_code: serviceFailureCode(error) ?? "mutation_failed",
+          error_code: readServiceFailureCode(error) ?? "mutation_failed",
         };
       }
     };
