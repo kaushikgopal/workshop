@@ -16,13 +16,17 @@ export type WorkshopHarnessOptions = {
   escalationModel: OrchestratorModel;
 };
 
+type HarnessInitialization =
+  | { kind: "preparing"; storage: Storage }
+  | { kind: "opening" }
+  | { kind: "opened"; harness: Harness };
+
 export async function openWorkshopHarness(
   storage: Storage,
   onStorageFailure?: (report: Report) => void,
   options?: WorkshopHarnessOptions,
 ): Promise<Harness> {
-  let harness: Harness | undefined;
-  let harnessOpenAttempted = false;
+  let initialization: HarnessInitialization = { kind: "preparing", storage };
   try {
     const registry = createRegistry();
     registry.install(defineExtension({
@@ -31,16 +35,20 @@ export async function openWorkshopHarness(
     }));
     const workshop = options === undefined ? undefined : createWorkshopExtension(options);
     if (workshop) registry.install(workshop);
-    harnessOpenAttempted = true;
-    harness = await Harness.open(storage, {
+    const harnessOptions = {
       models: options?.models ?? createModels(),
       registry,
-      onReport: (report) => {
+      onReport: (report: Report) => {
         const message = report.error instanceof Error ? report.error.message : String(report.error);
         console.error(`[workshop] durable ${report.kind}: ${message}`);
         if (report.kind === "storage_failed") onStorageFailure?.(report);
       },
-    }, BACKGROUND_CONTEXT);
+    };
+    const preparing = initialization;
+    if (preparing.kind !== "preparing") throw new Error("Workshop harness is not preparing");
+    initialization = { kind: "opening" };
+    const harness = await Harness.open(preparing.storage, harnessOptions, BACKGROUND_CONTEXT);
+    initialization = { kind: "opened", harness };
     if (workshop && options) {
       const tools = workshop.tools ?? [];
       const agent = {
@@ -58,8 +66,17 @@ export async function openWorkshopHarness(
     return harness;
   } catch (error) {
     try {
-      if (harness) await harness.close(BACKGROUND_CONTEXT);
-      else if (!harnessOpenAttempted) await storage.close(BACKGROUND_CONTEXT);
+      switch (initialization.kind) {
+        case "preparing":
+          await initialization.storage.close(BACKGROUND_CONTEXT);
+          break;
+        case "opening":
+          // Harness.open closes its internal session when task initialization fails.
+          break;
+        case "opened":
+          await initialization.harness.close(BACKGROUND_CONTEXT);
+          break;
+      }
     } catch (closeError) {
       throw new AggregateError([error, closeError], "Workshop harness initialization failed and cleanup was incomplete");
     }
