@@ -131,3 +131,8 @@ test("reports a direct workflow dependency on run modules", () => {
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("workflow state transitions do not import pi-durable", () => {
+  const source = readFileSync(resolve(projectRoot, "workflow/advance-workflow-state.ts"), "utf8");
+  assert.equal(importSpecifiers(source).includes("@earendil-works/pi-durable"), false);
+});

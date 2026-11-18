@@ -59,6 +59,7 @@ function attemptCheckpoint(context: WorkflowStateContext, retries = 1): Extract<
   }, context);
   assert.equal(decoded.phase, "attempt");
   if (decoded.phase !== "attempt") throw new Error("Expected an attempt checkpoint");
+  assert.equal(decoded.activeAttempt.taskId, 7);
   return decoded;
 }
 
@@ -237,6 +238,24 @@ test("checkpoint decoding rejects invalid step bounds and counters with field co
     assert.throws(() => decodeWorkflowTaskCheckpoint(checkpoint, context), (error: unknown) => {
       assert.ok(error instanceof WorkflowCheckpointIntegrityError);
       assert.ok(error.message.includes(field), `expected the integrity error to name ${field}`);
+      return true;
+    });
+  }
+});
+
+test("checkpoint decoding rejects invalid active child task identifiers", () => {
+  const context = makeContext(makeWorkflow(1, 0));
+  const step = context.workflow.steps[0];
+  assert.ok(step);
+
+  for (const taskId of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, "7"]) {
+    assert.throws(() => decodeWorkflowTaskCheckpoint({
+      ...stepCheckpoint(0),
+      phase: "attempt",
+      activeAttempt: { taskId, request: { step, pipeInput: "", feedback: "", attempt: 1 } },
+    }, context), (error: unknown) => {
+      assert.ok(error instanceof WorkflowCheckpointIntegrityError);
+      assert.ok(error.message.includes("checkpoint.activeAttempt.taskId"));
       return true;
     });
   }
