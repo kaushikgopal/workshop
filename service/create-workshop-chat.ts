@@ -1,6 +1,6 @@
 import { AssistantEntry, type ConversationView, type Harness, type SubmissionId, type SubmissionRecord } from "@earendil-works/pi-durable";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import type { ServiceRequest, ServiceResponse } from "./types.ts";
+import type { ServiceRequest, ServiceResponse } from "./parse-service-request.ts";
 import { initialChatProjectorState, projectChatEvents, type ChatProjectorState, type ChatSettlement } from "./project-chat-events.ts";
 
 function isRecord(value: unknown): value is Record<string, unknown> {

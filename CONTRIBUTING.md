@@ -14,7 +14,7 @@ A reader should know what a file does from its path alone, before opening it.
 - **Files** lead with a verb that says what they do: `workflow/load-workflows.ts`,
   `workflow/execute-workflow-attempt.ts`, `service/serve-service-socket.ts`. A noun
   alone, such as `workflow/types.ts`, says what a file is about, not what it does.
-- **Exception: pure shape.** A file that only declares types or a schema keeps a noun name, such as `workflow/types.ts` or `service/types.ts`.
+- **Exception: pure shape.** A file that only declares types or a schema keeps a noun name, such as `workflow/types.ts`.
 
 ### Use one verb per kind of work
 
@@ -162,7 +162,7 @@ service/                                  durable service and local API
   set-workflow-pause.ts                    pause and resume state changes
   start-service.ts                         entrypoint and lifecycle
   tick-workflows.ts                        workflow tick execution and task registration
-  types.ts                                 service request and response shapes
+  parse-service-request.ts               service request schema, parser, and response shapes
 workflow/                                 workflow loading and durable execution
   accept-blocked-decision.ts               blocked decision acceptance rules
   advance-workflow-state.ts                checkpoint validation and transitions

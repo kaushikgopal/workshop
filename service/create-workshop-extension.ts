@@ -3,7 +3,7 @@ import { join, resolve } from "node:path";
 import { Type } from "typebox";
 import { AssistantEntry, configure, defineExtension, defineTool, section } from "@earendil-works/pi-durable";
 import type { Extension, TaskId, ToolRegistration } from "@earendil-works/pi-durable";
-import { MAX_SERVICE_LIST_LIMIT, type ServiceResponse } from "./types.ts";
+import { MAX_SERVICE_LIST_LIMIT, type ServiceResponse } from "./parse-service-request.ts";
 import type { OrchestratorModel } from "./create-orchestrator-runtime.ts";
 
 export type WorkshopServiceInvocation = { taskId: TaskId };

@@ -13,7 +13,7 @@ import { createOrchestratorRuntime, type OrchestratorRuntime } from "./create-or
 import { createWorkshopService, type WorkshopService } from "./create-workshop-service.ts";
 import { openWorkshopHarness } from "./open-workshop-harness.ts";
 import { serveServiceSocket } from "./serve-service-socket.ts";
-import { parseServiceRequest } from "./types.ts";
+import { parseServiceRequest } from "./parse-service-request.ts";
 
 const sqliteFile = "workshop.sqlite";
 

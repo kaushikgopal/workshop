@@ -11,7 +11,7 @@ import { loadWorkflows } from "../workflow/load-workflows.ts";
 import { workshopStateDocument, workflowRunReferenceDocument } from "../workflow/define-workshop-state.ts";
 import type { AttemptHistoryEntry, WorkflowStepResult } from "../workflow/types.ts";
 import { projectWorkflowRunStatus, type WorkflowSchedulerAvailability } from "./project-workflow-run-status.ts";
-import { DEFAULT_SERVICE_LIST_LIMIT, type ServiceRequest, type ServiceResponse } from "./types.ts";
+import { DEFAULT_SERVICE_LIST_LIMIT, type ServiceRequest, type ServiceResponse } from "./parse-service-request.ts";
 
 type WorkflowTaskRecord = TaskRecord<JsonValue, JsonValue, unknown>;
 type WorkflowTaskState = WorkflowTaskCheckpoint;

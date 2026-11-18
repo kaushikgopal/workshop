@@ -8,7 +8,7 @@ import type { WorkflowDecision } from "../workflow/types.ts";
 import { checkpointOf, taskForRun } from "./read-workshop-status.ts";
 import { receiptFor, recordServiceReceipt } from "./record-service-receipt.ts";
 import { ServiceFailure } from "./read-service-failure-code.ts";
-import type { ServiceRequest, ServiceResponse } from "./types.ts";
+import type { ServiceRequest, ServiceResponse } from "./parse-service-request.ts";
 
 function actionNote(decision: WorkflowDecision, source: "chat" | "round"): string {
   const by = source === "round" ? "automatic failure round" : "chat";

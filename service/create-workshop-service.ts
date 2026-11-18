@@ -4,7 +4,7 @@ import type { Harness } from "@earendil-works/pi-durable";
 import type { WorkshopServiceInvocation } from "./create-workshop-extension.ts";
 import { createWorkflowStartPort, startWorkflow, type StartWorkflowOutcome } from "../run/start-workflow.ts";
 import { workshopStateDocument } from "../workflow/define-workshop-state.ts";
-import { DEFAULT_SERVICE_LIST_LIMIT, parseServiceRequest, type ServiceRequest, type ServiceResponse } from "./types.ts";
+import { DEFAULT_SERVICE_LIST_LIMIT, parseServiceRequest, type ServiceRequest, type ServiceResponse } from "./parse-service-request.ts";
 import { readWorkshopStatus } from "./read-workshop-status.ts";
 import { decideBlockedRun } from "./decide-blocked-run.ts";
 import { resolveFailureRound } from "./resolve-failure-round.ts";

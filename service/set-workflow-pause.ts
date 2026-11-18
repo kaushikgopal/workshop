@@ -3,7 +3,7 @@ import type { Harness } from "@earendil-works/pi-durable";
 import { transitionWorkflowPause } from "../run/transition-workflow-pause.ts";
 import { appendRecent, workshopStateDocument } from "../workflow/define-workshop-state.ts";
 import { receiptFor, recordServiceReceipt } from "./record-service-receipt.ts";
-import type { ServiceRequest, ServiceResponse } from "./types.ts";
+import type { ServiceRequest, ServiceResponse } from "./parse-service-request.ts";
 
 export async function setWorkflowPause(
   harness: Harness,

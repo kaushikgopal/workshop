@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { connect } from "node:net";
 import { resolve, join } from "node:path";
-import type { ServiceRequest, ServiceResponse } from "./types.ts";
+import type { ServiceRequest, ServiceResponse } from "./parse-service-request.ts";
 
 type RequestWithoutId<T> = T extends ServiceRequest ? Omit<T, "request_id"> & { request_id?: string } : never;
 export type ServiceRequestInput = RequestWithoutId<ServiceRequest>;

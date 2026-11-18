@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { requestService, type ServiceRequestInput } from "../service/request-service.ts";
-import type { ServiceResponse } from "../service/types.ts";
+import type { ServiceResponse } from "../service/parse-service-request.ts";
 
 const activityWindowMs = 24 * 60 * 60 * 1_000;
 

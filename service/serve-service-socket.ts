@@ -1,6 +1,6 @@
 import { connect, createServer, type Server, type Socket } from "node:net";
 import { chmodSync, existsSync, lstatSync, rmSync } from "node:fs";
-import type { ServiceResponse } from "./types.ts";
+import type { ServiceResponse } from "./parse-service-request.ts";
 
 const maximumRequestBytes = 1_048_576;
 type EventWriter = (event: ServiceResponse) => void;
