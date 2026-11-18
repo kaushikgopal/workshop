@@ -3,7 +3,7 @@ import type { Harness } from "@earendil-works/pi-durable";
 import { appendRecent, workshopStateDocument } from "../workflow/define-workshop-state.ts";
 import { WORKFLOW_TASK_NAME } from "../workflow/define-workflow-task.ts";
 import { runInputOf, statusOf, taskForRun } from "./read-workshop-status.ts";
-import { receiptFor, saveReceipt } from "./record-service-receipt.ts";
+import { receiptFor, recordServiceReceipt } from "./record-service-receipt.ts";
 import { ServiceFailure } from "./create-service-failure.ts";
 import type { ServiceRequest, ServiceResponse } from "./types.ts";
 
@@ -59,7 +59,7 @@ export async function cancelWorkflowRun(
         ? "Workflow run cancellation acknowledged during recovery."
         : "Workflow run cancellation requested from chat.",
     });
-    saveReceipt(state, request, result);
+    recordServiceReceipt(state, request, result);
     return result;
   }, BACKGROUND_CONTEXT);
 }

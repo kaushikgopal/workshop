@@ -2,7 +2,7 @@ import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { Harness } from "@earendil-works/pi-durable";
 import { transitionWorkflowPause } from "../run/transition-workflow-pause.ts";
 import { appendRecent, workshopStateDocument } from "../workflow/define-workshop-state.ts";
-import { receiptFor, saveReceipt } from "./record-service-receipt.ts";
+import { receiptFor, recordServiceReceipt } from "./record-service-receipt.ts";
 import type { ServiceRequest, ServiceResponse } from "./types.ts";
 
 export async function setWorkflowPause(
@@ -35,7 +35,7 @@ export async function setWorkflowPause(
       });
     }
     const response = { request_id: request.request_id, ok: true, workflow: request.workflow, paused, paused_workflows: [...state.paused] };
-    saveReceipt(state, request, response);
+    recordServiceReceipt(state, request, response);
     return response;
   }, BACKGROUND_CONTEXT);
 }

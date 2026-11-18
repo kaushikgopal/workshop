@@ -6,7 +6,7 @@ import { WORKFLOW_TASK_NAME, workflowDecisionDocument } from "../workflow/define
 import { parseWorkflowDecision } from "../workflow/parse-workflow-decision.ts";
 import type { WorkflowDecision } from "../workflow/types.ts";
 import { checkpointOf, taskForRun } from "./read-workshop-status.ts";
-import { receiptFor, saveReceipt } from "./record-service-receipt.ts";
+import { receiptFor, recordServiceReceipt } from "./record-service-receipt.ts";
 import { ServiceFailure } from "./create-service-failure.ts";
 import type { ServiceRequest, ServiceResponse } from "./types.ts";
 
@@ -120,7 +120,7 @@ export async function decideBlockedRun(
     mailbox.choice = { requestId: request.request_id, decisionNumber: request.decision_number, decision, source };
     const response: ServiceResponse = { request_id: request.request_id, ok: true, run_id: request.run_id, decision };
     appendRecent(state.actions, actionForDecision(failure.workflow, request.run_id, failure.step, decision, source, request.note, new Date().toISOString()));
-    saveReceipt(state, request, response);
+    recordServiceReceipt(state, request, response);
     return response;
   }, BACKGROUND_CONTEXT);
 }

@@ -35,7 +35,7 @@ export function receiptFor(state: WorkshopState, request: ServiceRequest): Servi
   return responseFromReceipt(receipt.response);
 }
 
-export function saveReceipt(state: WorkshopState, request: ServiceRequest, response: ServiceResponse): void {
+export function recordServiceReceipt(state: WorkshopState, request: ServiceRequest, response: ServiceResponse): void {
   const serialized = JSON.stringify(response);
   if (serialized === undefined) throw new Error("Service response could not be saved");
   const responseValue = JSON.parse(serialized);
