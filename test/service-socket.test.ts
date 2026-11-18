@@ -94,6 +94,45 @@ test("the SQLite store lock refuses a second owner and releases cleanly", async 
   }
 });
 
+test("overlapping SQLite lock releases wait for completion", async () => {
+  const lock = await acquireStoreLock(":memory:");
+  const completed: string[] = [];
+  try {
+    const first = lock.release().then(() => { completed.push("first"); });
+    const second = lock.release().then(() => { completed.push("second"); });
+    await Promise.all([first, second]);
+    assert.deepEqual(completed, ["first", "second"]);
+    assert.equal(await lock.release(), undefined);
+  } finally {
+    await lock.release();
+  }
+});
+
+test("repeated SQLite lock releases retain a DELETE failure", async () => {
+  const stateDirectory = mkdtempSync(join(tmpdir(), "workshop-lock-test-"));
+  const databasePath = join(stateDirectory, "workshop.sqlite");
+  const database = new DatabaseSync(databasePath);
+  let lock: Awaited<ReturnType<typeof acquireStoreLock>> | undefined;
+  try {
+    lock = await acquireStoreLock(databasePath);
+    database.exec(`CREATE TRIGGER deny_release BEFORE DELETE ON workshop_service_lock
+      BEGIN SELECT RAISE(ABORT, 'release denied'); END`);
+    const [first, second] = await Promise.allSettled([lock.release(), lock.release()]);
+    assert.ok(first.status === "rejected");
+    assert.ok(first.reason instanceof Error);
+    assert.equal(first.reason.message, "release denied");
+    assert.ok("code" in first.reason);
+    assert.equal(first.reason.code, "ERR_SQLITE_ERROR");
+    assert.deepEqual(second, { status: "rejected", reason: first.reason });
+    await assert.rejects(lock.release(), first.reason);
+    assert.equal(database.prepare("SELECT count(*) AS count FROM workshop_service_lock").get()?.count, 1);
+  } finally {
+    await lock?.release().catch(() => {});
+    database.close();
+    rmSync(stateDirectory, { recursive: true, force: true });
+  }
+});
+
 test("socket permission failure cleans up its listener and path", async () => {
   const stateDirectory = mkdtempSync(join(tmpdir(), "workshop-socket-permission-test-"));
   const socketPath = join(stateDirectory, "service.sock");

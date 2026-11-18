@@ -80,16 +80,19 @@ export async function acquireStoreLock(databasePath: string): Promise<StoreLock>
     throw error;
   }
 
-  let released = false;
+  let releasePromise: Promise<void> | undefined;
   return {
-    async release() {
-      if (released) return;
-      released = true;
-      try {
-        await releaseStoreLock(database, owner.token);
-      } finally {
-        await database.close();
-      }
+    release() {
+      if (releasePromise) return releasePromise;
+      // Every caller must observe the completed cleanup, including any failure.
+      releasePromise = (async () => {
+        try {
+          await releaseStoreLock(database, owner.token);
+        } finally {
+          await database.close();
+        }
+      })();
+      return releasePromise;
     },
   };
 }
