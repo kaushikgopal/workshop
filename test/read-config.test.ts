@@ -3,7 +3,7 @@ import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { checkProfileCommands, ConfigReadError, readConfig, type WorkshopConfig } from "../config/read-workshop-config.ts";
+import { checkProfileCommands, ConfigReadError, loadWorkshopConfig, type WorkshopConfig } from "../config/load-workshop-config.ts";
 
 function createDirectory(): string {
   return mkdtempSync(join(tmpdir(), "workshop-config-test-"));
@@ -37,7 +37,7 @@ test("config loads .env.local without overwriting the environment and substitute
     writeFileSync(join(directory, ".env.local"), `${envName}=value-from-file\n${existingName}=ignored-file-value\n${quotedName}="value # from file"\n${specialName}=ignored-special-value\n`);
     const file = writeConfig(directory, `agent_profiles:\n  writer:\n    command: [node, "\${${envName}}", "\${${existingName}}", "\${${quotedName}}", "\${${specialName}}"]\n    context_window: 64000\norchestrator: {}\n`);
     process.env[configName] = file;
-    const config = readConfig();
+    const config = loadWorkshopConfig();
     assert.deepEqual(config.agent_profiles.writer, {
       command: ["node", "value-from-file", "kept-from-process", "value # from file", specialValue],
       context_window: 64000,
@@ -100,7 +100,7 @@ test("config failures do not apply values staged from .env.local", () => {
       writeFileSync(join(directory, ".env.local"), failure.env);
       const file = writeConfig(directory, failure.config);
       process.env[configName] = file;
-      assert.throws(() => readConfig(), failure.message, `invalid input ${index}`);
+      assert.throws(() => loadWorkshopConfig(), failure.message, `invalid input ${index}`);
       assert.equal(process.env[failure.key], undefined, `failed read applied ${failure.key}`);
     }
   } finally {
@@ -125,7 +125,7 @@ test("config errors name an unset interpolation variable", () => {
   try {
     const file = writeConfig(directory, `agent_profiles:\n  writer:\n    command: [node, "\${${envName}}"]\norchestrator: {}\n`);
     process.env[configName] = file;
-    assert.throws(() => readConfig(), (error: unknown) => {
+    assert.throws(() => loadWorkshopConfig(), (error: unknown) => {
       assert.ok(error instanceof ConfigReadError);
       assert.match(error.message, new RegExp(envName));
       return true;
@@ -154,7 +154,7 @@ test("config validates command arrays, agent profile names, and context windows"
     ];
     for (const [index, item] of invalidConfigs.entries()) {
       const file = writeConfig(directory, item.source);
-      assert.throws(() => readConfig(file), item.message, `invalid config ${index}`);
+      assert.throws(() => loadWorkshopConfig(file), item.message, `invalid config ${index}`);
     }
   } finally {
     rmSync(directory, { recursive: true, force: true });
@@ -165,7 +165,7 @@ test("profile commands preserve empty arguments for CLI flags", () => {
   const directory = createDirectory();
   try {
     const file = writeConfig(directory, basicConfig('[node, "", -e, hello]'));
-    assert.deepEqual(readConfig(file).agent_profiles.writer?.command, ["node", "", "-e", "hello"]);
+    assert.deepEqual(loadWorkshopConfig(file).agent_profiles.writer?.command, ["node", "", "-e", "hello"]);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
@@ -213,7 +213,7 @@ test("resolves relative profile executables against the config directory", () =>
     writeFileSync(executable, "#!/bin/sh\nexit 0\n");
     chmodSync(executable, 0o755);
     const file = writeConfig(directory, basicConfig("[./bin/fake-profile]"));
-    const config = readConfig(file);
+    const config = loadWorkshopConfig(file);
 
     assert.equal(config.agent_profiles.writer?.command[0], executable);
     assert.deepEqual(checkProfileCommands(config, "", file), []);
