@@ -1,4 +1,5 @@
-import { checkProfileCommands, ConfigReadError, loadWorkshopConfig } from "../config/load-workshop-config.ts";
+import { checkProfileCommands } from "../config/check-profile-commands.ts";
+import { ConfigReadError, loadWorkshopConfig } from "../config/load-workshop-config.ts";
 
 try {
   const config = loadWorkshopConfig();

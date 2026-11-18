@@ -139,7 +139,8 @@ Folders and filenames follow [Naming files](#naming-files).
 ```text
 agent/instructions.md                     root orchestrator instructions
 config/                                   config loading and validation
-  load-workshop-config.ts                 YAML, environment, and profile validation
+  check-profile-commands.ts              executable lookup for configured profiles
+  load-workshop-config.ts                 YAML, environment, and profile-schema validation
 service/                                  durable service and local API
   acquire-store-lock.ts                   single-owner SQLite lock
   cancel-workflow-run.ts                   run cancellation and recovery

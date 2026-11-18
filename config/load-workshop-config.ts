@@ -1,5 +1,5 @@
-import { accessSync, constants, readFileSync, statSync } from "node:fs";
-import { delimiter, dirname, isAbsolute, resolve } from "node:path";
+import { readFileSync } from "node:fs";
+import { dirname, isAbsolute, resolve } from "node:path";
 import { parseDocument } from "yaml";
 import { z } from "zod";
 
@@ -172,38 +172,4 @@ export function loadWorkshopConfig(configFile?: string): WorkshopConfig {
     if (process.env[name] === undefined) process.env[name] = value;
   }
   return { ...result.data, agent_profiles };
-}
-
-export function checkProfileCommands(
-  config: WorkshopConfig,
-  pathValue: string | undefined = process.env.PATH,
-  configFile = process.env.WORKSHOP_CONFIG ?? "workshop.yaml",
-): ConfigIssue[] {
-  const searchPath = pathValue?.split(delimiter) ?? [];
-  const issues: ConfigIssue[] = [];
-  const configDirectory = dirname(resolve(configFile));
-  for (const [name, profile] of Object.entries(config.agent_profiles)) {
-    const executable = profile.command[0];
-    if (executable === undefined || !isExecutableOnPath(executable, searchPath, configDirectory)) {
-      issues.push({
-        file: configFile,
-        reason: `agent_profiles.${name}.command[0] ${JSON.stringify(executable ?? "")} must resolve to an executable file on PATH`,
-      });
-    }
-  }
-  return issues;
-}
-
-function isExecutableOnPath(executable: string, searchPath: string[], configDirectory: string): boolean {
-  const candidates = executable.includes("/")
-    ? [isAbsolute(executable) ? executable : resolve(configDirectory, executable)]
-    : searchPath.map((directory) => resolve(directory || process.cwd(), executable));
-  return candidates.some((candidate) => {
-    try {
-      accessSync(candidate, constants.X_OK);
-      return statSync(candidate).isFile();
-    } catch {
-      return false;
-    }
-  });
 }
