@@ -1544,7 +1544,7 @@ test("durable explicit-zero retry budgets override workflow defaults", { timeout
   const workflowDirectory = join(project.root, "workflows", "clock");
   writeFileSync(join(project.root, "workshop.yaml"), [
     "agent_profiles:",
-    `  writer:\n    command: ${JSON.stringify([process.execPath, join(process.cwd(), "test/fixtures/profile-command.mjs"), "fail"])}`,
+    `  writer:\n    command: ${JSON.stringify([process.execPath, join(process.cwd(), "test/fixtures/execute-profile-command.mjs"), "fail"])}`,
     "orchestrator: {}",
     "",
   ].join("\n"));

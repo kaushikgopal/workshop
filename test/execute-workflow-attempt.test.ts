@@ -10,7 +10,7 @@ import { executeWorkflowAttempt, parseMarkdownVerdict, transitionWorkflowAttempt
 import { parseWorkflowDecision } from "../workflow/parse-workflow-decision.ts";
 import type { Workflow, WorkflowStep } from "../workflow/types.ts";
 
-const fixture = resolve("test/fixtures/profile-command.mjs");
+const fixture = resolve("test/fixtures/execute-profile-command.mjs");
 
 function makeWorkflow(steps: WorkflowStep[], extra: Partial<Workflow> = {}): Workflow {
   return {
