@@ -1,6 +1,6 @@
 import type { JsonValue } from "@earendil-works/chord/json";
 import { defineDoc, defineDocFamily, type TaskId } from "@earendil-works/pi-durable";
-import type { OrchestratorDecision, WorkflowDecision } from "./types.ts";
+import type { MutationReceipt, OrchestratorDecision, WorkflowDecision } from "./types.ts";
 import { parseWorkflowDecision } from "./parse-workflow-decision.ts";
 
 export type WorkflowAdmission = {
@@ -20,12 +20,6 @@ export type WorkshopAction = {
   source: "chat" | "round";
   decision: WorkflowDecision | OrchestratorDecision | { action: "start" | "cancel" | "pause" | "resume" };
   note: string;
-};
-
-export type MutationReceipt = {
-  request_id: string;
-  fingerprint: string;
-  response: JsonValue;
 };
 
 export type WorkshopState = {

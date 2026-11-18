@@ -1,3 +1,5 @@
+import type { JsonValue } from "@earendil-works/chord/json";
+
 export type WorkflowStepKind = "agent" | "command";
 
 export type WorkflowDecision =
@@ -77,4 +79,10 @@ export type WorkflowLoadResult = {
 
 export type WorkflowLoadOptions = {
   ignoreTopLevelYaml?: boolean;
+};
+
+export type MutationReceipt = {
+  request_id: string;
+  fingerprint: string;
+  response: JsonValue;
 };

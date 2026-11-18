@@ -1,5 +1,5 @@
 import type { JsonValue } from "@earendil-works/chord/json";
-import type { MutationReceipt } from "../workflow/define-workshop-state.ts";
+import type { MutationReceipt } from "../workflow/types.ts";
 
 export type WorkflowAdmissionCommand =
   | { kind: "manual"; workflow: string }
