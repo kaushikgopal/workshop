@@ -64,6 +64,51 @@ test("projector emits nested tool completion when a later observation adds its s
   ]);
 });
 
+test("projector emits a root tool result only once after repeat and regression", () => {
+  const observation = (status: string) => ({
+    view: view({
+      run: { taskId: "turn-1", inputs: ["submission-1"] },
+      generation: { attempt: 1, message: { content: [] } },
+      tools: [{ callId: "tool-1", name: "search", status }],
+    }),
+    chatRequestId: "chat-1",
+  });
+
+  let projected = projectChatEvents(initialChatProjectorState(), observation("done"));
+  assert.deepEqual(projected.events.map(({ type }) => type), ["tool.call", "tool.result"]);
+  projected = projectChatEvents(projected.state, observation("done"));
+  assert.deepEqual(projected.events, []);
+  projected = projectChatEvents(projected.state, observation("pending"));
+  assert.deepEqual(projected.events, []);
+  projected = projectChatEvents(projected.state, observation("done"));
+  assert.deepEqual(projected.events, []);
+});
+
+test("projector emits a nested tool result only once after repeat and regression", () => {
+  const observation = (complete: boolean) => ({
+    view: view({
+      run: { taskId: "turn-1", inputs: ["submission-1"] },
+      generation: { attempt: 1, message: { content: [] } },
+      nestedTools: [{
+        callId: "nested-1",
+        name: "consult",
+        arguments: { question: "Review" },
+        ...(complete ? { summary: { isError: true } } : {}),
+      }],
+    }),
+    chatRequestId: "chat-1",
+  });
+
+  let projected = projectChatEvents(initialChatProjectorState(), observation(true));
+  assert.deepEqual(projected.events.map(({ type }) => type), ["tool.call", "tool.result"]);
+  projected = projectChatEvents(projected.state, observation(true));
+  assert.deepEqual(projected.events, []);
+  projected = projectChatEvents(projected.state, observation(false));
+  assert.deepEqual(projected.events, []);
+  projected = projectChatEvents(projected.state, observation(true));
+  assert.deepEqual(projected.events, []);
+});
+
 test("projector keeps one submission turn across generation tasks and ends it once settled", () => {
   const first = projectChatEvents(initialChatProjectorState(), {
     view: view({
