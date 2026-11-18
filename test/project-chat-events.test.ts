@@ -185,8 +185,16 @@ test("projector keeps text replacement pending through an empty retry observatio
     chatRequestId: "chat-1",
   });
   assert.deepEqual(emptyRetry.events, []);
+  const stillEmpty = projectChatEvents(emptyRetry.state, {
+    view: view({
+      run: { taskId: "turn-1", inputs: ["submission-1"] },
+      generation: { attempt: 2, message: { content: [] } },
+    }),
+    chatRequestId: "chat-1",
+  });
+  assert.deepEqual(stillEmpty.events, []);
 
-  const answer = projectChatEvents(emptyRetry.state, {
+  const answer = projectChatEvents(stillEmpty.state, {
     view: view({
       run: { taskId: "turn-1", inputs: ["submission-1"] },
       generation: { attempt: 2, message: { content: [{ type: "text", text: "Replacement" }] } },
@@ -195,6 +203,35 @@ test("projector keeps text replacement pending through an empty retry observatio
   });
   assert.deepEqual(answer.events.map(({ type, text, replace }) => ({ type, text, replace })), [
     { type: "assistant.delta", text: "Replacement", replace: true },
+  ]);
+});
+
+test("projector replaces old text after a direct generation change", () => {
+  const first = projectChatEvents(initialChatProjectorState(), {
+    view: view({
+      run: { taskId: "generation-1", inputs: ["submission-1"] },
+      generation: { attempt: 1, message: { content: [{ type: "text", text: "Old partial" }] } },
+    }),
+    chatRequestId: "chat-1",
+  });
+  const emptyGeneration = projectChatEvents(first.state, {
+    view: view({
+      run: { taskId: "generation-2", inputs: ["submission-1"] },
+      generation: { attempt: 2, message: { content: [] } },
+    }),
+    chatRequestId: "chat-1",
+  });
+  assert.deepEqual(emptyGeneration.events, []);
+
+  const replacement = projectChatEvents(emptyGeneration.state, {
+    view: view({
+      run: { taskId: "generation-2", inputs: ["submission-1"] },
+      generation: { attempt: 2, message: { content: [{ type: "text", text: "New answer" }] } },
+    }),
+    chatRequestId: "chat-1",
+  });
+  assert.deepEqual(replacement.events, [
+    { ok: true, type: "assistant.delta", chat_request_id: "chat-1", text: "New answer", replace: true },
   ]);
 });
 
