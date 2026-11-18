@@ -31,8 +31,12 @@ Give each verb one meaning and reuse it for that meaning:
 | `execute` | carry out a unit of work | `run/execute-workflow-process.ts` |
 | `open` | initialize a durable harness | `service/open-workshop-harness.ts` |
 | `serve` | expose the local JSON API | `service/serve-service-socket.ts` |
+| `read` | retrieve stored or runtime data; use `load` for checked files | `service/read-workshop-status.ts` |
+| `decide` | choose a domain outcome | `run/decide-workflow-admission.ts` |
+| `start` | begin a workflow execution or the service | `run/start-workflow.ts`, `service/start-service.ts` |
+| `project` | derive a public view from internal state | `service/project-workflow-run-status.ts` |
 
-Other plain verbs (`start`, `send`, `cancel`, `pause`, `resume`) are fine when no verb above already covers the job. Before adding a verb, check that it does not overlap one in the table; if it will recur, add it to the table.
+Other plain verbs (`send`, `cancel`, `pause`, `resume`) are fine when no verb above already covers the job. Before adding a verb, check that it does not overlap one in the table; if it will recur, add it to the table.
 
 ### Rules that prevent collisions
 
