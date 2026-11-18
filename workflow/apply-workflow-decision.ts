@@ -1,3 +1,4 @@
+import { isRetryProfileCompatible } from "./compute-retry-profiles.ts";
 import type { WorkflowDecision, WorkflowStep } from "./types.ts";
 
 export type AppliedWorkflowDecision =
@@ -21,8 +22,7 @@ export function applyWorkflowDecision(input: {
     if (input.step.kind !== "agent") throw new Error(`${input.step.number}-${input.step.name} cannot retry with a profile because it is a command step`);
     const retryCommand = input.profileCommands[decision.profile];
     if (!retryCommand) throw new Error(`Unknown retry profile "${decision.profile}" for ${input.step.number}-${input.step.name}`);
-    const originalExecutable = input.profileCommands[input.step.profile ?? ""]?.[0];
-    if (retryCommand[0] !== originalExecutable) {
+    if (!isRetryProfileCompatible(input.step, decision.profile, input.profileCommands)) {
       throw new Error(`Retry profile "${decision.profile}" must use the same executable as ${input.step.profile}`);
     }
     profile = decision.profile;
