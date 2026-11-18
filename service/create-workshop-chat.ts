@@ -39,16 +39,21 @@ function chatRequestId(record: SubmissionRecord): string | undefined {
   return requestId.length > 0 ? requestId : undefined;
 }
 
+type ChatSubmissionState =
+  | { phase: "observed"; record: SubmissionRecord }
+  | { phase: "tracking"; record: SubmissionRecord; chatRequestId: string }
+  | { phase: "settled"; record: SubmissionRecord; chatRequestId: string };
+
 async function loadLiveSubmissions(
   harness: Harness,
   ids: readonly SubmissionId[],
-  known: Map<SubmissionId, SubmissionRecord>,
+  submissions: Map<SubmissionId, ChatSubmissionState>,
 ): Promise<void> {
   for (const id of ids) {
-    if (known.has(id)) continue;
+    if (submissions.has(id)) continue;
     const submission = await harness.submission(id, BACKGROUND_CONTEXT);
     const record = await submission?.status(BACKGROUND_CONTEXT);
-    if (record) known.set(id, record);
+    if (record) submissions.set(id, { phase: "observed", record });
   }
 }
 
@@ -90,37 +95,40 @@ export function createWorkshopChat(input: { harness: Harness }): {
     const root = await input.harness.root(BACKGROUND_CONTEXT);
     const watch = await root.watch(BACKGROUND_CONTEXT);
     let projectorState: ChatProjectorState = initialChatProjectorState();
-    const knownSubmissions = new Map<SubmissionId, SubmissionRecord>();
-    const trackedSubmissions = new Map<SubmissionId, { id: SubmissionId; chatRequestId: string }>();
-    const settledSubmissionIds = new Set<SubmissionId>();
+    const submissions = new Map<SubmissionId, ChatSubmissionState>();
     let publishChain = Promise.resolve();
     let closed = false;
     const sendEvent = (event: ServiceResponse) => send({ request_id: requestId, ...event });
 
     const publish = async (view: ConversationView): Promise<void> => {
       const inputIds = liveSubmissionIds(view);
-      await loadLiveSubmissions(input.harness, inputIds, knownSubmissions);
+      await loadLiveSubmissions(input.harness, inputIds, submissions);
       for (const id of inputIds) {
-        const record = knownSubmissions.get(id);
-        const chatId = record === undefined ? undefined : chatRequestId(record);
-        const terminal = record?.status === "done" || record?.status === "unanswered";
-        if (record?.type === "input" && chatId !== undefined && (record.status === "placed" || (terminal && !settledSubmissionIds.has(id)))) {
-          trackedSubmissions.set(id, { id: record.id, chatRequestId: chatId });
+        const state = submissions.get(id);
+        if (state?.phase !== "observed") continue;
+        const { record } = state;
+        const chatId = chatRequestId(record);
+        const terminal = record.status === "done" || record.status === "unanswered";
+        if (record.type === "input" && chatId !== undefined && (record.status === "placed" || terminal)) {
+          submissions.set(id, { phase: "tracking", record, chatRequestId: chatId });
         }
       }
       const settledSubmissions: ChatSettlement[] = [];
-      for (const [key, tracked] of trackedSubmissions) {
-        const submission = await input.harness.submission(tracked.id, BACKGROUND_CONTEXT);
+      for (const [key, state] of submissions) {
+        if (state.phase !== "tracking") continue;
+        const submission = await input.harness.submission(state.record.id, BACKGROUND_CONTEXT);
         const record = await submission?.status(BACKGROUND_CONTEXT);
         if (!record) continue;
-        knownSubmissions.set(key, record);
-        if (record.status === "queued" || record.status === "placed") continue;
+        if (record.status === "queued" || record.status === "placed") {
+          submissions.set(key, { ...state, record });
+          continue;
+        }
         if (record.type === "input" && record.status === "done") {
           const entry = await input.harness.commit((tx) => tx.entry(AssistantEntry, record.answer), BACKGROUND_CONTEXT);
           sendEvent({
             ok: true,
             type: "assistant.final",
-            chat_request_id: tracked.chatRequestId,
+            chat_request_id: state.chatRequestId,
             conversation_id: root.id,
             answer: assistantText(entry),
           });
@@ -133,13 +141,13 @@ export function createWorkshopChat(input: { harness: Harness }): {
             ...(typeof record.detail === "string" ? { detail: record.detail } : {}),
           });
         }
-        settledSubmissionIds.add(key);
-        trackedSubmissions.delete(key);
+        submissions.set(key, { phase: "settled", record, chatRequestId: state.chatRequestId });
       }
 
       const correlatedRequestId = inputIds.flatMap((id) => {
-        const record = knownSubmissions.get(id);
-        const chatId = record === undefined ? undefined : chatRequestId(record);
+        const state = submissions.get(id);
+        if (state === undefined) return [];
+        const chatId = state.phase === "observed" ? chatRequestId(state.record) : state.chatRequestId;
         return chatId === undefined ? [] : [chatId];
       })[0];
       const projection = projectChatEvents(projectorState, { view, chatRequestId: correlatedRequestId, settledSubmissions });
