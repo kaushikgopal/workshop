@@ -16,6 +16,7 @@ import { workshopStateDocument, workflowRunReferenceDocument, type WorkshopActio
 import type { MutationReceipt } from "../workflow/types.ts";
 import { createWorkshopService } from "../service/create-workshop-service.ts";
 import { createWorkshopChat } from "../service/create-workshop-chat.ts";
+import { createWorkshopExtension } from "../service/create-workshop-extension.ts";
 import { openWorkshopHarness } from "../service/open-workshop-harness.ts";
 import { serveServiceSocket } from "../service/serve-service-socket.ts";
 import { parseServiceRequest } from "../service/parse-service-request.ts";
@@ -1888,6 +1889,47 @@ test("submit_chat reuses the configured root conversation through the service", 
   } finally {
     if (harness) await harness.close(BACKGROUND_CONTEXT);
     rmSync(project.root, { recursive: true, force: true });
+  }
+});
+
+test("a failed consult reports a reason without forwarding provider detail", { timeout: 5_000 }, async () => {
+  const faux = fauxProvider();
+  const models = createModels();
+  models.setProvider(faux.provider);
+  const model = faux.getModel();
+  assert.ok(model);
+  const modelRef = { provider: model.provider, modelId: model.id };
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("consult", { question: "Check the workflow." }), { stopReason: "toolUse" }),
+    fauxAssistantMessage([], { stopReason: "error", errorMessage: "Synthetic private provider detail" }),
+    fauxAssistantMessage("The consult failed."),
+  ]);
+  const extension = createWorkshopExtension({
+    projectRoot: process.cwd(),
+    request: async () => ({ ok: true, workflows: [], runs: [], actions: [] }),
+    escalationModel: { model: modelRef, thinkingLevel: "medium" },
+  });
+  const registry = createRegistry();
+  registry.install(extension);
+  const harness = await Harness.open(new MemoryStorage(), {
+    models, registry, settings: { retry: { maxRetries: 0 } },
+  }, BACKGROUND_CONTEXT);
+  try {
+    const root = await harness.root(BACKGROUND_CONTEXT, {
+      agent: { model: modelRef, extensions: [extension], tools: extension.tools, modelTools: extension.tools },
+    });
+    harness.resume();
+    const submission = await root.submit({ type: "input", content: "Ask for advice." }, BACKGROUND_CONTEXT);
+    assert.equal((await submission.wait(BACKGROUND_CONTEXT)).status, "done");
+    const context = await root.context(BACKGROUND_CONTEXT);
+    const consult = context.messages.find((message) => message.role === "toolResult" && message.toolName === "consult");
+    assert.ok(consult?.role === "toolResult");
+    assert.equal(consult.isError, true);
+    assert.deepEqual(consult.content, [{
+      type: "text", text: JSON.stringify({ ok: false, error: "consult_unanswered", reason: "model_error" }),
+    }]);
+  } finally {
+    await harness.close(BACKGROUND_CONTEXT);
   }
 });
 

@@ -9,6 +9,12 @@ import type { OrchestratorModel } from "./create-orchestrator-runtime.ts";
 export type WorkshopServiceInvocation = { taskId: TaskId };
 export type WorkshopServiceRequest = (request: unknown, invocation?: WorkshopServiceInvocation) => Promise<ServiceResponse>;
 
+// Only forward documented pi-durable categories, never the provider's detail.
+const consultFailureReasons = new Set([
+  "model_error", "no_model", "aborted", "reset", "interrupted", "faulted", "orphaned",
+  "restart_limit", "turn_limit", "nothing_to_answer", "missing_task", "task_too_old", "migration_failed",
+]);
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -194,7 +200,10 @@ export function createWorkshopExtension(input: {
       if (!child) throw new Error("Consult conversation is unavailable");
       const submitted = await child.submit({ type: "input", content: args.question, requestId: `consult:${api.callId}` }, context);
       const settled = await submitted.wait(context);
-      if (settled.status !== "done" || settled.type !== "input") return result({ ok: false, error: "consult_unanswered" });
+      if (settled.status !== "done" || settled.type !== "input") {
+        const reason = settled.status === "unanswered" && consultFailureReasons.has(settled.reason) ? settled.reason : "unknown";
+        return result({ ok: false, error: "consult_unanswered", reason });
+      }
       const entry = await api.commit((tx) => tx.entry(AssistantEntry, settled.answer), context);
       return { output: [{ type: "text", text: textContent(entry?.model?.[0]?.content) }] };
     },

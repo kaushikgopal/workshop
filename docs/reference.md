@@ -44,7 +44,9 @@ decide a blocked run, pause or resume a workflow, and list actions.
 The `consult` tool creates a read-only child conversation with
 `orchestrator.escalation_model`. It can inspect workflows, runs, and recent
 actions, but it has no tools that mutate Workshop state. A failure round can
-call `consult` for advice before deciding what to do.
+call `consult` for advice before deciding what to do. A consult that ends
+without an answer returns `consult_unanswered` with a reason category, not
+raw provider error details.
 
 ## Workflow folders and validation
 
