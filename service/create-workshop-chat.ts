@@ -97,7 +97,8 @@ export function createWorkshopChat(input: { harness: Harness }): {
     let projectorState: ChatProjectorState = initialChatProjectorState();
     const submissions = new Map<SubmissionId, ChatSubmissionState>();
     let publishChain = Promise.resolve();
-    let closed = false;
+    let closing: Promise<void> | undefined;
+    const stopWatch = () => Promise.resolve().then(async () => { await watch.stop(); });
     const sendEvent = (event: ServiceResponse) => send({ request_id: requestId, ...event });
 
     const publish = async (view: ConversationView): Promise<void> => {
@@ -156,7 +157,7 @@ export function createWorkshopChat(input: { harness: Harness }): {
     };
     const enqueuePublish = (view: ConversationView): Promise<void> => {
       publishChain = publishChain.then(async () => {
-        if (!closed) await publish(view);
+        if (closing === undefined) await publish(view);
       });
       return publishChain;
     };
@@ -168,18 +169,15 @@ export function createWorkshopChat(input: { harness: Harness }): {
         if (call.kind === "value") await enqueuePublish(call.value);
       });
     } catch (error) {
-      closed = true;
-      await Promise.resolve().then(() => watch.stop()).catch((cleanupError: unknown) => {
+      closing = stopWatch();
+      await closing.catch((cleanupError: unknown) => {
         throw new AggregateError([error, cleanupError], "Chat attachment failed and cleanup was incomplete");
       });
       throw error;
     }
     return {
-      async close() {
-        if (closed) return;
-        closed = true;
-        await watch.stop();
-        await publishChain;
+      close() {
+        return closing ??= stopWatch().then(() => publishChain);
       },
     };
   }

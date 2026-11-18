@@ -2204,6 +2204,42 @@ for (const scenario of [
   });
 }
 
+for (const failure of [undefined, new Error("watch stop failed")]) {
+  test(`repeated chat watch closes share ${failure ? "a cleanup failure" : "pending cleanup"}`, async () => {
+    const harness = await createHarness(new MemoryStorage());
+    const root = await harness.root(BACKGROUND_CONTEXT);
+    const watch = await root.watch(BACKGROUND_CONTEXT);
+    const stop = watch.stop.bind(watch);
+    const cleanup = Promise.withResolvers<void>();
+    watch.stop = async () => {
+      await cleanup.promise;
+      const stopped = await stop();
+      if (failure) throw failure;
+      return stopped;
+    };
+    root.watch = async () => watch;
+    harness.root = async () => root;
+    try {
+      const watcher = await createWorkshopChat({ harness }).watchChat("watch", () => {});
+      const first = watcher.close();
+      let repeatedFinished = false;
+      const repeated = watcher.close();
+      void repeated.then(() => { repeatedFinished = true; }, () => { repeatedFinished = true; });
+      await Promise.resolve();
+      const finishedBeforeCleanup = repeatedFinished;
+      cleanup.resolve();
+      const outcome = failure ? { status: "rejected", reason: failure } : { status: "fulfilled", value: undefined };
+      assert.deepEqual(await Promise.allSettled([first, repeated]), [outcome, outcome]);
+      assert.equal(finishedBeforeCleanup, false);
+      assert.deepEqual(await Promise.allSettled([watcher.close()]), [outcome]);
+    } finally {
+      cleanup.resolve();
+      await stop();
+      await harness.close(BACKGROUND_CONTEXT);
+    }
+  });
+}
+
 
 test("a replacement service watch recovers chat correlation and completion when settlement wins submission lookup", { timeout: 30_000 }, async () => {
   const project = createProject("printf 'unused'\\n");
