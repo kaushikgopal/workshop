@@ -12,7 +12,7 @@ import { test } from "node:test";
 import { createWorkshopService } from "../service/create-workshop-service.ts";
 import { openWorkshopHarness } from "../service/open-workshop-harness.ts";
 import { serveServiceSocket } from "../service/serve-service-socket.ts";
-import { parseServiceRequest } from "../service/types.ts";
+import { parseServiceRequest } from "../service/parse-service-request.ts";
 
 const chatScript = fileURLToPath(new URL("../scripts/chat-workshop.ts", import.meta.url));
 

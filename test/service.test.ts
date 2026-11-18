@@ -19,7 +19,7 @@ import { createWorkshopService } from "../service/create-workshop-service.ts";
 import { createWorkshopChat } from "../service/create-workshop-chat.ts";
 import { openWorkshopHarness } from "../service/open-workshop-harness.ts";
 import { serveServiceSocket } from "../service/serve-service-socket.ts";
-import { parseServiceRequest } from "../service/types.ts";
+import { parseServiceRequest } from "../service/parse-service-request.ts";
 import { tickWorkflows } from "../service/tick-workflows.ts";
 import { executeWorkflowProcess } from "../run/execute-workflow-process.ts";
 import { createStepAttemptTask, STEP_ATTEMPT_TASK_NAME, type StepAttemptTaskInput } from "../workflow/define-step-attempt-task.ts";
@@ -2728,7 +2728,7 @@ test("daily-summary gathers service activity and saves its report", { timeout: 2
   mkdirSync(serviceDirectory, { recursive: true });
   cpSync(new URL("../scripts/read-workshop-activity.ts", import.meta.url), join(scriptsDirectory, "read-workshop-activity.ts"));
   cpSync(new URL("../service/request-service.ts", import.meta.url), join(serviceDirectory, "request-service.ts"));
-  cpSync(new URL("../service/types.ts", import.meta.url), join(serviceDirectory, "types.ts"));
+  cpSync(new URL("../service/parse-service-request.ts", import.meta.url), join(serviceDirectory, "types.ts"));
 
   const fakeWriter = join(project.root, "fake-writer.mjs");
   writeFileSync(fakeWriter, [

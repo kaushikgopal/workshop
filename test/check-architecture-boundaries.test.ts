@@ -44,7 +44,7 @@ const sourceDirectories = ["config", "examples", "run", "schedule", "scripts", "
 function createSourceTree(): string {
   const root = mkdtempSync(join(tmpdir(), "workshop-architecture-test-"));
   for (const directory of sourceDirectories) mkdirSync(resolve(root, directory), { recursive: true });
-  writeFileSync(resolve(root, "service/types.ts"), "export type Service = string;\n");
+  writeFileSync(resolve(root, "service/parse-service-request.ts"), "export type Service = string;\n");
   return root;
 }
 
@@ -112,9 +112,9 @@ test("reports a transitive workflow dependency on the service API", () => {
   const root = createSourceTree();
   try {
     writeFileSync(resolve(root, "workflow/entry.ts"), 'import "../run/entry.ts";\n');
-    writeFileSync(resolve(root, "run/entry.ts"), 'export * from "../service/types.ts";\n');
+    writeFileSync(resolve(root, "run/entry.ts"), 'export * from "../service/parse-service-request.ts";\n');
     assert.deepEqual(serviceDependencyChains(root), [
-      "workflow/entry.ts -> run/entry.ts -> service/types.ts",
+      "workflow/entry.ts -> run/entry.ts -> service/parse-service-request.ts",
     ]);
   } finally {
     rmSync(root, { recursive: true, force: true });

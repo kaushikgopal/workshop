@@ -11,7 +11,7 @@ import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite
 import { acquireStoreLock } from "../service/acquire-store-lock.ts";
 import { requestService } from "../service/request-service.ts";
 import { serveServiceSocket } from "../service/serve-service-socket.ts";
-import { parseServiceRequest } from "../service/types.ts";
+import { parseServiceRequest } from "../service/parse-service-request.ts";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
