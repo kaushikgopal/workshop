@@ -44,24 +44,39 @@ type ServiceResources = {
   workshop?: WorkshopService;
 };
 
+type BootstrapStopRequest =
+  | { kind: "signal"; signal: string }
+  | { kind: "startup-failure"; error: unknown }
+  | { kind: "storage-failure"; error: unknown };
+
+type ServiceCompletion =
+  | { kind: "return" }
+  | { kind: "throw"; error: unknown };
+
+type ServiceStorageFailure = { error: unknown };
+
 export type ServiceLifecycle =
   | { kind: "starting"; stage: ServiceStage; resources: ServiceResources }
+  | { kind: "boot-stop-requested"; stage: ServiceStage; request: BootstrapStopRequest; resources: ServiceResources; storageFailure?: ServiceStorageFailure }
   | { kind: "ready"; resources: ServiceResources }
-  | { kind: "stopping"; cause: string; resources: ServiceResources }
-  | { kind: "stopped"; result: "success" | "failed" }
-  | { kind: "failed"; stage: ServiceStage; error: unknown; resources: ServiceResources };
+  | { kind: "cleaning"; cause: string; completion: ServiceCompletion; result: "success" | "failed"; resources: ServiceResources; storageFailure?: ServiceStorageFailure }
+  | { kind: "stopped"; completion: ServiceCompletion; result: "success" | "failed"; storageFailure?: ServiceStorageFailure };
 
 export type ServiceLifecycleEvent =
   | { type: "stage"; stage: ServiceStage }
   | { type: "ready" }
   | { type: "fail"; error: unknown }
-  | { type: "stop"; cause: string }
-  | { type: "stopped"; result: "success" | "failed" };
+  | { type: "stop"; signal: string }
+  | { type: "bootstrap-settled"; error: unknown }
+  | { type: "storage-failure"; error: unknown }
+  | { type: "cleanup-failed" }
+  | { type: "stopped" };
 
 export type ServiceLifecycleTransition =
   | { kind: "accepted"; state: ServiceLifecycle }
   | { kind: "already-stopping"; state: ServiceLifecycle }
   | { kind: "already-stopped"; state: ServiceLifecycle }
+  | { kind: "ignored"; state: ServiceLifecycle }
   | { kind: "rejected"; code: "invalid-transition"; state: ServiceLifecycle };
 
 export function createServiceLifecycle(resources: ServiceResources = { store: { kind: "not-opened" } }): ServiceLifecycle {
@@ -76,6 +91,42 @@ export function transitionServiceLifecycle(
   state: ServiceLifecycle,
   event: ServiceLifecycleEvent,
 ): ServiceLifecycleTransition {
+  if (event.type === "storage-failure") {
+    const storageFailure = { error: event.error };
+    if (state.kind === "starting") {
+      return {
+        kind: "accepted",
+        state: {
+          kind: "boot-stop-requested",
+          stage: state.stage,
+          request: { kind: "storage-failure", error: event.error },
+          resources: state.resources,
+          storageFailure,
+        },
+      };
+    }
+    if (state.kind === "boot-stop-requested") {
+      return state.storageFailure !== undefined
+        ? { kind: "ignored", state }
+        : { kind: "accepted", state: { ...state, storageFailure } };
+    }
+    if (state.kind === "ready") {
+      return {
+        kind: "accepted",
+        state: {
+          kind: "cleaning",
+          cause: "fatal durable storage failure",
+          completion: { kind: "return" },
+          result: "failed",
+          resources: state.resources,
+          storageFailure,
+        },
+      };
+    }
+    return state.storageFailure !== undefined
+      ? { kind: "ignored", state }
+      : { kind: "accepted", state: { ...state, storageFailure } };
+  }
   if (event.type === "stage") {
     return state.kind === "starting"
       ? { kind: "accepted", state: { ...state, stage: event.stage } }
@@ -87,26 +138,89 @@ export function transitionServiceLifecycle(
       : { kind: "rejected", code: "invalid-transition", state };
   }
   if (event.type === "fail") {
-    if (state.kind !== "starting" && state.kind !== "ready") {
-      return { kind: "rejected", code: "invalid-transition", state };
+    if (state.kind === "starting") {
+      return {
+        kind: "accepted",
+        state: {
+          kind: "boot-stop-requested",
+          stage: state.stage,
+          request: { kind: "startup-failure", error: event.error },
+          resources: state.resources,
+        },
+      };
+    }
+    return state.kind === "ready"
+      ? {
+          kind: "accepted",
+          state: {
+            kind: "cleaning",
+            cause: "startup failure",
+            completion: { kind: "throw", error: event.error },
+            result: "success",
+            resources: state.resources,
+          },
+        }
+      : { kind: "rejected", code: "invalid-transition", state };
+  }
+  if (event.type === "stop") {
+    if (state.kind === "boot-stop-requested" || state.kind === "cleaning") {
+      return { kind: "already-stopping", state };
+    }
+    if (state.kind === "stopped") return { kind: "already-stopped", state };
+    if (state.kind === "starting") {
+      return {
+        kind: "accepted",
+        state: {
+          kind: "boot-stop-requested",
+          stage: state.stage,
+          request: { kind: "signal", signal: event.signal },
+          resources: state.resources,
+        },
+      };
     }
     return {
       kind: "accepted",
       state: {
-        kind: "failed",
-        stage: state.kind === "starting" ? state.stage : "runtime",
-        error: event.error,
+        kind: "cleaning",
+        cause: event.signal,
+        completion: { kind: "return" },
+        result: "success",
         resources: state.resources,
       },
     };
   }
-  if (event.type === "stop") {
-    if (state.kind === "stopping") return { kind: "already-stopping", state };
-    if (state.kind === "stopped") return { kind: "already-stopped", state };
-    return { kind: "accepted", state: { kind: "stopping", cause: event.cause, resources: state.resources } };
+  if (event.type === "bootstrap-settled") {
+    if (state.kind !== "boot-stop-requested") {
+      return { kind: "rejected", code: "invalid-transition", state };
+    }
+    const interruptedBySignal = state.request.kind === "signal" && state.storageFailure === undefined;
+    return {
+      kind: "accepted",
+      state: {
+        kind: "cleaning",
+        cause: state.request.kind === "signal" ? state.request.signal : "startup failure",
+        completion: interruptedBySignal ? { kind: "return" } : { kind: "throw", error: event.error },
+        result: state.storageFailure === undefined ? "success" : "failed",
+        resources: state.resources,
+        ...(state.storageFailure === undefined ? {} : { storageFailure: state.storageFailure }),
+      },
+    };
   }
-  return state.kind === "stopping"
-    ? { kind: "accepted", state: { kind: "stopped", result: event.result } }
+  if (event.type === "cleanup-failed") {
+    return state.kind === "cleaning"
+      ? { kind: "accepted", state: { ...state, result: "failed" } }
+      : { kind: "rejected", code: "invalid-transition", state };
+  }
+  return state.kind === "cleaning"
+    ? {
+        kind: "accepted",
+        state: {
+          kind: "stopped",
+          completion: state.completion,
+          result: state.result,
+          ...(state.storageFailure === undefined ? {} : { storageFailure: state.storageFailure }),
+        },
+      }
     : { kind: "rejected", code: "invalid-transition", state };
 }
 export type ServiceStoreCleanup =
@@ -174,11 +288,6 @@ class ServiceStartupInterrupted extends Error {
 export async function startService(): Promise<void> {
   const resources: ServiceResources = { store: { kind: "not-opened" } };
   let lifecycle = createServiceLifecycle(resources);
-  let storageFailed = false;
-  let storageFailure: unknown;
-  let startupSignal: string | undefined;
-  let bootstrapRunning = true;
-  let cleanupStarted = false;
   let resolveStop: (() => void) | undefined;
   const stopPromise = new Promise<void>((resolveStopPromise) => { resolveStop = resolveStopPromise; });
 
@@ -189,62 +298,69 @@ export async function startService(): Promise<void> {
   };
 
   const assertStartupCanContinue = (): void => {
-    if (storageFailed) throw storageFailure;
+    if (lifecycle.kind === "boot-stop-requested") {
+      if (lifecycle.storageFailure !== undefined) throw lifecycle.storageFailure.error;
+      throw new ServiceStartupInterrupted();
+    }
     if (lifecycle.kind !== "starting") throw new ServiceStartupInterrupted();
   };
 
+  const markCleanupFailed = (): void => {
+    const transition = transitionServiceLifecycle(lifecycle, { type: "cleanup-failed" });
+    if (transition.kind !== "accepted") throw new Error(`Cannot record cleanup failure from ${lifecycle.kind}`);
+    lifecycle = transition.state;
+  };
+
   const finishStop = async (): Promise<void> => {
-    if (cleanupStarted) return await stopPromise;
-    cleanupStarted = true;
-    const cause = lifecycle.kind === "stopping" ? lifecycle.cause : "service shutdown";
-    console.log(JSON.stringify({ event: "stopping", signal: cause }));
-    let failed = storageFailed;
+    if (lifecycle.kind !== "cleaning") return await stopPromise;
+    console.log(JSON.stringify({ event: "stopping", signal: lifecycle.cause }));
     try {
       await resources.socket?.close();
       resources.socket = undefined;
     } catch (error) {
-      failed = true;
       process.exitCode = 1;
       logServiceError("socket shutdown failed", error);
+      markCleanupFailed();
     }
     const failedResult = await closeServiceStore(resources);
     if (failedResult.kind === "failed") {
-      failed = true;
       process.exitCode = 1;
       logServiceError(failedResult.stage === "close" ? "durable store shutdown failed" : "store lock release failed", failedResult.error);
+      markCleanupFailed();
     }
     try {
       await resources.orchestratorRuntime?.models.settleCredentialWrites();
       resources.orchestratorRuntime = undefined;
     } catch (error) {
-      failed = true;
       process.exitCode = 1;
       logServiceError("model runtime shutdown failed", error);
+      markCleanupFailed();
     }
-    if (failed) process.exitCode = 1;
-    const transition = transitionServiceLifecycle(lifecycle, { type: "stopped", result: failed ? "failed" : "success" });
+    const transition = transitionServiceLifecycle(lifecycle, { type: "stopped" });
     if (transition.kind !== "accepted") throw new Error(`Cannot finish service shutdown from ${lifecycle.kind}`);
     lifecycle = transition.state;
     console.log(JSON.stringify({ event: "stopped" }));
     resolveStop?.();
   };
 
-  const requestStop = (cause: string): Promise<void> => {
-    const transition = transitionServiceLifecycle(lifecycle, { type: "stop", cause });
-    if (transition.kind === "accepted") lifecycle = transition.state;
-    else if (transition.kind === "already-stopped") return stopPromise;
-    else if (transition.kind !== "already-stopping") throw new Error(`Cannot stop service from ${lifecycle.kind}`);
-    if (!bootstrapRunning) void finishStop();
+  const requestStop = (signal: string): Promise<void> => {
+    const transition = transitionServiceLifecycle(lifecycle, { type: "stop", signal });
+    if (transition.kind === "accepted") {
+      lifecycle = transition.state;
+      if (lifecycle.kind === "cleaning") void finishStop();
+    } else if (transition.kind === "already-stopped") {
+      return stopPromise;
+    } else if (transition.kind !== "already-stopping") {
+      throw new Error(`Cannot stop service from ${lifecycle.kind}`);
+    }
     return stopPromise;
   };
 
   const onSignal = (signal: NodeJS.Signals): void => {
-    if (lifecycle.kind === "starting") startupSignal = signal;
     if (lifecycle.kind === "starting" || lifecycle.kind === "ready") void requestStop(signal);
   };
   process.once("SIGINT", onSignal);
   process.once("SIGTERM", onSignal);
-
   try {
     setStage("validate-project");
     checkNodeVersion();
@@ -291,17 +407,13 @@ export async function startService(): Promise<void> {
     const orchestratorRuntime = resources.orchestratorRuntime;
     if (!orchestratorRuntime) throw new Error("Orchestrator runtime is not available for harness startup");
     const { harness } = await openServiceHarness(resources, (storage) => openWorkshopHarness(storage, (report) => {
-      if (storageFailed) return;
-      storageFailed = true;
-      storageFailure = report.error;
+      const wasReady = lifecycle.kind === "ready";
+      const transition = transitionServiceLifecycle(lifecycle, { type: "storage-failure", error: report.error });
+      if (transition.kind !== "accepted") return;
+      lifecycle = transition.state;
       process.exitCode = 1;
       logServiceError("fatal durable storage failure", report.error);
-      if (lifecycle.kind === "starting") {
-        const failed = transitionServiceLifecycle(lifecycle, { type: "fail", error: report.error });
-        if (failed.kind === "accepted") lifecycle = failed.state;
-      } else if (lifecycle.kind === "ready") {
-        void requestStop("fatal durable storage failure");
-      }
+      if (wasReady) void finishStop();
     }, {
       projectRoot,
       models: orchestratorRuntime.models,
@@ -329,19 +441,26 @@ export async function startService(): Promise<void> {
     const ready = transitionServiceLifecycle(lifecycle, { type: "ready" });
     if (ready.kind !== "accepted") throw new Error(`Cannot ready service from ${lifecycle.kind}`);
     lifecycle = ready.state;
-    bootstrapRunning = false;
     console.log(JSON.stringify({ event: "ready", pid: process.pid, node: process.version, socket: "state/service.sock", store: `state/${sqliteFile}` }));
     await stopPromise;
   } catch (error) {
-    const interruptedBySignal = lifecycle.kind === "stopping" && startupSignal !== undefined && !storageFailed;
-    if (!interruptedBySignal && lifecycle.kind === "starting") {
-      const failed = transitionServiceLifecycle(lifecycle, { type: "fail", error });
-      if (failed.kind === "accepted") lifecycle = failed.state;
+    if (lifecycle.kind === "cleaning" || lifecycle.kind === "stopped") {
+      await stopPromise;
+      throw error;
     }
-    bootstrapRunning = false;
-    const cause = interruptedBySignal ? startupSignal ?? "signal" : "startup failure";
-    await requestStop(cause);
-    if (interruptedBySignal) return;
+    if (lifecycle.kind === "starting" || lifecycle.kind === "ready") {
+      const failed = transitionServiceLifecycle(lifecycle, { type: "fail", error });
+      if (failed.kind !== "accepted") throw new Error(`Cannot fail service startup from ${lifecycle.kind}`);
+      lifecycle = failed.state;
+    }
+    if (lifecycle.kind === "boot-stop-requested") {
+      const settled = transitionServiceLifecycle(lifecycle, { type: "bootstrap-settled", error });
+      if (settled.kind !== "accepted") throw new Error(`Cannot settle service bootstrap from ${lifecycle.kind}`);
+      lifecycle = settled.state;
+    }
+    if (lifecycle.kind === "cleaning") void finishStop();
+    await stopPromise;
+    if (lifecycle.kind === "stopped" && lifecycle.completion.kind === "return") return;
     throw error;
   } finally {
     process.removeListener("SIGINT", onSignal);
