@@ -2,7 +2,9 @@ import { z } from "zod";
 
 const workflowName = z.string().regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/);
 const requestId = z.string().min(1).max(128);
-const listLimit = z.number().int().min(0).max(1_000).optional();
+export const DEFAULT_SERVICE_LIST_LIMIT = 20;
+export const MAX_SERVICE_LIST_LIMIT = 1_000;
+const listLimit = z.number().int().min(0).max(MAX_SERVICE_LIST_LIMIT).optional();
 
 const serviceRequestSchema = z.discriminatedUnion("type", [
   z.object({ request_id: requestId, type: z.literal("list_workflows") }).strict(),

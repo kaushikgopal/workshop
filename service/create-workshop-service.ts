@@ -4,7 +4,7 @@ import type { Harness } from "@earendil-works/pi-durable";
 import type { WorkshopServiceInvocation } from "./create-workshop-extension.ts";
 import { createWorkflowStartPort, startWorkflow, type StartWorkflowOutcome } from "../run/start-workflow.ts";
 import { workshopStateDocument } from "../workflow/define-workshop-state.ts";
-import { parseServiceRequest, type ServiceRequest, type ServiceResponse } from "./types.ts";
+import { DEFAULT_SERVICE_LIST_LIMIT, parseServiceRequest, type ServiceRequest, type ServiceResponse } from "./types.ts";
 import { readWorkshopStatus } from "./read-workshop-status.ts";
 import { decideBlockedRun } from "./decide-blocked-run.ts";
 import { resolveFailureRound } from "./resolve-failure-round.ts";
@@ -94,7 +94,7 @@ export function createWorkshopService(input: { projectRoot: string; harness: Har
           case "list_actions": {
             const state = await input.harness.snapshot(workshopStateDocument, BACKGROUND_CONTEXT);
             const all = [...(state?.actions ?? [])].reverse().filter((action) => request.workflow === undefined || action.workflow === request.workflow);
-            return { request_id: request.request_id, ok: true, actions: all.slice(0, request.limit ?? 20) };
+            return { request_id: request.request_id, ok: true, actions: all.slice(0, request.limit ?? DEFAULT_SERVICE_LIST_LIMIT) };
           }
         }
       } catch (error) {

@@ -10,7 +10,7 @@ import { loadWorkflows } from "../workflow/load-workflows.ts";
 import { workshopStateDocument, workflowRunReferenceDocument } from "../workflow/define-workshop-state.ts";
 import type { AttemptHistoryEntry, WorkflowStepResult } from "../workflow/types.ts";
 import { projectWorkflowRunStatus, type WorkflowSchedulerAvailability } from "./project-workshop-status.ts";
-import type { ServiceRequest, ServiceResponse } from "./types.ts";
+import { DEFAULT_SERVICE_LIST_LIMIT, type ServiceRequest, type ServiceResponse } from "./types.ts";
 
 type WorkflowTaskRecord = TaskRecord<JsonValue, JsonValue, unknown>;
 type WorkflowTaskState = WorkflowTaskCheckpoint;
@@ -325,7 +325,7 @@ export async function readWorkshopStatus(
       return { request_id: request.request_id, ok: true, ...listWorkflowStatus(loaded, new Set(state?.paused ?? [])) };
     }
     case "list_runs": {
-      const limit = request.limit ?? 20;
+      const limit = request.limit ?? DEFAULT_SERVICE_LIST_LIMIT;
       if (limit === 0) return { request_id: request.request_id, ok: true, runs: [] };
       const [tasks, state] = await Promise.all([
         scanLiveWorkflowTasks(input.harness),

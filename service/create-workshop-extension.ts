@@ -3,7 +3,7 @@ import { join, resolve } from "node:path";
 import { Type } from "typebox";
 import { AssistantEntry, configure, defineExtension, defineTool, section } from "@earendil-works/pi-durable";
 import type { Extension, TaskId, ToolRegistration } from "@earendil-works/pi-durable";
-import type { ServiceResponse } from "./types.ts";
+import { MAX_SERVICE_LIST_LIMIT, type ServiceResponse } from "./types.ts";
 import type { OrchestratorModel } from "./create-orchestrator-runtime.ts";
 
 export type WorkshopServiceInvocation = { taskId: TaskId };
@@ -108,7 +108,7 @@ export function createWorkshopExtension(input: {
     description: "List recent runs with status, phase, status_message, and allowed_actions. Blocked rows include compact step-action and retry-profile choices.",
     parameters: Type.Object({
       workflow: Type.Optional(Type.String()),
-      limit: Type.Optional(Type.Integer({ minimum: 0, maximum: 1_000 })),
+      limit: Type.Optional(Type.Integer({ minimum: 0, maximum: MAX_SERVICE_LIST_LIMIT })),
     }),
     replay: "safe",
     execute: async (args, _api, _context) => result(await send("list_runs", args)),
@@ -160,7 +160,7 @@ export function createWorkshopExtension(input: {
     description: "List recent significant Workshop actions.",
     parameters: Type.Object({
       workflow: Type.Optional(Type.String()),
-      limit: Type.Optional(Type.Integer({ minimum: 0, maximum: 1_000 })),
+      limit: Type.Optional(Type.Integer({ minimum: 0, maximum: MAX_SERVICE_LIST_LIMIT })),
     }),
     replay: "safe",
     execute: async (args, _api, _context) => result(await send("list_actions", args)),
