@@ -2,7 +2,7 @@ import { resolve } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { JsonValue } from "@earendil-works/chord/json";
 import { type Cursor, type Harness, type TaskRecord } from "@earendil-works/pi-durable";
-import { checkProfileCommands, readConfig } from "../config/read-workshop-config.ts";
+import { checkProfileCommands, loadWorkshopConfig } from "../config/load-workshop-config.ts";
 import { STEP_ATTEMPT_TASK_NAME } from "../workflow/define-step-attempt-task.ts";
 import { WORKFLOW_TASK_NAME, workflowDecisionDocument, type WorkflowTaskCheckpoint } from "../workflow/define-workflow-task.ts";
 import { listWorkflowStatus } from "../workflow/list-workflow-status.ts";
@@ -69,7 +69,7 @@ function outputTail(value: string, limit: number): string {
 
 function readConfiguration(projectRoot: string) {
   const configFile = process.env.WORKSHOP_CONFIG ?? resolve(projectRoot, "workshop.yaml");
-  const config = readConfig(configFile);
+  const config = loadWorkshopConfig(configFile);
   const issues = checkProfileCommands(config, process.env.PATH, configFile);
   if (issues.length > 0) throw new Error(issues.map(({ file, reason }) => `${file}: ${reason}`).join("\n"));
   return config;

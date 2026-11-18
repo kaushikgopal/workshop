@@ -2,7 +2,7 @@ import { resolve } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { defineTask, type Cursor, type Harness, type TaskRecord, type TaskRuntime, type Tx } from "@earendil-works/pi-durable";
 import type { JsonValue } from "@earendil-works/chord/json";
-import { checkProfileCommands, readConfig } from "../config/read-workshop-config.ts";
+import { checkProfileCommands, loadWorkshopConfig } from "../config/load-workshop-config.ts";
 import { startWorkflow, type WorkflowStartPort } from "../run/start-workflow.ts";
 import { workshopStateDocument, type WorkshopState } from "../workflow/define-workshop-state.ts";
 import { decideWorkflowSlot } from "../schedule/decide-workflow-slot.ts";
@@ -68,7 +68,7 @@ export async function tickWorkflows(input: {
 }): Promise<WorkflowTickResult[]> {
   const now = input.now ?? new Date();
   const configFile = process.env.WORKSHOP_CONFIG ?? resolve(input.projectRoot, "workshop.yaml");
-  const config = readConfig(configFile);
+  const config = loadWorkshopConfig(configFile);
   const commandIssues = checkProfileCommands(config, process.env.PATH, configFile);
   if (commandIssues.length > 0) throw new Error(commandIssues.map(({ file, reason }) => `${file}: ${reason}`).join("\n"));
   const loaded = loadWorkflows(resolve(input.projectRoot, "workflows"), new Set(Object.keys(config.agent_profiles)));

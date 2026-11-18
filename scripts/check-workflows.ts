@@ -1,5 +1,5 @@
 import { join } from "node:path";
-import { ConfigReadError, readConfig } from "../config/read-workshop-config.ts";
+import { ConfigReadError, loadWorkshopConfig } from "../config/load-workshop-config.ts";
 import { loadWorkflows } from "../workflow/load-workflows.ts";
 
 function printErrors(label: string, errors: { file: string; reason: string }[]): void {
@@ -10,8 +10,8 @@ function printErrors(label: string, errors: { file: string; reason: string }[]):
 }
 
 try {
-  const config = readConfig();
-  const exampleConfig = readConfig("workshop.example.yaml");
+  const config = loadWorkshopConfig();
+  const exampleConfig = loadWorkshopConfig("workshop.example.yaml");
   const localProfiles = new Set(Object.keys(config.agent_profiles));
   const exampleProfiles = new Set(Object.keys(exampleConfig.agent_profiles));
   const workflows = loadWorkflows(join(process.cwd(), "workflows"), localProfiles);

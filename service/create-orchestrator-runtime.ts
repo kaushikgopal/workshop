@@ -2,7 +2,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { ModelRuntime, resolveCliModel, SettingsManager } from "@earendil-works/pi-coding-agent";
 import type { AgentChange } from "@earendil-works/pi-durable";
-import type { WorkshopConfig } from "../config/read-workshop-config.ts";
+import type { WorkshopConfig } from "../config/load-workshop-config.ts";
 
 export type OrchestratorModel = {
   model: NonNullable<AgentChange["model"]>;

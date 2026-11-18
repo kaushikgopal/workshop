@@ -1,7 +1,7 @@
-import { checkProfileCommands, ConfigReadError, readConfig } from "../config/read-workshop-config.ts";
+import { checkProfileCommands, ConfigReadError, loadWorkshopConfig } from "../config/load-workshop-config.ts";
 
 try {
-  const config = readConfig();
+  const config = loadWorkshopConfig();
   const issues = checkProfileCommands(config);
   for (const { file, reason } of issues) console.error(`${file}: ${reason}`);
   if (issues.length > 0) process.exitCode = 1;

@@ -4,7 +4,7 @@ import { pathToFileURL } from "node:url";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import type { Harness } from "@earendil-works/pi-durable";
-import { checkProfileCommands, readConfig } from "../config/read-workshop-config.ts";
+import { checkProfileCommands, loadWorkshopConfig } from "../config/load-workshop-config.ts";
 import { loadWorkflows } from "../workflow/load-workflows.ts";
 import { ensureWorkflowTicker } from "./tick-workflows.ts";
 import { acquireStoreLock } from "./acquire-store-lock.ts";
@@ -368,7 +368,7 @@ export async function startService(): Promise<void> {
     const stateDirectory = resolve(projectRoot, "state");
     mkdirSync(stateDirectory, { recursive: true });
     const configFile = process.env.WORKSHOP_CONFIG ?? resolve(projectRoot, "workshop.yaml");
-    const config = readConfig(configFile);
+    const config = loadWorkshopConfig(configFile);
     const commandIssues = checkProfileCommands(config, process.env.PATH, configFile);
     if (commandIssues.length > 0) throw new Error(commandIssues.map(({ file, reason }) => `${file}: ${reason}`).join("\n"));
     const workflows = loadWorkflows(resolve(projectRoot, "workflows"), new Set(Object.keys(config.agent_profiles)));

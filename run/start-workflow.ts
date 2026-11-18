@@ -4,8 +4,8 @@ import { resolve } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { ConversationId, Cursor, Harness, TaskRecord, Tx } from "@earendil-works/pi-durable";
 import type { JsonValue } from "@earendil-works/chord/json";
-import { checkProfileCommands, readConfig } from "../config/read-workshop-config.ts";
-import type { WorkshopConfig } from "../config/read-workshop-config.ts";
+import { checkProfileCommands, loadWorkshopConfig } from "../config/load-workshop-config.ts";
+import type { WorkshopConfig } from "../config/load-workshop-config.ts";
 import { loadWorkflows } from "../workflow/load-workflows.ts";
 import type { Workflow } from "../workflow/types.ts";
 import { WorkflowTask, WORKFLOW_TASK_NAME, type WorkflowTaskInput, workflowDecisionDocument } from "../workflow/define-workflow-task.ts";
@@ -64,7 +64,7 @@ async function liveTasksInTransaction(tx: Tx): Promise<WorkflowTaskRecord[]> {
 
 function configurationFor(projectRoot: string, workflowName: string): { config: WorkshopConfig; workflow: Workflow } {
   const configFile = process.env.WORKSHOP_CONFIG ?? resolve(projectRoot, "workshop.yaml");
-  const config = readConfig(configFile);
+  const config = loadWorkshopConfig(configFile);
   const issues = checkProfileCommands(config, process.env.PATH, configFile);
   if (issues.length > 0) throw new Error(issues.map(({ file, reason }) => `${file}: ${reason}`).join("\n"));
   const workflows = loadWorkflows(resolve(projectRoot, "workflows"), new Set(Object.keys(config.agent_profiles)));

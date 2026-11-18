@@ -132,7 +132,7 @@ function describeSchemaIssues(file: string, issues: z.ZodIssue[]): ConfigIssue[]
   }));
 }
 
-export function readConfig(configFile?: string): WorkshopConfig {
+export function loadWorkshopConfig(configFile?: string): WorkshopConfig {
   const configuredFile = configFile ?? process.env.WORKSHOP_CONFIG ?? "workshop.yaml";
   const absoluteFile = isAbsolute(configuredFile) ? configuredFile : resolve(process.cwd(), configuredFile);
   const stagedEnvironment = loadEnvLocal(dirname(absoluteFile));
