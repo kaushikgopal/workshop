@@ -13,7 +13,7 @@ import { createRegistry, defineDoc, Harness, MemoryStorage, type Storage, type T
 import type { JsonValue } from "@earendil-works/chord/json";
 import { test } from "node:test";
 import { createWorkflowStartPort, startWorkflow } from "../run/start-workflow.ts";
-import { maxWorkshopHistoryRecords, workshopStateDocument, workflowRunReferenceDocument, type WorkshopAction, type WorkflowAdmission } from "../workflow/define-workshop-state.ts";
+import { workshopStateDocument, workflowRunReferenceDocument, type WorkshopAction, type WorkflowAdmission } from "../workflow/define-workshop-state.ts";
 import type { MutationReceipt } from "../workflow/types.ts";
 import { createWorkshopService } from "../service/create-workshop-service.ts";
 import { createWorkshopChat } from "../service/create-workshop-chat.ts";
@@ -193,7 +193,7 @@ test("workshop-state migration bounds history without losing scheduling counters
     harness = await createHarness(storage);
     await harness.commit(async (tx) => {
       const previous = await tx.doc(previousDocument);
-      for (let value = 0; value < maxWorkshopHistoryRecords + 5; value += 1) {
+      for (let value = 0; value < 1_005; value += 1) {
         const slot = String(value).padStart(6, "0");
         previous.admissions.push({ workflow: "clock", slot, run_id: `run-${value}`, outcome: "started", at: slot });
         previous.actions.push({ at: slot, workflow: "clock", run_id: `run-${value}`, step: null, source: "chat", decision: { action: "start" }, note: "Started" });
@@ -203,12 +203,17 @@ test("workshop-state migration bounds history without losing scheduling counters
     }, BACKGROUND_CONTEXT);
     await harness.commit(async (tx) => {
       const state = await tx.doc(workshopStateDocument);
-      assert.equal(state.startedCounts.clock, maxWorkshopHistoryRecords + 5);
-      assert.equal(state.lastSlots.clock, String(maxWorkshopHistoryRecords + 4).padStart(6, "0"));
-      assert.equal(state.admissions.length, maxWorkshopHistoryRecords);
+      assert.equal(state.startedCounts.clock, 1_005);
+      assert.equal(state.lastSlots.clock, "001004");
+      assert.equal(state.admissions.length, 1_000);
       assert.equal(state.admissions[0]?.run_id, "run-5");
-      assert.equal(state.actions.length, maxWorkshopHistoryRecords);
+      assert.equal(state.admissions.at(-1)?.run_id, "run-1004");
+      assert.equal(state.actions.length, 1_000);
+      assert.equal(state.actions[0]?.run_id, "run-5");
+      assert.equal(state.actions.at(-1)?.run_id, "run-1004");
+      assert.equal(state.receipts.length, 1_000);
       assert.equal(state.receipts[0]?.request_id, "request-5");
+      assert.equal(state.receipts.at(-1)?.request_id, "request-1004");
       return { migrated: true };
     }, BACKGROUND_CONTEXT);
   } finally {
