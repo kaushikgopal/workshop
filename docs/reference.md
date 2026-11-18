@@ -212,7 +212,7 @@ at version 3, the document cannot be read by an older build. The
 
 ## Local service API
 
-The service listens on `state/service.sock`, a Unix socket with mode `0600`. It does not open a network port. Requests and responses are JSON lines, with a 1 MiB limit per request. Standard requests receive one response and close the connection. `watch_chat` keeps a connection open for chat events and later requests. Responses include `ok`; errors include `error` and may include `request_id`. Failed mutation responses also include `error_code`; `error` remains the human-readable explanation.
+The service listens on `state/service.sock`, a Unix socket with mode `0600`. It does not open a network port. Requests and responses are JSON lines, with a 1 MiB limit per request. An oversized request ends the connection and discards requests that have not started. Standard requests receive one response and close the connection. `watch_chat` keeps a connection open for chat events and later requests. Responses include `ok`; errors include `error` and may include `request_id`. Failed mutation responses also include `error_code`; `error` remains the human-readable explanation.
 
 Each request requires a `request_id` from 1 to 128 characters and a `type`. The service supports:
 

@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { once } from "node:events";
+import { execFileSync, spawn } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { connect } from "node:net";
+import { connect, Socket } from "node:net";
 import { DatabaseSync } from "node:sqlite";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
@@ -287,3 +288,99 @@ for (const framing of ["lines", "trailing"] as const) {
     });
   }
 }
+
+test("a disconnect during watch attachment logs late cleanup failure and leaves the service available", () => {
+  const stateDirectory = mkdtempSync(join(tmpdir(), "workshop-socket-attach-"));
+  const socketPath = join(stateDirectory, "service.sock");
+  const script = `
+    import assert from 'node:assert/strict';
+    import { channel } from 'node:diagnostics_channel';
+    import { once } from 'node:events';
+    import { connect } from 'node:net';
+    import { serveServiceSocket } from ${JSON.stringify(new URL("../service/serve-service-socket.ts", import.meta.url).href)};
+    import { requestService } from ${JSON.stringify(new URL("../service/request-service.ts", import.meta.url).href)};
+    const path = ${JSON.stringify(socketPath)};
+    const attaching = Promise.withResolvers();
+    const finishAttachment = Promise.withResolvers();
+    const closed = Promise.withResolvers();
+    const diagnosticsLogged = [];
+    console.error = message => diagnosticsLogged.push(message);
+    let closeCalls = 0;
+    const service = await serveServiceSocket(path, async (request, send) => {
+      if (request.type !== 'watch_chat') {
+        send({ request_id: request.request_id, ok: true });
+        return;
+      }
+      attaching.resolve();
+      await finishAttachment.promise;
+      return { close: async () => {
+        closeCalls++;
+        closed.resolve();
+        throw new Error('late watch close failed');
+      } };
+    });
+    // Observe the server's close, not just the client's request to disconnect.
+    const diagnostics = channel('net.server.socket');
+    const accepted = Promise.withResolvers();
+    const observe = ({ socket }) => accepted.resolve(once(socket, 'close'));
+    diagnostics.subscribe(observe);
+    const client = connect(path);
+    client.write('{"request_id":"watch","type":"watch_chat"}\\n');
+    await attaching.promise;
+    diagnostics.unsubscribe(observe);
+    client.destroy();
+    await accepted.promise;
+    finishAttachment.resolve();
+    await closed.promise;
+    const probe = await requestService({ request_id: 'probe', type: 'list_workflows' }, ${JSON.stringify(stateDirectory)});
+    await service.close();
+    assert.deepEqual(probe, { request_id: 'probe', ok: true });
+    assert.equal(closeCalls, 1);
+    assert.deepEqual(diagnosticsLogged, ['[workshop] chat watch close failed: late watch close failed']);
+  `;
+  try {
+    execFileSync(process.execPath, ["--unhandled-rejections=strict", "--input-type=module", "-e", script], {
+      timeout: 10_000, killSignal: "SIGKILL", stdio: ["ignore", "pipe", "pipe"],
+    });
+  } finally {
+    rmSync(stateDirectory, { recursive: true, force: true });
+  }
+});
+
+test("a socket rejection discards queued requests and closes a watch still attaching", { timeout: 5_000 }, async () => {
+  const stateDirectory = mkdtempSync(join(tmpdir(), "workshop-socket-reject-"));
+  const socketPath = join(stateDirectory, "service.sock");
+  const attaching = Promise.withResolvers<void>();
+  const finishAttachment = Promise.withResolvers<void>();
+  const outcome = Promise.withResolvers<"closed" | "queued request answered">();
+  const service = await serveServiceSocket(socketPath, async (request) => {
+    if (!isRecord(request) || request.type !== "watch_chat") {
+      outcome.resolve("queued request answered");
+      return;
+    }
+    attaching.resolve();
+    await finishAttachment.promise;
+    return { close: async () => { outcome.resolve("closed"); } };
+  });
+  const client = new Socket({ allowHalfOpen: true });
+  try {
+    client.setEncoding("utf8");
+    client.connect(socketPath);
+    await once(client, "connect");
+    client.write('{"request_id":"watch","type":"watch_chat"}\n');
+    await attaching.promise;
+    let response = "";
+    client.on("data", (chunk: string) => { response += chunk; });
+    const rejected = once(client, "end");
+    client.write('{"request_id":"queued","type":"list_workflows"}\n' + "x".repeat(1_048_577));
+    await rejected;
+    assert.equal(response, '{"ok":false,"error":"Service request exceeds the 1 MiB limit"}\n');
+    finishAttachment.resolve();
+    assert.equal(await outcome.promise, "closed");
+  } finally {
+    finishAttachment.resolve();
+    client.destroy();
+    await service.close();
+    rmSync(stateDirectory, { recursive: true, force: true });
+  }
+});

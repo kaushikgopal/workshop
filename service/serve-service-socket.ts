@@ -27,7 +27,7 @@ function requestId(value: unknown): string | undefined {
 }
 
 function send(socket: Socket, event: ServiceResponse): void {
-  if (socket.destroyed) return;
+  if (socket.destroyed || socket.writableEnded) return;
   socket.write(`${JSON.stringify(event)}\n`);
 }
 
@@ -98,33 +98,36 @@ export async function serveServiceSocket(
     }
     return owner.closing;
   };
+  const closeClientSession = (socket: Socket): Promise<void> => closeSession(socket).catch((error: unknown) => {
+    console.error(`[workshop] chat watch close failed: ${errorMessage(error)}`);
+  });
   const server: Server = createServer((socket) => {
     sockets.add(socket);
     socket.once("close", () => {
       sockets.delete(socket);
-      void closeSession(socket).catch((error: unknown) => {
-        console.error(`[workshop] chat watch close failed: ${errorMessage(error)}`);
-      });
+      void closeClientSession(socket);
     });
     socket.on("error", () => {});
     socket.setEncoding("utf8");
     let request = "";
     let persistent = false;
     let processing = false;
-    let ended = false;
+    let inputState: "open" | "ended" | "rejected" = "open";
     const pending: string[] = [];
+    const canProcessRequests = () => inputState !== "rejected" && !socket.destroyed;
     const rejectSocket = (message: string) => {
+      inputState = "rejected";
+      request = "";
+      pending.length = 0;
       send(socket, { ok: false, error: message });
       socket.end();
-      void closeSession(socket).catch((error: unknown) => {
-        console.error(`[workshop] chat watch close failed: ${errorMessage(error)}`);
-      });
+      void closeClientSession(socket);
     };
     const processRequests = async () => {
       if (processing) return;
       processing = true;
       try {
-        while (pending.length > 0 && !socket.destroyed) {
+        while (pending.length > 0 && canProcessRequests()) {
           const line = pending.shift() ?? "";
           if (line.trim().length === 0) {
             send(socket, { ok: false, error: "Service request is empty" });
@@ -143,7 +146,7 @@ export async function serveServiceSocket(
             } else {
               persistent = true;
               sessions.set(socket, { session });
-              if (socket.destroyed) await closeSession(socket);
+              if (!canProcessRequests()) await closeClientSession(socket);
             }
           } else if (!persistent) {
             socket.end();
@@ -151,10 +154,8 @@ export async function serveServiceSocket(
             break;
           }
         }
-        if (ended && persistent) {
-          await closeSession(socket).catch((error: unknown) => {
-            console.error(`[workshop] chat watch close failed: ${errorMessage(error)}`);
-          });
+        if (inputState === "ended" && persistent) {
+          await closeClientSession(socket);
           socket.end();
         }
       } finally {
@@ -162,6 +163,7 @@ export async function serveServiceSocket(
       }
     };
     socket.on("data", (chunk: string) => {
+      if (inputState !== "open") return;
       request += chunk;
       let newline = request.indexOf("\n");
       while (newline >= 0) {
@@ -181,9 +183,10 @@ export async function serveServiceSocket(
       void processRequests();
     });
     socket.on("end", () => {
+      if (inputState !== "open") return;
       if (request.trim().length > 0) pending.push(request);
       request = "";
-      ended = true;
+      inputState = "ended";
       void processRequests();
     });
   });
