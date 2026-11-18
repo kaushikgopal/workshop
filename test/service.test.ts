@@ -1002,6 +1002,46 @@ test("two concurrent conflicting decisions allow only one winner", async () => {
   }
 });
 
+test("list endpoints honor default and boundary limits", async () => {
+  const project = createProject("exit 0");
+  let harness: Awaited<ReturnType<typeof createHarness>> | undefined;
+  try {
+    harness = await createHarness(new MemoryStorage());
+    harness.resume();
+    await harness.commit(async (tx) => {
+      const state = await tx.doc(workshopStateDocument);
+      for (let index = 0; index < 25; index += 1) {
+        const slot = String(index).padStart(2, "0");
+        const at = `2026-11-17T00:${slot}:00.000Z`;
+        state.admissions.push({ workflow: "clock", slot, run_id: null, outcome: "skipped", at });
+        state.actions.push({ at, workflow: "clock", run_id: `run-${slot}`, step: null, source: "chat", decision: { action: "start" }, note: "Started" });
+      }
+      return { seeded: true };
+    }, BACKGROUND_CONTEXT);
+
+    const service = createWorkshopService({ projectRoot: project.root, harness });
+    for (const type of ["list_runs", "list_actions"] as const) {
+      const collection = type === "list_runs" ? "runs" : "actions";
+      const rows = async (limit?: number) => {
+        const response = await service.handleRequest({
+          request_id: `${type}-${limit ?? "omitted"}`,
+          type,
+          ...(limit === undefined ? {} : { limit }),
+        });
+        return recordsFrom(response[collection]);
+      };
+
+      assert.equal((await rows()).length, 20, `${type} omitted-limit default`);
+      assert.equal((await rows(0)).length, 0, `${type} zero limit`);
+      assert.equal((await rows(1_000)).length, 25, `${type} maximum limit`);
+      for (const limit of [-1, 1_001, 1.5]) await assert.rejects(rows(limit));
+    }
+  } finally {
+    if (harness) await harness.close(BACKGROUND_CONTEXT);
+    rmSync(project.root, { recursive: true, force: true });
+  }
+});
+
 test("decision source is not accepted from service requests", () => {
   assert.throws(() => parseServiceRequest({
     request_id: "forged-source",
