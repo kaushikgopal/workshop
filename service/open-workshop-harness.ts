@@ -4,7 +4,7 @@ import { createRegistry, defineExtension, Harness, type Report, type Storage } f
 import { WorkflowTask } from "../workflow/define-workflow-task.ts";
 import { executeWorkflowProcess } from "../run/execute-workflow-process.ts";
 import { createStepAttemptTask } from "../workflow/define-step-attempt-task.ts";
-import { WorkflowTickTask } from "../schedule/tick-workflows.ts";
+import { WorkflowTickTask } from "./tick-workflows.ts";
 import { createWorkshopExtension, type WorkshopServiceRequest } from "./create-workshop-extension.ts";
 import type { OrchestratorModel } from "./create-orchestrator-runtime.ts";
 

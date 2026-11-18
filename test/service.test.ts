@@ -19,7 +19,7 @@ import { createWorkshopChat } from "../service/create-workshop-chat.ts";
 import { openWorkshopHarness } from "../service/open-workshop-harness.ts";
 import { serveServiceSocket } from "../service/serve-service-socket.ts";
 import { parseServiceRequest } from "../service/types.ts";
-import { tickWorkflows } from "../schedule/tick-workflows.ts";
+import { tickWorkflows } from "../service/tick-workflows.ts";
 import { executeWorkflowProcess } from "../run/execute-workflow-process.ts";
 import { createStepAttemptTask, STEP_ATTEMPT_TASK_NAME, type StepAttemptTaskInput } from "../workflow/define-step-attempt-task.ts";
 import * as workflowStepLoader from "../workflow/load-workflow-step.ts";

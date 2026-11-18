@@ -160,6 +160,7 @@ service/                                  durable service and local API
   serve-service-socket.ts                  private JSON socket
   set-workflow-pause.ts                    pause and resume state changes
   start-service.ts                         entrypoint and lifecycle
+  tick-workflows.ts                        workflow tick execution and task registration
   types.ts                                 service request and response shapes
 workflow/                                 workflow loading and durable execution
   accept-blocked-decision.ts               blocked decision acceptance rules
@@ -182,9 +183,8 @@ run/                                      admission and process execution
   execute-workflow-process.ts              command and profile process groups
   start-workflow.ts                        workflow admission and task creation
   transition-workflow-pause.ts              idempotent pause and resume transitions
-schedule/                                 cron-slot selection and durable ticks
+schedule/                                 cron-slot selection
   decide-workflow-slot.ts                  slot and `max_runs` decisions
-  tick-workflows.ts                        one-minute durable schedule tick
 scripts/                                  checks and user-facing commands
   check-config.ts                          local config and profile checks
   check-workflows.ts                       workflow and example checks

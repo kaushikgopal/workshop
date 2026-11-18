@@ -6,7 +6,7 @@ import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite
 import type { Harness } from "@earendil-works/pi-durable";
 import { checkProfileCommands, readConfig } from "../config/read-workshop-config.ts";
 import { loadWorkflows } from "../workflow/load-workflows.ts";
-import { ensureWorkflowTicker } from "../schedule/tick-workflows.ts";
+import { ensureWorkflowTicker } from "./tick-workflows.ts";
 import { acquireStoreLock } from "./acquire-store-lock.ts";
 import { createOrchestratorRuntime, type OrchestratorRuntime } from "./create-orchestrator-runtime.ts";
 import { createWorkshopService, type WorkshopService } from "./create-workshop-service.ts";

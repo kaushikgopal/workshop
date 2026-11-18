@@ -5,7 +5,7 @@ import type { JsonValue } from "@earendil-works/chord/json";
 import { checkProfileCommands, readConfig } from "../config/read-workshop-config.ts";
 import { startWorkflow, type WorkflowStartPort } from "../run/start-workflow.ts";
 import { workshopStateDocument, type WorkshopState } from "../workflow/define-workshop-state.ts";
-import { decideWorkflowSlot } from "./decide-workflow-slot.ts";
+import { decideWorkflowSlot } from "../schedule/decide-workflow-slot.ts";
 import { loadWorkflows } from "../workflow/load-workflows.ts";
 
 export const WORKFLOW_TICK_TASK_NAME = "workshop.schedule-tick";

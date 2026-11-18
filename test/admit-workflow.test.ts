@@ -7,7 +7,7 @@ import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createRegistry, Harness, MemoryStorage } from "@earendil-works/pi-durable";
 import { test } from "node:test";
 import { createWorkflowStartPort, startWorkflow, type WorkflowStartPort } from "../run/start-workflow.ts";
-import { tickWorkflows } from "../schedule/tick-workflows.ts";
+import { tickWorkflows } from "../service/tick-workflows.ts";
 import { executeWorkflowProcess } from "../run/execute-workflow-process.ts";
 import { createStepAttemptTask } from "../workflow/define-step-attempt-task.ts";
 import { workshopStateDocument } from "../workflow/define-workshop-state.ts";
