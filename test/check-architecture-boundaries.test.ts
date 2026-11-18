@@ -103,6 +103,11 @@ test("schedule modules do not depend on run modules", () => {
   assert.deepEqual(scheduleRunDependencyChains(), []);
 });
 
+test("admission policy does not depend on durable workshop state", () => {
+  const source = readFileSync(resolve(projectRoot, "run/decide-workflow-admission.ts"), "utf8");
+  assert.equal(importSpecifiers(source).includes("../workflow/define-workshop-state.ts"), false);
+});
+
 test("reports a transitive workflow dependency on the service API", () => {
   const root = createSourceTree();
   try {

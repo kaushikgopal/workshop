@@ -13,7 +13,8 @@ import { createRegistry, defineDoc, Harness, MemoryStorage, type Storage, type T
 import type { JsonValue } from "@earendil-works/chord/json";
 import { test } from "node:test";
 import { createWorkflowStartPort, startWorkflow } from "../run/start-workflow.ts";
-import { maxWorkshopHistoryRecords, workshopStateDocument, workflowRunReferenceDocument, type MutationReceipt, type WorkshopAction, type WorkflowAdmission } from "../workflow/define-workshop-state.ts";
+import { maxWorkshopHistoryRecords, workshopStateDocument, workflowRunReferenceDocument, type WorkshopAction, type WorkflowAdmission } from "../workflow/define-workshop-state.ts";
+import type { MutationReceipt } from "../workflow/types.ts";
 import { createWorkshopService } from "../service/create-workshop-service.ts";
 import { createWorkshopChat } from "../service/create-workshop-chat.ts";
 import { openWorkshopHarness } from "../service/open-workshop-harness.ts";
