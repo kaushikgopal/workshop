@@ -3,7 +3,7 @@ import { createModels } from "@earendil-works/pi-ai/models";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { MemoryStorage } from "@earendil-works/pi-durable";
 import { test } from "node:test";
-import { openWorkshopHarness } from "../service/open-workshop-harness.ts";
+import { openWorkshopHarness, type WorkshopHarnessOptions } from "../service/open-workshop-harness.ts";
 import type { OrchestratorModel } from "../service/create-orchestrator-runtime.ts";
 
 test("does not close storage when Harness.open option preparation fails", async () => {
