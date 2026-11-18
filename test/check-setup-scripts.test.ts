@@ -53,7 +53,7 @@ if [ "\${FAIL_MAKE_STEP-}" = "$1" ]; then echo 'fake make failure' >&2; exit 24;
   return { bin, gitLog, makeLog };
 }
 
-function runCopy(source: string, destination: string, options: {
+function executeCopy(source: string, destination: string, options: {
   bin: string;
   gitLog: string;
   makeLog: string;
@@ -90,7 +90,7 @@ test("copy uses HEAD when the source checkout is detached", () => {
   mkdirSync(source);
   const shims = createCommandShims(fixture);
   try {
-    const result = runCopy(source, destination, shims);
+    const result = executeCopy(source, destination, shims);
     assert.equal(result.status, 0, result.stderr || result.stdout);
     const gitCalls = readFileSync(shims.gitLog, "utf8");
     assert.ok(gitCalls.includes(`fetch --no-tags ${realpathSync(source)} HEAD\n`), gitCalls);
@@ -111,7 +111,7 @@ test("copy reports its failed stage and a recovery command without removing its 
   mkdirSync(source);
   const shims = createCommandShims(fixture);
   try {
-    const result = runCopy(source, destination, { ...shims, failGitStep: "fetch" });
+    const result = executeCopy(source, destination, { ...shims, failGitStep: "fetch" });
     assert.equal(result.status, 1);
     assert.match(result.stderr, /Copy stopped at stage: fetch source revision/);
     assert.ok(result.stderr.includes(`Partial destination retained: ${destination};`), result.stderr);
@@ -130,7 +130,7 @@ test("copy setup failure reports how to finish setup and keeps the copy", () => 
   mkdirSync(source);
   const shims = createCommandShims(fixture);
   try {
-    const result = runCopy(source, destination, { ...shims, failMakeStep: "setup" });
+    const result = executeCopy(source, destination, { ...shims, failMakeStep: "setup" });
     assert.equal(result.status, 1);
     assert.match(result.stderr, /Copy stopped at stage: run make setup/);
     assert.ok(result.stderr.includes(`Recovery command: cd ${quoteShellArgument(destination)} && make setup`), result.stderr);
