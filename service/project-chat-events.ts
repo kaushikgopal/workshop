@@ -8,6 +8,7 @@ type ProjectingTurn = {
   turnId: string;
   submissionId?: string;
   chatRequestId?: string;
+  generationTaskId?: string;
   generationAttempt?: number;
   partialText: string;
   replacePending: boolean;
@@ -221,6 +222,7 @@ export function projectChatEvents(
   }
 
   const identity = turnIdentity(run);
+  const taskId = String(run.taskId);
   let turn: ProjectingTurn;
   let events: ChatEvent[] = [];
   if (previous.phase === "idle") {
@@ -233,7 +235,9 @@ export function projectChatEvents(
     turn = startTurn(identity.turnId, identity.submissionId, observation.chatRequestId);
   } else {
     const attempt = generationAttempt(live);
-    if (attempt !== undefined && previous.generationAttempt !== undefined && attempt < previous.generationAttempt) {
+    // Retry ordinals restart for each task; a watch may fold the tool round between tasks.
+    const sameTask = previous.generationTaskId === taskId;
+    if (sameTask && attempt !== undefined && previous.generationAttempt !== undefined && attempt < previous.generationAttempt) {
       const settlement = settlementFor(previous, settlements);
       if (settlement === undefined) return { state: previous, events: [] };
       return {
@@ -241,11 +245,12 @@ export function projectChatEvents(
         events: runEnd(previous, live, settlement),
       };
     }
-    const newGeneration = attempt !== previous.generationAttempt;
+    const newGeneration = !sameTask || attempt !== previous.generationAttempt;
     turn = {
       ...previous,
       ...(previous.chatRequestId === undefined && observation.chatRequestId !== undefined ? { chatRequestId: observation.chatRequestId } : {}),
       ...(newGeneration ? {
+        generationTaskId: taskId,
         generationAttempt: attempt,
         partialText: "",
         replacePending: previous.replacePending || previous.partialText.length > 0,
@@ -256,7 +261,7 @@ export function projectChatEvents(
   }
 
   if (previous.phase === "idle" || (previous.phase === "projecting" && previous.turnId !== identity.turnId)) {
-    turn = { ...turn, generationAttempt: generationAttempt(live) };
+    turn = { ...turn, generationTaskId: taskId, generationAttempt: generationAttempt(live) };
   }
   const projected = projectTurn(turn, observation.view);
   const settlement = settlementFor(turn, settlements);

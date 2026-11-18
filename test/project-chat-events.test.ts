@@ -152,3 +152,29 @@ test("projector keeps text replacement pending through an empty retry observatio
     { type: "assistant.delta", text: "Replacement", replace: true },
   ]);
 });
+
+for (const firstAttempt of [1, 2]) {
+  test(`projector replaces text after a folded task handoff with attempts ${firstAttempt} to 1`, () => {
+    const first = projectChatEvents(initialChatProjectorState(), {
+      view: view({
+        run: { taskId: 10, inputs: ["submission-1"] },
+        generation: { attempt: firstAttempt, message: { content: [{ type: "text", text: "Plan" }] } },
+      }),
+      chatRequestId: "chat-1",
+    });
+    const next = {
+      run: { taskId: 11, inputs: ["submission-1"] },
+      generation: { attempt: 1, message: { content: [{ type: "text", text: "Plan complete" }] } },
+    };
+    const handoff = projectChatEvents(first.state, { view: view(next) });
+    assert.deepEqual(handoff.events, [
+      { ok: true, type: "assistant.delta", chat_request_id: "chat-1", text: "Plan complete", replace: true },
+    ]);
+    const progress = projectChatEvents(handoff.state, {
+      view: view({ ...next, generation: { attempt: 1, message: { content: [{ type: "text", text: "Plan complete." }] } } }),
+    });
+    assert.deepEqual(progress.events, [
+      { ok: true, type: "assistant.delta", chat_request_id: "chat-1", text: "." },
+    ]);
+  });
+}
