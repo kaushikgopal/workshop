@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import { Watch } from "@earendil-works/chord/watch";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { createRegistry, defineDoc, Harness, MemoryStorage, type Storage, type TaskRecord, type Wake } from "@earendil-works/pi-durable";
 import type { JsonValue } from "@earendil-works/chord/json";
@@ -14,6 +15,7 @@ import { test } from "node:test";
 import { createWorkflowStartPort, startWorkflow } from "../run/start-workflow.ts";
 import { maxWorkshopHistoryRecords, workshopStateDocument, workflowRunReferenceDocument, type MutationReceipt, type WorkshopAction, type WorkflowAdmission } from "../workflow/define-workshop-state.ts";
 import { createWorkshopService } from "../service/create-workshop-service.ts";
+import { createWorkshopChat } from "../service/create-workshop-chat.ts";
 import { openWorkshopHarness } from "../service/open-workshop-harness.ts";
 import { serveServiceSocket } from "../service/serve-service-socket.ts";
 import { parseServiceRequest } from "../service/types.ts";
@@ -2155,6 +2157,60 @@ test("the chat socket streams fake-model text and tool events to multiple watche
     rmSync(project.root, { recursive: true, force: true });
   }
 });
+
+
+for (const scenario of [
+  { stage: "send", cleanup: "none", failure: new Error("attachment send failed") },
+  { stage: "lookup", cleanup: "none", failure: "submission lookup failed" },
+  { stage: "lookup", cleanup: "sync", failure: new Error("submission lookup failed") },
+  { stage: "send", cleanup: "async", failure: "attachment send failed" },
+]) {
+  test(`failed chat attachment releases its observer (${scenario.stage}, cleanup ${scenario.cleanup})`, { timeout: 5_000 }, async () => {
+    const harness = await createHarness(new MemoryStorage());
+    const root = await harness.root(BACKGROUND_CONTEXT);
+    const snapshot = await root.watch(BACKGROUND_CONTEXT);
+    await snapshot.stop();
+    let detached = false;
+    const watch = new Watch({
+      ...snapshot.value,
+      docs: { ...snapshot.value.docs, "pi.live": { run: { taskId: 1, inputs: [1] } } },
+    }, () => { detached = true; }, (error) => assert.fail(String(error)));
+    const stop = watch.stop.bind(watch);
+    const cleanupError = new Error("watch cleanup failed");
+    watch.stop = () => {
+      const stopped = stop();
+      if (scenario.cleanup === "sync") throw cleanupError;
+      return scenario.cleanup === "async" ? stopped.then(() => { throw cleanupError; }) : stopped;
+    };
+    root.watch = async () => watch;
+    harness.root = async () => root;
+    harness.submission = async () => { throw scenario.failure; };
+    const events: Record<string, unknown>[] = [];
+    try {
+      const chat = createWorkshopChat({ harness });
+      await assert.rejects(chat.watchChat("failed-watch", (event) => {
+        events.push(event);
+        if (scenario.stage === "send") throw scenario.failure;
+      }), (error: unknown) => {
+        assert.equal(detached, true, "failed attachment must release its observer before rejecting");
+        if (scenario.cleanup === "none") {
+          assert.equal(error, scenario.failure);
+        } else {
+          assert.ok(error instanceof AggregateError);
+          assert.equal(error.message, "Chat attachment failed and cleanup was incomplete");
+          assert.deepEqual(error.errors, [scenario.failure, cleanupError]);
+        }
+        return true;
+      });
+      assert.deepEqual(events, [{
+        request_id: "failed-watch", ok: true, type: "chat.attached", conversation_id: root.id, busy: true,
+      }]);
+    } finally {
+      await stop();
+      await harness.close(BACKGROUND_CONTEXT);
+    }
+  });
+}
 
 
 test("a replacement service watch recovers chat correlation and completion when settlement wins submission lookup", { timeout: 30_000 }, async () => {

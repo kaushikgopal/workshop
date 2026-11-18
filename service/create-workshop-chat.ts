@@ -153,11 +153,19 @@ export function createWorkshopChat(input: { harness: Harness }): {
       return publishChain;
     };
 
-    sendEvent({ ok: true, type: "chat.attached", conversation_id: root.id, busy: liveRun(watch.value) !== undefined });
-    await enqueuePublish(watch.value);
-    watch.start(async (call) => {
-      if (call.kind === "value") await enqueuePublish(call.value);
-    });
+    try {
+      sendEvent({ ok: true, type: "chat.attached", conversation_id: root.id, busy: liveRun(watch.value) !== undefined });
+      await enqueuePublish(watch.value);
+      watch.start(async (call) => {
+        if (call.kind === "value") await enqueuePublish(call.value);
+      });
+    } catch (error) {
+      closed = true;
+      await Promise.resolve().then(() => watch.stop()).catch((cleanupError: unknown) => {
+        throw new AggregateError([error, cleanupError], "Chat attachment failed and cleanup was incomplete");
+      });
+      throw error;
+    }
     return {
       async close() {
         if (closed) return;
