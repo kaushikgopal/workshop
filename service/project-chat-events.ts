@@ -2,7 +2,7 @@ import type { ConversationView } from "@earendil-works/pi-durable";
 
 type ChatView = Pick<ConversationView, "entries" | "docs">;
 type ChatEvent = { ok: true; type: string; chat_request_id?: string; [key: string]: unknown };
-type ProjectedTool = { status: string; resultSent: boolean };
+type ProjectedTool = "call-emitted" | "result-emitted";
 type ProjectingTurn = {
   phase: "projecting";
   turnId: string;
@@ -160,7 +160,7 @@ function projectTurn(turn: ProjectingTurn, view: ChatView): { state: ProjectingT
     const callId = item.callId;
     const status = typeof item.status === "string" ? item.status : "pending";
     const previous = tools.get(callId);
-    if (!previous) {
+    if (previous === undefined) {
       const argumentsSummary = summarizedArguments(toolArguments(view, callId));
       emit("tool.call", {
         call_id: callId,
@@ -169,10 +169,10 @@ function projectTurn(turn: ProjectingTurn, view: ChatView): { state: ProjectingT
       });
     }
     const completed = status === "done";
-    if (completed && previous?.resultSent !== true) {
+    if (completed && previous !== "result-emitted") {
       emit("tool.result", { call_id: callId, name: item.name, ...toolResult(view, callId) });
     }
-    tools.set(callId, { status, resultSent: completed || previous?.resultSent === true });
+    tools.set(callId, completed || previous === "result-emitted" ? "result-emitted" : "call-emitted");
   }
 
   const currentNestedTools = Array.isArray(live.nestedTools) ? live.nestedTools : [];
@@ -180,7 +180,7 @@ function projectTurn(turn: ProjectingTurn, view: ChatView): { state: ProjectingT
     if (!isRecord(item) || typeof item.callId !== "string" || typeof item.name !== "string") continue;
     const callId = item.callId;
     const previous = nestedTools.get(callId);
-    if (!previous) {
+    if (previous === undefined) {
       const argumentsSummary = summarizedArguments(item.arguments);
       emit("tool.call", {
         call_id: callId,
@@ -190,7 +190,7 @@ function projectTurn(turn: ProjectingTurn, view: ChatView): { state: ProjectingT
       });
     }
     const completed = isRecord(item.summary);
-    if (completed && previous?.resultSent !== true) {
+    if (completed && previous !== "result-emitted") {
       const summary = item.summary;
       if (isRecord(summary)) emit("tool.result", {
         call_id: callId,
@@ -198,7 +198,7 @@ function projectTurn(turn: ProjectingTurn, view: ChatView): { state: ProjectingT
         status: summary.isError === true ? "error" : "ok",
       });
     }
-    nestedTools.set(callId, { status: completed ? "done" : "pending", resultSent: completed || previous?.resultSent === true });
+    nestedTools.set(callId, completed || previous === "result-emitted" ? "result-emitted" : "call-emitted");
   }
 
   return { state: { ...turn, partialText, replacePending, tools, nestedTools }, events };
