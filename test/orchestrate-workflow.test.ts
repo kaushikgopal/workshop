@@ -82,6 +82,52 @@ test("automatic retry rules reject a different executable", () => {
   }), /same executable/);
 });
 
+test("automatic retry accepts a profile with the configured executable", () => {
+  const step: WorkflowStep = { kind: "agent", file: "10-write.md", number: 10, name: "write", profile: "pi-local" };
+  const applied = applyWorkflowDecision({
+    decision: { action: "retry", profile: "pi-fast" },
+    step,
+    currentProfile: "pi-local",
+    profileCommands: { "pi-local": ["pi", "--model", "local"], "pi-fast": ["pi", "--model", "fast"] },
+    lastError: "check failed",
+  });
+  assert.deepEqual(applied, { action: "retry", profile: "pi-fast", feedback: "check failed" });
+});
+
+test("automatic retry keeps command-step and unknown-profile errors", () => {
+  const step: WorkflowStep = { kind: "agent", file: "10-write.md", number: 10, name: "write", profile: "pi-local" };
+  const profileCommands = { "pi-local": ["pi", "--model", "local"] };
+  assert.throws(() => applyWorkflowDecision({
+    decision: { action: "retry", profile: "unknown" },
+    step,
+    currentProfile: "pi-local",
+    profileCommands,
+    lastError: "check failed",
+  }), /Unknown retry profile "unknown" for 10-write/);
+
+  const commandStep: WorkflowStep = { kind: "command", file: "10-write.sh", number: 10, name: "write" };
+  assert.throws(() => applyWorkflowDecision({
+    decision: { action: "retry", profile: "pi-local" },
+    step: commandStep,
+    currentProfile: undefined,
+    profileCommands,
+    lastError: "check failed",
+  }), /10-write cannot retry with a profile because it is a command step/);
+});
+
+test("retry listing and application handle a missing configured executable", () => {
+  const step: WorkflowStep = { kind: "agent", file: "10-write.md", number: 10, name: "write", profile: "missing" };
+  const profileCommands = { "pi-fast": ["pi", "--model", "fast"] };
+  assert.deepEqual(computeRetryProfiles(step, profileCommands), []);
+  assert.throws(() => applyWorkflowDecision({
+    decision: { action: "retry", profile: "pi-fast" },
+    step,
+    currentProfile: "missing",
+    profileCommands,
+    lastError: "check failed",
+  }), /same executable as missing/);
+});
+
 test("workflow listing reports enabled, paused, and broken workflows", () => {
   const result = listWorkflowStatus({
     workflows: [
