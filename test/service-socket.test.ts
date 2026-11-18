@@ -160,3 +160,87 @@ test("socket shutdown closes every watcher and listener after a watcher fails", 
     rmSync(stateDirectory, { recursive: true, force: true });
   }
 });
+
+for (const framing of ["lines", "trailing"] as const) {
+  for (const failure of ["none", "error", "non-error"] as const) {
+    const behavior = failure === "none"
+      ? "closes once and preserves responses"
+      : "logs watcher cleanup rejection without terminating";
+    test(`socket EOF ${behavior} (${framing}, ${failure})`, { timeout: 15_000 }, async () => {
+      const stateDirectory = mkdtempSync(join(tmpdir(), "workshop-socket-eof-"));
+      const socketPath = join(stateDirectory, "service.sock");
+      const moduleUrl = new URL("../service/serve-service-socket.ts", import.meta.url).href;
+      const requestUrl = new URL("../service/request-service.ts", import.meta.url).href;
+      // A child keeps Node's fatal unhandled-rejection policy intact.
+      const script = `
+        import { connect } from 'node:net';
+        import { serveServiceSocket } from ${JSON.stringify(moduleUrl)};
+        import { requestService } from ${JSON.stringify(requestUrl)};
+        let closeCalls = 0;
+        let finishClose;
+        const closed = new Promise(resolve => { finishClose = resolve; });
+        const service = await serveServiceSocket(${JSON.stringify(socketPath)}, async (request, send) => {
+          send({ request_id: request.request_id, ok: true, type: request.type });
+          if (request.type !== 'watch_chat') return;
+          return { close: async () => {
+            closeCalls += 1;
+            finishClose();
+            if (${JSON.stringify(failure)} === 'error') throw new Error('watch close failed');
+            if (${JSON.stringify(failure)} === 'non-error') throw 'watch close failed';
+          } };
+        });
+        let transcript = '';
+        await new Promise((resolve, reject) => {
+          const client = connect(${JSON.stringify(socketPath)});
+          client.setEncoding('utf8');
+          client.once('error', reject);
+          client.once('close', resolve);
+          let ended = false;
+          client.on('data', chunk => {
+            transcript += chunk;
+            if (${JSON.stringify(framing)} === 'lines' && !ended && transcript.includes('\\n')) {
+              ended = true;
+              client.end('{"request_id":"later","type":"list_workflows"}');
+            }
+          });
+          client.once('connect', () => {
+            const watch = '{"request_id":"watch","type":"watch_chat"}';
+            if (${JSON.stringify(framing)} === 'trailing') client.end(watch);
+            else client.write(watch + '\\n');
+          });
+        });
+        await closed;
+        const probe = await requestService({ request_id: 'probe', type: 'list_workflows' }, ${JSON.stringify(stateDirectory)});
+        await service.close();
+        console.log(JSON.stringify({ transcript, probe, closeCalls }));
+      `;
+      const child = spawn(process.execPath, ["--unhandled-rejections=strict", "--input-type=module", "-e", script], {
+        stdio: ["ignore", "pipe", "pipe"], timeout: 10_000, killSignal: "SIGKILL",
+      });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.setEncoding("utf8");
+      child.stderr.setEncoding("utf8");
+      child.stdout.on("data", (chunk: string) => { stdout += chunk; });
+      child.stderr.on("data", (chunk: string) => { stderr += chunk; });
+      try {
+        const code = await new Promise<number | null>((resolve, reject) => {
+          child.once("error", reject);
+          child.once("close", resolve);
+        });
+        assert.equal(code, 0, stderr);
+        const diagnostic = failure === "error" ? "watch close failed" : "Service request failed";
+        assert.equal(stderr, failure === "none" ? "" : `[workshop] chat watch close failed: ${diagnostic}\n`);
+        assert.deepEqual(JSON.parse(stdout), {
+          transcript: '{"request_id":"watch","ok":true,"type":"watch_chat"}\n'
+            + (framing === "lines" ? '{"request_id":"later","ok":true,"type":"list_workflows"}\n' : ""),
+          probe: { request_id: "probe", ok: true, type: "list_workflows" },
+          closeCalls: 1,
+        });
+      } finally {
+        child.kill("SIGKILL");
+        rmSync(stateDirectory, { recursive: true, force: true });
+      }
+    });
+  }
+}

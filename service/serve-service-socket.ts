@@ -152,7 +152,9 @@ export async function serveServiceSocket(
           }
         }
         if (ended && persistent) {
-          await closeSession(socket);
+          await closeSession(socket).catch((error: unknown) => {
+            console.error(`[workshop] chat watch close failed: ${errorMessage(error)}`);
+          });
           socket.end();
         }
       } finally {
