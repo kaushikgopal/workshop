@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { projectWorkflowRunStatus } from "../service/project-workflow-run-status.ts";
+import { projectWorkflowRunStatus } from "../service/project-workshop-status.ts";
 
 const attemptHistory = [{ attempt: 1, output: "result", error: "exit 7" }];
 const failure = {
