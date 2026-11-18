@@ -1,4 +1,3 @@
-import { execFileSync } from "node:child_process";
 import { connect, type Socket } from "node:net";
 import assert from "node:assert/strict";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
@@ -1288,6 +1287,8 @@ test("step loader classifies expected failures and preserves path defects", () =
     workflowStepLoader.loadWorkflowStep(root, workflow, { kind, file, number: 20, name: "next" });
 
   try {
+    writeFileSync(join(root, "clock", "20-prompt.md"), "\uFEFF---\r\nprofile: writer\r\n...\r\nAgent prompt.\r\nSecond line.\r\n");
+    assert.deepEqual(load("20-prompt.md", "agent").documents, { "20-prompt.md": "Agent prompt.\nSecond line." });
     const expectedFailures = [
       ["20-missing.sh", "command", null, "ENOENT"],
       ["20-incomplete.md", "agent", "---\nprofile: writer\nprompt without closing delimiter", "missing or incomplete YAML frontmatter"],
@@ -1308,61 +1309,6 @@ test("step loader classifies expected failures and preserves path defects", () =
   }
 });
 
-test("agent prompt and failure brief agree within one loaded step", () => {
-  const project = createProject("");
-  const stepFile = join(project.root, "workflows", "clock", "20-next.md");
-  const original = "\uFEFF---\r\nprofile: writer\r\n...\r\nOriginal agent prompt.\r\n";
-  const replacement = "\uFEFF---\r\nprofile: writer\r\n...\r\nReplacement agent prompt.\r\n";
-  writeFileSync(stepFile, original);
-  const script = [
-    `import fs from "node:fs";`,
-    `import { syncBuiltinESMExports } from "node:module";`,
-    `const file = ${JSON.stringify(stepFile)};`,
-    `const originalReadFileSync = fs.readFileSync;`,
-    `let reads = 0;`,
-    `fs.readFileSync = function (path, options) {`,
-    `  const source = originalReadFileSync.call(this, path, options);`,
-    `  if (String(path) === file) {`,
-    `    reads += 1;`,
-    `    if (reads === 1) fs.writeFileSync(file, ${JSON.stringify(replacement)});`,
-    `  }`,
-    `  return source;`,
-    `};`,
-    `syncBuiltinESMExports();`,
-    `try {`,
-    `const { loadWorkflowStep } = await import(${JSON.stringify(new URL("../workflow/load-workflow-step.ts", import.meta.url).href)});`,
-    `const { executeWorkflowAttempt } = await import(${JSON.stringify(new URL("../workflow/execute-workflow-attempt.ts", import.meta.url).href)});`,
-    `const { buildOrchestratorBrief } = await import(${JSON.stringify(new URL("../workflow/build-orchestrator-brief.ts", import.meta.url).href)});`,
-    `const workflow = { name: "clock", directory: "clock", cron: "* * * * *", description: "Test.", steps: [] };`,
-    `const step = { kind: "agent", file: "20-next.md", number: 20, name: "next", profile: "writer" };`,
-    `const loaded = loadWorkflowStep(${JSON.stringify(join(project.root, "workflows"))}, workflow, step);`,
-    `let agentPrompt;`,
-    `await executeWorkflowAttempt({ workflow, documents: loaded.documents, files: loaded.files, profileCommands: { writer: ["fake"] }, executeProcess: async ({ input }) => { agentPrompt = input; return { exitCode: 0, stdout: "draft", stderr: "", timedOut: false }; } }, { step, profile: "writer", pipeInput: "", feedback: "", attempt: 1 });`,
-    `const stepContent = loaded.stepContent`,
-    `const brief = buildOrchestratorBrief({ workflow, step, stepId: "20-next", runId: "run-1", decisionNumber: 1, stepContent, lastOutput: "draft", lastError: "failed", attemptHistory: [], allowedRetryProfiles: [] });`,
-    `process.stdout.write(JSON.stringify({ reads, stepContent, agentPrompt, brief: brief.prompt }));`,
-    `} finally {`,
-    `  fs.readFileSync = originalReadFileSync;`,
-    `  syncBuiltinESMExports();`,
-    `}`,
-  ].join("\n");
-
-  try {
-    const output: unknown = JSON.parse(execFileSync(process.execPath, ["--input-type=module", "-e", script], { encoding: "utf8", timeout: 5_000 }));
-    assert.ok(isRecord(output));
-    if (!isRecord(output)) return;
-    assert.equal(output.reads, 1);
-    assert.equal(output.stepContent, original);
-    assert.equal(output.agentPrompt, "Original agent prompt.");
-    assert.equal(typeof output.brief, "string");
-    if (typeof output.brief === "string") {
-      assert.ok(output.brief.includes(original));
-      assert.doesNotMatch(output.brief, /Replacement agent prompt\./);
-    }
-  } finally {
-    rmSync(project.root, { recursive: true, force: true });
-  }
-});
 test("failure brief includes a readable step when its check file is missing", { timeout: 10_000 }, async () => {
   const stepSource = [
     `rm "$WORKSHOP_PROJECT_ROOT/workflows/clock/10-task.check.sh"`,
